@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Node and TypeScript tooling
+node_modules/
+
+# Declarations the host CLI writes for the mod when it first loads it (see
+# plugins/claude_code_mod/README.md, Testing). Generated, not source.
+plugins/claude_code_mod/.claude-plugin/types/
+
+# Release build output (build_dist.sh <dir>, release-mod.yml)
+/out/
+
+# Environment files and credentials (never commit downloaded keys)
+.env
+service-account*.json
+credentials.json
+*-credentials.json
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+.DS_Store?
+._*
+
+# Local working notes, kept outside the repository
+intent.md
+plan.md
+spec.md
