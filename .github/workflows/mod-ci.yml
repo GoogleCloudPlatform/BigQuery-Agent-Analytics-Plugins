@@ -49,6 +49,8 @@ on:
       - '.claude-plugin/marketplace.json'
       - '.github/workflows/mod-ci.yml'
       - '.github/workflows/release-mod.yml'
+  # Run the same checks on demand, on any branch.
+  workflow_dispatch:
 
 permissions:
   contents: read
