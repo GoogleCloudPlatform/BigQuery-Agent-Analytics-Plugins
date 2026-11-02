@@ -49,6 +49,8 @@ import subprocess
 import sys
 from typing import Iterable
 
+from ._utils import PYTHON_C_DROP_WORKING_DIR
+
 # Modules whose absence blocks the writer entirely.
 _REQUIRED_IMPORTS: tuple[tuple[str, str], ...] = (
     ("google.cloud.bigquery", "google-cloud-bigquery"),
@@ -173,9 +175,11 @@ def _probe_imports(
     # handles. ``collect_report`` skips this loop entirely when the
     # interpreter is broken, but keep the catches so a direct caller
     # never sees a raw OSError from a misconfigured python_bin.
+    # The probe runs in the caller's working directory, usually a
+    # checked-out repository, so it drops that from sys.path first.
     try:
       proc = subprocess.run(
-          [python_bin, "-c", f"import {module}"],
+          [python_bin, "-c", PYTHON_C_DROP_WORKING_DIR + f"import {module}"],
           capture_output=True,
           text=True,
           timeout=15,

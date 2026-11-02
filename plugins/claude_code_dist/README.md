@@ -62,11 +62,22 @@ trigger on `tracing-v*` tags from the SDK repository's
 ## Do not edit the contents directly
 
 `plugins/claude_code_dist/bigquery-agent-analytics-tracing/` is a verbatim
-copy of the released tarball, apart from the Apache license header that the
-nine per-event hook wrappers (`hooks/<event>.sh`) carry here and in
-[`plugins/claude_code/hooks/`](../claude_code/hooks/); keep it when you sync
-a release. Other edits there get overwritten on the next release sync. Send
-patches to:
+copy of the released tarball, apart from:
+
+- The Apache license header that the nine per-event hook wrappers
+  (`hooks/<event>.sh`) carry here and in
+  [`plugins/claude_code/hooks/`](../claude_code/hooks/); keep it when you sync
+  a release.
+- The launcher hardening from SDK pull request
+  [#557](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/557),
+  which keeps the working directory off `sys.path`. The `tracing-v0.1.0`
+  tarball predates it, so it is applied here by hand to `hooks/common.sh`,
+  `scripts/run_setup_check.sh`, `commands/bqaa-setup.md`, `README.md` and the
+  vendored `_utils.py`, `logger.py`, `setup_check.py` and `claude_code.py`
+  (docstring only). Sync only a release that includes #557, or re-apply it;
+  then drop this bullet.
+
+Other edits there get overwritten on the next release sync. Send patches to:
 
 - [`producers/src/bigquery_agent_analytics_tracing/`](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/tree/main/producers/src/bigquery_agent_analytics_tracing/) in the SDK repository — for the vendored Python.
 - [`plugins/claude_code/`](../claude_code/) — for the plugin manifest, hooks, slash commands, scripts, and docs.
