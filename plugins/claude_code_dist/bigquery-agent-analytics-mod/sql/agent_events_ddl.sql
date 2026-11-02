@@ -18,10 +18,10 @@
 -- (https://adk.dev/integrations/bigquery-agent-analytics/), so ADK agents,
 -- the settings-hook tracing plugin and this mod can share one table.
 --
--- Replace {PROJECT}, {DATASET} and {TABLE} first (the skill's
--- scripts/run_bq.py fills them from GCP_PROJECT_ID, BQ_DATASET and
--- BQ_TABLE), then run it with `bq query --use_legacy_sql=false` or in the
--- console.
+-- Replace {PROJECT}, {DATASET} and {TABLE} first (scripts/run_bq.py fills
+-- them from --project, --dataset and --table, or from BQAA_PROJECT_ID,
+-- BQAA_DATASET and BQAA_TABLE), then run it with
+-- `bq query --use_legacy_sql=false` or in the console.
 --
 -- The mod creates this table itself on first write when it is missing
 -- (BQAA_AUTO_CREATE_TABLE, on by default); the dataset must exist.

@@ -54,3 +54,19 @@ before agent events can land in BigQuery.
 For the bootstrap that actually does those things, see
 [`plugins/claude_code/MARKETPLACE.md`](../MARKETPLACE.md#bigquery-iam-requirements)
 for the IAM model and the manual `gcloud` / `bq` commands.
+
+## Switching Google Cloud projects
+
+If the user changed their GCP project (for example with `gcloud config set project`),
+remind them that the hooks read `BQAA_PROJECT_ID` (then `GCP_PROJECT_ID` /
+`GOOGLE_CLOUD_PROJECT`) from `~/.claude/settings.json` (`"env"`),
+`.claude/settings.local.json`, or the shell environment rather than `gcloud`
+config:
+
+1. Create the target dataset and `agent_events` table in the new project.
+2. Update `BQAA_PROJECT_ID` in `~/.claude/settings.json` (`"env"`),
+   `.claude/settings.local.json`, and their shell profile (`~/.zshrc` /
+   `~/.bashrc`). (If they are using `bigquery-agent-analytics-mod`, they must
+   also update `project` via `/config` or `claude plugin install ... --config project=NEW_PROJECT`,
+   because `pluginConfigs` in `~/.claude/settings.json` overrides `BQAA_PROJECT_ID`.)
+3. Start a new Claude Code session and re-run `/bqaa-setup` to verify.

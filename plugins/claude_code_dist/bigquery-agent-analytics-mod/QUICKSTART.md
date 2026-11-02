@@ -107,19 +107,40 @@ When rows cannot reach BigQuery, the mod buffers them on disk and shows the caus
 | `BigQuery cannot find the dataset ...` or `BigQuery cannot find the table ...` (`404`) | Verify `project` and `dataset`, or run the `setup.sh` command shown in `/bqaa-status`. Newly created tables can take a few minutes to accept streaming inserts; queued rows send automatically once ready. |
 | Duplicate events in BigQuery | First check whether both this mod and `bigquery-agent-analytics-tracing` (or manual tracing hooks) write to the same table; if so, turn off the tracer as described in [MIGRATION.md](MIGRATION.md). With only the mod enabled, retries or backfills can still duplicate rows because `insertAll` deduplication is best-effort; deduplicate on `event_id` using the query in [What it writes](README.md#what-it-writes). |
 | `Plugin "bigquery-agent-analytics-mod" not found in marketplace` | Your cached `bqaa-tracing` marketplace predates the mod. Run `claude plugin marketplace update bqaa-tracing` and install again. |
+| `bigquery-agent-analytics-mod its classic.SessionStart hook was skipped. "cc-plugin-sec-default" runs first and sent the event on past it.` | Expected on organization-managed CLIs (`claude-labs`), where the built-in `cc-plugin-sec-default` security hook runs at the `prepend` tier and intercepts legacy `classic.*` bridge events. This does **not** break tracing: session setup, `/bqaa-status`, prompts, model responses, tool calls, permission decisions (`telemetry.log` `tool_decision` collector records), inferred subagent starts, and `session.end` all run on native mod hooks (`session.start`, `prompt.submit`, `turn.*`, `tool.call`, `session.end`). Only the optional `classic.SessionStart` `STATE_DELTA` (`session_start`) row is omitted (see [docs/managed-settings.md](docs/managed-settings.md#choose-the-tier)). |
+| Changed your GCP project, but rows still go to the old project | `--config project=...` or `/config` saves `"project"` in `~/.claude/settings.json` (`pluginConfigs`), which takes precedence over `BQAA_PROJECT_ID`, `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, and `gcloud config set project`. Follow [Changing your Google Cloud project](#changing-your-google-cloud-project) below. |
+
+### Changing your Google Cloud project
+
+Because `--config project=...` (or `/config`) saves `"project"` in `~/.claude/settings.json` under `pluginConfigs["bigquery-agent-analytics-mod@bqaa-tracing"].options`, exporting a new `BQAA_PROJECT_ID` or running `gcloud config set project NEW_PROJECT` alone will not change where the mod writes. To switch to `NEW_PROJECT`:
+
+1. **Provision the dataset, table, and views in the new project**:
+   ```bash
+   BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics \
+     ./BigQuery-Agent-Analytics-Plugins/plugins/claude_code_mod/setup.sh
+   ```
+2. **Update the saved `project` option**:
+   - In `/config` (or `/plugin configure`), set `project` to `NEW_PROJECT`, or reinstall with the updated flag:
+     ```bash
+     claude plugin install bigquery-agent-analytics-mod@bqaa-tracing \
+       --config project=NEW_PROJECT --config dataset=agent_analytics
+     ```
+   - Or, if you want `BQAA_PROJECT_ID` / `GOOGLE_CLOUD_PROJECT` in your shell environment to control the target project, set `"project": ""` (or remove `"project"`) under `pluginConfigs["bigquery-agent-analytics-mod@bqaa-tracing"].options` in `~/.claude/settings.json`.
+   - If your setup uses `accessTokenCommand` to impersonate a per-project writer service account (`bqaa-row-writer@OLD_PROJECT.iam.gserviceaccount.com`), update `accessTokenCommand` to the new project's service account as well.
+3. **Reload and verify**: Run `/reload-plugins` (or start a new `claude` session) and run `/bqaa-status` to confirm `BigQuery Agent Analytics mod: enabled, target NEW_PROJECT.agent_analytics.agent_events (US)`.
 
 ## For administrators
 
 1. **Create the dataset, table, and views**: Run `setup.sh` (see [Step A.3](#3-create-the-bigquery-dataset-and-table)) in a dedicated GCP project where regular users do not hold project-wide BigQuery read roles. This creates `<dataset>.agent_events` and two aggregate views (`daily_usage_by_user`, `daily_usage_by_model`) in `<dataset>_reporting`.
-2. **Create the writer service account and grant your two groups**: The bootstrap script lives in a separate repository and runs in a Python virtual environment with `google-cloud-bigquery`:
+2. **Create the writer service account and grant your two groups**: The bootstrap script comes with this plugin (`scripts/setup_gcp_prereqs.py`, in the checkout from Step A.3). Run it from the plugin folder; applying its plan needs `google-cloud-bigquery`, so use a Python virtual environment:
    ```bash
-   git clone --depth 1 https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill
+   cd BigQuery-Agent-Analytics-Plugins/plugins/claude_code_mod
    python3 -m venv .venv && .venv/bin/pip install google-cloud-bigquery
-   .venv/bin/python bigquery_agent_analytics_skill/plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+   .venv/bin/python scripts/setup_gcp_prereqs.py \
      --project YOUR_PROJECT --dataset agent_analytics --no-create-dataset --no-create-table \
      --service-account bqaa-row-writer --writer-role row-writer \
      --token-creator group:WRITERS@example.com --reader group:READERS@example.com
    ```
-   Review the plan it prints, then run the same command again with `--execute` (if it stops on grants it cannot verify via Cloud Identity, audit them and add `--accept-unverified`). Verify isolation with `tests/access.live.sh`—see [docs/service-account-auth.md#set-it-up](docs/service-account-auth.md#set-it-up).
+   It prints the plan and changes nothing until you run the same command again with `--execute` (it never creates the dataset or table; `setup.sh` does). Review the plan first; if it stops on grants it cannot verify via Cloud Identity, audit them and add `--accept-unverified`. Verify isolation with `tests/access.live.sh`—see [docs/service-account-auth.md#set-it-up](docs/service-account-auth.md#set-it-up).
 3. **Roll out to developers**: Share `project`, `dataset`, and `accessTokenCommand` (`gcloud auth print-access-token --impersonate-service-account=bqaa-row-writer@YOUR_PROJECT.iam.gserviceaccount.com`) for [Path B](#b-your-team-set-it-up), or deploy an organization policy with [docs/managed-settings.md](docs/managed-settings.md).
-4. **Query usage and traces**: Point stakeholders to `<dataset>_reporting` (`daily_usage_by_user`, `daily_usage_by_model`) for daily adoption and token counts, and use [`sql/sample_queries.sql`](sql/sample_queries.sql) (filling in `{PROJECT}`, `{DATASET}`, and `{TABLE}`) and [docs/value.md](docs/value.md) for admin-level latency, tool-error, and trace queries.
+4. **Query usage and traces**: Point stakeholders to `<dataset>_reporting` (`daily_usage_by_user`, `daily_usage_by_model`) for daily adoption and token counts, and use [`sql/sample_queries.sql`](sql/sample_queries.sql) (filling in `{PROJECT}`, `{DATASET}`, and `{TABLE}`, or letting [`scripts/run_bq.py`](scripts/run_bq.py) fill them in) and [docs/value.md](docs/value.md) for admin-level latency, tool-error, and trace queries.

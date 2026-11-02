@@ -46,3 +46,31 @@ for (const write of ['both', 'b'] as const) {
     expect(seen.afterB?.value).toBe(2)
   })
 }
+
+// Compile-time check that host-boundary types in `claude-code` do not decay to
+// `any` under `tsc -p tsconfig.ci.json --noEmit` (`"skipLibCheck": false`). Each
+// of the five aliases in tests/shim/claude-code.d.ts is read where the host API
+// uses it: `Usage` (`TurnStepResult['usage']`), `TurnStepChunk`, `Options`
+// (`Register`'s second parameter), `ToolOutcome` (the `tool.call` hook's result)
+// and `StepResult` (the `turn.step` hook's generator return). If any of them
+// resolves to `any`, its `@ts-expect-error` directive below becomes unused and
+// fails `tsc` with `TS2578`.
+const _hostBoundaryContract: [
+  NonNullable<import('claude-code').TurnStepResult['usage']>['input_tokens'],
+  import('claude-code').TurnStepChunk['kind'],
+  Parameters<import('claude-code').Register>[1],
+  import('claude-code').EventPayloadMap['tool.call']['result'],
+  import('claude-code').EventPayloadMap['turn.step']['result'] extends AsyncGenerator<unknown, infer R extends { answer: unknown }, unknown> ? R['answer'] : never,
+] = [
+  // @ts-expect-error TurnStepResult['usage']['input_tokens'] must be number, not any
+  'not-a-number',
+  // @ts-expect-error TurnStepChunk['kind'] must be string, not any
+  123,
+  // @ts-expect-error Register options must be Options (Readonly<Record<string, string | number | boolean | readonly string[]>>), not any
+  'not-an-object',
+  // @ts-expect-error the tool.call hook's result must be a ToolOutcome, not any
+  'not-a-tool-outcome',
+  // @ts-expect-error the turn.step generator must return a StepResult, whose answer is a string, not any
+  123,
+]
+void _hostBoundaryContract

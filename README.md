@@ -1,6 +1,7 @@
 # BigQuery Agent Analytics Plugins
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Repo CI](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/actions/workflows/repo-ci.yml/badge.svg)](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/actions/workflows/repo-ci.yml)
 [![Mod CI](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/actions/workflows/mod-ci.yml/badge.svg)](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/actions/workflows/mod-ci.yml)
 
 Claude Code plugins that stream coding-agent sessions to BigQuery in the
@@ -53,16 +54,37 @@ Notes:
 - Organization-wide deployment of the mod is covered in
   [`docs/managed-settings.md`](plugins/claude_code_mod/docs/managed-settings.md).
 
+### Switching Google Cloud projects
+
+- **`bigquery-agent-analytics-mod`**: Passing `--config project=...` (or setting
+  `project` in `/config`) saves `"project"` in `~/.claude/settings.json`
+  (`pluginConfigs`), which takes precedence over `BQAA_PROJECT_ID` and
+  `gcloud config set project`. To switch to `NEW_PROJECT`, run
+  `BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics ./plugins/claude_code_mod/setup.sh`,
+  update `project` via `/config` or
+  `claude plugin install bigquery-agent-analytics-mod@bqaa-tracing --config project=NEW_PROJECT --config dataset=agent_analytics`
+  (or set `"project": ""` in `~/.claude/settings.json` to fall back to
+  `BQAA_PROJECT_ID`), and run `/reload-plugins` (see
+  [Changing the GCP project or dataset](plugins/claude_code_mod/README.md#changing-the-gcp-project-or-dataset)).
+- **`bigquery-agent-analytics-tracing`**: Provision the dataset and
+  `agent_events` table in the new project, update `BQAA_PROJECT_ID` in
+  `~/.claude/settings.json` (`"env"`), `.claude/settings.local.json`, or your
+  shell profile (`~/.zshrc` / `~/.bashrc`), start a new session, and verify with
+  `/bqaa-setup` (see
+  [Switching Google Cloud projects](plugins/claude_code/README.md#switching-google-cloud-projects)).
+
 ## Repository layout
 
 ```text
 .claude-plugin/marketplace.json  the bqaa-tracing catalog
-plugins/claude_code_mod/         mod source, tests, SQL and docs
+plugins/claude_code_mod/         mod source, tests, SQL, scripts and docs
 plugins/claude_code/             tracing plugin source: manifest, hooks, command, docs
 plugins/claude_code_dist/        built copies the catalog serves
   bigquery-agent-analytics-mod/       built from plugins/claude_code_mod
   bigquery-agent-analytics-tracing/   built from the SDK repository, per release
-.github/workflows/               Mod CI and the mod release workflow
+scripts/                         checks that span the whole repository
+.github/                         workflows (Repo CI, Mod CI, the mod release),
+                                 issue and pull request templates
 ```
 
 [`plugins/claude_code_dist/README.md`](plugins/claude_code_dist/README.md)
@@ -93,13 +115,37 @@ bash tests/build_dist.test.sh
 bash tests/setup.test.sh
 bash tests/version.test.sh
 node tests/reload.test.mjs
+npm ci --ignore-scripts --prefix tests
+./tests/node_modules/.bin/tsc -p tsconfig.ci.json --noEmit
+node --import ./tests/shim/register.mjs --test --test-concurrency=1 tests/*.test.ts tests/state-contract/state.contract.ts
 python3 -m venv .venv && .venv/bin/pip install duckdb==1.5.6
 .venv/bin/python tests/views.test.py
+.venv/bin/python tests/queries.test.py
+python3 tests/scripts.test.py
 ```
 
-After changing the mod's source, rebuild the served copy with
-`bash plugins/claude_code_mod/build_dist.sh plugins/claude_code_dist/bigquery-agent-analytics-mod`
-so `build_dist.sh --check` passes. The mod's
+Repository-wide checks need only Python 3.9 or newer, and ShellCheck for the
+last command: repository hygiene (the marketplace catalog against each plugin
+manifest, links and anchors in the Markdown, stale references, shell syntax),
+the tests for the mod's `scripts/`, and ShellCheck over every shell script. Run
+them from the repository root:
+
+```bash
+python3 scripts/check_repo_hygiene.py
+python3 plugins/claude_code_mod/tests/scripts.test.py
+git ls-files -z '*.sh' | xargs -0 shellcheck -S warning
+```
+
+[Repo CI](.github/workflows/repo-ci.yml) runs them on every pull request and
+every push to `main`. [CONTRIBUTING.md](CONTRIBUTING.md) describes the full
+workflow for a change.
+
+Until the first `mod-vX.Y.Z` release is tagged, rebuild the served copy after
+changing the mod's source, with
+`bash plugins/claude_code_mod/build_dist.sh plugins/claude_code_dist/bigquery-agent-analytics-mod`,
+so `build_dist.sh --check` passes. Once a release is tagged, the copy moves only
+with a release sync (see
+[Where a change goes](CONTRIBUTING.md#where-a-change-goes)). The mod's
 [README](plugins/claude_code_mod/README.md#testing) lists the remaining checks,
 which need the host CLI or a Google Cloud project. The tracing plugin's Python
 package and its tests live in the SDK repository.
@@ -126,6 +172,13 @@ security issue, see [SECURITY.md](SECURITY.md).
 ## License
 
 Apache License 2.0; see [LICENSE](LICENSE).
+
+## Terms of Service
+
+These plugins write data to Google BigQuery. Use of Google Cloud services,
+including BigQuery, is subject to the
+[Google Cloud Terms of Service](https://cloud.google.com/terms). See also the
+[Google Privacy Policy](https://policies.google.com/privacy).
 
 ## Disclaimer
 

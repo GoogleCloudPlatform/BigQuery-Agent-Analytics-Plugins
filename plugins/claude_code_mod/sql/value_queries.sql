@@ -15,13 +15,12 @@
 -- The questions docs/value.md answers, one query each: a developer (V1, V2),
 -- a team lead or administrator (V3 to V6) and a platform team (V7).
 -- Placeholders as in sample_queries.sql: {PROJECT}, {DATASET}, {TABLE} and
--- the parameters @start and @end, which
--- bigquery-agent-analytics-skill/scripts/run_bq.py fills and binds. It runs
--- with your Application Default Credentials, not the mod's settings, and
--- stops a query that would bill more than --max-gb (1 GB by default). Pass
--- one query at a time:
+-- the parameters @start and @end, which scripts/run_bq.py fills and binds.
+-- It runs with your Application Default Credentials, not the mod's
+-- settings, and stops a query that would bill more than --max-gb (1 GB by
+-- default). Pass one query at a time:
 --
---   python3 bigquery-agent-analytics-skill/scripts/run_bq.py \
+--   python3 scripts/run_bq.py \
 --     --project my-gcp-project --dataset agent_analytics --table agent_events \
 --     --start 2026-10-01 --end 2026-10-31 --max-gb 1 "<one query below>"
 --

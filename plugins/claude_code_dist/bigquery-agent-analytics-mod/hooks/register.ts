@@ -265,7 +265,9 @@ async function readEnv($: EngineInterface): Promise<EnvSnapshot> {
 // permission prompt, a subagent) then find the tool already started.
 async function readSessionId($: EngineInterface): Promise<void> {
   try {
-    tracer.setSession({ sessionId: await $.session.id() })
+    const next = await $.session.id()
+    if (next && tracer.sessionId !== null && next !== tracer.sessionId) resets += 1
+    tracer.setSession({ sessionId: next })
   } catch {
     // The tracer keeps what it has.
   }
@@ -1129,6 +1131,7 @@ export const register: Register = (on, registered) => {
   })
 
   on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear' || e.reason === 'resume') resets += 1
     safely(() => tracer.sessionEnded(e))
     if (writer) {
       if (e.reason === 'clear' || e.reason === 'resume') {

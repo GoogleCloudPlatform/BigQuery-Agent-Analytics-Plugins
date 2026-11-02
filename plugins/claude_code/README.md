@@ -115,6 +115,24 @@ pip install google-cloud-bigquery-storage pyarrow  # Storage Write path (optiona
 Run `/bqaa-setup` inside Claude Code to verify the env vars and runtime
 deps are correctly configured before relying on tracing.
 
+### Switching Google Cloud projects
+
+`bigquery-agent-analytics-tracing` resolves the target project from
+`BQAA_PROJECT_ID` (falling back to `GCP_PROJECT_ID`, then
+`GOOGLE_CLOUD_PROJECT`) in your Claude Code settings (`~/.claude/settings.json`
+`env` block or `.claude/settings.local.json`) or shell environment; it does
+not read `gcloud config get-value project`.
+To switch to a new Google Cloud project:
+
+1. Create the BigQuery dataset and `agent_events` table in the new project
+   (see [`MARKETPLACE.md`](MARKETPLACE.md#bigquery-iam-requirements)).
+2. Update `BQAA_PROJECT_ID` (and `BQAA_DATASET` if changing datasets) in
+   `~/.claude/settings.json` (`"env"`), `.claude/settings.local.json`, and
+   your shell profile (`~/.zshrc` or `~/.bashrc`).
+3. Start a new Claude Code session so hooks inherit the updated environment,
+   then run `/bqaa-setup` to confirm `BQAA_PROJECT_ID` points to the new
+   project.
+
 ### Submission to Anthropic's official marketplace
 
 Tracked in [#251](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/251)

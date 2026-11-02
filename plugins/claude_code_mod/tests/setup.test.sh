@@ -70,6 +70,9 @@ check 'no placeholder is left' lacks '{' "$log"
 check 'queries are standard SQL in the location' has 'query --use_legacy_sql=false --location=US' "$log"
 check 'three queries in all: the table, then the two views' test "$(grep -c -- '--- sql' "$log")" -eq 3
 check 'the next step names the project and dataset, and no table, views dataset or location (the defaults)' bash -c "grep -qF -- '--project my-gcp-project --dataset agent_analytics --no-create-dataset' '$log.out'"
+printf -v bootstrap '%q' "$plugin/scripts/setup_gcp_prereqs.py"
+check "the next step runs the bootstrap that sits beside setup.sh, by its full path" has "python3 $bootstrap" "$log.out"
+check 'the next step sends nobody to a checkout of another repository' bash -c "! grep -qE 'github\.com|git clone' '$log.out'"
 
 # 2. Run again with both datasets there: nothing is made but the views.
 log="$work/again.log"
@@ -102,6 +105,17 @@ log="$work/none.log"
 check 'no project: refused' bash -c "$(declare -f run_setup); work='$work'; plugin='$plugin'; ! run_setup '$log' BQAA_DATASET=agent_analytics"
 check 'no project: says which variable' has 'set BQAA_PROJECT_ID' "$log.err"
 check 'an unknown argument is refused' bash -c "! bash '$plugin/setup.sh' --force 2>/dev/null"
+
+help_log="$work/help.log"
+: >"$help_log"
+check '--help succeeds without project or dataset' bash -c "env -i PATH='$work/bin:/usr/bin:/bin' BQ_LOG='$help_log' bash '$plugin/setup.sh' --help >'$help_log.out' 2>'$help_log.err'"
+check '--help makes no bq call' test ! -s "$help_log"
+check '--help prints Usage:' has 'Usage:' "$help_log.out"
+check '--help lists BQAA_PROJECT_ID' has 'BQAA_PROJECT_ID' "$help_log.out"
+check '--help omits the Apache license header' lacks 'Licensed under the Apache License' "$help_log.out"
+short_log="$work/short-help.log"
+: >"$short_log"
+check '-h matches --help' bash -c "env -i PATH='$work/bin:/usr/bin:/bin' BQ_LOG='$short_log' bash '$plugin/setup.sh' -h >'$short_log.out' 2>'$short_log.err' && cmp -s '$help_log.out' '$short_log.out' && test ! -s '$short_log'"
 
 # 6. The command the mod prints when BigQuery cannot find the dataset (the
 # shape tests/destination.test.ts holds it to) sets every name setup.sh

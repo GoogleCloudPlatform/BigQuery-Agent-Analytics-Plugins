@@ -48,7 +48,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=1 ;;
     -h | --help)
-      sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      awk 'NR > 1 && /^$/ { if (++block > 1) exit; next } block == 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
@@ -137,9 +137,9 @@ names=""
 if [[ "$table" != agent_events ]]; then names+=" --table $table"; fi
 if [[ "$views_dataset" != "${dataset}_reporting" ]]; then names+=" --views-dataset $views_dataset"; fi
 if [[ "$location" != US ]]; then names+=" --location $location"; fi
-echo "Next, who writes and who reads (docs/service-account-auth.md). For a team, from a"
-echo "checkout of haiyuan-eng-google/bigquery_agent_analytics_skill, which holds the bootstrap:"
-echo "  python3 plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \\"
+echo "Next, who writes and who reads (docs/service-account-auth.md). For a team, the"
+echo "bootstrap in this plugin's scripts folder prints its plan; --execute applies it:"
+printf '  python3 %q \\\n' "$here/scripts/setup_gcp_prereqs.py"
 echo "    --project $project --dataset $dataset$names --no-create-dataset --no-create-table \\"
 echo "    --service-account bqaa-row-writer --writer-role row-writer \\"
 echo "    --token-creator group:WRITERS --reader group:READERS"

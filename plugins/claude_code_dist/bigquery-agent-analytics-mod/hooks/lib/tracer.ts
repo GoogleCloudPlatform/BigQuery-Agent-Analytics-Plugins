@@ -218,7 +218,18 @@ export class Tracer {
   }
 
   setSession(info: { sessionId?: string | null; cwd?: string | null; engineVersion?: string | null; hostName?: string | null }): void {
-    if (info.sessionId) this.sessionId = info.sessionId
+    if (info.sessionId) {
+      if (this.sessionId !== null && info.sessionId !== this.sessionId) {
+        this.sessionStartedAt = this.deps.now()
+        this.turnCount = 0
+        this.main = null
+        this.others.clear()
+        this.loops.clear()
+        this.inflightTools.clear()
+        this.decisions.clear()
+      }
+      this.sessionId = info.sessionId
+    }
     if (info.cwd) this.cwd = info.cwd
     if (info.engineVersion) this.engineVersion = info.engineVersion
     if (info.hostName) this.hostName = info.hostName
@@ -277,8 +288,14 @@ export class Tracer {
     this.inflightTools.clear()
     this.decisions.clear()
     // After /clear, /resume or /branch the process goes on under another id:
-    // until it is read, rows carry none rather than the old one.
-    if (e.reason === 'clear' || e.reason === 'resume') this.sessionId = null
+    // until it is read, rows carry none rather than the old one, and the
+    // next session starts its own duration and turn count even when
+    // classic.SessionStart is skipped on a managed CLI.
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      this.sessionId = null
+      this.sessionStartedAt = null
+      this.turnCount = 0
+    }
   }
 
   // prompt.submit, once the prompt entered (after `next` resolved).

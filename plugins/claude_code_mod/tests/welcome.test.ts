@@ -872,3 +872,20 @@ test('a close whose session-state write is refused hides the card at once, and t
   await world.clock.settle()
   expect((await band($)).texts).toEqual(['drawn beneath'])
 })
+
+test('session.end(clear) while store.get is in flight cancels the in-flight welcome card even when classic.SessionStart is skipped', { options: OPTIONS }, async ($, on) => {
+  let answer: ((stored: { value: unknown }) => void) | undefined
+  on('store.get', { key: 'welcome' }, () => (answer === undefined ? new Promise<{ value: unknown }>(resolve => (answer = resolve)) : { value: world.store.get('welcome') }))
+  const world = setUp(on, {}, {})
+  await $.session.start(START)
+  await world.clock.settle()
+  expect(answer).toBeDefined()
+  // The user runs /clear while classic.SessionStart is skipped by cc-plugin-sec-default:
+  // session.end(clear) increments resets so the stale store.get answer shows nothing.
+  await $.session.end({ reason: 'clear' })
+  answer?.({ value: undefined })
+  await world.clock.settle()
+  expect(welcomeLines(world.transcript)).toEqual([])
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+  expect(greeted(world)).toBeUndefined()
+})

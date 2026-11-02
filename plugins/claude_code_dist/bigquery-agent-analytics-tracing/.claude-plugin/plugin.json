@@ -5,8 +5,8 @@
   "author": {
     "name": "Google LLC"
   },
-  "repository": "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK",
-  "homepage": "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/tree/main/plugins/claude_code",
+  "repository": "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins",
+  "homepage": "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/tree/main/plugins/claude_code",
   "license": "Apache-2.0",
   "keywords": [
     "bigquery",

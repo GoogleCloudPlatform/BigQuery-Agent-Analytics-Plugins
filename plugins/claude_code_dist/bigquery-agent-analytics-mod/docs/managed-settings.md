@@ -39,7 +39,7 @@ in place:
 | Under `allowManagedModsOnly` | Loads | Refused |
 | Under `allowManagedHooksOnly` | Loads | Not loaded |
 | A person's `enabledPlugins` false, or `plugin uninstall` | No effect | No effect |
-| Session-start rows and permission-prompt flags | Recorded | Not recorded, and subagent starts are inferred: on a managed machine those events pass over a mod in the user tier (the README's Limitations) |
+| Session-start rows and permission-prompt flags | Recorded | Not recorded, and subagent starts are inferred: on a managed machine (`claude-labs`) the built-in `cc-plugin-sec-default` hook runs in `tier prepend` and sends `classic.*` events past a mod in `tier user` (`bigquery-agent-analytics-mod its classic.SessionStart hook was skipped. "cc-plugin-sec-default" runs first and sent the event on past it.`), while native `session.start`, `prompt.submit`, `turn.*`, `tool.call`, `telemetry.log`, and `session.end` hooks still record turns, tools, permission decisions, and session end (the README's Limitations) |
 | What you deliver | A folder and the policy | The policy only |
 | The version | The release archive you copied, checked against its `SHA256SUMS` | A `mod-dist-vX.Y.Z` tag, with `autoUpdate` off |
 

@@ -14,9 +14,8 @@
 # limitations under the License.
 
 """Live: runs every query in sql/value_queries.sql and sql/sample_queries.sql
-through the analysis skill's runner (its scripts/run_bq.py, which is in the
-mod's source repository, haiyuan-eng-google/bigquery_agent_analytics_skill:
-name it with RUNNER) against a synthetic fixture, and checks the answers.
+through the mod's runner (scripts/run_bq.py; name another with RUNNER)
+against a synthetic fixture, and checks the answers.
 
 The fixture holds what the queries must count right:
   - a row the mod sent twice (a replay: the same event_id);
@@ -80,7 +79,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 MOD = HERE.parent
-RUNNER = Path(os.environ.get("RUNNER", ""))
+RUNNER = Path(os.environ.get("RUNNER") or MOD / "scripts" / "run_bq.py")
 START, END = "2026-10-19", "2026-10-20"
 
 MOD_WRITER = {"plugin": "bigquery-agent-analytics-mod", "version": "0.1.0", "label": "bigquery-agent-analytics-mod/0.1.0"}
@@ -597,8 +596,7 @@ def main() -> int:
     if not project:
         sys.exit("set PROJECT")
     if not RUNNER.is_file():
-        sys.exit("set RUNNER to the analysis skill's scripts/run_bq.py, from a checkout of "
-                 "haiyuan-eng-google/bigquery_agent_analytics_skill")
+        sys.exit(f"RUNNER is not a file: {RUNNER} (the default is the mod's scripts/run_bq.py)")
     dataset = f"bqaa_query_check_{secrets.token_hex(4)}"
     client = bigquery.Client(project=project)
     made = bigquery.Dataset(f"{project}.{dataset}")

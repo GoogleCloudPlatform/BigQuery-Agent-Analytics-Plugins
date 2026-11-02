@@ -107,7 +107,7 @@ on `BQAA_PYTHON`):
 
 ## Submission process
 
-1. Cut a `tracing-vX.Y.Z` release per [`producers/RELEASING.md`](../../producers/RELEASING.md).
+1. Cut a `tracing-vX.Y.Z` release per [`producers/RELEASING.md`](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/blob/main/producers/RELEASING.md).
 2. Run the manual verification above against the published tarball.
 3. Submit the plugin to the marketplace per
    [Claude Code's marketplace submission docs](https://docs.claude.com/en/docs/claude-code/plugins).

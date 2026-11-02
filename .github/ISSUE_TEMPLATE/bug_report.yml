@@ -1,0 +1,78 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Bug report
+description: A plugin, its setup scripts or its docs do not work as described.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. To report a security issue, do not use this form;
+        follow the [security policy](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/security/policy).
+
+        Remove project IDs, dataset names, user names and prompts from anything
+        you paste below.
+  - type: dropdown
+    id: plugin
+    attributes:
+      label: Plugin
+      description: Run only one tracer per table. If you are not sure which one wrote your rows, choose "Not sure".
+      options:
+        - bigquery-agent-analytics-mod
+        - bigquery-agent-analytics-tracing
+        - Marketplace, setup scripts or docs
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version
+      description: The `Version:` line that `claude plugin list` shows for the plugin.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: claude_code_version
+    attributes:
+      label: Claude Code version
+      description: The output of `claude --version`.
+      placeholder: "2.1.304"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and shell
+      placeholder: "macOS 15, zsh"
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands or the configuration (`--config` flags, environment variables) that lead to it.
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: For the mod, `/bqaa-status` is a good start. It shows only counters and notices, never prompts or tokens.
+      render: shell

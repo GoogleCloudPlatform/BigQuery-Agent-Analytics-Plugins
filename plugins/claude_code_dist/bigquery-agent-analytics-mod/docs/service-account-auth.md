@@ -145,19 +145,23 @@ events dataset, where only the administrators hold project roles.
 1. **The dataset, table and views**: the mod's [`setup.sh`](../setup.sh)
    (the README's [The dataset](../README.md#the-dataset)).
 2. **The writer and the readers**: the bootstrap,
-   [`setup_gcp_prereqs.py`](https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill/blob/main/plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py),
-   which is still in the mod's source repository: run it from a checkout of
-   that repository. It prints its plan; read it, then run it again with
-   `--execute`:
+   [`setup_gcp_prereqs.py`](../scripts/setup_gcp_prereqs.py), which comes
+   with this plugin: run it from the plugin folder. It prints its plan and
+   changes nothing; read it, then run it again with `--execute`:
 
    ```bash
-   python3 plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+   python3 scripts/setup_gcp_prereqs.py \
      --project my-gcp-project --dataset agent_analytics \
      --no-create-dataset --no-create-table \
      --service-account bqaa-row-writer --writer-role row-writer \
      --token-creator group:bqaa-writers@example.com \
      --reader group:bqaa-readers@example.com
    ```
+
+   It never makes the dataset or the table (step 1 does): it stops, before it
+   changes anything, if either is missing, and `--no-create-dataset` and
+   `--no-create-table` are accepted only so that this command reads the same
+   as older ones.
 
    With `--writer-role row-writer` it:
    - creates, or finds, the service account
@@ -200,7 +204,8 @@ events dataset, where only the administrators hold project roles.
      there could select any column. It refuses a views dataset that is the
      events dataset.
 
-   It needs `gcloud`, `bq` and the Python BigQuery client
+   Printing the plan needs none of the following; applying it (`--execute`)
+   needs `gcloud`, `bq` and the Python BigQuery client
    (`python3 -m venv .venv && .venv/bin/pip install google-cloud-bigquery`,
    then run the script with `.venv/bin/python`; it checks the client before
    it changes anything), signed in (with `gcloud auth login`, and
@@ -267,7 +272,8 @@ bq --project_id=my-gcp-project add-iam-policy-binding \
   my-gcp-project:agent_analytics.agent_events
 ```
 
-(The role is the one `setup_gcp_prereqs.py --writer-role row-writer` makes.)
+(The role is the one [`scripts/setup_gcp_prereqs.py`](../scripts/setup_gcp_prereqs.py)
+`--writer-role row-writer` makes.)
 Keep that group free of anyone who may edit the project's custom roles
 (`iam.roles.update`, in Role Administrator): they could add a reading
 permission to `bqaaRowWriter` and read every row through the group's

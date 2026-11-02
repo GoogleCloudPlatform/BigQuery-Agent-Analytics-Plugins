@@ -14,12 +14,12 @@
 
 -- Sample queries over rows written by the bigquery-agent-analytics-mod.
 --
--- Placeholders follow the repo's analysis skill: {PROJECT}, {DATASET},
--- {TABLE}, and the query parameters @start, @end and @trace_id, which
--- bigquery-agent-analytics-skill/scripts/run_bq.py fills and binds. Pass
--- one query at a time:
+-- Placeholders: {PROJECT}, {DATASET}, {TABLE}, and the query parameters
+-- @start, @end and @trace_id, which scripts/run_bq.py fills and binds (the
+-- project and dataset from --project and --dataset, or from BQAA_PROJECT_ID
+-- and BQAA_DATASET). Pass one query at a time:
 --
---   python bigquery-agent-analytics-skill/scripts/run_bq.py --dry-run \
+--   python3 scripts/run_bq.py --dry-run \
 --     --start 2026-10-01 --end 2026-10-13 "<one query below>"
 --
 -- Every query reads only this mod's rows (attributes.writer.plugin: a table
@@ -48,13 +48,17 @@ SELECT
   session_id,
   JSON_VALUE(attributes, '$.model') AS model,
   COUNT(*) AS model_requests,
-  SUM(CAST(JSON_VALUE(attributes, '$.usage_metadata.input_tokens') AS INT64)) AS input_tokens,
-  SUM(CAST(JSON_VALUE(attributes, '$.usage_metadata.cache_read_input_tokens') AS INT64)) AS cache_read_tokens,
-  SUM(CAST(JSON_VALUE(attributes, '$.usage_metadata.cache_creation_input_tokens') AS INT64)) AS cache_write_tokens,
-  SUM(CAST(JSON_VALUE(attributes, '$.usage_metadata.output_tokens') AS INT64)) AS output_tokens,
+  SUM(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.input_tokens') AS INT64)) AS input_tokens,
+  SUM(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.cache_read_input_tokens') AS INT64)) AS cache_read_tokens,
+  SUM(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.cache_creation_input_tokens') AS INT64)) AS cache_write_tokens,
+  SUM(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.output_tokens') AS INT64)) AS output_tokens,
   ROUND(SAFE_DIVIDE(
-    SUM(CAST(JSON_VALUE(attributes, '$.usage_metadata.cache_read_input_tokens') AS INT64)),
-    SUM(CAST(JSON_VALUE(attributes, '$.usage_metadata.prompt_tokens') AS INT64))), 3) AS cache_read_share
+    SUM(IF(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.cache_read_input_tokens') AS INT64) IS NOT NULL
+      AND SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.prompt_tokens') AS INT64) IS NOT NULL,
+      SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.cache_read_input_tokens') AS INT64), NULL)),
+    SUM(IF(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.cache_read_input_tokens') AS INT64) IS NOT NULL
+      AND SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.prompt_tokens') AS INT64) IS NOT NULL,
+      SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.prompt_tokens') AS INT64), NULL))), 3) AS cache_read_share
 FROM responses
 GROUP BY session_id, model
 ORDER BY output_tokens DESC;
@@ -71,9 +75,9 @@ WITH responses AS (
 SELECT
   JSON_VALUE(attributes, '$.model') AS model,
   COUNT(*) AS requests,
-  APPROX_QUANTILES(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(50)] AS p50_total_ms,
-  APPROX_QUANTILES(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(95)] AS p95_total_ms,
-  APPROX_QUANTILES(CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS INT64), 100)[OFFSET(50)] AS p50_ttft_ms
+  APPROX_QUANTILES(SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(50)] AS p50_total_ms,
+  APPROX_QUANTILES(SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(95)] AS p95_total_ms,
+  APPROX_QUANTILES(SAFE_CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS INT64), 100)[OFFSET(50)] AS p50_ttft_ms
 FROM responses
 GROUP BY model
 ORDER BY requests DESC;
@@ -115,14 +119,15 @@ SELECT
   COUNTIF(refusal = 'rule') AS denied_by_rule,
   COUNTIF(refusal = 'other') AS refused_other,
   COUNTIF(JSON_VALUE(attributes, '$.permission_requested') = 'true') AS asked_permission,
-  APPROX_QUANTILES(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(50)] AS p50_ms,
-  APPROX_QUANTILES(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(95)] AS p95_ms
+  APPROX_QUANTILES(SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(50)] AS p50_ms,
+  APPROX_QUANTILES(SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(95)] AS p95_ms
 FROM tools
 GROUP BY tool_name, tool_origin
 ORDER BY failures DESC, calls DESC;
 
 -- 5. One line per turn: the prompt, how long it took, how many model
---    requests and tool calls it made, its tokens and how it ended.
+--    requests and tool calls it made, its tokens (including subagents' and
+--    responses_without_usage) and how it ended.
 WITH events AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
@@ -135,11 +140,12 @@ SELECT
   invocation_id,
   MIN(timestamp) AS started_at,
   STRING_AGG(IF(event_type = 'USER_MESSAGE_RECEIVED', JSON_VALUE(content, '$.text_summary'), NULL), ' / ' ORDER BY timestamp) AS prompt,
-  MAX(IF(event_type IN ('INVOCATION_COMPLETED', 'INVOCATION_ERROR'), CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)) AS turn_ms,
+  MAX(IF(event_type IN ('INVOCATION_COMPLETED', 'INVOCATION_ERROR'), SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)) AS turn_ms,
   COUNTIF(event_type = 'LLM_RESPONSE') AS model_requests,
   COUNTIF(event_type = 'TOOL_COMPLETED') AS tool_calls,
   COUNTIF(event_type = 'AGENT_STARTING') AS subagents,
-  MAX(IF(event_type IN ('INVOCATION_COMPLETED', 'INVOCATION_ERROR'), CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64), NULL)) AS turn_tokens,
+  SUM(IF(event_type = 'LLM_RESPONSE', SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64), 0)) AS turn_tokens,
+  COUNTIF(event_type = 'LLM_RESPONSE' AND SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64) IS NULL) AS responses_without_usage,
   MAX(IF(event_type IN ('INVOCATION_COMPLETED', 'INVOCATION_ERROR'), JSON_VALUE(attributes, '$.finish_reason'), NULL)) AS finish_reason,
   COUNTIF(status = 'ERROR') AS error_rows
 FROM events
@@ -158,7 +164,7 @@ SELECT
   child.parent_span_id,
   parent.event_type AS parent_event_type,
   COALESCE(JSON_VALUE(child.content, '$.tool'), JSON_VALUE(child.attributes, '$.model')) AS detail,
-  CAST(JSON_VALUE(child.latency_ms, '$.total_ms') AS INT64) AS total_ms,
+  SAFE_CAST(JSON_VALUE(child.latency_ms, '$.total_ms') AS INT64) AS total_ms,
   child.status
 FROM `{PROJECT}.{DATASET}.{TABLE}` AS child
 LEFT JOIN (
@@ -190,8 +196,8 @@ SELECT
   agent AS subagent_type,
   COUNT(*) AS runs,
   COUNTIF(status = 'ERROR') AS failed_runs,
-  ROUND(AVG(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64)) / 1000, 1) AS avg_seconds,
-  SUM(CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64)) AS total_tokens
+  ROUND(AVG(SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64)) / 1000, 1) AS avg_seconds,
+  SUM(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64)) AS total_tokens
 FROM agents
 GROUP BY subagent_type
 ORDER BY runs DESC;

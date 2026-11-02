@@ -87,6 +87,28 @@ Advanced tuning (environment variables only):
 | `BQAA_AUTO_CREATE_TABLE` | `true` | Create the `agent_events` table automatically when `insertAll` returns `404` for the table. |
 | `BQAA_AUTO_BACKFILL` | `true` | Automatically replay local `spill` and `retry` files at session start and after recovery. |
 
+### Changing the GCP project or dataset
+
+`options.project` in `~/.claude/settings.json` (`pluginConfigs["bigquery-agent-analytics-mod@bqaa-tracing"].options.project`, written by `--config project=...`, `/config`, or `/plugin configure`) takes precedence over environment variables (`BQAA_PROJECT_ID` > `GCP_PROJECT_ID` > `GOOGLE_CLOUD_PROJECT`), and the mod does not read `gcloud config get-value project`. Exporting a new `BQAA_PROJECT_ID` or running `gcloud config set project` will not switch projects while a non-empty `options.project` is saved in `~/.claude/settings.json`.
+
+To move capture to `NEW_PROJECT`:
+
+1. **Create the dataset, `agent_events` table, and `<dataset>_reporting` views in the new project**:
+   ```bash
+   BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics \
+     ./plugins/claude_code_mod/setup.sh
+   ```
+2. **Update the saved plugin setting**:
+   - Update `project` via `/config` (or `/plugin configure`), or re-run:
+     ```bash
+     claude plugin install bigquery-agent-analytics-mod@bqaa-tracing \
+       --config project=NEW_PROJECT --config dataset=agent_analytics
+     ```
+   - Or edit `~/.claude/settings.json` and set `pluginConfigs["bigquery-agent-analytics-mod@bqaa-tracing"].options.project` to `"NEW_PROJECT"` (or to `""` so `BQAA_PROJECT_ID` / `GOOGLE_CLOUD_PROJECT` in the environment controls the target project).
+   - If `accessTokenCommand` impersonates a project-specific service account (`bqaa-row-writer@OLD_PROJECT.iam.gserviceaccount.com`), update it to the new project's service account too.
+3. **Reload and verify**: Run `/reload-plugins` (or start a new session) and run `/bqaa-status` to verify `enabled, target NEW_PROJECT.<dataset>.<table> (<location>)`.
+4. **Dead-letter partitioning**: Unsent files under `~/.bqaa-mod/dead-letter/<OLD_PROJECT.dataset.table>/` stay scoped to the old table (`/bqaa-status` lists them as `for other tables`) so rows from the old destination are never replayed into the new one unless moved deliberately.
+
 ### Authentication
 
 The background writer uploads over HTTPS using a Google OAuth access token obtained from `BQAA_ACCESS_TOKEN` when set, or otherwise by running `accessTokenCommand` directly (no shell; default `gcloud auth application-default print-access-token`).
@@ -176,7 +198,7 @@ GROUP BY event_type
 ORDER BY row_count DESC;
 ```
 
-See [`sql/sample_queries.sql`](sql/sample_queries.sql) for query templates (fill in `{PROJECT}`, `{DATASET}`, and `{TABLE}`), and [`docs/value.md`](docs/value.md) (with [`sql/value_queries.sql`](sql/value_queries.sql)) for team adoption and cost estimates.
+See [`sql/sample_queries.sql`](sql/sample_queries.sql) for query templates (fill in `{PROJECT}`, `{DATASET}`, and `{TABLE}`), and [`docs/value.md`](docs/value.md) (with [`sql/value_queries.sql`](sql/value_queries.sql)) for team adoption and cost estimates. [`scripts/run_bq.py`](scripts/run_bq.py) fills those placeholders in, binds `@start`, `@end`, and `@trace_id`, and runs one query with a billing limit (`--dry-run` first estimates the bytes it would scan).
 
 ### Sample rows
 
@@ -215,8 +237,13 @@ Run each block from the repository root of a full checkout (the marketplace copy
   bash tests/setup.test.sh
   bash tests/version.test.sh
   node tests/reload.test.mjs        # requires Node 24+
+  npm ci --ignore-scripts --prefix tests   # installs the pinned TypeScript only
+  ./tests/node_modules/.bin/tsc -p tsconfig.ci.json --noEmit
+  node --import ./tests/shim/register.mjs --test --test-concurrency=1 tests/*.test.ts tests/state-contract/state.contract.ts
   python3 -m venv .venv && .venv/bin/pip install duckdb
   .venv/bin/python tests/views.test.py
+  .venv/bin/python tests/queries.test.py
+  python3 tests/scripts.test.py     # the bootstrap and query scripts, with no GCP calls
 )
 ```
 
@@ -233,7 +260,7 @@ Run each block from the repository root of a full checkout (the marketplace copy
 )
 ```
 
-The CI suite verifies marketplace sync against release tags, tests `setup.sh` with a stand-in `bq` binary, checks welcome-card behavior across hot reloads in Node 24+, and executes both reporting views in DuckDB. The host CLI suite validates `plugin.json`, exercises hooks/redaction/retries/backfill against stubbed host APIs and mock timers, and verifies host state semantics. Live GCP scripts (`tests/access.live.sh`, `tests/queries.live.py`, and `tests/managed-settings.live.sh`) verify IAM isolation, SQL queries, and managed policies before cutting a release.
+The CI suite verifies marketplace sync against release tags, tests `setup.sh` with a stand-in `bq` binary, and checks welcome-card behavior across hot reloads in Node 24+. It type-checks the hooks, types and tests offline (`tsconfig.ci.json`, with `"skipLibCheck": false`), then runs the TypeScript suites and the state-contract check against a stand-in for the host's `claude-code` module (`tests/shim/`). It also executes both reporting views and every query in `sql/sample_queries.sql` and `sql/value_queries.sql` in DuckDB, and runs `tests/scripts.test.py`, which exercises both scripts against stand-ins for the BigQuery client and `gcloud` (the repository-wide CI runs it too). The host CLI suite validates `plugin.json`, exercises hooks/redaction/retries/backfill against stubbed host APIs and mock timers, and verifies host state semantics. Live GCP scripts (`tests/access.live.sh`, `tests/queries.live.py`, and `tests/managed-settings.live.sh`) verify IAM isolation, SQL queries, and managed policies before cutting a release.
 
 ## Limitations
 
@@ -245,7 +272,7 @@ The CI suite verifies marketplace sync against release tags, tests `setup.sh` wi
 - **Permission decision window (`2 s`)**: No separate `HITL_*` rows are written; tool permission answers come from the `tool_decision` collector record on `TOOL_COMPLETED`, and rejections arriving more than 2 seconds after the tool returned are not recorded.
 - **Exit spill, table-scoped dead letters, and completion records**: `session.end` writes queued rows to a spill file rather than starting network requests. Dead-letter and spill files are replayed only by a session configured for that exact `<project.dataset.table>`, and files without a matching completion record (such as an interrupted write) stay on disk as `incomplete` in `/bqaa-status` for manual inspection.
 - **Mid-session reload or crash**: Reloading mods mid-session (`/reload-plugins` or `--plugin-dir` edits) or a worker crash can lose up to one `flushIntervalMs` window of buffered in-memory rows, plus any batch currently in retry backoff.
-- **User-tier classic hooks on managed CLIs**: On organization-managed CLIs, a user-installed mod does not receive `classic.SessionStart`, `classic.SubagentStart`, or `classic.PermissionRequest` (session-start rows are omitted, subagent starts are inferred, and `allowManagedModsOnly` or web-fetch policies can block user mods; see [docs/managed-settings.md](docs/managed-settings.md)).
+- **User-tier classic hooks on managed CLIs (`cc-plugin-sec-default`)**: On organization-managed CLIs (`claude-labs`), the built-in `cc-plugin-sec-default` security plugin runs at the `prepend` tier and intercepts `classic.SessionStart`, `classic.SubagentStart`, and `classic.PermissionRequest` before a user-installed mod sees them, displaying `bigquery-agent-analytics-mod its classic.SessionStart hook was skipped. "cc-plugin-sec-default" runs first and sent the event on past it.` (and a first-turn model side-note). Native mod hooks (`session.start`, `prompt.submit`, `turn.start`, `turn.step`, `tool.call`, `turn.complete`, `telemetry.log`, and `session.end`) still run normally: prompts, model steps, tool calls, permission decisions (`tool_decision` collector records), inferred subagent starts, and `session.end` (`trace_count` and `duration_ms`, including across `/clear`, `/resume`, and `/branch`) are all recorded; only the `classic.SessionStart` `STATE_DELTA` (`session_start`) row and `permission_requested` flag are omitted (`allowManagedModsOnly` or web-fetch policies can still block user mods; see [docs/managed-settings.md](docs/managed-settings.md)).
 - **Best-effort free-text redaction**: Structured JSON keys use a strict allowlist (redacting unlisted keys such as MCP tool arguments), whereas free-text shell and URL scrubbing uses bounded heuristics rather than full shell parsing. Known open edge cases pinned in `tests/units.test.ts` (see [#546](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/546)) include:
   - Backslash-escaped credential names after a quoted space in a flag list (`VERSION="a b",DB_PA\SSWORD=...`), locale-quoted flag names with separate values (`--pass$"word" ...`), or ANSI-C option names containing NUL bytes (`$'--password\0'`).
   - Provider-token-shaped variable names rewritten before `name=value` parsing (`github_pat_...=value`), or values trailing `[REDACTED]` / provider tokens when the shell word end is uncertain.
@@ -261,6 +288,7 @@ MIGRATION.md                  moving from an earlier marketplace or installation
 .claude-plugin/plugin.json    mod manifest and userConfig schema
 hooks/                        in-process hooks, row builder, allowlist, sanitizer, and writer
 setup.sh                      idempotent BigQuery dataset, table, and reporting-views setup
+scripts/                      setup_gcp_prereqs.py (writer and reader IAM, a dry run unless --execute) and run_bq.py (runs one query with a billing limit)
 build_dist.sh / sync_dist.sh  builds and verifies the marketplace copy in claude_code_dist
 docs/                         team service-account auth, managed settings, and analytics guide
 sql/                          agent_events DDL, reporting views, and sample/value queries

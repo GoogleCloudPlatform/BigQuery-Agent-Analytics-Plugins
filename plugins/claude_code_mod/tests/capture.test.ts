@@ -473,3 +473,64 @@ test('a model request from a turn the mod never saw start does not take over the
   expect(tool?.invocation_id).toBe('turn-a')
   expect(tool?.parent_span_id).toBe(turn?.span_id ?? 'missing')
 })
+
+test('when classic.SessionStart is skipped, turns, tools and session end still record and reset across /clear', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.steps.push(
+    { chunks: [{ kind: 'text', index: 0, text: 'First answer.' }], result: { answer: 'First answer.', stopReason: 'end_turn', usage: USAGE } },
+    { chunks: [{ kind: 'text', index: 0, text: 'Second answer.' }], result: { answer: 'Second answer.', stopReason: 'end_turn', usage: USAGE } },
+  )
+  // Start without classic.SessionStart (as when cc-plugin-sec-default skips it).
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.prompt.submit({ text: 'first prompt', wait: false, origin: { kind: 'composer' } })
+  await $.turn.start({ turnId: 'turn-s1', text: 'first prompt' })
+  await runStep($, { turnId: 'turn-s1', index: 0 })
+  await $.tool.call({ tool: 'Read', file_path: 'README.md' })
+  await $.turn.complete({ turnId: 'turn-s1', answer: 'First answer.', durationMs: 500, isAborted: false, reason: 'answer', usage: USAGE })
+  await $.session.end({ reason: 'clear' })
+  await world.clock.advance(5000)
+
+  // Second session after /clear, again without classic.SessionStart.
+  world.sessionId = 'second-session-id'
+  await $.prompt.submit({ text: 'second prompt', wait: false, origin: { kind: 'composer' } })
+  await $.turn.start({ turnId: 'turn-s2', text: 'second prompt' })
+  await runStep($, { turnId: 'turn-s2', index: 0 })
+  await $.turn.complete({ turnId: 'turn-s2', answer: 'Second answer.', durationMs: 400, isAborted: false, reason: 'answer', usage: USAGE })
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'second-session-id' })
+
+  const sentEnds = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
+  const spilledEnds = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
+  expect(sentEnds.length).toBe(1)
+  expect(spilledEnds.length).toBe(1)
+  expect(sentEnds[0]?.session_id).toBe(SESSION_ID)
+  expect(json(sentEnds[0]?.attributes ?? null)).toMatchObject({
+    state_delta: { source: 'coding_agent_session_end', reason: 'clear', trace_count: 1 },
+  })
+  expect(spilledEnds[0]?.session_id).toBe('second-session-id')
+  expect(json(spilledEnds[0]?.attributes ?? null)).toMatchObject({
+    state_delta: { source: 'coding_agent_session_end', reason: 'prompt_input_exit', trace_count: 1 },
+  })
+})
+
+test('when classic.SessionStart is skipped and the session id changes on /branch, turn count resets for the new session', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.turn.start({ turnId: 'turn-b1', text: 'before branch' })
+  await $.turn.complete({ turnId: 'turn-b1', answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer' })
+  await $.turn.start({ turnId: 'turn-b2', text: 'second before branch' })
+  await $.turn.complete({ turnId: 'turn-b2', answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer' })
+
+  // Mid-process branch switches $.session.id() without classic.SessionStart or session.end.
+  world.sessionId = 'branched-session-id'
+  await $.turn.start({ turnId: 'turn-b3', text: 'after branch' })
+  await $.turn.complete({ turnId: 'turn-b3', answer: 'branched', durationMs: 200, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'branched-session-id' })
+
+  const ends = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
+  expect(ends.length).toBe(1)
+  expect(ends[0]?.session_id).toBe('branched-session-id')
+  expect(json(ends[0]?.attributes ?? null)).toMatchObject({
+    state_delta: { source: 'coding_agent_session_end', reason: 'prompt_input_exit', trace_count: 1 },
+  })
+})

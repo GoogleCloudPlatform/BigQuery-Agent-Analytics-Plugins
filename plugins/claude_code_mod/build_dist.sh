@@ -37,7 +37,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 dist="$repo/plugins/claude_code_dist/bigquery-agent-analytics-mod"
-FILES=(.claude-plugin/plugin.json hooks types sql setup.sh README.md QUICKSTART.md MIGRATION.md docs)
+FILES=(.claude-plugin/plugin.json hooks types sql setup.sh README.md QUICKSTART.md MIGRATION.md docs scripts)
 
 build() { # source folder, out folder
   rm -rf "$2"
