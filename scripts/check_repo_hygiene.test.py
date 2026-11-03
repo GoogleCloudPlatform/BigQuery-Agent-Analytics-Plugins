@@ -352,6 +352,17 @@ class TestRenovateRuntimePins(unittest.TestCase):
             "helpers:pinGitHubActionDigests must be in extends",
         )
 
+    def test_dependencyDashboardAutoclose_is_true(self):
+        """dependencyDashboardAutoclose must be True so Renovate
+        automatically closes the Dependency Dashboard (Issue #5) when
+        there are zero pending or blocked updates."""
+        data = json.loads(self._RENOVATE_PATH.read_text(encoding="utf-8"))
+        self.assertTrue(
+            data.get("dependencyDashboardAutoclose") is True,
+            "dependencyDashboardAutoclose must be True in renovate.json so "
+            "the Dependency Dashboard auto-closes when no updates are pending",
+        )
+
     def test_runtime_pins_disabled(self):
         """python, node, and ubuntu must be disabled under github-actions
         via enabled:false — NOT via allowedVersions, which the
@@ -360,7 +371,13 @@ class TestRenovateRuntimePins(unittest.TestCase):
         rules = data.get("packageRules", [])
         self.assertTrue(rules, "renovate.json must define packageRules")
 
-        required_names = {"python", "node", "ubuntu"}
+        required_names = {
+            "python",
+            "node",
+            "ubuntu",
+            "actions/python-versions",
+            "actions/node-versions",
+        }
         found_rule = False
         for rule in rules:
             managers = rule.get("matchManagers", [])

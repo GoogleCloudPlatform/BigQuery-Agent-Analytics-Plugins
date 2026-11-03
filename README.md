@@ -119,7 +119,7 @@ node tests/reload.test.mjs
 npm ci --ignore-scripts --prefix tests
 ./tests/node_modules/.bin/tsc -p tsconfig.ci.json --noEmit
 node --import ./tests/shim/register.mjs --test --test-concurrency=1 tests/*.test.ts tests/state-contract/state.contract.ts
-python3 -m venv .venv && .venv/bin/pip install duckdb==1.5.6
+python3 -m venv .venv && .venv/bin/pip install duckdb==2.0.0
 .venv/bin/python tests/views.test.py
 .venv/bin/python tests/queries.test.py
 python3 tests/scripts.test.py
