@@ -87,7 +87,7 @@ jobs:
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: The checks Mod CI runs
         working-directory: plugins/claude_code_mod
@@ -100,7 +100,7 @@ jobs:
           npm ci --ignore-scripts --prefix tests
           ./tests/node_modules/.bin/tsc -p tsconfig.ci.json --noEmit
           node --import ./tests/shim/register.mjs --test --test-concurrency=1 tests/*.test.ts tests/state-contract/state.contract.ts
-          python -m pip install duckdb==1.5.6
+          python -m pip install --only-binary=:all: duckdb==1.5.6
           python tests/views.test.py
           python tests/queries.test.py
           python tests/scripts.test.py

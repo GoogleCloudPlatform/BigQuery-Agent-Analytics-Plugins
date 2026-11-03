@@ -79,7 +79,7 @@ and ShellCheck:
 - ShellCheck, at warning level, over every `*.sh` file.
 
 [Tracing CI](.github/workflows/tracing-ci.yml) runs the tracing plugin tests on
-Python 3.10 through 3.14:
+Python 3.10 through 3.15:
 
 - [`plugins/claude_code/tests/tracing_plugin.test.py`](plugins/claude_code/tests/tracing_plugin.test.py):
   source/dist parity, working-directory `sys.path` isolation, `BQAA_TRACE_ENABLED`,
