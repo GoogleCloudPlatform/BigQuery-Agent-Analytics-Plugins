@@ -58,7 +58,7 @@ have the details.
 
 ### Run the checks
 
-Two workflows run on GitHub. [Repo CI](.github/workflows/repo-ci.yml) runs on
+Three workflows run on GitHub. [Repo CI](.github/workflows/repo-ci.yml) runs on
 every pull request and every push to `main`, and needs only Python 3.9 or newer
 and ShellCheck:
 
@@ -66,16 +66,28 @@ and ShellCheck:
   marketplace catalog agrees with each plugin's manifest, JSON files parse,
   relative links and heading anchors in Markdown resolve, no file refers to the
   repository the mod was first published from (apart from the
-  [migration notes](plugins/claude_code_mod/MIGRATION.md)), and shell scripts
-  pass `bash -n`.
+  [migration notes](plugins/claude_code_mod/MIGRATION.md)), shell scripts pass
+  `bash -n`, no working notes (intent.md, plan.md, spec.md) are committed, and
+  source/script/workflow files carry the Apache-2.0 license header.
+- [`scripts/check_repo_hygiene.test.py`](scripts/check_repo_hygiene.test.py):
+  unit tests for the repo hygiene check, covering both clean repos and every
+  deliberate failure mode.
 - [`plugins/claude_code_mod/tests/scripts.test.py`](plugins/claude_code_mod/tests/scripts.test.py):
   the mod's `scripts/` (`setup_gcp_prereqs.py` and `run_bq.py`), run against
   stand-ins for the BigQuery client and `gcloud`, so it makes no Google Cloud
   calls.
 - ShellCheck, at warning level, over every `*.sh` file.
 
-[Mod CI](.github/workflows/mod-ci.yml) runs the mod's other offline checks when
-a change touches the mod, its served copy or the catalog.
+[Tracing CI](.github/workflows/tracing-ci.yml) runs the tracing plugin tests on
+Python 3.10 through 3.14:
+
+- [`plugins/claude_code/tests/tracing_plugin.test.py`](plugins/claude_code/tests/tracing_plugin.test.py):
+  source/dist parity, working-directory `sys.path` isolation, `BQAA_TRACE_ENABLED`,
+  and offline end-to-end hook/drainer/setup tests. Uses only the Python standard
+  library.
+
+[Mod CI](.github/workflows/mod-ci.yml) runs the mod's other offline checks on
+every pull request and every push to `main`.
 [Development and testing](README.md#development-and-testing) in the README has
 the commands for both; run them before you push. The mod's
 [README](plugins/claude_code_mod/README.md#testing) lists the checks that need

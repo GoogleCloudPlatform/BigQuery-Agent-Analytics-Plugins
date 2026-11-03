@@ -33,7 +33,12 @@ fails, listing each problem as path:line: message, when:
     repository the mod was first published from
     (haiyuan-eng-google/bigquery_agent_analytics_skill): everything the
     plugins need now ships in this repository;
-  - a shell script does not pass bash -n.
+  - a shell script does not pass bash -n;
+  - a git-known file has a case-insensitive basename in {intent.md,
+    plan.md, spec.md}: working notes that must not be committed;
+  - a source, script or workflow file (.py, .sh, .ts, .mjs, .js, .sql,
+    .github/workflows/*.yml) lacks the Apache-2.0 license header
+    (Copyright and "Licensed under the Apache License, Version 2.0").
 
 Only the standard library is used, so the check runs the same on a laptop
 and in the repo-ci workflow. Exit status: 0 when clean, 1 when a problem was
@@ -57,6 +62,11 @@ SHARED_FIELDS = ("name", "version", "license", "homepage", "repository")
 # References that must not survive outside the migration notes.
 STALE_REFERENCES = ("haiyuan-eng-google", "bigquery_agent_analytics_skill")
 STALE_ALLOWED_BASENAMES = {"MIGRATION.md"}
+# Working-note files that must not be committed.
+WORKING_NOTE_BASENAMES = {"intent.md", "plan.md", "spec.md"}
+# Extensions and workflow paths whose files need the Apache-2.0 header.
+LICENSE_HEADER_SUFFIXES = {".py", ".sh", ".ts", ".mjs", ".js", ".sql"}
+LICENSE_HEADER_NEEDED = ("Copyright", "Licensed under the Apache License, Version 2.0")
 TEXT_SUFFIXES = {
     ".md", ".sh", ".py", ".ts", ".js", ".json", ".sql", ".yml", ".yaml",
     ".txt", ".toml", ".cfg", ".ini", ".d.ts",
@@ -353,6 +363,56 @@ def check_shell(root: Path, files: list[Path], problems: list[Problem]) -> int:
     return len(scripts)
 
 
+# --- Working notes -----------------------------------------------------------
+
+def check_working_notes(root: Path, files: list[Path], problems: list[Problem]) -> int:
+    """Fail on committed working-note files (intent.md, plan.md, spec.md)."""
+    checked = 0
+    for path in files:
+        if path.name.lower() in WORKING_NOTE_BASENAMES:
+            checked += 1
+            problems.append((
+                rel(root, path), 0,
+                f"{path.name} is a working note and must not be committed",
+            ))
+    return checked
+
+
+# --- License headers ---------------------------------------------------------
+
+def _needs_license_header(root: Path, path: Path) -> bool:
+    """True for source/script/workflow files that must carry the Apache header."""
+    rel_path = path.relative_to(root)
+    # GitHub Actions workflows under .github/workflows/*.yml and *.yaml.
+    if rel_path.parts[:2] == (".github", "workflows") and path.suffix in (".yml", ".yaml"):
+        return True
+    return path.suffix in LICENSE_HEADER_SUFFIXES
+
+
+def check_license_headers(root: Path, files: list[Path], problems: list[Problem]) -> int:
+    """Fail if a source/script/workflow file lacks the Apache-2.0 header."""
+    checked = 0
+    for path in files:
+        if not _needs_license_header(root, path):
+            continue
+        checked += 1
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        # The header is expected in the first 25 lines.
+        header = "\n".join(text.split("\n")[:25])
+        for needle in LICENSE_HEADER_NEEDED:
+            if needle not in header:
+                problems.append((
+                    rel(root, path), 1,
+                    f"missing Apache-2.0 license header ({needle!r} not found"
+                    f" in the first 25 lines)",
+                ))
+                break
+    return checked
+
+
 def main(argv: list[str]) -> int:
     if argv[1:] in (["-h"], ["--help"]):
         print(__doc__.strip())
@@ -371,10 +431,16 @@ def main(argv: list[str]) -> int:
     md_files, links = check_markdown(root, files, problems)
     text_files = check_stale_references(root, files, problems)
     scripts = check_shell(root, files, problems)
+    working_notes = check_working_notes(root, files, problems)
+    licensed = check_license_headers(root, files, problems)
     for path, line, message in sorted(problems):
         print(f"{path}:{line}: {message}" if line else f"{path}: {message}")
-    summary = (f"{entries} catalog entries, {json_files} JSON files, {links} relative links in "
-               f"{md_files} Markdown files, {text_files} text files, {scripts} shell scripts")
+    summary = (
+        f"{entries} catalog entries, {json_files} JSON files, {links} relative"
+        f" links in {md_files} Markdown files, {text_files} text files,"
+        f" {scripts} shell scripts, {working_notes} working notes,"
+        f" {licensed} license-checked files"
+    )
     if problems:
         print(f"FAIL - {len(problems)} problem(s) ({summary})")
         return 1

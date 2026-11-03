@@ -70,8 +70,12 @@ copy of the released tarball, apart from:
   a release.
 - The launcher hardening from SDK pull request
   [#557](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/557),
-  which keeps the working directory off `sys.path`. The `tracing-v0.1.0`
-  tarball predates it, so it is applied here by hand to `hooks/common.sh`,
+  which keeps the working directory off `sys.path`, and the
+  `BQAA_TRACE_ENABLED` case-glob shell guard in `hooks/common.sh`
+  (only the word `true` in any letter case enables tracing; an unset
+  variable defaults to on; every other set value, including an empty
+  string, disables it). The `tracing-v0.1.0`
+  tarball predates these, so they are applied here by hand to `hooks/common.sh`,
   `scripts/run_setup_check.sh`, `commands/bqaa-setup.md`, `README.md` and the
   vendored `_utils.py`, `logger.py`, `setup_check.py` and `claude_code.py`
   (docstring only). Sync only a release that includes #557, or re-apply it;

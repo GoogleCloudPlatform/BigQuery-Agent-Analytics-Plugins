@@ -3,6 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Repo CI](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/actions/workflows/repo-ci.yml/badge.svg)](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/actions/workflows/repo-ci.yml)
 [![Mod CI](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/actions/workflows/mod-ci.yml/badge.svg)](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/actions/workflows/mod-ci.yml)
+[![Tracing CI](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/actions/workflows/tracing-ci.yml/badge.svg)](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/actions/workflows/tracing-ci.yml)
 
 Claude Code plugins that stream coding-agent sessions to BigQuery in the
 [BigQuery Agent Analytics](https://adk.dev/integrations/bigquery-agent-analytics/)
@@ -83,7 +84,7 @@ plugins/claude_code_dist/        built copies the catalog serves
   bigquery-agent-analytics-mod/       built from plugins/claude_code_mod
   bigquery-agent-analytics-tracing/   built from the SDK repository, per release
 scripts/                         checks that span the whole repository
-.github/                         workflows (Repo CI, Mod CI, the mod release),
+.github/                         workflows (Repo CI, Mod CI, Tracing CI, the mod release),
                                  issue and pull request templates
 ```
 
@@ -126,19 +127,25 @@ python3 tests/scripts.test.py
 
 Repository-wide checks need only Python 3.9 or newer, and ShellCheck for the
 last command: repository hygiene (the marketplace catalog against each plugin
-manifest, links and anchors in the Markdown, stale references, shell syntax),
-the tests for the mod's `scripts/`, and ShellCheck over every shell script. Run
-them from the repository root:
+manifest, links and anchors in the Markdown, stale references, shell syntax,
+working notes and license headers), the tests for the mod's `scripts/`, and
+ShellCheck over every shell script. Run them from the repository root:
 
 ```bash
 python3 scripts/check_repo_hygiene.py
+python3 scripts/check_repo_hygiene.test.py
 python3 plugins/claude_code_mod/tests/scripts.test.py
 git ls-files -z '*.sh' | xargs -0 shellcheck -S warning
 ```
 
 [Repo CI](.github/workflows/repo-ci.yml) runs them on every pull request and
-every push to `main`. [CONTRIBUTING.md](CONTRIBUTING.md) describes the full
-workflow for a change.
+every push to `main`. The tracing plugin's offline parity, hook and drainer
+tests run on Python 3.10 through 3.14 in
+[Tracing CI](.github/workflows/tracing-ci.yml):
+
+```bash
+python3 plugins/claude_code/tests/tracing_plugin.test.py
+```
 
 Until the first `mod-vX.Y.Z` release is tagged, rebuild the served copy after
 changing the mod's source, with
@@ -148,7 +155,8 @@ with a release sync (see
 [Where a change goes](CONTRIBUTING.md#where-a-change-goes)). The mod's
 [README](plugins/claude_code_mod/README.md#testing) lists the remaining checks,
 which need the host CLI or a Google Cloud project. The tracing plugin's Python
-package and its tests live in the SDK repository.
+package lives in the SDK repository; offline parity and hook tests run here in
+[Tracing CI](.github/workflows/tracing-ci.yml).
 
 ## Releases
 

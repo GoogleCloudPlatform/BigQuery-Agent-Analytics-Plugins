@@ -13,9 +13,8 @@
 # limitations under the License.
 
 # Checks that hold for the whole repository, whichever plugin a change touches.
-# Mod CI runs only when the mod, its marketplace copy or the catalog change;
-# this workflow has no path filter, so a change to the tracing plugin, its
-# copy, the README or CONTRIBUTING.md is checked too.
+# Mod CI and Tracing CI also run without path filters, so every pull request
+# and every push to main is checked by all three workflows.
 #
 # Run here:
 #   - repository hygiene (scripts/check_repo_hygiene.py): the marketplace
@@ -36,14 +35,19 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: repo-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     name: Repository checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -56,6 +60,9 @@ jobs:
 
       - name: Repository hygiene
         run: python3 scripts/check_repo_hygiene.py
+
+      - name: Repository hygiene unit tests
+        run: python3 scripts/check_repo_hygiene.test.py
 
       - name: The mod's scripts
         run: python3 plugins/claude_code_mod/tests/scripts.test.py
