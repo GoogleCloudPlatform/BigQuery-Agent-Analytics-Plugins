@@ -4,6 +4,7 @@
     "config:recommended",
     "helpers:pinGitHubActionDigests"
   ],
+  "dependencyDashboardAutoclose": true,
   "packageRules": [
     {
       "description": "Disable runtime updates for github-actions workflow pins (python, node, ubuntu). Renovate's python-version and node-version datasources do not support allowedVersions ranges, so enabled:false is the only reliable suppression. GitHub Actions (actions/*) remain auto-updated and SHA-pinned via helpers:pinGitHubActionDigests.",
@@ -13,7 +14,9 @@
       "matchPackageNames": [
         "python",
         "node",
-        "ubuntu"
+        "ubuntu",
+        "actions/python-versions",
+        "actions/node-versions"
       ],
       "enabled": false
     }

@@ -72,11 +72,11 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
-          node-version: "24"
+          node-version: "26"
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       - name: The marketplace copy is what its release tag builds
         run: bash build_dist.sh --check
@@ -103,7 +103,7 @@ jobs:
 
       - name: Test SQL views and sample/value queries (DuckDB)
         run: |
-          python -m pip install --only-binary=:all: duckdb==1.5.6
+          python -m pip install --only-binary=:all: duckdb==2.0.0
           python tests/views.test.py
           python tests/queries.test.py
 
