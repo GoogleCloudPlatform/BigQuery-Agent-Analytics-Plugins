@@ -325,6 +325,86 @@ class TestHasLicenseHeader(unittest.TestCase):
         self.assertEqual(code, 0, output)
 
 
+class TestRenovateRuntimePins(unittest.TestCase):
+    """Verify renovate.json disables python, node, and ubuntu runtime pins
+    under the github-actions manager without relying on allowedVersions.
+
+    Renovate's python-version and node-version datasources do not support
+    range-based allowedVersions, so allowedVersions like "<3.15" or "<24"
+    are silently ignored and updates queue in the Dependency Dashboard.
+    The only reliable suppression is enabled:false under matchManagers
+    github-actions.  See:
+    https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/issues/5
+    """
+
+    _RENOVATE_PATH = (
+        Path(__file__).resolve().parent.parent / "renovate.json"
+    )
+
+    def test_helpers_pinGitHubActionDigests_in_extends(self):
+        """helpers:pinGitHubActionDigests must remain in extends so
+        GitHub Actions (actions/*) are still SHA-pinned."""
+        data = json.loads(self._RENOVATE_PATH.read_text(encoding="utf-8"))
+        self.assertIn("extends", data, "renovate.json must have an extends array")
+        self.assertIn(
+            "helpers:pinGitHubActionDigests",
+            data["extends"],
+            "helpers:pinGitHubActionDigests must be in extends",
+        )
+
+    def test_runtime_pins_disabled(self):
+        """python, node, and ubuntu must be disabled under github-actions
+        via enabled:false — NOT via allowedVersions, which the
+        python-version / node-version datasources ignore."""
+        data = json.loads(self._RENOVATE_PATH.read_text(encoding="utf-8"))
+        rules = data.get("packageRules", [])
+        self.assertTrue(rules, "renovate.json must define packageRules")
+
+        required_names = {"python", "node", "ubuntu"}
+        found_rule = False
+        for rule in rules:
+            managers = rule.get("matchManagers", [])
+            names = set(rule.get("matchPackageNames", []))
+            enabled = rule.get("enabled")
+            if (
+                "github-actions" in managers
+                and required_names.issubset(names)
+                and enabled is False
+            ):
+                found_rule = True
+                # The rule must NOT rely on allowedVersions for python/node,
+                # since those datasources ignore ranges.
+                self.assertNotIn(
+                    "allowedVersions",
+                    rule,
+                    "Runtime pin rule must use enabled:false, not "
+                    "allowedVersions (ignored by python/node datasources)",
+                )
+                break
+        self.assertTrue(
+            found_rule,
+            "No rule found that disables python, node, and ubuntu under "
+            "github-actions with enabled:false",
+        )
+
+    def test_no_allowedVersions_for_python_or_node(self):
+        """No packageRule may use allowedVersions for python or node.
+        The python-version and node-version datasources do not support
+        range expressions, so allowedVersions is silently ignored and
+        updates still queue."""
+        data = json.loads(self._RENOVATE_PATH.read_text(encoding="utf-8"))
+        rules = data.get("packageRules", [])
+        for rule in rules:
+            names = rule.get("matchPackageNames", [])
+            if "allowedVersions" in rule:
+                bad = set(names) & {"python", "node"}
+                self.assertFalse(
+                    bad,
+                    f"Rule for {bad} uses allowedVersions, which is ignored "
+                    "by python/node datasources — use enabled:false instead",
+                )
+
+
 class TestDirectFunctions(unittest.TestCase):
     """Direct unit tests for the new check functions."""
 
