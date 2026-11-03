@@ -3,5 +3,36 @@
   "extends": [
     "config:recommended",
     "helpers:pinGitHubActionDigests"
+  ],
+  "packageRules": [
+    {
+      "description": "Cap workflow Python below 3.15 until duckdb pins a version with cp315/abi3 prebuilt wheels",
+      "matchFileNames": [
+        ".github/workflows/mod-ci.yml",
+        ".github/workflows/release-mod.yml",
+        ".github/workflows/repo-ci.yml"
+      ],
+      "matchPackageNames": [
+        "python"
+      ],
+      "allowedVersions": "<3.15"
+    },
+    {
+      "description": "Keep ubuntu-22.04 runners (<10s startup vs 35m+ org runner queue on newer labels)",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "ubuntu"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Pin Node.js <=24 to match the Claude Code plugin host runtime",
+      "matchPackageNames": [
+        "node"
+      ],
+      "allowedVersions": "<=24"
+    }
   ]
 }
