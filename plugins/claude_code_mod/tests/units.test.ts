@@ -1025,14 +1025,17 @@ test('selected continued, quoted and backslash-spelled option names redact', () 
 test('a value is read in the quote it starts in where the whole-text scan and the word alone agree on it, and otherwise runs to the end of the text', () => {
   const stats = newStats()
   const cases: [string, string][] = [
-    // Prose or an odd quote before it: the scan and the word alone disagree
-    // on the quote the value starts in, so it runs to the end of the text.
-    [`It's set up. Run: cli '--password Secret Suffix' --verbose`, `It's set up. Run: cli '--password [REDACTED]`],
-    [`It's set up.\ncli '--password Secret\nSuffix' --verbose\necho ordinary`, `It's set up.\ncli '--password [REDACTED]`],
+    // An odd quote before it: the scan and the word alone disagree on the
+    // quote the value starts in, so it runs to the end of the text. An
+    // apostrophe in a word of prose (`It's`) is no quote: the value is read
+    // in the quote it starts in.
+    [`It's set up. Run: cli '--password Secret Suffix' --verbose`, `It's set up. Run: cli '--password [REDACTED]' --verbose`],
+    [`It's set up.\ncli '--password Secret\nSuffix' --verbose\necho ordinary`, `It's set up.\ncli '--password [REDACTED]' --verbose\necho ordinary`],
     [`It's set up. Run: cli $'--password Secret Suffix' --verbose`, `It's set up. Run: cli $'--password [REDACTED]`],
     [`Use a 27" screen; cli "--password Secret Suffix" --verbose`, `Use a 27" screen; cli "--password [REDACTED]`],
-    // Read as shell, the text is in a quote from `Don't` on: to its end.
-    [`Don't: cli "--password Secret Suffix" --verbose`, `Don't: cli "--password [REDACTED]`],
+    // Read as shell, the text would be in a quote from `Don't` on; `Don't`
+    // is prose, and the value is read in its own quote.
+    [`Don't: cli "--password Secret Suffix" --verbose`, `Don't: cli "--password [REDACTED]" --verbose`],
     // A comment is read on its own.
     [`# example: cli "--password Secret Suffix" --verbose`, `# example: cli "--password [REDACTED]" --verbose`],
     // Comments and words the scan reads as the shells do.
@@ -1073,19 +1076,21 @@ test('where the scan and the word alone disagree on the quote a value starts in,
   const token = `ghp_${'0'.repeat(36)}`
   const cases: [string, string][] = [
     // Prose with an odd quote before a value quoted the ordinary way: to the
-    // end of the text.
-    [`It's set up. Run: cli --password 'Secret Suffix' --verbose`, `It's set up. Run: cli --password [REDACTED]`],
+    // end of the text. After an apostrophe in a word of prose (`It's`,
+    // `Here's`), the value is read in its own quote.
+    [`It's set up. Run: cli --password 'Secret Suffix' --verbose`, `It's set up. Run: cli --password [REDACTED] --verbose`],
     [`Use a 27" screen; cli --password "Secret Suffix" --verbose`, `Use a 27" screen; cli --password [REDACTED]`],
-    [`Here's the command:\n\`\`\`\ncli --password 'Secret Suffix'\n\`\`\``, `Here's the command:\n\`\`\`\ncli --password [REDACTED]`],
+    [`Here's the command:\n\`\`\`\ncli --password 'Secret Suffix'\n\`\`\``, `Here's the command:\n\`\`\`\ncli --password [REDACTED]\n\`\`\``],
     [`error: can't connect; retry with --password 'Secret Suffix'`, `error: can't connect; retry with --password [REDACTED]`],
-    [`It's set up. Run: cli --passphrase "it's my Suffix phrase" --verbose`, `It's set up. Run: cli --passphrase [REDACTED]`],
-    [`It's set up: export DB_PASSWORD='Secret\nSuffix'\necho ordinary`, `It's set up: export DB_PASSWORD=[REDACTED]`],
-    [`It's set up: cli --password='Secret\nSuffix' --verbose\necho ordinary`, `It's set up: cli --password=[REDACTED]`],
+    [`It's set up. Run: cli --passphrase "it's my Suffix phrase" --verbose`, `It's set up. Run: cli --passphrase [REDACTED] --verbose`],
+    [`It's set up: export DB_PASSWORD='Secret\nSuffix'\necho ordinary`, `It's set up: export DB_PASSWORD=[REDACTED]\necho ordinary`],
+    [`It's set up: cli --password='Secret\nSuffix' --verbose\necho ordinary`, `It's set up: cli --password=[REDACTED]\necho ordinary`],
     [`Use a 27" screen; cli -Dssl.password="Secret\nSuffix" --verbose\necho ordinary`, `Use a 27" screen; cli -Dssl.password=[REDACTED]`],
-    [`It's here: cli "--pass"word 'Secret Suffix' --verbose`, `It's here: cli "--pass"word [REDACTED]`],
+    [`It's here: cli "--pass"word 'Secret Suffix' --verbose`, `It's here: cli "--pass"word [REDACTED] --verbose`],
     [`x=\nprintf '<%s>' "\${x:-it's}"; printf '<%s>' --password 'Secret Suffix' --verbose`, `x=\nprintf '<%s>' "\${x:-it's}"; printf '<%s>' --password [REDACTED] --verbose`],
-    // Their mirrors: read as shell, the text is in a quote to its end.
-    [`Don't: cli --password "Secret Suffix" --verbose`, `Don't: cli --password [REDACTED]`],
+    // Their mirrors: read as shell, the text is in a quote to its end
+    // (`Don't` is prose: the value is read in its own quote).
+    [`Don't: cli --password "Secret Suffix" --verbose`, `Don't: cli --password [REDACTED] --verbose`],
     [`Use a 27" screen; cli --password 'Secret Suffix' --verbose`, `Use a 27" screen; cli --password [REDACTED]`],
     // An option quoted by escaped quotes in a command string.
     [`sh -c "cli \\"--password\\" \\"Secret Suffix\\" --verbose"`, `sh -c "cli \\"--password\\" [REDACTED]`],
@@ -1114,13 +1119,13 @@ test('where the scan and the word alone disagree on the quote a value starts in,
     // Prose, Markdown and other code before a quoted value; a marker before
     // the rest of a value; comments, here-document bodies and prose that
     // hold a command string.
-    [`I'm stuck. Please run: mysql -u admin --password 'correct horse battery Suffix' -h db.internal app`, `I'm stuck. Please run: mysql -u admin --password [REDACTED]`],
-    [`Here's the fix:\n\`\`\`\nPGPASSWORD='correct horse\nbattery Suffix' psql -h db app\n\`\`\``, `Here's the fix:\n\`\`\`\nPGPASSWORD=[REDACTED]`],
+    [`I'm stuck. Please run: mysql -u admin --password 'correct horse battery Suffix' -h db.internal app`, `I'm stuck. Please run: mysql -u admin --password [REDACTED] -h db.internal app`],
+    [`Here's the fix:\n\`\`\`\nPGPASSWORD='correct horse\nbattery Suffix' psql -h db app\n\`\`\``, `Here's the fix:\n\`\`\`\nPGPASSWORD=[REDACTED]\n\`\`\``],
     [`It's set up. Run: cli --password $'Secret Suffix' --verbose`, `It's set up. Run: cli --password [REDACTED]`],
     [`It's set up. Run: cli --password "$(printf %s 'Secret Suffix')" --verbose`, `It's set up. Run: cli --password [REDACTED]`],
     [`fn f(x: &'static str) {}\ncli --password 'Secret Suffix' --verbose`, `fn f(x: &'static str) {}\ncli --password [REDACTED]`],
     [`Use the \` key; cli --password 'Secret Suffix' --verbose`, `Use the \` key; cli --password [REDACTED]`],
-    [`It's set up. Run: cli $'--pa\\x73sword' 'Secret Suffix' --verbose`, `It's set up. Run: cli $'--pa\\x73sword' [REDACTED]`],
+    [`It's set up. Run: cli $'--pa\\x73sword' 'Secret Suffix' --verbose`, `It's set up. Run: cli $'--pa\\x73sword' [REDACTED] --verbose`],
     [`echo "\${x:-it's}"\ncli --password 'Secret Suffix' --verbose`, `echo "\${x:-it's}"\ncli --password [REDACTED] --verbose`],
     [`cli "a b"--password=[REDACTED]"Secret\nSuffix" --verbose`, `cli "a b"--password=[REDACTED]`],
     [`env "DB_\\\n"PASSWORD=[REDACTED]"Secret\nSuffix" printenv DB_PASSWORD\necho ordinary`, `env "DB_\\\n"PASSWORD=[REDACTED]`],
@@ -1141,6 +1146,33 @@ test('where the scan and the word alone disagree on the quote a value starts in,
   }
   // Query strings keep their rule.
   expect(redactText('/path?token=abc&x=1 next', stats)).toBe('/path?token=[REDACTED]&x=1 next')
+})
+
+test('in prose, an apostrophe in a word or inline code before a credential costs no more than its line, and a loss past it marks the row cut', () => {
+  // Each text, what is kept, and whether text past the credential's line went.
+  const cases: [string, string, boolean][] = [
+    [`It's done:\n--password=hunter2\nline three\nline four`, `It's done:\n--password=[REDACTED]\nline three\nline four`, false],
+    [`It's done; don't worry:\n--password=hunter2\nline three`, `It's done; don't worry:\n--password=[REDACTED]\nline three`, false],
+    [`Don't commit this:\nexport API_TOKEN=abc123\nThen run npm test.\nAll good.`, `Don't commit this:\nexport API_TOKEN=[REDACTED]\nThen run npm test.\nAll good.`, false],
+    [`Here's the output:\n\n\`\`\`\n--password=hunter2\ncat: x.txt: No such file\n\`\`\`\n\nThe \`cat\` failed.`, `Here's the output:\n\n\`\`\`\n--password=[REDACTED]\ncat: x.txt: No such file\n\`\`\`\n\nThe \`cat\` failed.`, false],
+    // Inline code: the backtick that closes the span ends the value.
+    [`Run \`export API_TOKEN=abc123\` and then \`npm run deploy\`. After that, check the logs.`, `Run \`export API_TOKEN=[REDACTED]\` and then \`npm run deploy\`. After that, check the logs.`, false],
+    // The rest of the line still goes.
+    [`mysql -u root --password=hunter2 mydb < dump.sql\nline two`, `mysql -u root --password=[REDACTED]\nline two`, false],
+    // An odd quote that is no word's apostrophe: to the end of the text, and
+    // the row says so.
+    [`Use a 27" screen:\n--password=hunter2\nline three`, `Use a 27" screen:\n--password=[REDACTED]`, true],
+  ]
+  for (const [input, want, cut] of cases) {
+    const stats = newStats()
+    expect(redactText(input, stats)).toBe(want)
+    expect(stats.truncated).toBe(cut)
+    for (const text of pathsOf(input)) expect(text).not.toMatch(/hunter2|abc123/)
+  }
+  const { row } = buildRow({ eventType: 'USER_MESSAGE_RECEIVED', timestampMs: 0, eventId: 'e1', agent: 'coding-agent', sessionId: 's1',
+    invocationId: 'i1', userId: 'dev', traceId: null, spanId: null, parentSpanId: null,
+    content: { text_summary: `Use a 27" screen:\n--password=hunter2\nline three` }, attributes: {}, maxPayloadChars: 16384 })
+  expect(row.is_truncated).toBe(true)
 })
 
 test('a value in a command string another shell runs, or after an escape its quoting leaves in, runs to the end of the text', () => {
@@ -1312,16 +1344,16 @@ test('round 8 and 9 fixtures remove the canary in the eight tested paths', () =>
   const token = `ghp_${'0'.repeat(36)}`
   const cases: [string, string][] = [
     // Round 8, A: prose, an odd quote or a lone backtick before a quoted value.
-    [`It's set up. Run: cli --password 'Secret Suffix' --verbose`, `It's set up. Run: cli --password [REDACTED]`],
+    [`It's set up. Run: cli --password 'Secret Suffix' --verbose`, `It's set up. Run: cli --password [REDACTED] --verbose`],
     [`Use a 27" screen; cli --password "Secret Suffix" --verbose`, `Use a 27" screen; cli --password [REDACTED]`],
     [`Use a 27" screen; cli --password="Secret\nSuffix" --verbose\necho ordinary`, `Use a 27" screen; cli --password=[REDACTED]`],
-    [`I'm stuck. Please run: mysql -u admin --password 'correct horse battery Suffix' -h db.internal app`, `I'm stuck. Please run: mysql -u admin --password [REDACTED]`],
-    [`Here's the fix:\n\`\`\`\nPGPASSWORD='correct horse\nbattery Suffix' psql -h db app\n\`\`\``, `Here's the fix:\n\`\`\`\nPGPASSWORD=[REDACTED]`],
+    [`I'm stuck. Please run: mysql -u admin --password 'correct horse battery Suffix' -h db.internal app`, `I'm stuck. Please run: mysql -u admin --password [REDACTED] -h db.internal app`],
+    [`Here's the fix:\n\`\`\`\nPGPASSWORD='correct horse\nbattery Suffix' psql -h db app\n\`\`\``, `Here's the fix:\n\`\`\`\nPGPASSWORD=[REDACTED]\n\`\`\``],
     [`It's set up. Run: cli --password $'Secret Suffix' --verbose`, `It's set up. Run: cli --password [REDACTED]`],
     [`It's set up. Run: cli --password "$(printf %s 'Secret Suffix')" --verbose`, `It's set up. Run: cli --password [REDACTED]`],
     [`fn f(x: &'static str) {}\ncli --password 'Secret Suffix' --verbose`, `fn f(x: &'static str) {}\ncli --password [REDACTED]`],
     [`Use the \` key; cli --password 'Secret Suffix' --verbose`, `Use the \` key; cli --password [REDACTED]`],
-    [`It's set up. Run: cli $'--pa\\x73sword' 'Secret Suffix' --verbose`, `It's set up. Run: cli $'--pa\\x73sword' [REDACTED]`],
+    [`It's set up. Run: cli $'--pa\\x73sword' 'Secret Suffix' --verbose`, `It's set up. Run: cli $'--pa\\x73sword' [REDACTED] --verbose`],
     [`echo "\${x:-it's}"\ncli --password 'Secret Suffix' --verbose`, `echo "\${x:-it's}"\ncli --password [REDACTED] --verbose`],
     [`cli "a b"--password=[REDACTED]"Secret\nSuffix" --verbose`, `cli "a b"--password=[REDACTED]`],
     // Round 8, B: a marker, or a token the token rule makes one, before the rest of a value.
