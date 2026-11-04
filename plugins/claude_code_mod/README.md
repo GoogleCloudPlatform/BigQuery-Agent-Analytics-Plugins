@@ -7,7 +7,7 @@ The mod records events inside the CLI and sends them to BigQuery in batches in t
 ## Install
 
 **Prerequisites:**
-- Claude Code CLI **v2.1.296+** (`claude --version`; tested with `2.1.296`, `2.1.299`, `2.1.302`, and `2.1.304` on macOS and Linux terminals)
+- Claude Code CLI **v2.1.296+** (`claude --version`; tested with `2.1.296`, `2.1.299`, `2.1.302`, `2.1.304`, and `2.1.318` on macOS and Linux terminals)
 - A BigQuery dataset in a Google Cloud project (see [The dataset](#the-dataset))
 - Google Cloud credentials (see [Authentication](#authentication))
 
@@ -83,7 +83,7 @@ Advanced tuning (environment variables only):
 | `BQAA_USER_ID` | `$USER` / `$USERNAME` | Overrides `user_id` (unless `userIdFromCredentials` is enabled and resolved). |
 | `BQAA_REQUEST_TIMEOUT_MS` | `10000` (`1000`–`30000`) | Client timeout (ms) per `insertAll` HTTP request. |
 | `BQAA_MAX_QUEUE_ROWS` | `5000` (`10`–`100000`) | Max rows buffered in memory (also bounded at `8 MiB` UTF-8). |
-| `BQAA_EXIT_FLUSH_MS` | `800` (`0`–`1200`) | Max wait (ms) at `session.end` to write queued rows to a local spill file (`0` = fire-and-forget). |
+| `BQAA_EXIT_FLUSH_MS` | `800` (`0`–`1200`) | Max wait (ms) at `session.end` to write queued rows to a local spill file; up to half of it waits for the answer to a request already out, so rows BigQuery took are not spilled (`0` = fire-and-forget). |
 | `BQAA_AUTO_CREATE_TABLE` | `true` | Create the `agent_events` table automatically when `insertAll` returns `404` for the table. |
 | `BQAA_AUTO_BACKFILL` | `true` | Automatically replay local `spill` and `retry` files at session start and after recovery. |
 
@@ -121,6 +121,7 @@ The background writer uploads over HTTPS using a Google OAuth access token obtai
 All slash commands run immediately—even mid-turn—and display only safe operational counters (never prompts, payloads, or tokens):
 
 - `/bqaa-status` — Shows the target table, queue depth, row counters (`captured`, `sent`, `dead-lettered`, `spilled`, `dropped`), request health, active troubleshooting notices (including a ready-to-run `setup.sh` command when the dataset is missing), and local dead-letter file counts (including any `incomplete` files).
+- `/bqaa-setup` — Prints the ready-to-run `setup.sh` command for this installed copy so you can create the BigQuery dataset, `agent_events` table, and `<dataset>_reporting` views without cloning the repository.
 - `/bqaa-flush` — Flushes queued rows to BigQuery immediately instead of waiting for the next `flushIntervalMs` tick.
 - `/bqaa-backfill` — Replays local dead-letter files (`spill`, `retry`, and `rejected`) for the configured table in the background. Pass `/bqaa-backfill force` to reclaim a file left behind by a terminated session once its 10-minute lease expires; files missing their completion record (listed as `incomplete` in `/bqaa-status`) are skipped so truncated rows are never sent.
 
@@ -140,7 +141,7 @@ Host hook ──► sanitize & enqueue (in-memory, <= 5,000 rows / 8 MiB) ──
 - **In-process, fail-open capture**: Hooks never wait on network requests. Turn, model, and tool hooks sanitize and enqueue rows synchronously in memory (`<= 5,000` rows / `8 MiB`), `session.start` and `session.end` perform bounded local setup and spill work, and internal errors are caught so your CLI session is never interrupted.
 - **Background batching**: Every `flushIntervalMs` (default `5 s`) and at the end of each main-loop turn, the background writer sends batches of up to `500` rows or `3 MiB` UTF-8 to BigQuery `tabledata.insertAll` with `insertId = event_id`.
 - **Retries and queue protection**: Transient errors (`408`, `429`, `5xx`, network timeouts, quota `403`s, and `404`s while a dataset or table propagates) retry up to 3 times with exponential backoff (`1 s`–`60 s`, capped at `30 s` for credential or missing-dataset pauses). If the queue fills up (`5,000` rows or `8 MiB`), the oldest queued rows are dropped; while BigQuery is failing in backoff, each flush tick spills the oldest half to disk once the queue passes 80% capacity so drops stay rare.
-- **Local dead-letter and exit spill**: Exhausted batches write to `retry-*.jsonl`, rejected rows (`400`, `403`, invalid row) write to `rejected-*.jsonl`, and rows still queued at process exit write to `spill-*.jsonl` (waiting up to `BQAA_EXIT_FLUSH_MS`) under `~/.bqaa-mod/dead-letter/<project.dataset.table>/`.
+- **Local dead-letter and exit spill**: Exhausted batches write to `retry-*.jsonl`, rejected rows (`400`, `403`, invalid row) write to `rejected-*.jsonl`, and rows still queued at process exit, or whose request had no answer within half of `BQAA_EXIT_FLUSH_MS`, write to `spill-*.jsonl` (waiting up to `BQAA_EXIT_FLUSH_MS`) under `~/.bqaa-mod/dead-letter/<project.dataset.table>/`.
 - **Automatic backfill**: Fifteen seconds after session start—and whenever BigQuery recovers from an outage—the writer automatically replays complete `spill` and `retry` files belonging to the configured table (`rejected` files wait for `/bqaa-backfill`).
 
 ## What it writes
@@ -158,7 +159,7 @@ Host hook ──► sanitize & enqueue (in-memory, <= 5,000 rows / 8 MiB) ──
 | `classic.SubagentStart` | `AGENT_STARTING` | `{"agent_type", "agent_id"}` | Sets top-level `agent` column to the subagent type |
 | `turn.complete` (subagent) | `AGENT_COMPLETED` / `AGENT_ERROR` | `{}` | `attributes.usage_metadata` (subagent totals); `latency_ms.total_ms` |
 | `turn.complete` (main loop, answered) | `AGENT_RESPONSE` | `{"response": answer}` | `attributes.source_turn_id` only; no `latency_ms` |
-| `turn.complete` (main loop, completion or error) | `INVOCATION_COMPLETED` / `INVOCATION_ERROR` | `{}` on completion; `{"reason": reason}` on error | `attributes.finish_reason`, `attributes.is_aborted`, `attributes.step_count`, `attributes.usage_metadata`; `latency_ms.total_ms` |
+| `turn.complete` (main loop, completion or error) | `INVOCATION_COMPLETED` / `INVOCATION_ERROR` | `{}` on completion; `{"reason": reason}` on error | `attributes.finish_reason`, `attributes.is_aborted`, `attributes.ended_on_rejection` (`true` when the turn's last main-loop tool was rejected by the user and no answer followed), `attributes.step_count`, `attributes.usage_metadata`; `latency_ms.total_ms` |
 | `classic.PermissionRequest` | *(no separate row)* | — | Sets `attributes.permission_requested` on the waiting tool's `TOOL_COMPLETED` row |
 | `telemetry.log` (`tool_decision`) | *(no separate row)* | — | Sets `attributes.permission_decision` (`accept`/`reject`) and `attributes.permission_decision_source` on `TOOL_COMPLETED` |
 | `session.end` | `STATE_DELTA` | `{"session_end": true}` | `attributes.state_delta.{reason, trace_count, duration_ms}` |
@@ -240,7 +241,7 @@ Run each block from the repository root of a full checkout (the marketplace copy
   npm ci --ignore-scripts --prefix tests   # installs the pinned TypeScript only
   ./tests/node_modules/.bin/tsc -p tsconfig.ci.json --noEmit
   node --import ./tests/shim/register.mjs --test --test-concurrency=1 tests/*.test.ts tests/state-contract/state.contract.ts
-  python3 -m venv .venv && .venv/bin/pip install duckdb
+  python3 -m venv .venv && .venv/bin/pip install duckdb==2.0.0
   .venv/bin/python tests/views.test.py
   .venv/bin/python tests/queries.test.py
   python3 tests/scripts.test.py     # the bootstrap and query scripts, with no GCP calls
@@ -264,11 +265,12 @@ The CI suite verifies marketplace sync against release tags, tests `setup.sh` wi
 
 ## Limitations
 
-- **Early-access mod API**: Host CLI mods are an early-access feature, tested with `2.1.296`, `2.1.299`, `2.1.302`, and `2.1.304` on macOS and Linux terminals; hook events and runtime APIs can change between CLI releases.
+- **Early-access mod API**: Host CLI mods are an early-access feature, tested with `2.1.296`, `2.1.299`, `2.1.302`, `2.1.304`, and `2.1.318` on macOS and Linux terminals; hook events and runtime APIs can change between CLI releases.
 - **Eventual deduplication (`tabledata.insertAll`)**: Uploads use HTTP `tabledata.insertAll` (gRPC Storage Write API is unavailable in the mod runtime), whose `insertId` deduplication is best-effort—always deduplicate on `event_id` in queries.
 - **Bounded queue**: Rows wait in memory (`5,000` rows or `8 MiB` by default). When the queue is full, the oldest rows are dropped and counted (`dropped` in `/bqaa-status`). While BigQuery is failing, the writer spills rows to disk once the queue passes 80%, so drops are rare. Rows can also be lost if that spill write fails.
 - **First-prompt-only `LLM_REQUEST` and empty `content_parts`**: Only a turn's first model request includes the user's prompt; prior conversation history and system prompts are omitted, and `content_parts` is always empty (attachments are listed by type only).
 - **Subagent parent span and detection**: A subagent's span attaches directly under the main turn rather than under the `Agent` tool call that launched it, and subagent turns are distinguished from main turns via `turn.start`'s `agentId` (from `2.1.299`).
+- **Loops with no run start (`unidentified_loop`)**: The host also runs model loops of its own, such as the fork that proposes the next prompt after a turn, whose tool calls it refuses. Such a loop has an `agentId` but no `turn.start` or `SubagentStart`, so its rows are written with `agent = 'unidentified_loop'` and `attributes.unidentified_loop = true` until a `SubagentStart` names it; a subagent already running when the mod loaded (`/reload-plugins`) is marked the same way. The sample and value queries that count tool calls, refusals and agents (4, V1, V2, V5, V6, V7) leave these rows out.
 - **Permission decision window (`2 s`)**: No separate `HITL_*` rows are written; tool permission answers come from the `tool_decision` collector record on `TOOL_COMPLETED`, and rejections arriving more than 2 seconds after the tool returned are not recorded.
 - **Exit spill, table-scoped dead letters, and completion records**: `session.end` writes queued rows to a spill file rather than starting network requests. Dead-letter and spill files are replayed only by a session configured for that exact `<project.dataset.table>`, and files without a matching completion record (such as an interrupted write) stay on disk as `incomplete` in `/bqaa-status` for manual inspection.
 - **Mid-session reload or crash**: Reloading mods mid-session (`/reload-plugins` or `--plugin-dir` edits) or a worker crash can lose up to one `flushIntervalMs` window of buffered in-memory rows, plus any batch currently in retry backoff.
@@ -279,6 +281,7 @@ The CI suite verifies marketplace sync against release tags, tests `setup.sh` wi
   - URL user-info containing extra `@` characters (`https://u:p@secret@host`) or URL query parameters containing shell expansions (`?token=$(...)`, `?token=${...}`, `?token=$'...'`).
   - Declared custom delimiters (`^delim^...`) hidden by delimiter-looking earlier values, splitting an allowlisted name (`^.^...max.tokens=...`), spelled with ANSI-C quotes, following a quoted flag name, or `>= 256` characters long.
   - Over-redaction when a credential follows a non-`/` `sed` delimiter after an assignment (`x=1 sed 's#pass"word"=.*#x#' file`) or when allowlisted entries follow a redacted list entry (`DB_PASSWORD=x,max_tokens=1024`).
+  - Over-redaction of the rest of a credential's line after a `--flag=value` or `NAME=value` value (`mysql --password=x mydb` keeps `mysql --password=[REDACTED]`) or a `name: value` value (`-H "Authorization: Bearer x" https://…` loses the URL), and of the rest of the text after an odd quote that is no apostrophe in a word (`a 27" screen`). A row that lost text past the credential's line has `is_truncated = true`.
 
 ## Files
 
