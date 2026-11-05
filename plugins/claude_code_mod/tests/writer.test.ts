@@ -243,9 +243,12 @@ test('a permission error parks rows as refused; /bqaa-backfill sends them once f
   expect(world.insertCalls().length).toBe(1)
   const [file] = deadLetterFiles(world)
   expect(file?.[0].startsWith(`${PARTITION_DIR}/rejected-`)).toBe(true)
-  // The status line says what is wrong, and the fix, with the rows waiting.
-  expect(world.statusLines.at(-1) ?? '').toBe(
-    'BQAA: BigQuery denied the identity access to the dataset. To fix, ask for bigquery.tables.get and bigquery.tables.updateData on the table my-gcp-project.agent_analytics.agent_events (no role that reads rows), then run /bqaa-backfill (3 row(s) waiting)',
+  // In an interactive terminal session where the AbovePrompt band shows the
+  // permission notice, the persistent status line is not duplicated; the toast
+  // and /bqaa-status carry the fix and waiting count.
+  expect(world.statusLines.at(-1)).toBeUndefined()
+  expect(world.toasts[0] ?? '').toContain(
+    'BQAA: rows are not being written: BigQuery denied the identity access to the dataset. To fix, ask for bigquery.tables.get and bigquery.tables.updateData on the table my-gcp-project.agent_analytics.agent_events (no role that reads rows), then run /bqaa-backfill.',
   )
   // Refused rows are not replayed automatically.
   await world.clock.advance(60_000)
@@ -349,20 +352,54 @@ test('session end starts no request: it spills what is queued, and the next sess
   expect(world.files.get(file?.[0] ?? '')).toBe('')
 })
 
-test('session end does not wait for a stuck request: its rows are spilled too', { options: OPTIONS }, async ($, on) => {
+test('session end waits no more than half its budget for a stuck request: its rows are spilled too', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [{ hang: true }]
   await startSession($)
   await world.clock.advance(5000)
   expect(world.insertCalls().length).toBe(1)
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
-  // Returns without the clock moving: nothing waits on the request.
-  await $.session.end({ ...END, reason: 'other' })
+  let ended = false
+  const ending = $.session.end({ ...END, reason: 'other' }).then(() => {
+    ended = true
+  })
+  await world.clock.settle()
+  // The rows queued after the request are on disk at once.
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  // BQAA_EXIT_FLUSH_MS defaults to 800 ms: the answer is waited for up to
+  // half of it (the host's bound can leave a millisecond less).
+  await world.clock.advance(300)
+  expect(ended).toBe(false)
+  await world.clock.advance(100)
+  await ending
   // No second request was started behind the stuck one.
   expect(world.insertCalls().length).toBe(1)
-  // The stuck batch (it may yet land; event_id dedups) and everything after it.
-  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  // The stuck batch (it may yet land; event_id dedups) follows.
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA', 'STATE_DELTA'])
   world.releaseHung(200, '{}')
+})
+
+test('session end waits, inside half its budget, for a request already out: rows BigQuery took are not spilled and sent again', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [{ hang: true }, OK_INSERT]
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  const ending = $.session.end({ ...END, reason: 'other' })
+  // The answer comes 168 ms after session end began, as in short -p runs.
+  await world.clock.advance(168)
+  world.releaseHung(200, '{}')
+  await ending
+  expect(world.insertCalls().length).toBe(1)
+  // Only the rows queued after the request are spilled.
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  // The next session replays them: every row went out once.
+  await startSession($)
+  await world.clock.advance(15_000)
+  const ids = world.sentRows().map(r => r.event_id)
+  expect(ids.length).toBeGreaterThan(4)
+  expect(new Set(ids).size).toBe(ids.length)
 })
 
 test('a spill write that hangs holds session end no longer than its budget', { options: OPTIONS }, async ($, on) => {
@@ -547,7 +584,7 @@ test('a dead-letter file over the 4 MiB read limit is reported, not skipped sile
 test('the failing token-command fixture keeps its canaries out of the exercised files and diagnostics', { options: { ...OPTIONS, accessTokenCommand: 'fake-token-tool --profile argcanaryprofile' } }, async ($, on) => {
   const world = setUp(on)
   world.processReply = { exitCode: 1, stdout: '', stderr: `ERROR: refresh failed for ${LEAKY}\n` }
-  await startSession($)
+  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   // Four attempts, then the rows are parked; the automatic replay at 15 s
   // stops on the same failure, and so does /bqaa-backfill.
@@ -577,7 +614,8 @@ test('the scripted API error fixture keeps its canaries out of the exercised fil
   const invalid = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: `bad value ${LEAKY}` }] }] }) }
   const busy = { status: 503, text: JSON.stringify({ error: { code: 503, message: `backend busy ${LEAKY}` } }) }
   world.replies = [refusal, invalid, busy]
-  await startSession($)
+  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   // Refused: the row is parked with BigQuery's reason, and the status line says so.
   await world.clock.advance(5000)
   // A backfill: insertAll reports the row invalid, so its reason is replaced.
@@ -1015,4 +1053,20 @@ test('a write that fails while a replay splits leaves the source whole', async (
   expect(report.held ?? report.error ?? '').toMatch(/disk full/)
   expect(parseFile(files.get(source) ?? '').lines.length).toBe(1000)
   expect(new Set(ids).size).toBe(1000)
+})
+
+test('/bqaa-status reports replayed row count, replay request batches, and retired 0-byte/outcome files after backfill', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // Seed a spill file with 2 rows from a prior session, plus an outcome-* marker file.
+  const spilled = parkedFile(parkedLine(TABLE_REF, 'spilled-row-1', 'old-session'), parkedLine(TABLE_REF, 'spilled-row-2', 'old-session'))
+  world.files.set(`${PARTITION_DIR}/spill-1700000000000-aa.jsonl`, spilled)
+  world.files.set(`${PARTITION_DIR}/outcome-spill-1699999000000-bb.jsonl`, '{"fates":"L"}\n')
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  // Let the 15s auto-backfill replay the 2 spilled rows (with no live rows sent).
+  await world.clock.advance(15_000)
+  await world.clock.settle()
+  const status = await statusText($)
+  expect(status).toContain('sent 2 (2 replayed)')
+  expect(status).toMatch(/requests: 1 ok, 0 retried/)
+  expect(status).toMatch(/dead-letter: 0 file\(s\), 0 B in .*; \d+ replayed\/retired file\(s\) \(0-byte or outcome-\*, cleaned up after 24h\)/)
 })

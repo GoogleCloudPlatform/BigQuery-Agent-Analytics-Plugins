@@ -474,6 +474,8 @@ function createTestHarness(pluginRoot) {
         return null
       case 'command.run':
         return { text: '' }
+      case 'session.end':
+        return {}
       case 'state.set': {
         const k = `${e.plugin}:${e.key}`
         const current = stateStore.get(k) ?? { value: undefined, version: 0 }
@@ -584,11 +586,15 @@ function createTestHarness(pluginRoot) {
       id: () => unwrapEnvelope('session.id', {}),
       version: () => unwrapEnvelope('session.version', {}),
       start: e => runTopDispatch('session.start', e),
-      end: e => {
+      end: async e => {
         if (e && (e.reason === 'clear' || e.reason === 'resume' || e.reason === 'fork')) {
           resetSessionState()
         }
-        return runTopDispatch('session.end', e, { budget: { remainingMs: 5000 } })
+        const result = await runTopDispatch('session.end', e, { budget: { remainingMs: 5000 } })
+        if (typeof result?.sessionId !== 'string') {
+          throw new Error('no implementation for session.end: returned no { sessionId }')
+        }
+        return result
       },
     },
     classic: {

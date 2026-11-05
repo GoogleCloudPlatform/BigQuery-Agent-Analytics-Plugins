@@ -17,7 +17,8 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
-import { ACCESS_TOKEN, DRY_RUN_DIR, OPTIONS, type Row, SESSION_ID, USAGE, type World, byType, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
+import { PLUGIN_VERSION } from '../hooks/lib/config.ts'
+import { ACCESS_TOKEN, COMMAND, DRY_RUN_DIR, OPTIONS, type Row, SESSION_ID, USAGE, type World, byType, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
 
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX16 = /^[0-9a-f]{16}$/
@@ -87,7 +88,13 @@ test('a turn becomes rows under one trace, with spans, tokens and latency', { op
     expect(row.is_truncated).toBe(false)
     expect(Number.isNaN(Date.parse(row.timestamp))).toBe(false)
     const writer = json(row.attributes).writer as Record<string, unknown>
-    expect(writer).toEqual({ plugin: 'bigquery-agent-analytics-mod', version: '0.1.0', label: 'bigquery-agent-analytics-mod/0.1.0', agent: 'coding-agent', mode: 'insert_all' })
+    expect(writer).toEqual({
+      plugin: 'bigquery-agent-analytics-mod',
+      version: PLUGIN_VERSION,
+      label: `bigquery-agent-analytics-mod/${PLUGIN_VERSION}`,
+      agent: 'coding-agent',
+      mode: 'insert_all',
+    })
   }
   expect(new Set(rows.map(r => r.event_id)).size).toBe(rows.length)
 
@@ -295,6 +302,44 @@ test('a subagent run whose SubagentStart never comes gets one inferred AGENT_STA
   expect(byType(rows, 'LLM_REQUEST').map(r => r.parent_span_id)).toEqual([starts[0]?.span_id])
 })
 
+test('a loop seen first at a tool call, with no run start, is unidentified_loop: each of its rows says so, and the queries leave them out', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // The host's fork that proposes the next prompt after a turn: no
+  // turn.start and no SubagentStart, and the host refuses its tools.
+  world.toolReply = () => ({ deny: 'No tools needed for suggestion' })
+  await startSession($)
+  await $.turn.start({ turnId: 'main-turn', text: 'list the files' })
+  await runStep($, { turnId: 'main-turn', index: 0 })
+  await $.turn.complete({ turnId: 'main-turn', answer: 'Done.', durationMs: 400, isAborted: false, reason: 'answer', usage: USAGE })
+  await $.tool.call({ tool: 'ScheduleWakeup', agentId: 'afork0000000001', stop: true } as never)
+  await world.clock.advance(5000)
+  const rows = world.sentRows().filter(r => json(r.attributes).agent_id === 'afork0000000001')
+  expect(rows.map(r => [r.event_type, r.agent, r.status])).toEqual([
+    ['AGENT_STARTING', 'unidentified_loop', 'OK'],
+    ['TOOL_STARTING', 'unidentified_loop', 'OK'],
+    ['TOOL_COMPLETED', 'unidentified_loop', 'ERROR'],
+  ])
+  expect(rows.every(r => json(r.attributes).unidentified_loop === true)).toBe(true)
+  // The main loop's rows and a subagent whose run was seen to start carry no mark.
+  expect(world.sentRows().filter(r => json(r.attributes).agent_id === undefined).some(r => 'unidentified_loop' in json(r.attributes))).toBe(false)
+})
+
+test('a SubagentStart that comes for an unidentified loop names it: its later rows are the subagent\'s, unmarked', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.turn.start({ turnId: 'main-turn', text: 'delegate' })
+  // Its run was under way when the mod loaded: its first row is a tool call.
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts', agentId: 'agent-5' } as never)
+  await $.classic.SubagentStart({ agent_id: 'agent-5', agent_type: 'Explore' } as never)
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts', agentId: 'agent-5' } as never)
+  await world.clock.advance(5000)
+  const rows = world.sentRows().filter(r => json(r.attributes).agent_id === 'agent-5' && r.event_type === 'TOOL_STARTING')
+  expect(rows.map(r => [r.agent, json(r.attributes).unidentified_loop])).toEqual([
+    ['unidentified_loop', true],
+    ['Explore', undefined],
+  ])
+})
+
 test('a SubagentStart that comes after the run\'s first row names the run without opening a second span', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)
@@ -487,7 +532,7 @@ test('when classic.SessionStart is skipped, turns, tools and session end still r
   await runStep($, { turnId: 'turn-s1', index: 0 })
   await $.tool.call({ tool: 'Read', file_path: 'README.md' })
   await $.turn.complete({ turnId: 'turn-s1', answer: 'First answer.', durationMs: 500, isAborted: false, reason: 'answer', usage: USAGE })
-  await $.session.end({ reason: 'clear' })
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
   await world.clock.advance(5000)
 
   // Second session after /clear, again without classic.SessionStart.
@@ -496,7 +541,7 @@ test('when classic.SessionStart is skipped, turns, tools and session end still r
   await $.turn.start({ turnId: 'turn-s2', text: 'second prompt' })
   await runStep($, { turnId: 'turn-s2', index: 0 })
   await $.turn.complete({ turnId: 'turn-s2', answer: 'Second answer.', durationMs: 400, isAborted: false, reason: 'answer', usage: USAGE })
-  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'second-session-id' })
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'second-session-id', resume: { id: 'second-session-id' } })
 
   const sentEnds = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
   const spilledEnds = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
@@ -525,7 +570,7 @@ test('when classic.SessionStart is skipped and the session id changes on /branch
   await $.turn.start({ turnId: 'turn-b3', text: 'after branch' })
   await $.turn.complete({ turnId: 'turn-b3', answer: 'branched', durationMs: 200, isAborted: false, reason: 'answer' })
   await world.clock.advance(5000)
-  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'branched-session-id' })
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'branched-session-id', resume: { id: 'branched-session-id' } })
 
   const ends = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
   expect(ends.length).toBe(1)
@@ -533,4 +578,37 @@ test('when classic.SessionStart is skipped and the session id changes on /branch
   expect(json(ends[0]?.attributes ?? null)).toMatchObject({
     state_delta: { source: 'coding_agent_session_end', reason: 'prompt_input_exit', trace_count: 1 },
   })
+})
+
+test('session_start omits model and permission_mode when classic.SessionStart does not provide them', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+  const [start] = byType(world.sentRows(), 'STATE_DELTA')
+  const delta = (json(start?.attributes ?? null).state_delta ?? {}) as Record<string, unknown>
+  expect('model' in delta).toBe(false)
+  expect('permission_mode' in delta).toBe(false)
+})
+
+test('a session that runs only /bqaa-status and exits emits and spills no session_start or session_end rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  expect(world.sentRows()).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('the offline test shim rejects a session.end handler that returns no { sessionId }', { options: OPTIONS }, async ($, on) => {
+  setUp(on)
+  on('session.end', async (_$, _e, _next) => ({}) as never)
+  let caught: Error | null = null
+  try {
+    await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  } catch (err) {
+    caught = err as Error
+  }
+  expect(caught?.message ?? '').toContain('no implementation for session.end: returned no { sessionId }')
 })

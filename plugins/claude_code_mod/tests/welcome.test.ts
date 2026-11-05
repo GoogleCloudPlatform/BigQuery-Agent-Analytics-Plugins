@@ -314,7 +314,7 @@ for (const operation of ['get', 'set'] as const) {
     await world.clock.advance(5000)
     expect(started).toBe(true)
     expect(world.acceptedRows().length).toBe(1)
-    expect(world.registered).toEqual(['bqaa-status', 'bqaa-flush', 'bqaa-backfill'])
+    expect(world.registered).toEqual(['bqaa-status', 'bqaa-flush', 'bqaa-backfill', 'bqaa-setup'])
     // Never read: no card. Read, but never recorded: the card, with its rows.
     expect(held).toBe(1)
     const texts = (await band($)).texts
@@ -882,7 +882,7 @@ test('session.end(clear) while store.get is in flight cancels the in-flight welc
   expect(answer).toBeDefined()
   // The user runs /clear while classic.SessionStart is skipped by cc-plugin-sec-default:
   // session.end(clear) increments resets so the stale store.get answer shows nothing.
-  await $.session.end({ reason: 'clear' })
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
   answer?.({ value: undefined })
   await world.clock.settle()
   expect(welcomeLines(world.transcript)).toEqual([])

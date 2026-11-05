@@ -2077,7 +2077,10 @@ test('the exit spill after a takeover takes the batch the writer before still ha
   await atRequest
   const after = w.writer('a-session')
   after.adopt(before)
-  expect(await after.spillForExit(1000)).toEqual({ spilled: 1 })
+  const exiting = after.spillForExit(1000)
+  // Its answer is waited for half the budget, then the batch is spilled.
+  w.fire(500)
+  expect(await exiting).toEqual({ spilled: 1 })
   const spilled = (id: string): number => [...w.files].filter(([path, text]) => path.includes('/spill-') && text !== '').flatMap(([, text]) => parseFile(text).lines).filter(l => l.row.event_id === id).length
   expect(spilled(a)).toBe(1)
   // A row captured after: neither writer sends it.

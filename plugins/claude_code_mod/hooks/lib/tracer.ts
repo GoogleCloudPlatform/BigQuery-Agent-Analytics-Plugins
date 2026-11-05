@@ -43,7 +43,7 @@ export const DECISION_WAIT_MS = 2000
 const DECISION_VALUE = /^[a-z][a-z0-9_]{0,31}$/
 
 // A finished call waiting for its decision, and its timer.
-type AwaitingDecision = { write: (decision: ToolDecision | undefined) => void; timer: { cancel: () => void } | null }
+type AwaitingDecision = { write: (decision: ToolDecision | undefined) => void; timer: { cancel: () => void } | null; onSettled?: () => void }
 
 // The token counts the engine reports (`ModelUsage` plus the model's id).
 export type Usage = {
@@ -62,6 +62,8 @@ type TurnCtx = {
   prompt: string
   lastStepSpan: string | null
   steps: number
+  lastMainToolUseId: string | null
+  lastMainToolDecisionSource: string | null
 }
 
 // One run of a subagent's (or teammate's) loop: its span under the main turn
@@ -71,6 +73,13 @@ type LoopCtx = {
   agentType: string
   // Named by classic.SubagentStart, not guessed.
   typeKnown: boolean
+  // A run of it was seen to start: turn.start with its loop id, or
+  // classic.SubagentStart. A loop seen first at one of its rows (a tool call,
+  // a model step) is one the host started no run of, such as the fork that
+  // proposes the next prompt after a turn, or one whose run was under way
+  // when this module loaded: `unidentified_loop`, and its rows say so, until
+  // a SubagentStart names it.
+  seen: boolean
   traceId: string
   invocationId: string | null
   spanId: string
@@ -132,6 +141,9 @@ export type TurnEnd = {
   refusal?: { category: string | null; explanation: string | null }
   usage?: Usage
 }
+
+// The agent of a loop no run start was seen for (see LoopCtx).
+const UNIDENTIFIED_LOOP = 'unidentified_loop'
 
 const RESERVED_TOOL_KEYS = new Set(['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent'])
 
@@ -197,6 +209,7 @@ export class Tracer {
   private engineVersion: string | null = null
   private sessionStartedAt: number | null = null
   private turnCount = 0
+  private sessionHasActivity = false
   private main: TurnCtx | null = null
   // Turns seen only through their model requests (this module loaded after
   // their turn.start), kept apart so they never replace the current turn.
@@ -217,11 +230,16 @@ export class Tracer {
     this.deps = deps
   }
 
+  get hasActivity(): boolean {
+    return this.sessionHasActivity
+  }
+
   setSession(info: { sessionId?: string | null; cwd?: string | null; engineVersion?: string | null; hostName?: string | null }): void {
     if (info.sessionId) {
       if (this.sessionId !== null && info.sessionId !== this.sessionId) {
         this.sessionStartedAt = this.deps.now()
         this.turnCount = 0
+        this.sessionHasActivity = false
         this.main = null
         this.others.clear()
         this.loops.clear()
@@ -246,6 +264,7 @@ export class Tracer {
     if (e.source !== 'compact') {
       this.sessionStartedAt = at
       this.turnCount = 0
+      this.sessionHasActivity = false
     }
     this.emit({
       eventType: 'STATE_DELTA',
@@ -256,32 +275,35 @@ export class Tracer {
         state_delta: {
           source: 'coding_agent_session_start',
           start_source: e.source,
-          model: e.model ?? null,
-          permission_mode: e.permission_mode ?? null,
+          ...(e.model ? { model: e.model } : {}),
+          ...(e.permission_mode ? { permission_mode: e.permission_mode } : {}),
         },
         session_metadata: this.sessionMetadata(),
       },
     })
   }
 
-  sessionEnded(e: { reason: string; sessionId?: string }): void {
+  sessionEnded(e: { reason: string; sessionId?: string }, opts?: { suppressRow?: boolean }): void {
     if (e.sessionId) this.sessionId = e.sessionId
     // Calls still waiting for their decision are written first, without it.
     this.writeAwaiting()
-    const now = this.deps.now()
-    this.emit({
-      eventType: 'STATE_DELTA',
-      ids: this.sessionIds(),
-      content: { session_end: true },
-      attributes: {
-        state_delta: {
-          source: 'coding_agent_session_end',
-          reason: e.reason,
-          trace_count: this.turnCount,
-          duration_ms: this.sessionStartedAt === null ? null : Math.max(0, now - this.sessionStartedAt),
+    if (!opts?.suppressRow) {
+      const now = this.deps.now()
+      this.emit({
+        eventType: 'STATE_DELTA',
+        ids: this.sessionIds(),
+        content: { session_end: true },
+        attributes: {
+          state_delta: {
+            source: 'coding_agent_session_end',
+            reason: e.reason,
+            trace_count: this.turnCount,
+            duration_ms: this.sessionStartedAt === null ? null : Math.max(0, now - this.sessionStartedAt),
+          },
         },
-      },
-    })
+      })
+    }
+    this.sessionHasActivity = false
     this.main = null
     this.others.clear()
     this.loops.clear()
@@ -307,6 +329,7 @@ export class Tracer {
     wait?: boolean
     attachments?: readonly { type: string }[]
   }): void {
+    this.sessionHasActivity = true
     const turn = this.main && (e.duringTurnId === undefined || this.main.turnId === e.duringTurnId) ? this.main : null
     this.emit({
       eventType: 'USER_MESSAGE_RECEIVED',
@@ -328,6 +351,7 @@ export class Tracer {
   }
 
   turnStarted(e: { turnId: string; text: string; agentId?: string }): void {
+    this.sessionHasActivity = true
     // A subagent's or teammate's run (`agentId`, its loop): a turn of that
     // loop inside the main turn, which it neither replaces nor counts as a
     // turn of its own. No INVOCATION_STARTING.
@@ -343,6 +367,8 @@ export class Tracer {
       prompt: e.text,
       lastStepSpan: null,
       steps: 0,
+      lastMainToolUseId: null,
+      lastMainToolDecisionSource: null,
     }
     this.turnCount += 1
     this.emit({
@@ -354,6 +380,7 @@ export class Tracer {
   }
 
   stepStarted(e: { turnId: string; index: number; model: string; effort?: string | number; messageCount: number; agentId?: string }): StepCtx {
+    this.sessionHasActivity = true
     const spanId = this.deps.ids.spanId()
     const startedAt = this.deps.now()
     let ctx: StepCtx
@@ -463,8 +490,10 @@ export class Tracer {
   }
 
   toolStarted(e: Record<string, unknown>): ToolCtx {
+    this.sessionHasActivity = true
     const tool = String(e.tool ?? 'unknown')
     const agentId = typeof e.agentId === 'string' && e.agentId !== '' ? e.agentId : undefined
+    const toolUseId = typeof e.tool_use_id === 'string' ? e.tool_use_id : null
     const args: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(e)) if (!RESERVED_TOOL_KEYS.has(key)) args[key] = value
     let parentSpanId: string | null = null
@@ -481,6 +510,8 @@ export class Tracer {
       parentSpanId = this.main.lastStepSpan ?? this.main.spanId
       traceId = this.main.traceId
       invocationId = this.main.turnId
+      this.main.lastMainToolUseId = toolUseId
+      this.main.lastMainToolDecisionSource = null
     }
     const ctx: ToolCtx = {
       spanId: this.deps.ids.spanId(),
@@ -490,7 +521,7 @@ export class Tracer {
       agent,
       agentId,
       tool,
-      toolUseId: typeof e.tool_use_id === 'string' ? e.tool_use_id : null,
+      toolUseId,
       origin: toolOrigin(tool),
       args,
       fingerprint: fingerprintOf(tool, args),
@@ -526,7 +557,13 @@ export class Tracer {
       this.toolCompleted(ctx, outcome, endedAt, known)
       return
     }
-    const waiting: AwaitingDecision = { write: decision => this.toolCompleted(ctx, outcome, endedAt, decision), timer: null }
+    const waiting: AwaitingDecision = {
+      write: decision => {
+        this.toolCompleted(ctx, outcome, endedAt, decision)
+        waiting.onSettled?.()
+      },
+      timer: null,
+    }
     this.awaitingDecision.set(id, waiting)
     // Past the bound, the oldest waiting call is written without its decision.
     if (this.awaitingDecision.size > MAX_TRACKED) {
@@ -578,6 +615,12 @@ export class Tracer {
   }
 
   private toolCompleted(ctx: ToolCtx, outcome: ToolOutcome, endedAt: number, decision: ToolDecision | undefined): void {
+    if (!ctx.agentId) {
+      const turn = ctx.invocationId !== null ? (this.main?.turnId === ctx.invocationId ? this.main : this.others.get(ctx.invocationId) ?? null) : this.main
+      if (turn && (ctx.toolUseId === null || turn.lastMainToolUseId === ctx.toolUseId)) {
+        turn.lastMainToolDecisionSource = decision?.source ?? null
+      }
+    }
     const latencyMs = { total_ms: endedAt - ctx.startedAt }
     const attributes: Record<string, unknown> = {
       tool_use_id: ctx.toolUseId,
@@ -652,18 +695,20 @@ export class Tracer {
   // a moment before (turn.start with its loop id), and its AGENT_STARTING
   // row waited for this; otherwise this starts the run's span.
   subagentStarted(e: { agent_id: string; agent_type: string }): void {
+    this.sessionHasActivity = true
     const known = this.loops.get(e.agent_id)
     let loop = known
     if (!loop || loop.ended) {
-      loop = this.newLoop(e.agent_id, null, known)
+      loop = this.newLoop(e.agent_id, null, known, true)
       remember(this.loops, e.agent_id, loop)
     }
-    loop.agentType = e.agent_type || loop.agentType
+    loop.agentType = e.agent_type || (loop.seen ? loop.agentType : 'subagent')
     loop.typeKnown = true
+    loop.seen = true
     if (!loop.started) this.emitAgentStarting(loop, false)
   }
 
-  turnCompleted(e: TurnEnd): void {
+  turnCompleted(e: TurnEnd, onComplete?: () => void): void {
     const isFailure = e.reason === 'error' || e.reason === 'refusal'
     const refusal = e.refusal ? ['model refused', e.refusal.category, e.refusal.explanation].filter(Boolean).join(': ') : 'model refused'
     const errorMessage = !isFailure ? null : e.reason === 'refusal' ? refusal : 'the turn ended on an API error'
@@ -686,32 +731,49 @@ export class Tracer {
       return
     }
     const turn = this.turnFor(e.turnId)
-    const ids = { traceId: turn.traceId, spanId: turn.spanId, parentSpanId: null, invocationId: turn.turnId }
-    if (e.answer !== '') {
-      this.emit({
-        eventType: 'AGENT_RESPONSE',
-        ids,
-        content: { response: e.answer },
-        attributes: { source_turn_id: e.turnId },
-      })
-    }
-    this.emit({
-      eventType: isFailure ? 'INVOCATION_ERROR' : 'INVOCATION_COMPLETED',
-      ids,
-      content: isFailure ? { reason: e.reason } : {},
-      attributes: {
-        finish_reason: e.reason,
-        is_aborted: e.isAborted,
-        step_count: turn.steps,
-        usage_metadata: usage,
-        model: e.usage?.model,
-      },
-      latencyMs: { total_ms: e.durationMs },
-      status: isFailure ? 'ERROR' : 'OK',
-      errorMessage,
-    })
     if (this.main === turn) this.main = null
-    this.others.delete(e.turnId)
+    remember(this.others, e.turnId, turn)
+    const finish = (): void => {
+      const ids = { traceId: turn.traceId, spanId: turn.spanId, parentSpanId: null, invocationId: turn.turnId }
+      if (e.answer !== '') {
+        this.emit({
+          eventType: 'AGENT_RESPONSE',
+          ids,
+          content: { response: e.answer },
+          attributes: { source_turn_id: e.turnId },
+        })
+      }
+      const endedOnRejection = !isFailure && !e.answer?.trim() && turn.lastMainToolDecisionSource === 'user_reject'
+      this.emit({
+        eventType: isFailure ? 'INVOCATION_ERROR' : 'INVOCATION_COMPLETED',
+        ids,
+        content: isFailure ? { reason: e.reason } : {},
+        attributes: {
+          finish_reason: e.reason,
+          is_aborted: e.isAborted,
+          ended_on_rejection: endedOnRejection || undefined,
+          step_count: turn.steps,
+          usage_metadata: usage,
+          model: e.usage?.model,
+        },
+        latencyMs: { total_ms: e.durationMs },
+        status: isFailure ? 'ERROR' : 'OK',
+        errorMessage,
+      })
+      if (this.main === turn) this.main = null
+      this.others.delete(e.turnId)
+      onComplete?.()
+    }
+    const pendingTool = turn.lastMainToolUseId !== null ? this.awaitingDecision.get(turn.lastMainToolUseId) : undefined
+    if (pendingTool) {
+      const prev = pendingTool.onSettled
+      pendingTool.onSettled = () => {
+        prev?.()
+        finish()
+      }
+      return
+    }
+    finish()
   }
 
   // ---- internals -------------------------------------------------------
@@ -731,6 +793,8 @@ export class Tracer {
       prompt: '',
       lastStepSpan: null,
       steps: 0,
+      lastMainToolUseId: null,
+      lastMainToolDecisionSource: null,
     }
     if (this.main === null) this.main = turn
     else remember(this.others, turnId, turn)
@@ -745,7 +809,7 @@ export class Tracer {
     const known = this.loops.get(agentId)
     let loop = known
     if (!loop || loop.ended) {
-      loop = this.newLoop(agentId, turnId, known)
+      loop = this.newLoop(agentId, turnId, known, false)
       remember(this.loops, agentId, loop)
     }
     if (!loop.started) this.emitAgentStarting(loop, !loop.typeKnown)
@@ -757,18 +821,23 @@ export class Tracer {
   // that names its type, or for the run's first row if that never comes.
   private loopRunStarted(agentId: string, turnId: string): void {
     const known = this.loops.get(agentId)
-    if (known && !known.ended) return
-    remember(this.loops, agentId, this.newLoop(agentId, turnId, known))
+    if (known && !known.ended) {
+      known.seen = true
+      return
+    }
+    remember(this.loops, agentId, this.newLoop(agentId, turnId, known, true))
   }
 
   // A run's span, under the main turn now running: its trace, its
   // invocation and its span as parent. A later run of a loop keeps the type
-  // an earlier one was named.
-  private newLoop(agentId: string, turnId: string | null, previous: LoopCtx | undefined): LoopCtx {
+  // an earlier one was named; `seen` when this run's start was (see LoopCtx).
+  private newLoop(agentId: string, turnId: string | null, previous: LoopCtx | undefined, seen: boolean): LoopCtx {
+    const named = seen || previous?.seen === true
     return {
       agentId,
-      agentType: previous?.agentType ?? 'subagent',
+      agentType: previous?.seen === true ? previous.agentType : named ? 'subagent' : UNIDENTIFIED_LOOP,
       typeKnown: previous?.typeKnown ?? false,
+      seen: named,
       traceId: this.main?.traceId ?? this.deps.ids.traceId(),
       invocationId: this.main?.turnId ?? turnId,
       spanId: this.deps.ids.spanId(),
@@ -777,6 +846,11 @@ export class Tracer {
       started: false,
       ended: false,
     }
+  }
+
+  // Whether a row's loop is one no run start was seen for (see LoopCtx).
+  private unidentified(agentId: unknown): boolean {
+    return typeof agentId === 'string' && this.loops.get(agentId)?.seen === false
   }
 
   private emitAgentStarting(loop: LoopCtx, inferred: boolean): void {
@@ -837,6 +911,7 @@ export class Tracer {
         root_agent_name: config.agentName,
         source: 'coding_agent',
         ...args.attributes,
+        unidentified_loop: this.unidentified(args.attributes.agent_id) || undefined,
         writer: {
           plugin: PLUGIN_NAME,
           version: PLUGIN_VERSION,

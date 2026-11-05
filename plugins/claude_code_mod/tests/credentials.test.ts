@@ -75,7 +75,9 @@ test('without working credentials, the band, one toast and one transcript line g
   // The session-start row and the call's two rows wait.
   expect(await band($)).toEqual({ line: LINE, waiting: ' 3 row(s) waiting.', beneath: true })
   expect(world.toasts).toEqual([`BQAA: ${LINE}`])
-  expect(world.statusLines.at(-1)).toBe(`BQAA: no working Google credentials. To fix, ${FIX} (3 row(s) waiting)`)
+  // In an interactive terminal session where the AbovePrompt band renders, the
+  // problem notice is not duplicated onto the persistent status line.
+  expect(world.statusLines.at(-1)).toBeUndefined()
   // The transcript line has the reason: gcloud's ERROR line, not its
   // WARNING line or its instructions.
   const [notice] = noticeLines(world)
@@ -301,4 +303,13 @@ test("with gcloud's own account as the token command, the fix is gcloud auth log
   await startSession($)
   await world.clock.advance(5000)
   expect((await band($)).line).toBe('rows are not being written: no working Google credentials. To fix, run: gcloud auth login.')
+})
+
+test('when the AbovePrompt band cannot show (non-terminal surface), the problem notice is written to the status line', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.processReply = GCLOUD_FAILS
+  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(world.statusLines.at(-1)).toBe(`BQAA: no working Google credentials. To fix, ${FIX} (2 row(s) waiting)`)
 })

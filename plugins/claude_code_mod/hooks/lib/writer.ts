@@ -66,6 +66,10 @@ export type Io = {
   toast?: (text: string) => void
   notice?: (text: string) => void
   redraw?: () => void
+  // True when the AbovePrompt band renders in this session, so problem
+  // notices already visible in the band are not duplicated onto the persistent
+  // status line.
+  canShowBand?: () => boolean
   // The mod's own directory, where setup.sh is: the fix for a dataset
   // BigQuery cannot find names the script there. Absent, the fix is told
   // without a command.
@@ -90,6 +94,8 @@ export type Counters = {
   captured: number
   // Rows BigQuery accepted (or, in a dry run, written to the dry-run files).
   sent: number
+  // Of `sent`, rows replayed from dead-letter / spill files via backfill.
+  replayed: number
   // Rows moved to dead-letter files after a failure (retry + rejected).
   failed: number
   // Of those, rows BigQuery or the configuration refused.
@@ -254,6 +260,18 @@ const PLAIN_LOCATION = /^[A-Za-z0-9-]+$/
 // escaped and reopened.
 const shellQuote = (text: string): string => `'${text.replace(/'/g, `'\\''`)}'`
 
+// Builds the shell command to run the mod's setup.sh for `c`, or null when
+// `root` is unknown or not a POSIX path without control characters, any name
+// is one setup.sh would refuse, or the command would be cut or redacted.
+export function buildSetupCommand(c: Config, root: string | undefined): string | null {
+  if (root === undefined || !root.startsWith('/') || /[\u0000-\u001f\u007f]/.test(root)) return null
+  const views = `${c.dataset}_reporting`
+  if (!PLAIN_PROJECT.test(c.project) || ![c.dataset, views, c.table].every(name => PLAIN_NAME.test(name)) || !PLAIN_LOCATION.test(c.location)) return null
+  const script = root.endsWith('/') ? `${root}setup.sh` : `${root}/setup.sh`
+  const command = `BQAA_PROJECT_ID=${c.project} BQAA_DATASET=${c.dataset} BQAA_TABLE=${c.table} BQAA_VIEWS_DATASET=${views} BQAA_LOCATION=${c.location} bash ${shellQuote(script)}`
+  return diagnostic(`Run: ${command}`, SETUP_COMMAND_CHARS + 5) === `Run: ${command}` ? command : null
+}
+
 // How the refused and parked counts know a line's row: its event_id; for one
 // with none (in a file another writer made), the key a replay gave the line
 // as it rewrote it, else the file (`name`) and the line's place there, which
@@ -393,6 +411,7 @@ export class Writer {
   readonly counters: Counters = {
     captured: 0,
     sent: 0,
+    replayed: 0,
     failed: 0,
     rejected: 0,
     spilled: 0,
@@ -847,8 +866,9 @@ export class Writer {
 
   // A line the surface does not take leaves the one shown as it was, and the
   // next status is written again.
-  private setStatus(text: string | undefined): void {
-    const clean = text === undefined ? undefined : diagnostic(text, 300)
+  private setStatus(text: string | undefined, opts?: { inBand?: boolean }): void {
+    const raw = opts?.inBand && this.io.canShowBand?.() ? undefined : text
+    const clean = raw === undefined ? undefined : diagnostic(raw, 300)
     if (clean === this.status.text) return
     this.call(() => {
       this.io.status(clean)
@@ -935,7 +955,7 @@ export class Writer {
   private showProblem(): void {
     if (this.problem === null) return
     const { headline, fix } = this.problemText()
-    this.setStatus(`BQAA: ${headline}. To fix, ${fix} (${this.waitingText()} row(s) waiting)`)
+    this.setStatus(`BQAA: ${headline}. To fix, ${fix} (${this.waitingText()} row(s) waiting)`, { inBand: true })
     this.call(() => this.io.redraw?.())
   }
 
@@ -968,20 +988,7 @@ export class Writer {
   // long, or holds text redaction would change, to be shown as it is.
   setupCommand(): string | null {
     if (this.problem?.kind !== 'destination') return null
-    const c = this.config()
-    const root = this.io.pluginRoot
-    // A path with a control character (a line break, say) cannot be copied
-    // whole from a line.
-    if (root === undefined || !root.startsWith('/') || /[\u0000-\u001f\u007f]/.test(root)) return null
-    // The views go to `<dataset>_reporting`, held to the same rule.
-    const views = `${c.dataset}_reporting`
-    if (!PLAIN_PROJECT.test(c.project) || ![c.dataset, views, c.table].every(name => PLAIN_NAME.test(name)) || !PLAIN_LOCATION.test(c.location)) return null
-    // A POSIX path: a backslash in it is part of a name, not a separator.
-    const script = root.endsWith('/') ? `${root}setup.sh` : `${root}/setup.sh`
-    const command = `BQAA_PROJECT_ID=${c.project} BQAA_DATASET=${c.dataset} BQAA_TABLE=${c.table} BQAA_VIEWS_DATASET=${views} BQAA_LOCATION=${c.location} bash ${shellQuote(script)}`
-    // Redaction also cuts a text past its limit, so a longer command fails
-    // the same check.
-    return diagnostic(`Run: ${command}`, SETUP_COMMAND_CHARS + 5) === `Run: ${command}` ? command : null
+    return buildSetupCommand(this.config(), this.io.pluginRoot)
   }
 
   // The band's and the transcript's line for the setup command: the command
@@ -1258,52 +1265,87 @@ export class Writer {
 
   // ---- session end -------------------------------------------------------
 
+  // Drops a single unsent `session_start` row for `sessionId` when the session
+  // ran only mod slash commands and has not sent or in-flight-flushed any row
+  // for this session yet. Returns true when the session can end silently.
+  dropUnsentSessionStart(sessionId: string | null): boolean {
+    if (sessionId === null) return false
+    const writers = [...this.before, this]
+    if (writers.some(w => w.inFlightRows.some(q => q.row.session_id === sessionId))) return false
+    if (this.counters.sent - this.counters.replayed > 0) return false
+    const items = this.queue.takeAll()
+    const kept: Queued[] = []
+    let removed = 0
+    for (const item of items) {
+      if (item.row.session_id === sessionId && item.row.event_type === 'STATE_DELTA' && item.row.content === '{"session_start":true}') {
+        removed += 1
+      } else {
+        kept.push(item)
+      }
+    }
+    this.queue.append(kept)
+    this.counters.captured = Math.max(0, this.counters.captured - removed)
+    return true
+  }
+
   // Called from session.end when the process is ending, inside the engine's
-  // short end-of-session bound. Starts no request: the rows still queued, and
-  // rows whose request has not answered (it may yet land; event_id dedups),
-  // go to a spill file the next session sends, or in a dry run to the dry-run
-  // files. Waits at most `budgetMs` for those writes, and for the dead-letter
-  // writes already under way. Never throws.
+  // short end-of-session bound. Starts no request: the rows still queued go
+  // at once to a spill file the next session sends, or in a dry run to the
+  // dry-run files. A batch whose request is out may yet be answered: the exit
+  // waits for that answer up to half its budget, so rows BigQuery took are
+  // not sent again from a spill file, then spills the rows no answer took
+  // (they may yet land; event_id dedups). Waits at most `budgetMs` in all,
+  // for those writes and for the dead-letter writes under way. Never throws.
   async spillForExit(budgetMs: number): Promise<{ spilled: number }> {
     const c = this.config()
-    const until = this.io.now() + budgetMs
+    const start = this.io.now()
+    const until = start + budgetMs
     this.closing = true
     this.soon?.cancel()
     this.soon = null
     // The writers this one took over from start nothing more either, and a
-    // batch one still has out, its answer not come, goes with the rest. Rows
-    // an answer refused, or parks after their retries, are in a file being
-    // written already: a copy here would send them again, so the exit waits
-    // for that write instead, within the same bound.
-    const out: Queued[] = []
-    for (const writer of [...this.before, this]) {
-      writer.closing = true
-      out.push(...writer.inFlightRows)
-    }
-    const pending = [...this.persisting]
-    const rows = [...out, ...this.queue.takeAll()]
-    if (rows.length === 0) {
-      if (pending.length > 0) await this.raceUntil(Promise.all(pending), until)
-      return { spilled: 0 }
-    }
+    // batch one still has out goes with the rest once its wait is over.
+    const writers = [...this.before, this]
+    for (const writer of writers) writer.closing = true
     const toDryRun = c.dryRun && c.dryRunDir !== ''
-    const write = (async (): Promise<void> => {
-      if (!toDryRun) {
-        this.counters.spilled += rows.length
-        await this.deadLetter('spill', rows, 'session ended before these rows were confirmed sent')
-        return
-      }
-      try {
-        await this.writeDryRunFiles(rows, c)
-        this.counters.sent += rows.length
-        this.call(() => this.io.sent?.(rows.length, c))
-      } catch (err) {
-        this.counters.dropped += rows.length
-        this.recordError(`dry run write at exit failed (${rows.length} rows lost): ${errorText(err)}`)
-      }
-    })()
-    await this.raceUntil(Promise.all([write, ...pending]), until)
-    return { spilled: toDryRun ? 0 : rows.length }
+    const writes: Promise<void>[] = []
+    let spilled = 0
+    const park = (rows: Queued[]): void => {
+      if (rows.length === 0) return
+      if (!toDryRun) spilled += rows.length
+      writes.push(this.exitWrite(rows, c, toDryRun))
+    }
+    park(this.queue.takeAll())
+    const flights = writers.flatMap(writer => (writer.inFlightRows.length > 0 && writer.inFlight !== null ? [writer.inFlight] : []))
+    if (flights.length > 0 && budgetMs > 0) await this.raceUntil(Promise.all(flights), start + Math.floor(budgetMs / 2))
+    // What no answer took: the rows still out, and those an answer asked
+    // for again. Rows an answer refused, or parks after their retries, are
+    // in a file being written already: a copy here would send them again,
+    // so the exit waits for that write instead, within the same bound.
+    const out: Queued[] = []
+    for (const writer of writers) out.push(...writer.inFlightRows)
+    park([...out, ...this.queue.takeAll()])
+    const pending = [...writes, ...this.persisting]
+    if (pending.length > 0) await this.raceUntil(Promise.all(pending), until)
+    return { spilled }
+  }
+
+  // The rows of an exit: to a spill file, or in a dry run to the dry-run
+  // files.
+  private async exitWrite(rows: Queued[], c: Config, toDryRun: boolean): Promise<void> {
+    if (!toDryRun) {
+      this.counters.spilled += rows.length
+      await this.deadLetter('spill', rows, 'session ended before these rows were confirmed sent')
+      return
+    }
+    try {
+      await this.writeDryRunFiles(rows, c)
+      this.counters.sent += rows.length
+      this.call(() => this.io.sent?.(rows.length, c))
+    } catch (err) {
+      this.counters.dropped += rows.length
+      this.recordError(`dry run write at exit failed (${rows.length} rows lost): ${errorText(err)}`)
+    }
   }
 
   private raceUntil(work: Promise<unknown>, until: number): Promise<unknown> {
@@ -2198,7 +2240,9 @@ export class Writer {
           }
         })
         report.rowsSent += landed
+        this.counters.batches += 1
         this.counters.sent += landed
+        this.counters.replayed += landed
         // In the order they came, as for a send: rows landing end the count,
         // then this request's refusals start it again.
         this.tookRequest(landed)

@@ -24,7 +24,7 @@ import type { BackfillReport, Writer } from './writer.ts'
 // dead-letter directory (other tables' subdirectories, an older flat
 // layout), and files too large to read back.
 export type DeadLetterSummary =
-  | { dir: string; files: number; bytes: number; byKind: Record<string, number>; oversized: string[]; elsewhere: number }
+  | { dir: string; files: number; bytes: number; byKind: Record<string, number>; oversized: string[]; elsewhere: number; retiredFiles?: number }
   | { error: string }
 
 const ago = (now: number, at: number | null): string => {
@@ -60,7 +60,7 @@ export function formatStatus(args: {
   const lines = [
     short(`BigQuery Agent Analytics mod: ${c.enabled ? 'enabled' : 'disabled'}, target ${target}`),
     `queue: ${s.queued} rows (${kb(s.queuedBytes)}), ${s.inFlight} in flight; flush every ${c.flushIntervalMs} ms`,
-    `rows: captured ${k.captured}, sent ${k.sent}, dead-lettered ${k.failed} (${k.rejected} refused), spilled ${k.spilled}, dropped ${s.dropped}, not captured ${k.skipped}`,
+    `rows: captured ${k.captured}, sent ${k.sent}${k.replayed > 0 ? ` (${k.replayed} replayed)` : ''}, dead-lettered ${k.failed} (${k.rejected} refused), spilled ${k.spilled}, dropped ${s.dropped}, not captured ${k.skipped}`,
     `requests: ${k.batches} ok, ${k.retries} retried; last success ${ago(now, s.lastSuccessAt)}`,
   ]
   if (s.consecutiveFailures > 0) lines.push(`backing off: ${s.consecutiveFailures} failure(s) in a row, next try in about ${Math.max(0, Math.round((s.pausedUntil - now) / 1000))}s`)
@@ -80,10 +80,15 @@ export function formatStatus(args: {
   if ('error' in args.deadLetter) lines.push(`dead-letter: ${args.deadLetter.error}`)
   else {
     const d = args.deadLetter
-    const kinds = Object.entries(d.byKind)
-      .map(([kind, n]) => `${n} ${kind}`)
-      .join(', ')
-    lines.push(`dead-letter: ${d.files} file(s), ${kb(d.bytes)}${kinds ? ` (${kinds})` : ''} in ${d.dir}`)
+    const retired = d.retiredFiles ?? 0
+    const configuredTarget = Boolean(c.project && c.dataset)
+    if (configuredTarget || d.files > 0 || retired > 0) {
+      const kinds = Object.entries(d.byKind)
+        .map(([kind, n]) => `${n} ${kind}`)
+        .join(', ')
+      const retiredNote = retired > 0 ? `; ${retired} replayed/retired file(s) (0-byte or outcome-*, cleaned up after 24h)` : ''
+      lines.push(`dead-letter: ${d.files} file(s), ${kb(d.bytes)}${kinds ? ` (${kinds})` : ''} in ${d.dir}${retiredNote}`)
+    }
     if (d.oversized.length > 0) lines.push(`dead-letter: ${d.oversized.length} file(s) over the 4 MiB read limit, not replayed: ${names(d.oversized)}`)
     if (d.elsewhere > 0) lines.push(`dead-letter: ${d.elsewhere} more file(s) in ${c.deadLetterDir} for other tables or an older layout, not replayed under this configuration`)
   }
