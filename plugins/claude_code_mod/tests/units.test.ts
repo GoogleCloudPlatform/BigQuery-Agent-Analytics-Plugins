@@ -1204,29 +1204,36 @@ test('delimiter-run inline code spans redact the value and keep the suffix', () 
   // the next backtick run of the same length on the same line. The value
   // inside the span redacts, and the text after the closing backtick stays.
   const cases: [string, string, boolean][] = [
-    // A fenced block with a command-substitution backtick inside: the fence
-    // is read as a fence, not a span; the glued backtick runs to the end.
+    // Multi-backtick spans with a command-substitution backtick inside: the
+    // outer run does not pair across interior backticks, so the value runs to
+    // the end of the text.
+    [`Run \`\`\`cli --password=pre\` printf %s SecretSuffix\` --verbose\`\`\` then check.\nTAIL`, `Run \`\`\`cli --password=[REDACTED]`, true],
     [`Run \`\`cli --password=pre\` printf %s SecretSuffix\` --verbose\`\` then check.\nTAIL`, `Run \`\`cli --password=[REDACTED]`, true],
-    // A single-backtick span with a credential value: the closing backtick
-    // ends the value, and the text after it stays.
-    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\` and AFTER`, `Run \`export API_TOKEN=[REDACTED]\` CANARY7f9c2e\` and AFTER`, false],
-    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`, and AFTER`, `Run \`export API_TOKEN=[REDACTED]\` CANARY7f9c2e\`, and AFTER`, false],
-    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`; and AFTER`, `Run \`export API_TOKEN=[REDACTED]\` CANARY7f9c2e\`; and AFTER`, false],
-    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`\r\nand AFTER`, `Run \`export API_TOKEN=[REDACTED]\` CANARY7f9c2e\`\r\nand AFTER`, false],
+    [`Run \`export API_TOKEN=pre\` printf %s SecretSuffix\` and AFTER\nTAIL`, `Run \`export API_TOKEN=[REDACTED]`, true],
+    // Odd-backtick lines (command substitution inside an unclosed backtick):
+    // no spans are recorded, so the value runs to the end of the text.
+    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\` and AFTER`, `Run \`export API_TOKEN=[REDACTED]`, false],
+    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`, and AFTER`, `Run \`export API_TOKEN=[REDACTED]`, false],
+    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`; and AFTER`, `Run \`export API_TOKEN=[REDACTED]`, false],
+    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`\r\nand AFTER`, `Run \`export API_TOKEN=[REDACTED]`, true],
     // An unclosed backtick run: no spans are recorded, so the value runs to
     // the end of the text.
     [`Run \`export API_TOKEN=Secret\`Suffix more`, `Run \`export API_TOKEN=[REDACTED]`, false],
     // A double-backtick span: the value redacts and the text after stays.
     [`Run \`\`export API_TOKEN=CANARY7f9c2e\`\` and AFTER`, `Run \`\`export API_TOKEN=[REDACTED]\`\` and AFTER`, false],
+    // A fenced block and a comment with a backtick above a valid inline span:
+    // neither poisons the inline span's closing boundary.
+    [
+      `\`\`\`sh\necho ok\n\`\`\`\n# comment with \` tick\nRun \`export API_TOKEN=CANARY7f9c2e\` and AFTER\nLine 3`,
+      `\`\`\`sh\necho ok\n\`\`\`\n# comment with \` tick\nRun \`export API_TOKEN=[REDACTED]\` and AFTER\nLine 3`,
+      false,
+    ],
   ]
   for (const [input, want, cut] of cases) {
     const stats = newStats()
     expect(redactText(input, stats)).toBe(want)
     expect(stats.truncated).toBe(cut)
-    // The credential value (Secret, Suffix, or the value inside the span)
-    // must not survive in any of the 8 paths. CANARY7f9c2e is not a credential
-    // value in the single-backtick cases, so it may survive there.
-    for (const text of pathsOf(input)) expect(text).not.toMatch(/Secret|Suffix/)
+    for (const text of pathsOf(input)) expect(text).not.toMatch(/Secret|Suffix|CANARY7f9c2e/)
   }
 })
 

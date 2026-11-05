@@ -1665,6 +1665,27 @@ def clean_dead_letter_checks():
         check('dry-run: nothing is actually deleted', source.exists() and outcome.exists(),
               f'{source.exists()} {outcome.exists()}')
 
+    # 5. Symlinked files and symlinked subdirectories are ignored and kept.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        base = tmp_path / 'dead-letter'
+        d = make_dir(tmp_path)
+        ext_dir = tmp_path / 'external'
+        ext_dir.mkdir()
+        ext_file = ext_dir / 'spill-ext.jsonl'
+        ext_file.write_bytes(b'')
+        symlink_file = d / 'spill-link.jsonl'
+        symlink_file.symlink_to(ext_file)
+        symlink_dir = base / 'linked.ds.tbl'
+        symlink_dir.symlink_to(ext_dir, target_is_directory=True)
+        to_delete = clean.plan_deletions(base)
+        check('symlinked files and symlinked subdirectories are ignored by plan_deletions',
+              to_delete == [], str(to_delete))
+        call(clean.main, '--dir', str(base), '--execute')
+        check('symlinked files, symlinked dirs, and their targets survive --execute',
+              symlink_file.is_symlink() and symlink_dir.is_symlink() and ext_file.exists(),
+              f'{symlink_file.is_symlink()} {symlink_dir.is_symlink()} {ext_file.exists()}')
+
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
           writer_grants_checks, row_writer_role_checks, resources_checks, readers_checks, api_checks,

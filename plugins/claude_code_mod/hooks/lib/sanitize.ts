@@ -454,16 +454,42 @@ function isFenceStart(text: string, from: number, to: number, i: number, L: numb
   return !text.slice(i + L, lineStop).includes('`')
 }
 
-function readQuotes(text: string, from: number, to: number, states?: Uint8Array, ticks?: Uint8Array, lastPlainQuote = -1): number {
+function pairLineRuns(text: string, from: number, to: number, lineRuns: { start: number; len: number }[], spanEnds?: Int32Array): number {
+  let unclosed = -1
+  let r = 0
+  while (r < lineRuns.length) {
+    const openRun = lineRuns[r]!
+    const closeRun = lineRuns[r + 1]
+    if (closeRun !== undefined && openRun.len === closeRun.len) {
+      const inner = text.slice(openRun.start + openRun.len, closeRun.start)
+      if (!inner.includes('`')) {
+        const beforeChar = openRun.start > from ? (text[openRun.start - 1] ?? '') : ''
+        const beforeOk = openRun.start === from || beforeChar === '\n' || /[\s([{"',;:]/.test(beforeChar)
+        const afterEnd = closeRun.start + closeRun.len
+        const afterChar = afterEnd < to ? (text[afterEnd] ?? '') : ''
+        const afterOk = afterEnd >= to || afterChar === '\r' || afterChar === '\n' || /[\s.,;:!?)}\]]/.test(afterChar)
+        if (openRun.start + openRun.len < closeRun.start && !/^\s|\s$/.test(inner) && beforeOk && afterOk) {
+          spanEnds?.fill(closeRun.start, openRun.start + openRun.len, closeRun.start)
+        }
+        r += 2
+        continue
+      }
+    }
+    if (unclosed === -1) unclosed = openRun.start
+    r += 1
+  }
+  lineRuns.length = 0
+  return unclosed
+}
+
+function readQuotes(text: string, from: number, to: number, states?: Uint8Array, spanEnds?: Int32Array, lastPlainQuote = -1): number {
   // These are the only characters that can alter the initial quote state.
   // A supplied state table is newly zeroed, so plain spans need no writes.
   if (!/["'\\$`<#]/.test(text.slice(from, to))) return NONE
   let q = NONE
   let comment = false
-  // Where a backtick outside quotes opened what has not closed, and whether a
-  // line break has crossed it since.
-  let tick = -1
-  let tickNewline = false
+  let unclosedTick = -1
+  let lineRuns: { start: number; len: number }[] | undefined
   let i = from
   while (i < to) {
     QUOTE_TEXT.lastIndex = i
@@ -474,7 +500,10 @@ function readQuotes(text: string, from: number, to: number, states?: Uint8Array,
       continue
     }
     const c = text[i] as string
-    if (c === '\n' && tick !== -1) tickNewline = true
+    if (c === '\n' && lineRuns !== undefined && lineRuns.length > 0) {
+      const lineUnclosed = pairLineRuns(text, from, to, lineRuns, spanEnds)
+      if (unclosedTick === -1 && lineUnclosed !== -1) unclosedTick = lineUnclosed
+    }
     let next = i + 1
     let after = q
     if (comment && c === '\n') {
@@ -505,16 +534,13 @@ function readQuotes(text: string, from: number, to: number, states?: Uint8Array,
         // A comment's text holds no code.
       } else if (c === '`') {
         let runLen = 0
-        while (text[i + runLen] === '`') runLen += 1
-        if (tick === -1 && isFenceStart(text, from, to, i, runLen)) {
+        while (i + runLen < to && text[i + runLen] === '`') runLen += 1
+        if (unclosedTick === -1 && (lineRuns === undefined || lineRuns.length === 0) && isFenceStart(text, from, to, i, runLen)) {
           const nl = text.indexOf('\n', i + runLen)
           next = nl === -1 ? to : nl + 1
-        } else if (tick === -1) {
-          tick = i
-          tickNewline = false
         } else {
-          if (!tickNewline) ticks?.fill(1, tick + 1, i)
-          tick = -1
+          ;(lineRuns ??= []).push({ start: i, len: runLen })
+          next = i + runLen
         }
       } else if (c === '#' && (i === 0 || /[\s;&|()<>]/.test(text[i - 1] as string))) {
         if (i === 0 || /\s/.test(text[i - 1] as string)) comment = true
@@ -526,7 +552,12 @@ function readQuotes(text: string, from: number, to: number, states?: Uint8Array,
       }
     }
     if (after === UNKNOWN) {
-      states?.fill(UNKNOWN, i)
+      if (lineRuns !== undefined && lineRuns.length > 0) {
+        const lineUnclosed = pairLineRuns(text, from, to, lineRuns, spanEnds)
+        if (unclosedTick === -1 && lineUnclosed !== -1) unclosedTick = lineUnclosed
+      }
+      if (unclosedTick !== -1) spanEnds?.fill(0)
+      states?.fill(UNKNOWN, unclosedTick !== -1 && unclosedTick < i ? unclosedTick : i)
       return UNKNOWN
     }
     states?.fill(q, i, Math.min(next, to))
@@ -534,8 +565,15 @@ function readQuotes(text: string, from: number, to: number, states?: Uint8Array,
     i = next
   }
   if (states !== undefined) {
+    if (lineRuns !== undefined && lineRuns.length > 0) {
+      const lineUnclosed = pairLineRuns(text, from, to, lineRuns, spanEnds)
+      if (unclosedTick === -1 && lineUnclosed !== -1) unclosedTick = lineUnclosed
+    }
     states[to] = q
-    if (tick !== -1) states.fill(UNKNOWN, tick)
+    if (unclosedTick !== -1) {
+      spanEnds?.fill(0)
+      states.fill(UNKNOWN, unclosedTick)
+    }
   }
   return i > to ? UNKNOWN : q
 }
@@ -578,97 +616,11 @@ function lastPlainQuoteOf(text: string): number {
 // Each position's quote as the whole-text scan reads it (see readQuotes).
 function quoteStates(text: string): Uint8Array {
   const states = new Uint8Array(text.length + 1)
-  const ticks = text.includes('`') ? new Uint8Array(text.length + 1) : undefined
+  const spanEnds = text.includes('`') ? new Int32Array(text.length + 1) : undefined
   const lastPlainQuote = lastPlainQuoteOf(text)
-  readQuotes(text, 0, text.length, states, ticks, lastPlainQuote)
-  if (ticks !== undefined) {
-    // Record same-line code spans in an Int32Array (SPAN_ENDS).
-    const spanEnds = recordSpanEnds(text, states, ticks)
-    SPAN_ENDS.set(states, spanEnds)
-  }
+  readQuotes(text, 0, text.length, states, spanEnds, lastPlainQuote)
+  if (spanEnds !== undefined) SPAN_ENDS.set(states, spanEnds)
   return states
-}
-
-// Record same-line Markdown code spans: for each index inside an unambiguous
-// same-line span (open and close on one line, equal run lengths, no interior
-// backtick, valid Markdown boundaries, non-empty interior), store the
-// `closeStart` index; `0` everywhere else. A line (outside quotes, comments,
-// fence lines) is scanned for paired backtick runs. If any backtick run in the
-// text is unclosed, all spans are cleared.
-function recordSpanEnds(text: string, states: Uint8Array, ticks: Uint8Array): Int32Array {
-  const spanEnds = new Int32Array(text.length + 1)
-  let unclosedTick = -1
-  let i = 0
-  while (i < text.length) {
-    // Skip to line start positions outside quotes, comments and fence lines.
-    if (text[i] !== '\n' && text[i] !== '`') { i += 1; continue }
-    if (text[i] === '\n') { i += 1; continue }
-    // We're at a backtick at position i. Check if it's inside a quote/comment/fence.
-    if (states[i] !== NONE) { i += 1; continue }
-    // Find the line boundaries.
-    let lineStart = i
-    while (lineStart > 0 && text[lineStart - 1] !== '\n') lineStart -= 1
-    let lineEnd = text.indexOf('\n', i)
-    if (lineEnd === -1) lineEnd = text.length
-    // Scan the line for backtick runs.
-    let k = lineStart
-    const runs: { start: number; len: number }[] = []
-    while (k < lineEnd) {
-      if (text[k] === '`' && states[k] === NONE) {
-        let runLen = 0
-        while (k + runLen < lineEnd && text[k + runLen] === '`') runLen += 1
-        runs.push({ start: k, len: runLen })
-        k += runLen
-      } else {
-        k += 1
-      }
-    }
-    // Pair runs: each open run pairs with the next run of equal length.
-    const paired: boolean[] = new Array(runs.length).fill(false)
-    let openIdx = -1
-    for (let r = 0; r < runs.length; r++) {
-      if (paired[r]) continue
-      // Find the next unpaired run with the same length.
-      let found = false
-      for (let s = r + 1; s < runs.length; s++) {
-        if (!paired[s] && runs[s].len === runs[r].len) {
-          // Check it's a valid span: no interior backtick, valid boundaries,
-          // non-empty interior.
-          const openStart = runs[r].start
-          const openLen = runs[r].len
-          const closeStart = runs[s].start
-          const closeLen = runs[s].len
-          if (openStart + openLen >= closeStart) { found = false; break } // empty or overlapping
-          const inner = text.slice(openStart + openLen, closeStart)
-          if (inner.includes('`')) { found = false; break }
-          if (/^\s|\s$/.test(inner)) { found = false; break }
-          // Valid Markdown boundaries.
-          const beforeOk = openStart === lineStart || text[openStart - 1] === '\n' ||
-            /[\s([{"']/.test(text[openStart - 1] ?? '')
-          const afterEnd = closeStart + closeLen
-          const afterOk = afterEnd === lineEnd || text[afterEnd] === '\r' || text[afterEnd] === '\n' ||
-            /[\s.,;:!?)}\]]/.test(text[afterEnd] ?? '')
-          if (!beforeOk || !afterOk) { found = false; break }
-          paired[r] = true
-          paired[s] = true
-          // Record spanEnds for positions in [openStart + openLen, closeStart).
-          for (let p = openStart + openLen; p < closeStart; p++) {
-            spanEnds[p] = closeStart
-          }
-          found = true
-          break
-        }
-      }
-      if (!found && !paired[r]) {
-        // Unclosed backtick run.
-        unclosedTick = runs[r].start
-      }
-    }
-    // Move past this line.
-    i = lineEnd
-  }
-  if (unclosedTick !== -1) spanEnds.fill(0)
-  return spanEnds
 }
 
 // Where the word that holds `p` starts, as it reads alone: just past the last

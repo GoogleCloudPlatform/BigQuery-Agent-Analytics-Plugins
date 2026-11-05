@@ -104,7 +104,7 @@ def _plan_single_dir(directory: Path) -> list[Path]:
     non_empty_parents: set[str] = set()
 
     for entry in entries:
-        if not entry.is_file():
+        if entry.is_symlink() or not entry.is_file():
             continue
         name = entry.name
         if _is_source(name):
@@ -147,7 +147,7 @@ def plan_deletions(directory: Path) -> list[Path]:
     if not directory.is_dir():
         return []
 
-    dirs = [directory, *[d for d in sorted(directory.iterdir()) if d.is_dir()]]
+    dirs = [directory, *[d for d in sorted(directory.iterdir()) if d.is_dir() and not d.is_symlink()]]
     deletable: list[Path] = []
     for d in dirs:
         deletable.extend(_plan_single_dir(d))
