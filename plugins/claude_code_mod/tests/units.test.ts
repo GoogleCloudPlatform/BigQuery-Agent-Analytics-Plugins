@@ -1180,11 +1180,24 @@ test('in prose, an apostrophe in a word or inline code before a credential costs
     [`echo It's --password Secret Suffix' done`, `echo It's --password [REDACTED]`, false],
     // A value quoted the ordinary way after a contraction keeps the text after
     // it: read as shell, with the contraction a quote, the quotes would not
-    // close. With a single quote left open after it, which the contraction's
-    // could pair with instead, the value runs to the end of the text.
+    // close. Where the shell's quote closes around text after the value (with
+    // a later contraction or comment, or across a `'` inside `"…"`), the value
+    // runs to the end of the text.
     [`It's set up. Run: cli '--password SecretSuffix' --verbose\nAFTER`, `It's set up. Run: cli '--password [REDACTED]' --verbose\nAFTER`, false],
+    [`It's set up. Run: cli --password 'Secret Suffix' --verbose\nAFTER`, `It's set up. Run: cli --password [REDACTED] --verbose\nAFTER`, false],
+    [`It's set up. Run: cli --password "Secret Suffix" --verbose\nAFTER`, `It's set up. Run: cli --password [REDACTED] --verbose\nAFTER`, false],
     [`echo It's\ncli '--password Secret' Suffix' --verbose`, `echo It's\ncli '--password [REDACTED]`, false],
     [`echo It's\ncli '--password Secret' Suffix' --verbose\nAFTER`, `echo It's\ncli '--password [REDACTED]`, true],
+    [`echo It's\ncli --password 'Secret' 'Suffix' don't`, `echo It's\ncli --password [REDACTED]`, false],
+    [`echo It's\ncli --password 'Secret' 'Suffix' don't\nAFTER`, `echo It's\ncli --password [REDACTED]`, true],
+    [`echo It's\ncli '--password Secret' 'Suffix' don't`, `echo It's\ncli '--password [REDACTED]`, false],
+    [`echo It's\ncli '--password Secret' 'Suffix' don't\nAFTER`, `echo It's\ncli '--password [REDACTED]`, true],
+    [`echo It's\ncli '--password Secret' Suffix' # '` + `\necho AFTER`, `echo It's\ncli '--password [REDACTED]`, true],
+    [`echo It's 'done'; cli --password "Sec'ret" Suffix" --verbose`, `echo It's 'done'; cli --password [REDACTED]`, false],
+    [`echo It's 'done'; cli --password "Sec'ret" Suffix" --verbose\necho AFTER`, `echo It's 'done'; cli --password [REDACTED]`, true],
+    [`echo It's 'done'; cli --password "Sec'ret" Suffix" # "` + `\necho AFTER`, `echo It's 'done'; cli --password [REDACTED]`, true],
+    [`echo It's\ncli --password 'Secret' 'Suffix'\necho "done'"`, `echo It's\ncli --password [REDACTED]`, true],
+    [`echo It's 'done'; cli --password "Sec'ret" Suffix" "tail`, `echo It's 'done'; cli --password [REDACTED]`, false],
     // Unicode contractions: a Unicode letter before the apostrophe is read as
     // prose, so the value costs no more than its line.
     [`Café's done:\n--password=CANARY7f9c2e\nAFTER`, `Café's done:\n--password=[REDACTED]\nAFTER`, false],
@@ -1198,7 +1211,11 @@ test('in prose, an apostrophe in a word or inline code before a credential costs
     const stats = newStats()
     expect(redactText(input, stats)).toBe(want)
     expect(stats.truncated).toBe(cut)
-    for (const text of pathsOf(input)) expect(text).not.toMatch(/hunter2|abc123|SecretSuffix|Secret|Suffix|CANARY7f9c2e/)
+    const { row } = buildRow({ eventType: 'USER_MESSAGE_RECEIVED', timestampMs: 0, eventId: 'e1', agent: 'coding-agent', sessionId: 's1',
+      invocationId: 'i1', userId: 'dev', traceId: null, spanId: null, parentSpanId: null,
+      content: { text_summary: input }, attributes: {}, maxPayloadChars: 16384 })
+    expect(row.is_truncated).toBe(cut)
+    for (const text of pathsOf(input)) expect(text).not.toMatch(/hunter2|abc123|SecretSuffix|Secret|Sec'ret|Suffix|CANARY7f9c2e/)
   }
   const { row } = buildRow({ eventType: 'USER_MESSAGE_RECEIVED', timestampMs: 0, eventId: 'e1', agent: 'coding-agent', sessionId: 's1',
     invocationId: 'i1', userId: 'dev', traceId: null, spanId: null, parentSpanId: null,

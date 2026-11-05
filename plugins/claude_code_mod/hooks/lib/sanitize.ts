@@ -611,9 +611,10 @@ const SPAN_ENDS = new WeakMap<Uint8Array, Int32Array>()
 // The shell's own reading, for the states quoteStates read where the
 // whole-text scan read an apostrophe in prose as text (absent elsewhere):
 // each position's quote with every apostrophe a quote (see readQuotes), where
-// the first apostrophe read as text is, and where the last `'` that is no
-// apostrophe in prose is (-1 where none is).
-type ShellReading = { states: Uint8Array; firstProse: number; lastPlainQuote: number }
+// the first apostrophe read as text is, where the last `'` that is no
+// apostrophe in prose is (-1 where none is), and the last position outside
+// quotes (-1 where none is).
+type ShellReading = { states: Uint8Array; firstProse: number; lastPlainQuote: number; lastNone: number }
 const SHELL_READINGS = new WeakMap<Uint8Array, ShellReading>()
 
 function lastPlainQuoteOf(text: string): number {
@@ -634,7 +635,9 @@ function quoteStates(text: string): Uint8Array {
     if (states[k] === NONE && proseApostrophe(text, k)) {
       const shell = new Uint8Array(text.length + 1)
       readQuotes(text, 0, text.length, shell, undefined, false)
-      SHELL_READINGS.set(states, { states: shell, firstProse: k, lastPlainQuote: lastPlainQuoteOf(text) })
+      let lastNone = text.length
+      while (lastNone >= 0 && shell[lastNone] !== NONE) lastNone -= 1
+      SHELL_READINGS.set(states, { states: shell, firstProse: k, lastPlainQuote: lastPlainQuoteOf(text), lastNone })
       break
     }
   }
@@ -725,9 +728,9 @@ function quoteCloses(text: string, open: number): number {
 // SHELL_READINGS), in which an apostrophe in prose before it opens a quote
 // that a later `'` can close. It does where both readings start the value in
 // the same quote. A value that is one quoted string (`'--password Secret'`,
-// `--password 'Secret'`) keeps the whole-text scan's reading where that
-// leaves no `'` open at the end (nor cannot tell there), as such a `'` could
-// pair with the apostrophe instead. An unquoted value keeps it where the
+// `--password 'Secret'`) keeps the whole-text scan's reading where the
+// shell's reading leaves a quote open from `end` through the end of the text
+// without closing around following text. An unquoted value keeps it where the
 // shell's reading puts it in a single quote that only a later apostrophe in
 // prose can close (`It's … --password=x … don't`), no other `'` coming at or
 // after it.
@@ -735,7 +738,8 @@ function shellAgrees(text: string, start: number, end: number, q: number, states
   const shell = SHELL_READINGS.get(states)
   if (shell === undefined || shell.firstProse >= start || shell.states[start] === q) return true
   if (q !== NONE || ((text[start] === "'" || text[start] === '"') && end - 1 > start && quoteCloses(text, start) === end - 1)) {
-    return states[text.length] !== SINGLE && states[text.length] !== UNKNOWN
+    const sq = shell.states[end]
+    return (sq === SINGLE || sq === DOUBLE) && shell.states[text.length] === sq && shell.lastNone < end
   }
   return shell.states[start] === SINGLE && shell.lastPlainQuote < start
 }
