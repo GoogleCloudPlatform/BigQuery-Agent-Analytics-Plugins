@@ -348,13 +348,50 @@ def run_bq_checks():
     for what, argv in (('a start after the end', ['--start', '2026-10-31', '--end', '2026-10-01', 'SELECT 1']),
                        ('a limit of 0', ['--max-gb', '0', 'SELECT 1']),
                        ('a start that is no date', ['--start', 'yesterday', 'SELECT 1']),
-                       ('no query', [])):
+                       ('no query', []),
+                       ('both positional query and --query', ['--query', '1', 'SELECT 1']),
+                       ('an unknown --query ID', ['--query', 'V99'])):
         fake = FakeBigQuery()
         status, out, err = run_bq_with(fake, *base, *argv)
         check(f'{what}: exit 2 with the usage', status == 2 and 'usage:' in err and fake.clients == [], f'{status} {err!r}')
+    # Named queries via --query / -q (1..8 and V1..V7, case-insensitive) and ADC quota-project warning filter.
+    named_map = run_bq.load_named_queries()
+    check('load_named_queries loads 1..8 and V1..V7',
+          list(named_map) == ['1', '2', '3', '4', '5', '6', '7', '8', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'V7'],
+          list(named_map))
+    for flag, qid, expected_id in (('--query', '4', '4'), ('-q', 'V5', 'V5'), ('--query', 'v1', 'V1')):
+        fake = FakeBigQuery(rows=[{'ok': 1}])
+        status, out, err = run_bq_with(fake, *base, flag, qid)
+        expected_sql = run_bq.inject_placeholders(named_map[expected_id], 'my-gcp-project', 'agent_analytics', 'agent_events')
+        check(f'{flag} {qid} resolves to query {expected_id} and runs it',
+              status == 0 and len(fake.queries) == 1 and fake.queries[0][0] == expected_sql, f'{status} {err!r}')
+
+    class QuotaWarningBigQuery(FakeBigQuery):
+        def __init__(self):
+            super().__init__(rows=[{'ok': 1}])
+            orig_client = self.Client
+
+            class WarnClient(orig_client):
+                def __init__(self, project=None):
+                    import warnings as _w
+                    _w.warn(
+                        'Your application has authenticated using end user credentials from Google Cloud SDK '
+                        'without a quota project. You might receive a "quota exceeded" or "API not enabled" error.',
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    super().__init__(project=project)
+
+            self.Client = WarnClient
+
+    status, out, err = run_bq_with(QuotaWarningBigQuery(), *base, '--query', '1')
+    check('run_bq suppresses the Google Cloud SDK ADC quota-project UserWarning on stderr',
+          status == 0 and 'without a quota project' not in err and err == '', f'{status} {err!r}')
     with environment(), modules(NO_CLIENT):
         status, out, err = call(run_bq.main, '--help')
-    check('--help needs no BigQuery client', status == 0 and '--max-gb' in out, f'{status} {err!r}')
+    check('--help needs no BigQuery client and documents --query and set-quota-project',
+          status == 0 and '--max-gb' in out and '--query' in out and 'set-quota-project' in out.replace('-\n', '-'),
+          f'{status} {out!r} {err!r}')
     with environment(), modules(NO_CLIENT):
         status, out, err = call(run_bq.main, *base, 'SELECT 1')
     check('without the BigQuery client: exit 1, and how to install it',
@@ -480,8 +517,10 @@ def setup_dry_run_checks():
     status, out, err = attempt(*DOCUMENTED, '--dry-run', '--execute')
     check('--dry-run with --execute: exit 2', status == 2 and 'not allowed with argument' in err, f'{status} {err!r}')
     status, out, err = attempt('--help')
-    check('--help: exit 0, and it needs no program and no client', status == 0 and '--writer-role' in out,
-          f'{status} {err!r}')
+    check('--help: exit 0, needs no program and no client, and describes --project, --dataset, --table and --location defaults',
+          status == 0 and '--writer-role' in out and 'BQAA_PROJECT_ID' in out and 'BQAA_DATASET' in out
+          and 'BQAA_TABLE' in out and 'BQAA_LOCATION' in out,
+          f'{status} {out!r} {err!r}')
     status, out, err = attempt(*BASE, '--no-create-dataset', '--no-create-table')
     check('--no-create-dataset and --no-create-table are accepted, and change nothing',
           status == 0 and plan(*BASE) == steps_of(out), f'{status} {err!r}')
@@ -1493,8 +1532,12 @@ def repo_checks():
         else:
             fake = FakeBigQuery()
             status, out, err = run_bq_with(fake, *argv, BQAA_PROJECT_ID=PROJECT, BQAA_DATASET=DATASET)
-            check(f'{where}: the runner command it shows runs, with its last word as the query',
-                  status == 0 and fake.queries and fake.queries[-1][0] == argv[-1], f'{status} {err!r}')
+            with environment(BQAA_PROJECT_ID=PROJECT, BQAA_DATASET=DATASET):
+                parsed_args = run_bq.parse_args(argv) if status == 0 else None
+            expected = (run_bq.inject_placeholders(parsed_args.query, parsed_args.project, parsed_args.dataset, parsed_args.table)
+                        if parsed_args is not None else None)
+            check(f'{where}: the runner command it shows runs, with its last word or --query as the query',
+                  status == 0 and fake.queries and fake.queries[-1][0] in (argv[-1], expected), f'{status} {err!r}')
 
 
 def setup_sh_checks():
@@ -1502,6 +1545,13 @@ def setup_sh_checks():
     if bash is None:
         check('setup.sh prints a bootstrap command that the bootstrap takes (skipped: no bash)', True)
         return
+    solo = subprocess.run([bash, str(PLUGIN / 'setup.sh'), '--dry-run'], capture_output=True, text=True,
+                          env={**clean_environment(), 'BQAA_PROJECT_ID': PROJECT, 'BQAA_DATASET': DATASET},
+                          cwd=tempfile.gettempdir())
+    check('setup.sh --dry-run (solo default) points to setup.sh --team and docs/service-account-auth.md without the full bootstrap command',
+          solo.returncode == 0 and 'setup.sh --team' in solo.stdout and 'docs/service-account-auth.md' in solo.stdout
+          and 'scripts/setup_gcp_prereqs.py' not in solo.stdout,
+          f'{solo.returncode} {solo.stdout!r} {solo.stderr!r}')
     for what, env, wanted in (
         ('with the variables the docs name', {'BQAA_PROJECT_ID': PROJECT, 'BQAA_DATASET': DATASET},
          (PROJECT, DATASET, TABLE, '', 'US')),
@@ -1510,14 +1560,15 @@ def setup_sh_checks():
           'BQAA_LOCATION': 'EU', 'BQAA_VIEWS_DATASET': 'reports'},
          ('other-project', 'events', 'coding_events', 'reports', 'EU')),
     ):
-        result = subprocess.run([bash, str(PLUGIN / 'setup.sh'), '--dry-run'], capture_output=True, text=True,
+        result = subprocess.run([bash, str(PLUGIN / 'setup.sh'), '--dry-run', '--team'], capture_output=True, text=True,
                                 env={**clean_environment(), **env}, cwd=tempfile.gettempdir())
         line = next((line for line in result.stdout.replace('\\\n', ' ').splitlines()
                      if 'scripts/setup_gcp_prereqs.py' in line), '')
         words = shlex.split(line)
-        check(f'setup.sh --dry-run, {what}: it prints a command that runs the bootstrap of the scripts folder',
+        check(f'setup.sh --dry-run --team, {what}: it prints a command that runs the bootstrap of the scripts folder',
               result.returncode == 0 and len(words) > 2 and words[0] == 'python3'
-              and pathlib.Path(words[1]).resolve() == (SCRIPTS / 'setup_gcp_prereqs.py').resolve(),
+              and pathlib.Path(words[1]).resolve() == (SCRIPTS / 'setup_gcp_prereqs.py').resolve()
+              and 'google-cloud-bigquery' in result.stdout,
               f'{result.returncode} {line!r} {result.stderr!r}')
         args = parsed(*words[2:])
         check('  ... naming the project, dataset, table, views dataset and location it was given',

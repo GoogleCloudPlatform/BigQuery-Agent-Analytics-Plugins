@@ -1441,10 +1441,26 @@ def main(argv: list[str] | None = None) -> int:
             "--execute is given."
         )
     )
-    parser.add_argument("--project", default=_default_project())
-    parser.add_argument("--dataset", default=_default_dataset())
-    parser.add_argument("--table", default=_default_table())
-    parser.add_argument("--location", default=os.environ.get("BQAA_LOCATION") or "US")
+    parser.add_argument(
+        "--project",
+        default=_default_project(),
+        help="Google Cloud project ID (default: BQAA_PROJECT_ID, GCP_PROJECT_ID, or GOOGLE_CLOUD_PROJECT).",
+    )
+    parser.add_argument(
+        "--dataset",
+        default=_default_dataset(),
+        help="BigQuery dataset for the events table (default: BQAA_DATASET, BQ_DATASET, or agent_analytics).",
+    )
+    parser.add_argument(
+        "--table",
+        default=_default_table(),
+        help="BigQuery events table name (default: BQAA_TABLE, BQ_TABLE, or agent_events).",
+    )
+    parser.add_argument(
+        "--location",
+        default=os.environ.get("BQAA_LOCATION") or "US",
+        help="BigQuery dataset location (default: BQAA_LOCATION or US).",
+    )
     parser.add_argument(
         "--principal",
         help=(

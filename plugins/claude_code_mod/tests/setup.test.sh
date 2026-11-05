@@ -52,13 +52,14 @@ run_setup() { # log file, then environment assignments, then setup.sh arguments
   local log="$1"
   shift
   : >"$log"
+  # shellcheck disable=SC2086
   env -i PATH="$work/bin:/usr/bin:/bin" BQ_LOG="$log" "$@" bash "$plugin/setup.sh" ${SETUP_ARGS:-} >"$log.out" 2>"$log.err"
 }
 
 # 1. A first run creates both datasets, the table and the two views.
 log="$work/first.log"
 check 'a first run succeeds' run_setup "$log" BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics
-check 'it creates the events dataset in US' has 'bq --project_id=my-gcp-project --location=US mk --dataset' "$log"
+check 'it creates the events dataset in US' has 'bq --quiet --project_id=my-gcp-project --location=US mk --dataset' "$log"
 check 'it creates the views dataset' has 'my-gcp-project:agent_analytics_reporting' "$log"
 check 'the table DDL names the table' has 'CREATE TABLE IF NOT EXISTS `my-gcp-project.agent_analytics.agent_events`' "$log"
 check 'the table gets its event_id column' has 'ADD COLUMN IF NOT EXISTS event_id STRING' "$log"
@@ -67,12 +68,18 @@ check 'the user view is made in the views dataset' has 'CREATE OR REPLACE VIEW `
 check 'the views read the events table' has 'FROM `my-gcp-project.agent_analytics.agent_events`' "$log"
 check "the views keep to this mod's rows" test "$(grep -cF "AND JSON_VALUE(attributes, '\$.writer.plugin') = 'bigquery-agent-analytics-mod'" "$log")" -eq 2
 check 'no placeholder is left' lacks '{' "$log"
-check 'queries are standard SQL in the location' has 'query --use_legacy_sql=false --location=US' "$log"
+check 'queries are standard SQL in the location' has 'bq --quiet --project_id=my-gcp-project query --use_legacy_sql=false --location=US' "$log"
 check 'three queries in all: the table, then the two views' test "$(grep -c -- '--- sql' "$log")" -eq 3
-check 'the next step names the project and dataset, and no table, views dataset or location (the defaults)' bash -c "grep -qF -- '--project my-gcp-project --dataset agent_analytics --no-create-dataset' '$log.out'"
+check 'default solo output points to setup.sh --team and docs/service-account-auth.md' has 'setup.sh --team' "$log.out"
+check 'default solo output omits the full team bootstrap command' lacks 'setup_gcp_prereqs.py' "$log.out"
+
+team_log="$work/team.log"
+check 'a --team run succeeds' env SETUP_ARGS=--team bash -c "$(declare -f run_setup); work='$work'; plugin='$plugin'; run_setup '$team_log' BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics"
+check 'with --team, the next step names the project and dataset, and no table, views dataset or location (the defaults)' bash -c "grep -qF -- '--project my-gcp-project --dataset agent_analytics --no-create-dataset' '$team_log.out'"
 printf -v bootstrap '%q' "$plugin/scripts/setup_gcp_prereqs.py"
-check "the next step runs the bootstrap that sits beside setup.sh, by its full path" has "python3 $bootstrap" "$log.out"
-check 'the next step sends nobody to a checkout of another repository' bash -c "! grep -qE 'github\.com|git clone' '$log.out'"
+check "with --team, the next step runs the bootstrap that sits beside setup.sh, by its full path" has "python3 $bootstrap" "$team_log.out"
+check 'with --team, the next step notes that --execute needs a virtual environment with google-cloud-bigquery' has 'google-cloud-bigquery' "$team_log.out"
+check 'the next step sends nobody to a checkout of another repository' bash -c "! grep -qE 'github\.com|git clone' '$team_log.out'"
 
 # 2. Run again with both datasets there: nothing is made but the views.
 log="$work/again.log"
@@ -82,7 +89,7 @@ check 'the table DDL runs again (CREATE ... IF NOT EXISTS)' has 'CREATE TABLE IF
 
 # 3. Other names, and the fallbacks the mod reads.
 log="$work/names.log"
-check 'fallback variables and a views dataset of its own' run_setup "$log" GOOGLE_CLOUD_PROJECT=other-project BQ_DATASET=events BQ_TABLE=coding_events BQAA_LOCATION=EU BQAA_VIEWS_DATASET=reports
+check 'fallback variables and a views dataset of its own' env SETUP_ARGS=--team bash -c "$(declare -f run_setup); work='$work'; plugin='$plugin'; run_setup '$log' GOOGLE_CLOUD_PROJECT=other-project BQ_DATASET=events BQ_TABLE=coding_events BQAA_LOCATION=EU BQAA_VIEWS_DATASET=reports"
 check 'the table comes from BQ_TABLE' has '`other-project.events.coding_events`' "$log"
 check 'the views go to BQAA_VIEWS_DATASET' has '`other-project.reports.daily_usage_by_model`' "$log"
 check 'the location is EU' has '--location=EU mk --dataset' "$log"

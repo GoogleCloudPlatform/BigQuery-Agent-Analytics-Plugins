@@ -35,16 +35,18 @@
 -- tests/queries.live.py runs each one on a synthetic fixture.
 
 -- V1. Developer: my sessions at a glance. Per session: when it started, how
---     long it was open, its prompts, turns, model requests, tool calls, the
---     tool calls that failed, the tokens recorded, and the responses that
---     recorded none (their tokens are unknown, not zero). Add
---     AND user_id = 'you' for yours (user_id is the login name the machine
---     reported).
+--     long it was open, its prompts (excluding host-injected
+--     task-notification messages, which are counted in notifications),
+--     turns, model requests, tool calls, the tool calls that failed, the
+--     tokens recorded, and the responses that recorded none (their tokens
+--     are unknown, not zero). Add AND user_id = 'you' for yours (user_id
+--     is the login name the machine reported).
 WITH events AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN @start AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 )
 SELECT
@@ -52,7 +54,14 @@ SELECT
   ANY_VALUE(user_id) AS user_id,
   MIN(timestamp) AS started_at,
   ROUND(TIMESTAMP_DIFF(MAX(timestamp), MIN(timestamp), SECOND) / 60, 1) AS minutes_open,
-  COUNTIF(event_type = 'USER_MESSAGE_RECEIVED') AS prompts,
+  COUNTIF(
+    event_type = 'USER_MESSAGE_RECEIVED'
+    AND IFNULL(JSON_VALUE(attributes, '$.prompt_origin'), '') != 'task-notification'
+  ) AS prompts,
+  COUNTIF(
+    event_type = 'USER_MESSAGE_RECEIVED'
+    AND JSON_VALUE(attributes, '$.prompt_origin') = 'task-notification'
+  ) AS notifications,
   COUNTIF(event_type = 'INVOCATION_STARTING') AS turns,
   COUNTIF(event_type = 'LLM_RESPONSE') AS model_requests,
   COUNTIF(event_type = 'TOOL_COMPLETED') AS tool_calls,
@@ -80,7 +89,12 @@ ORDER BY started_at DESC;
 --     earlier calls may be missing, so its model and tool time and its
 --     permission prompts are NULL, and started_at comes from its end row
 --     (its end less its total; NULL without one). The parts can add up to
---     more than the turn: a tool call can run beside a model request.
+--     more than the turn, or exceed turn_ms individually: tool calls can
+--     run in parallel with model requests, a permission prompt's wait is
+--     included in TOOL_COMPLETED's duration while the host leaves that
+--     wait out of INVOCATION_COMPLETED's turn_ms, and background subagent
+--     model requests carry the launching turn's invocation_id even when
+--     they finish after the foreground turn.
 WITH events AS (
   SELECT
     *,
@@ -88,6 +102,7 @@ WITH events AS (
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN TIMESTAMP_SUB(@start, INTERVAL 1 DAY) AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
     AND invocation_id IS NOT NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 ),
@@ -252,6 +267,9 @@ ORDER BY r.session_id, r.model;
 --     (refused_other_pct: one the host did not give, which the mod records
 --     as unknown, or one not named here). Those four add up to refused_pct.
 --     A call that a rule blocks before the host records it leaves no row.
+--     Rows of a loop the mod saw no start for (unidentified_loop, such as
+--     the host's own fork that proposes the next prompt) are left out here
+--     and in V1, V2, V6 and V7.
 WITH tools AS (
   SELECT
     *,
@@ -267,6 +285,7 @@ WITH tools AS (
   WHERE event_type = 'TOOL_COMPLETED'
     AND timestamp BETWEEN @start AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 )
 SELECT
@@ -304,6 +323,7 @@ WITH events AS (
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN @start AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 )
 SELECT
@@ -356,6 +376,7 @@ WITH events AS (
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN TIMESTAMP_SUB(@start, INTERVAL 1 DAY) AND @end
     AND IFNULL(JSON_VALUE(attributes, '$.writer.plugin'), 'bigquery-agent-analytics-mod') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 ),
 spans AS (
