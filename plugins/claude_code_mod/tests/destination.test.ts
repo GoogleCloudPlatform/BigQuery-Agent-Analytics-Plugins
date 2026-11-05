@@ -22,7 +22,7 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
-import { resolveConfig } from '../hooks/lib/config.ts'
+import { PLUGIN_VERSION, resolveConfig } from '../hooks/lib/config.ts'
 import { parseFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
@@ -513,8 +513,8 @@ test('/bqaa-setup prints the ready-to-run setup.sh command when configured, and 
 test('when project or dataset is unset, /bqaa-setup prints a template command, /bqaa-status omits ..agent_events, and subsequent sessions show a 1-line AbovePrompt warning', { options: {} }, async ($, on) => {
   const world = setUp(on)
   // Pretend the welcome card was already shown in an earlier session so this session is a subsequent session.
-  world.store.set('welcome', { version: '0.1.0', sessionId: 'earlier-session', previous: null })
-  world.store.set('welcome:0.1.0', { sessionId: 'earlier-session', previous: null })
+  world.store.set('welcome', { version: PLUGIN_VERSION, sessionId: 'earlier-session', previous: null })
+  world.store.set(`welcome:${PLUGIN_VERSION}`, { sessionId: 'earlier-session', previous: null })
   await startSession($)
   await world.clock.settle()
   const setupRes = await $.command.run({ command: 'bqaa-setup', args: '', ...COMMAND })

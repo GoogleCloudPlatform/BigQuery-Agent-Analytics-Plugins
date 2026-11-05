@@ -444,28 +444,34 @@ const UNKNOWN = 4
 // prose as text (see proseApostrophe), and records in `ticks` where a
 // backtick it reads outside quotes is open.
 const QUOTE_TEXT = /[^"'\\$`<#\n]+/y
+function isFenceStart(text: string, from: number, i: number): boolean {
+  if (text[i + 1] !== '`' || text[i + 2] !== '`') return false
+  let p = i
+  while (p > from && text[p - 1] === ' ' && i - p < 3) p -= 1
+  return p === from || text[p - 1] === '\n'
+}
+
 function readQuotes(text: string, from: number, to: number, states?: Uint8Array, ticks?: Uint8Array): number {
   // These are the only characters that can alter the initial quote state.
   // A supplied state table is newly zeroed, so plain spans need no writes.
   if (!/["'\\$`<#]/.test(text.slice(from, to))) return NONE
   let q = NONE
   let comment = false
-  // Where a backtick outside quotes opened what has not closed.
+  // Where a backtick outside quotes opened what has not closed, and whether a
+  // line break has crossed it since.
   let tick = -1
+  let tickNewline = false
   let i = from
   while (i < to) {
     QUOTE_TEXT.lastIndex = i
     if (QUOTE_TEXT.test(text)) {
       const end = Math.min(to, QUOTE_TEXT.lastIndex)
       states?.fill(q, i, end)
-      if (tick !== -1) ticks?.fill(1, i, end)
       i = end
       continue
     }
     const c = text[i] as string
-    // A backtick span open before this character, as `states` holds the
-    // quote before it.
-    const ticked = tick !== -1
+    if (c === '\n' && tick !== -1) tickNewline = true
     let next = i + 1
     let after = q
     if (comment && c === '\n') {
@@ -495,7 +501,16 @@ function readQuotes(text: string, from: number, to: number, states?: Uint8Array,
       } else if (comment) {
         // A comment's text holds no code.
       } else if (c === '`') {
-        tick = tick === -1 ? i : -1
+        if (tick === -1 && isFenceStart(text, from, i)) {
+          const nl = text.indexOf('\n', i + 3)
+          next = nl === -1 ? to : nl + 1
+        } else if (tick === -1) {
+          tick = i
+          tickNewline = false
+        } else {
+          if (!tickNewline) ticks?.fill(1, tick + 1, i)
+          tick = -1
+        }
       } else if (c === '#' && (i === 0 || /[\s;&|()<>]/.test(text[i - 1] as string))) {
         if (i === 0 || /\s/.test(text[i - 1] as string)) comment = true
         else after = UNKNOWN
@@ -510,7 +525,6 @@ function readQuotes(text: string, from: number, to: number, states?: Uint8Array,
       return UNKNOWN
     }
     states?.fill(q, i, Math.min(next, to))
-    if (ticked) ticks?.fill(1, i, Math.min(next, to))
     q = after
     i = next
   }
@@ -598,6 +612,7 @@ function simpleEnd(text: string, start: number, q: number, span = false): number
       if (d === '' || d === '\n' || d === '\r' || (q === NONE && /["'\\$`]/.test(d))) return -1
       i += 1
     } else if (c === '`' && span && q === NONE && i > start) {
+      if (d !== '' && !/[\s.,;:!?)}\]]/.test(d)) return -1
       break
     } else if (c === '`' || (c === '$' && /[({['"]/.test(d))) {
       return -1

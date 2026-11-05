@@ -1157,6 +1157,14 @@ test('in prose, an apostrophe in a word or inline code before a credential costs
     [`Here's the output:\n\n\`\`\`\n--password=hunter2\ncat: x.txt: No such file\n\`\`\`\n\nThe \`cat\` failed.`, `Here's the output:\n\n\`\`\`\n--password=[REDACTED]\ncat: x.txt: No such file\n\`\`\`\n\nThe \`cat\` failed.`, false],
     // Inline code: the backtick that closes the span ends the value.
     [`Run \`export API_TOKEN=abc123\` and then \`npm run deploy\`. After that, check the logs.`, `Run \`export API_TOKEN=[REDACTED]\` and then \`npm run deploy\`. After that, check the logs.`, false],
+    // Fenced blocks and glued backtick command substitutions inside or outside
+    // inline code spans redact the full suffix and mark multi-line cuts.
+    [`\`\`\`\ncli --password=pre\`printf %s SecretSuffix\` --verbose\n\`\`\``, `\`\`\`\ncli --password=[REDACTED]`, true],
+    [`\`\`\`\ncli --password pre\`printf %s SecretSuffix\` --verbose\n\`\`\``, `\`\`\`\ncli --password [REDACTED]`, true],
+    [`\`\`\`sh\nexport API_TOKEN=abc\`SecretSuffix\n\`\`\`\nAfter.`, `\`\`\`sh\nexport API_TOKEN=[REDACTED]`, true],
+    [`Run \`echo a; cli --password=pre\`SecretSuffix\` --verbose\``, `Run \`echo a; cli --password=[REDACTED]`, false],
+    [`Run \`echo a; cli --password=pre\`SecretSuffix\` --verbose\`\nline two`, `Run \`echo a; cli --password=[REDACTED]`, true],
+    [`Here is the snippet:\n\`\`\`sh\nexport API_TOKEN=hunter2\necho line2`, `Here is the snippet:\n\`\`\`sh\nexport API_TOKEN=[REDACTED]\necho line2`, false],
     // The rest of the line still goes.
     [`mysql -u root --password=hunter2 mydb < dump.sql\nline two`, `mysql -u root --password=[REDACTED]\nline two`, false],
     // An odd quote that is no word's apostrophe: to the end of the text, and
@@ -1167,7 +1175,7 @@ test('in prose, an apostrophe in a word or inline code before a credential costs
     const stats = newStats()
     expect(redactText(input, stats)).toBe(want)
     expect(stats.truncated).toBe(cut)
-    for (const text of pathsOf(input)) expect(text).not.toMatch(/hunter2|abc123/)
+    for (const text of pathsOf(input)) expect(text).not.toMatch(/hunter2|abc123|SecretSuffix/)
   }
   const { row } = buildRow({ eventType: 'USER_MESSAGE_RECEIVED', timestampMs: 0, eventId: 'e1', agent: 'coding-agent', sessionId: 's1',
     invocationId: 'i1', userId: 'dev', traceId: null, spanId: null, parentSpanId: null,

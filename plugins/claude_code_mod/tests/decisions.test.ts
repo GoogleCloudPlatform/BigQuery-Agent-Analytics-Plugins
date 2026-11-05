@@ -20,7 +20,7 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
-import { COMMAND, OPTIONS, SESSION_ID, type ToolReply, type World, byType, deadLetterRows, json, setUp, startSession } from './helpers.ts'
+import { COMMAND, OPTIONS, SESSION_ID, type ToolReply, type World, byType, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
 
 const LOGGED_AT = '2026-10-14T05:00:00.000Z'
 
@@ -194,4 +194,15 @@ test('when the last main-loop tool call is rejected by the user and the turn end
 
   const inv2 = world.sentRows().find(r => r.invocation_id === 'turn-rej-answered' && r.event_type === 'INVOCATION_COMPLETED')
   expect(json(inv2?.attributes ?? null).ended_on_rejection).toBeUndefined()
+
+  // Case 3: user rejects a tool, then a subsequent main-loop step starts and is aborted with an empty answer -> ended_on_rejection is omitted.
+  await $.turn.start({ turnId: 'turn-rej-later-step', text: 'try another step' })
+  await $.tool.call({ tool: 'Bash', command: 'rm -rf /tmp/demo3', tool_use_id: 'toolu_rej_3' })
+  await decision($, 'toolu_rej_3', 'reject', 'user_reject')
+  await runStep($, { turnId: 'turn-rej-later-step', index: 1 })
+  await $.turn.complete({ turnId: 'turn-rej-later-step', answer: '', durationMs: 400, isAborted: true, reason: 'interrupted' })
+  await world.clock.advance(5000)
+
+  const inv3 = world.sentRows().find(r => r.invocation_id === 'turn-rej-later-step' && r.event_type === 'INVOCATION_COMPLETED')
+  expect(json(inv3?.attributes ?? null).ended_on_rejection).toBeUndefined()
 })

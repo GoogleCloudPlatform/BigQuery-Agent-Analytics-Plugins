@@ -403,6 +403,8 @@ export class Tracer {
       const turn = this.turnFor(e.turnId)
       turn.lastStepSpan = spanId
       turn.steps += 1
+      turn.lastMainToolUseId = null
+      turn.lastMainToolDecisionSource = null
       if (e.index === 0 && turn.prompt !== '') prompt = [{ role: 'user', content: turn.prompt }]
       ctx = {
         spanId,
@@ -743,7 +745,7 @@ export class Tracer {
           attributes: { source_turn_id: e.turnId },
         })
       }
-      const endedOnRejection = !isFailure && !e.answer?.trim() && turn.lastMainToolDecisionSource === 'user_reject'
+      const endedOnRejection = !isFailure && !e.isAborted && !e.answer?.trim() && turn.lastMainToolDecisionSource === 'user_reject'
       this.emit({
         eventType: isFailure ? 'INVOCATION_ERROR' : 'INVOCATION_COMPLETED',
         ids,
@@ -822,6 +824,7 @@ export class Tracer {
   private loopRunStarted(agentId: string, turnId: string): void {
     const known = this.loops.get(agentId)
     if (known && !known.ended) {
+      if (!known.typeKnown && known.agentType === UNIDENTIFIED_LOOP) known.agentType = 'subagent'
       known.seen = true
       return
     }

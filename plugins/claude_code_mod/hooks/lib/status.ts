@@ -86,7 +86,7 @@ export function formatStatus(args: {
       const kinds = Object.entries(d.byKind)
         .map(([kind, n]) => `${n} ${kind}`)
         .join(', ')
-      const retiredNote = retired > 0 ? `; ${retired} replayed/retired file(s) (0-byte or outcome-*, cleaned up after 24h)` : ''
+      const retiredNote = retired > 0 ? `; ${retired} replayed/retired file(s) (0-byte or outcome-*, expected leftovers; host fs cannot delete)` : ''
       lines.push(`dead-letter: ${d.files} file(s), ${kb(d.bytes)}${kinds ? ` (${kinds})` : ''} in ${d.dir}${retiredNote}`)
     }
     if (d.oversized.length > 0) lines.push(`dead-letter: ${d.oversized.length} file(s) over the 4 MiB read limit, not replayed: ${names(d.oversized)}`)

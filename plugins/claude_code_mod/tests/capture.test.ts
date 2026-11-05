@@ -340,6 +340,21 @@ test('a SubagentStart that comes for an unidentified loop names it: its later ro
   ])
 })
 
+test('a turn.start that arrives for an open unidentified loop without SubagentStart promotes its later rows to subagent, unmarked', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.turn.start({ turnId: 'main-turn', text: 'delegate' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts', agentId: 'agent-5b' } as never)
+  await $.turn.start({ turnId: 'sub-run-5b', text: 'continue', agentId: 'agent-5b' })
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts', agentId: 'agent-5b' } as never)
+  await world.clock.advance(5000)
+  const rows = world.sentRows().filter(r => json(r.attributes).agent_id === 'agent-5b' && r.event_type === 'TOOL_STARTING')
+  expect(rows.map(r => [r.agent, json(r.attributes).unidentified_loop])).toEqual([
+    ['unidentified_loop', true],
+    ['subagent', undefined],
+  ])
+})
+
 test('a SubagentStart that comes after the run\'s first row names the run without opening a second span', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)

@@ -1068,5 +1068,5 @@ test('/bqaa-status reports replayed row count, replay request batches, and retir
   const status = await statusText($)
   expect(status).toContain('sent 2 (2 replayed)')
   expect(status).toMatch(/requests: 1 ok, 0 retried/)
-  expect(status).toMatch(/dead-letter: 0 file\(s\), 0 B in .*; \d+ replayed\/retired file\(s\) \(0-byte or outcome-\*, cleaned up after 24h\)/)
+  expect(status).toMatch(/dead-letter: 0 file\(s\), 0 B in .*; \d+ replayed\/retired file\(s\) \(0-byte or outcome-\*, expected leftovers; host fs cannot delete\)/)
 })
