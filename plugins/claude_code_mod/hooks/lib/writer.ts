@@ -553,8 +553,11 @@ export class Writer {
     previous.queue.append(this.queue.takeAll())
     this.queue = previous.queue
     this.counters.captured += inherited
-    for (const s of previous.sentSessions) this.sentSessions.add(s)
-    previous.sentSessions = this.sentSessions
+    // The sessions with a row sent or parked: the same set too, so a batch
+    // any writer before still has out that lands counts here, after any
+    // number of takeovers.
+    for (const s of this.sentSessions) previous.sentSessions.add(s)
+    this.sentSessions = previous.sentSessions
     // The status line too (session.start clears it after the takeover,
     // `clearStatus`): a line the writer before sets late is then one this
     // writer's next landing clears.
@@ -601,7 +604,8 @@ export class Writer {
     const c = this.config()
     if (!canDeliver(c) || c.dryRun) return
     void this.getToken()
-      .then(token => this.identityFor(token, c))
+      // Once the exit began, no lookup starts.
+      .then(token => (this.closing ? null : this.identityFor(token, c)))
       .catch(err => this.recordError(`authentication: ${messageOf(err)}`))
   }
 
@@ -669,7 +673,9 @@ export class Writer {
       return false
     }
     // This process's rows carry the account of the token they go out with.
-    await this.stampFor(batch, token, c)
+    // Once the exit began, no lookup starts: the batch goes back to the
+    // queue the exit spills.
+    if (!this.closing) await this.stampFor(batch, token, c)
     if (this.closing) {
       this.queue.unshift(batch)
       return false
@@ -681,9 +687,10 @@ export class Writer {
       return false
     }
     let outcome = classifyInsert(answer, batch.length)
-    if (outcome.kind === 'auth') {
+    if (outcome.kind === 'auth' && !this.closing) {
       // The token may have run out early: one more try at once, with a fresh
       // one. A second 401 means BigQuery refuses the credentials themselves.
+      // Once the exit began, no fresh token is fetched: the batch waits.
       this.dropToken()
       try {
         token = await this.getToken()
@@ -692,7 +699,7 @@ export class Writer {
         return false
       }
       // The fresh token can be another account's: the rows go out under it.
-      await this.stampFor(batch, token, c)
+      if (!this.closing) await this.stampFor(batch, token, c)
       if (this.closing) {
         this.queue.unshift(batch)
         return false
@@ -739,7 +746,9 @@ export class Writer {
         await this.retryLater(batch, `authentication: ${outcome.message}`)
         return false
       case 'not-found': {
-        if (c.autoCreateTable && !this.createAttempted && !isDatasetMissing(outcome.message)) {
+        // Once the exit began, no table is created: the batch waits, and the
+        // exit spills it.
+        if (!this.closing && c.autoCreateTable && !this.createAttempted && !isDatasetMissing(outcome.message)) {
           this.createAttempted = true
           if (await this.createTable(c, token)) {
             this.queue.unshift(batch)
@@ -774,10 +783,11 @@ export class Writer {
     this.tookRequest(rows)
     if (rows > 0) this.call(() => this.io.sent?.(rows, c))
     // BigQuery is reachable again: replay what this session parked on disk.
-    if (hadFailures && this.parked.recoverable && this.config().autoBackfill) {
+    // Not once the exit began: the next session replays it.
+    if (!this.closing && hadFailures && this.parked.recoverable && this.config().autoBackfill) {
       this.parked.recoverable = false
       this.io.after(1000, () => {
-        void this.backfill(['spill', 'retry'], 'recovery')
+        if (!this.closing) void this.backfill(['spill', 'retry'], 'recovery')
       })
     }
   }
@@ -1303,10 +1313,14 @@ export class Writer {
     return items.every(q => q.row.session_id === sessionId && q.row.event_type === 'STATE_DELTA' && q.row.content === '{"session_start":true}')
   }
 
-  // Drops a single unsent `session_start` row for `sessionId` when the session
+  // Drops the unsent `session_start` row(s) for `sessionId` when the session
   // ran only mod slash commands and has not sent or in-flight-flushed any row
-  // for this session yet. Returns true when the session can end silently.
-  dropUnsentSessionStart(sessionId: string | null): boolean {
+  // for this session yet. `startCaptured` says whether the session wrote a
+  // `session_start` row at all: a managed CLI that keeps classic hooks from
+  // a user plugin raises no classic.SessionStart, and with none to drop such
+  // a session ends silently too. Returns true when the session can end
+  // silently.
+  dropUnsentSessionStart(sessionId: string | null, startCaptured = true): boolean {
     if (sessionId === null || this.sentSessions.has(sessionId)) return false
     const writers = [...this.before, this]
     if (writers.some(w => w.inFlightRows.some(q => q.row.session_id === sessionId))) return false
@@ -1332,7 +1346,7 @@ export class Writer {
     }
     this.queue.append(kept)
     this.counters.captured = Math.max(0, this.counters.captured - removed)
-    return removed > 0
+    return startCaptured ? removed > 0 : true
   }
 
   // Called from session.end when the process is ending, inside the engine's
@@ -2257,10 +2271,11 @@ export class Writer {
         continue
       }
       let outcome = classifyInsert(answer, chunk.length)
-      if (outcome.kind === 'auth') {
+      if (outcome.kind === 'auth' && !this.closing) {
         // As for a send: one more try at once with a fresh token, and a
         // second 401 is the credentials notice. The rows keep the user_id
-        // they were parked with.
+        // they were parked with. Once the exit began, no fresh token is
+        // fetched.
         this.dropToken()
         try {
           token = await this.getToken()

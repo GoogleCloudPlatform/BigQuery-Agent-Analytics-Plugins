@@ -194,37 +194,53 @@ PY
 }
 
 run_selftest() {
-  local selftest="$work/selftest"
+  local selftest="$work/${1:-selftest}"
   local st_plugin="$selftest/plugins/claude_code_mod"
   local st_dist="$selftest/plugins/claude_code_dist/bigquery-agent-analytics-mod"
+  local log="$selftest.log"
   mkdir -p "$selftest/plugins/claude_code_dist" "$selftest/.claude-plugin"
   cp -Rp "$plugin" "$st_plugin"
   rm -rf "$st_plugin/.claude-plugin/types" "$st_plugin/tests/node_modules"
   set_repo_version "$st_plugin" "0.1.0"
   bash "$st_plugin/build_dist.sh" "$st_dist"
 
-  git -C "$selftest" init -q
-  git -C "$selftest" -c user.name=test -c user.email=test@example.com add -A
-  git -C "$selftest" -c user.name=test -c user.email=test@example.com commit -qm "baseline 0.1.0"
-  git -C "$selftest" tag mod-v0.1.0
-  git -C "$selftest" tag mod-dist-v0.1.0
+  # The self-test's repository is its own: the caller's Git settings (a
+  # global hook that refuses commits, signing that needs a key) must not
+  # decide it. Its Git reads no global or system configuration and runs no
+  # hook; the checks of the real repository run as the caller.
+  mkdir -p "$work/git-home/.config" "$work/empty-hooks"
+  local HOME="$work/git-home" XDG_CONFIG_HOME="$work/git-home/.config" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+  export HOME XDG_CONFIG_HOME GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
+  local -a st_git=(git -C "$selftest" -c core.hooksPath="$work/empty-hooks" -c commit.gpgsign=false -c tag.gpgSign=false
+    -c user.name=test -c user.email=test@example.com)
+  # Checked step by step: run as a condition, a function is not stopped by
+  # set -e.
+  if ! { "${st_git[@]}" -c init.defaultBranch=main init -q &&
+    "${st_git[@]}" add -A &&
+    "${st_git[@]}" commit --no-verify -qm "baseline 0.1.0" &&
+    "${st_git[@]}" tag mod-v0.1.0 &&
+    "${st_git[@]}" tag mod-dist-v0.1.0; } >"$log" 2>&1; then
+    echo "not ok - selftest could not commit and tag its baseline 0.1.0:"
+    cat "$log"
+    return 1
+  fi
 
-  if ! check_version_tree "$selftest" >"$work/selftest.log" 2>&1; then
+  if ! check_version_tree "$selftest" >"$log" 2>&1; then
     echo "not ok - selftest baseline 0.1.0 failed:"
-    cat "$work/selftest.log"
+    cat "$log"
     return 1
   fi
 
   echo "" >>"$st_plugin/README.md"
-  if check_version_tree "$selftest" >"$work/selftest.log" 2>&1; then
+  if check_version_tree "$selftest" >"$log" 2>&1; then
     echo "not ok - selftest accepted an unbumped 0.1.0 edit"
     return 1
   fi
 
   set_repo_version "$st_plugin" "0.1.1"
-  if ! check_version_tree "$selftest" >"$work/selftest.log" 2>&1; then
+  if ! check_version_tree "$selftest" >"$log" 2>&1; then
     echo "not ok - selftest rejected a bumped 0.1.1 edit:"
-    cat "$work/selftest.log"
+    cat "$log"
     return 1
   fi
   echo "ok - selftest verified unbumped edits fail and bumped edits pass"
@@ -232,3 +248,23 @@ run_selftest() {
 
 check_version_tree "$repo"
 run_selftest
+
+# A caller whose own Git settings refuse every commit (a pre-commit hook
+# that fails, by core.hooksPath and by init's template) and sign every
+# commit and tag (with a signing program that fails) runs the self-test
+# just the same.
+poisoned="$work/poisoned-home"
+mkdir -p "$poisoned/.config/git/hooks" "$poisoned/.config/git/template/hooks"
+for hook in "$poisoned/.config/git/hooks/pre-commit" "$poisoned/.config/git/template/hooks/pre-commit"; do
+  printf '#!/bin/sh\necho "refused by the caller pre-commit hook" >&2\nexit 1\n' >"$hook"
+  chmod +x "$hook"
+done
+printf '[core]\n\thooksPath = %s\n[init]\n\ttemplateDir = %s\n' \
+  "$poisoned/.config/git/hooks" "$poisoned/.config/git/template" >"$poisoned/.gitconfig"
+printf '[commit]\n\tgpgSign = true\n[tag]\n\tgpgSign = true\n[gpg]\n\tprogram = false\n' >"$poisoned/.config/git/config"
+if ! HOME="$poisoned" XDG_CONFIG_HOME="$poisoned/.config" run_selftest selftest-poisoned >"$work/poisoned.log" 2>&1; then
+  echo "not ok - selftest failed under a caller's refusing hook and signing settings:"
+  cat "$work/poisoned.log"
+  exit 1
+fi
+echo "ok - selftest ignores the caller's Git hooks and signing settings"

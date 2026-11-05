@@ -1204,7 +1204,7 @@ export const register: Register = (on, registered) => {
     const suppressEmpty =
       ranModCommand &&
       !tracer.hasActivity &&
-      (writer === null || writer.dropUnsentSessionStart(e.sessionId ?? tracer.sessionId))
+      (writer === null || writer.dropUnsentSessionStart(e.sessionId ?? tracer.sessionId, tracer.hasSessionStart))
     ranModCommand = false
     safely(() => tracer.sessionEnded(e, { suppressRow: suppressEmpty }))
     if (writer) {
@@ -1247,6 +1247,12 @@ export const register: Register = (on, registered) => {
     ranModCommand = true
     if (!writer) return say('BigQuery Agent Analytics mod: not started.')
     if (!canDeliver(config)) return say(`BigQuery Agent Analytics mod: nothing to flush to (${config.problems.join('; ') || 'disabled'}).`)
+    // A session that has run only mod commands queues at most its own
+    // session_start row, which session.end drops: sent now, it would keep a
+    // session of commands alone (the flush tick holds it back too).
+    if (!tracer.hasActivity && (writer.queue.length === 0 || writer.hasOnlyUnsentSessionStart(tracer.sessionId))) {
+      return say('BigQuery Agent Analytics mod: nothing to flush (this session has recorded no activity yet).')
+    }
     const queued = writer.queue.length
     writer.requestFlush(0)
     return say(`BigQuery Agent Analytics mod: flush requested for ${queued} queued row(s); /bqaa-status shows the result.`)

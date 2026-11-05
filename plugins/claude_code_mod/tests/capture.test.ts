@@ -18,7 +18,7 @@
 import { type Engine, expect, test } from 'claude-code/testing'
 
 import { PLUGIN_VERSION } from '../hooks/lib/config.ts'
-import { ACCESS_TOKEN, COMMAND, DRY_RUN_DIR, OPTIONS, type Row, SESSION_ID, USAGE, type World, byType, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
+import { ACCESS_TOKEN, COMMAND, DRY_RUN_DIR, OK_INSERT, OPTIONS, type Row, SESSION_ID, USAGE, type World, byType, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
 
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX16 = /^[0-9a-f]{16}$/
@@ -627,6 +627,59 @@ test('a session that runs only /bqaa-status and lasts past a 5000 ms flush tick 
   expect(deadLetterRows(world)).toEqual([])
 })
 
+test('with no classic.SessionStart (a managed CLI), a session that runs only /bqaa-status and exits emits and spills 0 rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  expect(world.sentRows()).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('a session that runs only /bqaa-flush sends nothing for it, and emits and spills 0 rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  const reply = await $.command.run({ command: 'bqaa-flush', args: '', ...COMMAND })
+  expect(reply.text ?? '').toMatch(/nothing to flush/)
+  await world.clock.settle()
+  expect(world.insertCalls().length).toBe(0)
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  expect(world.sentRows()).toEqual([])
+  expect(world.acceptedRows()).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('with no classic.SessionStart (a managed CLI), a session that runs only /bqaa-flush emits and spills 0 rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  const reply = await $.command.run({ command: 'bqaa-flush', args: '', ...COMMAND })
+  expect(reply.text ?? '').toMatch(/nothing to flush/)
+  await world.clock.settle()
+  expect(world.insertCalls().length).toBe(0)
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  expect(world.sentRows()).toEqual([])
+  expect(world.acceptedRows()).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('/bqaa-flush right after /clear still sends what the session before it left queued', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-clear-session'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-session' })
+  // The new session has done nothing yet, but the queue holds the earlier
+  // session's rows: they are sent.
+  const reply = await $.command.run({ command: 'bqaa-flush', args: '', ...COMMAND })
+  expect(reply.text ?? '').toMatch(/flush requested for [1-9]\d* queued row/)
+  await world.clock.settle()
+  expect(byType(world.acceptedRows(), 'TOOL_COMPLETED').length).toBe(1)
+})
+
 test('completion-only activity (mid-turn load) followed by /bqaa-status keeps session_start and emits session_end', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)
@@ -651,6 +704,28 @@ test('writer takeover after /bqaa-status after session_start already flushed sti
   const allRows = [...world.sentRows(), ...deadLetterRows(world)]
   const ends = byType(allRows, 'STATE_DELTA').filter(r => json(r.content).session_end === true)
   expect(ends.length).toBe(1)
+})
+
+test('a session_start the first writer had out lands after two takeovers: a later SessionStart and /bqaa-status still end with session_end', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [{ hang: true }, OK_INSERT]
+  await startSession($)
+  // The first writer's request for the session_start row is out, unanswered.
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+  // session.start fires twice more: each writer takes over from the one before.
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  // Only then does BigQuery take the first writer's row.
+  world.releaseHung(OK_INSERT.status, OK_INSERT.text)
+  await world.clock.settle()
+  expect(byType(world.sentRows(), 'STATE_DELTA').map(r => json(r.content))).toEqual([{ session_start: true }])
+  await $.classic.SessionStart({ source: 'compact', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  // The session sent a row: its end is written, and the later start with it.
+  const spilled = byType(deadLetterRows(world), 'STATE_DELTA').map(r => json(r.content))
+  expect(spilled).toEqual([{ session_start: true }, { session_end: true }])
 })
 
 test('an in-flight subagent model step and tool call started before SubagentStart pick up agent_type and clear unidentified_loop on completion', { options: OPTIONS }, async ($, on) => {

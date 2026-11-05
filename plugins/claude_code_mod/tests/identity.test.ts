@@ -189,6 +189,52 @@ test("rows still queued at exit go to the spill file with this process's account
   expect(spilled.every(r => r.user_id === ADDRESS)).toBe(true)
 })
 
+test('a token that comes after session end began has no account looked up: neither the send waiting for it nor the start-up fetch asks', { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
+  const world = setUp(on)
+  world.tokenInfo = VERIFIED
+  // The token command started at session start answers 200 ms after session end begins.
+  world.processDelayMs = 5200
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(world.fetches.length).toBe(0)
+  const ending = $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.settle()
+  await world.clock.advance(200)
+  await ending
+  await world.clock.settle()
+  expect(world.fetches.filter(f => f.url === TOKEN_INFO_URL).length).toBe(0)
+  expect(world.insertCalls().length).toBe(0)
+  // The rows keep the user_id they were built with.
+  const spilled = deadLetterRows(world)
+  expect(spilled.map(r => r.content).sort()).toEqual(['{"session_end":true}', '{"session_start":true}'])
+  expect(spilled.every(r => r.user_id === 'dev')).toBe(true)
+})
+
+test("a 401's fresh token that comes after session end began has no account looked up: the batch goes to the spill file", { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
+  const world = setUp(on)
+  world.tokenInfo = verified(FIRST)
+  world.replies = [UNAUTHENTICATED]
+  await startSession($)
+  // From here the token command prints the other account's token, 300 ms
+  // after it starts.
+  world.processReply = { exitCode: 0, stdout: `${SECOND_TOKEN}\n`, stderr: '' }
+  world.tokenInfo = verified(SECOND)
+  world.processDelayMs = 300
+  // The send gets a 401: its fresh token is on its way when session end begins.
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+  const lookups = (): number => world.fetches.filter(f => f.url === TOKEN_INFO_URL).length
+  const before = lookups()
+  expect(before).toBe(1)
+  const ending = $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(300)
+  await ending
+  await world.clock.settle()
+  expect(lookups()).toBe(before)
+  expect(world.insertCalls().length).toBe(1)
+  expect(deadLetterRows(world).map(r => r.content).sort()).toEqual(['{"session_end":true}', '{"session_start":true}'])
+})
+
 test('a new credential after a session change: the rows sent with it carry its account, the 401 retry included', { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
   const world = setUp(on)
   world.tokenInfo = verified(FIRST)

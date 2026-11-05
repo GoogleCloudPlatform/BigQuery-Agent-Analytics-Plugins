@@ -398,11 +398,12 @@ function namedValueEnd(text: string, start: number): number {
 }
 
 // Where a `name=` value whose shell word ends at `end` stops: there for a
-// flag's whose word a control operator ends, and for one whose word the
-// backtick closing its span ends (`span`, see readValue), else at the end of
-// that line.
-const valueStop = (text: string, start: number, end: number, flag: boolean, span = false): number =>
-  span || (flag && /[;&|<>)]/.test(text[end] ?? '')) ? end : lineEnd(text, start, end)
+// flag's whose word a control operator ends; for one in a code span
+// (`spanEnd`, see readValue), at the backtick that closes the span, so the
+// span stays closed and the text after it stays; else at the end of that
+// line.
+const valueStop = (text: string, start: number, end: number, flag: boolean, spanEnd = 0): number =>
+  flag && /[;&|<>)]/.test(text[end] ?? '') ? end : spanEnd > 0 ? spanEnd : lineEnd(text, start, end)
 
 // Text a redaction removes past the end of the credential's own line (an end
 // these rules cannot tell runs to the end of the text) is lost, not hidden:
@@ -441,7 +442,8 @@ const UNKNOWN = 4
 // which open code, an escaped quote, backslash, `$` or backtick outside
 // quotes (which a command string's quoting can leave in), or where an escape
 // runs past `to`. The whole-text scan also reads an apostrophe in a word of
-// prose as text (see proseApostrophe), and records in `ticks` where a
+// prose as text (see proseApostrophe), unless `prose` is false (the shell's
+// own reading, see SHELL_READINGS), and records in `ticks` where a
 // backtick it reads outside quotes is open.
 const QUOTE_TEXT = /[^"'\\$`<#\n]+/y
 function isFenceStart(text: string, from: number, to: number, i: number, L: number): boolean {
@@ -468,11 +470,16 @@ function pairLineRuns(text: string, from: number, to: number, lineRuns: { start:
         const afterEnd = closeRun.start + closeRun.len
         const afterChar = afterEnd < to ? (text[afterEnd] ?? '') : ''
         const afterOk = afterEnd >= to || afterChar === '\r' || afterChar === '\n' || /[\s.,;:!?)}\]]/.test(afterChar)
-        if (openRun.start + openRun.len < closeRun.start && !/^\s|\s$/.test(inner) && beforeOk && afterOk) {
-          spanEnds?.fill(closeRun.start, openRun.start + openRun.len, closeRun.start)
+        // Two runs pair as a code span, or, one backtick each, as a command
+        // substitution right after `=` (VERSION=`git rev-parse HEAD`, is no
+        // span). Where two runs pair as neither, the runs of the line may pair
+        // otherwise (the value in X=pre` SECRET` and `ok may run past SECRET),
+        // so the line is left unclosed.
+        if (openRun.start + openRun.len < closeRun.start && !/^\s|\s$/.test(inner) && afterOk && (beforeOk || (openRun.len === 1 && beforeChar === '='))) {
+          if (beforeOk) spanEnds?.fill(closeRun.start, openRun.start + openRun.len, closeRun.start)
+          r += 2
+          continue
         }
-        r += 2
-        continue
       }
     }
     if (unclosed === -1) unclosed = openRun.start
@@ -482,7 +489,7 @@ function pairLineRuns(text: string, from: number, to: number, lineRuns: { start:
   return unclosed
 }
 
-function readQuotes(text: string, from: number, to: number, states?: Uint8Array, spanEnds?: Int32Array, lastPlainQuote = -1): number {
+function readQuotes(text: string, from: number, to: number, states?: Uint8Array, spanEnds?: Int32Array, prose = true): number {
   // These are the only characters that can alter the initial quote state.
   // A supplied state table is newly zeroed, so plain spans need no writes.
   if (!/["'\\$`<#]/.test(text.slice(from, to))) return NONE
@@ -518,7 +525,7 @@ function readQuotes(text: string, from: number, to: number, states?: Uint8Array,
       next = i + 2
     } else if (q === DOUBLE || q === ANSI) {
       if (c === (q === DOUBLE ? '"' : "'")) after = NONE
-    } else if (states !== undefined && c === "'" && proseApostrophe(text, i) && i > lastPlainQuote) {
+    } else if (states !== undefined && prose && c === "'" && proseApostrophe(text, i)) {
       // Text, not a quote (see proseApostrophe).
     } else if (c === "'" || c === '"') {
       after = c === "'" ? SINGLE : DOUBLE
@@ -583,10 +590,9 @@ function readQuotes(text: string, from: number, to: number, states?: Uint8Array,
 // `I'm`). Prompts and answers are prose: read as a quote that never closes,
 // one such apostrophe leaves the end of every credential value after it
 // uncertain, and all the text from the first such value on is removed. In
-// shell code the same word opens a quote; the scan reading it as text can
-// only make the two readings of a value disagree (see readValue), which
-// removes more, or agree on a value read by the shell's rules, whose line
-// still goes after it (see valueStop).
+// shell code the same word opens a quote, which a later `'` can close: a
+// credential value after one is also read that way (see shellAgrees), and
+// where the two readings of its end disagree, more is removed.
 const WORD_BEFORE_APOSTROPHE = /[\p{L}\p{M}]/u
 const CONTRACTION_END = /(?:s|t|re|ve|ll|d|m)(?![\p{L}\p{M}\p{N}_'])/iyu
 function proseApostrophe(text: string, i: number): boolean {
@@ -602,10 +608,14 @@ function proseApostrophe(text: string, i: number): boolean {
 // otherwise. Absent for a text with no backtick.
 const SPAN_ENDS = new WeakMap<Uint8Array, Int32Array>()
 
-// The last `'` in the text that is not a prose apostrophe, or -1 when none
-// is. A contraction before a later non-contraction `'` still opens a shell
-// quote that the later `'` could close, so the conservative rule reads the
-// contraction as a quote (the whole-text scan's to-the-end behavior).
+// The shell's own reading, for the states quoteStates read where the
+// whole-text scan read an apostrophe in prose as text (absent elsewhere):
+// each position's quote with every apostrophe a quote (see readQuotes), where
+// the first apostrophe read as text is, and where the last `'` that is no
+// apostrophe in prose is (-1 where none is).
+type ShellReading = { states: Uint8Array; firstProse: number; lastPlainQuote: number }
+const SHELL_READINGS = new WeakMap<Uint8Array, ShellReading>()
+
 function lastPlainQuoteOf(text: string): number {
   for (let k = text.length - 1; k >= 0; k -= 1) {
     if (text[k] === "'" && !proseApostrophe(text, k)) return k
@@ -617,9 +627,17 @@ function lastPlainQuoteOf(text: string): number {
 function quoteStates(text: string): Uint8Array {
   const states = new Uint8Array(text.length + 1)
   const spanEnds = text.includes('`') ? new Int32Array(text.length + 1) : undefined
-  const lastPlainQuote = lastPlainQuoteOf(text)
-  readQuotes(text, 0, text.length, states, spanEnds, lastPlainQuote)
+  readQuotes(text, 0, text.length, states, spanEnds)
   if (spanEnds !== undefined) SPAN_ENDS.set(states, spanEnds)
+  // An apostrophe in prose outside quotes is one the scan read as text.
+  for (let k = text.indexOf("'"); k !== -1; k = text.indexOf("'", k + 1)) {
+    if (states[k] === NONE && proseApostrophe(text, k)) {
+      const shell = new Uint8Array(text.length + 1)
+      readQuotes(text, 0, text.length, shell, undefined, false)
+      SHELL_READINGS.set(states, { states: shell, firstProse: k, lastPlainQuote: lastPlainQuoteOf(text) })
+      break
+    }
+  }
   return states
 }
 
@@ -692,6 +710,36 @@ function simpleEnd(text: string, start: number, q: number, span = false, spanClo
   return q === NONE ? i : -1
 }
 
+// Where the quote that opens at `open` closes; -1 where it does not.
+function quoteCloses(text: string, open: number): number {
+  const c = text[open]
+  for (let i = open + 1; i < text.length; i += 1) {
+    if (text[i] === c) return i
+    if (c === '"' && text[i] === '\\') i += 1
+  }
+  return -1
+}
+
+// Whether a credential value that starts at `start` in quote `q`, its word
+// ending at `end`, ends there by the shell's own reading too (see
+// SHELL_READINGS), in which an apostrophe in prose before it opens a quote
+// that a later `'` can close. It does where both readings start the value in
+// the same quote. A value that is one quoted string (`'--password Secret'`,
+// `--password 'Secret'`) keeps the whole-text scan's reading where that
+// leaves no `'` open at the end (nor cannot tell there), as such a `'` could
+// pair with the apostrophe instead. An unquoted value keeps it where the
+// shell's reading puts it in a single quote that only a later apostrophe in
+// prose can close (`It's … --password=x … don't`), no other `'` coming at or
+// after it.
+function shellAgrees(text: string, start: number, end: number, q: number, states: Uint8Array): boolean {
+  const shell = SHELL_READINGS.get(states)
+  if (shell === undefined || shell.firstProse >= start || shell.states[start] === q) return true
+  if (q !== NONE || ((text[start] === "'" || text[start] === '"') && end - 1 > start && quoteCloses(text, start) === end - 1)) {
+    return states[text.length] !== SINGLE && states[text.length] !== UNKNOWN
+  }
+  return shell.states[start] === SINGLE && shell.lastPlainQuote < start
+}
+
 // A credential value that starts at `start`, in the word that starts at
 // `from`: where its shell word ends (see simpleEnd), and the quote it starts
 // in, put back after the marker. Null where that end cannot be told with
@@ -699,15 +747,21 @@ function simpleEnd(text: string, start: number, q: number, span = false, spanClo
 // whole-text scan (`states`) and the word read alone from `from` disagree on
 // it or either cannot tell (as after an apostrophe in prose, in a command
 // string such as `sh -c "… --password …"`, past a here-document); where it
-// starts in `$'…'`; or where simpleEnd cannot tell. `alone`, where given, is
-// the quote the word read alone is in at `start`, already read. `span` when
-// the backtick that closes the span the value starts in ends it.
-function readValue(text: string, start: number, from: number, states: Uint8Array, alone?: number): { end: number; close: string; span: boolean } | null {
+// starts in `$'…'`; where simpleEnd cannot tell; or where, after an
+// apostrophe in prose, the shell's own reading may end it elsewhere (see
+// shellAgrees). `alone`, where given, is the quote the word read alone is in
+// at `start`, already read. `spanEnd`, where the value starts in a code span
+// (see SPAN_ENDS) and its word ends within it, is where the backtick that
+// closes that span starts; else 0. A word that runs past that backtick
+// (`it's` and a later `don't`, which the whole-text scan reads as prose and
+// this word as a quote) gets 0.
+function readValue(text: string, start: number, from: number, states: Uint8Array, alone?: number): { end: number; close: string; spanEnd: number } | null {
   const q = states[start] ?? UNKNOWN
   if (from === -1 || q === UNKNOWN || q === ANSI || (alone ?? readQuotes(text, from, start)) !== q) return null
   const spanClose = q === NONE ? (SPAN_ENDS.get(states)?.[start] ?? 0) : 0
   const end = simpleEnd(text, start, q, false, spanClose)
-  return end === -1 ? null : { end, close: q === DOUBLE ? '"' : q === SINGLE ? "'" : '', span: spanClose > 0 && end === spanClose }
+  if (end === -1 || !shellAgrees(text, start, end, q, states)) return null
+  return { end, close: q === DOUBLE ? '"' : q === SINGLE ? "'" : '', spanEnd: spanClose > 0 && end <= spanClose ? spanClose : 0 }
 }
 
 const JOINS = new RegExp(JOIN, 'g')
@@ -781,7 +835,7 @@ function redactNamedValues(text: string, stats: SanitizeStats): string {
       }
     } else if (equals && start === m.separator + 1 && !/[ \t]/.test(text[m.separator - 1] as string)) {
       const read = readValue(text, start, from, (states ??= quoteStates(text)))
-      end = read === null ? text.length : valueStop(text, start, read.end, /^\$?["']*-/.test(text.slice(from, start)), read.span)
+      end = read === null ? text.length : valueStop(text, start, read.end, /^\$?["']*-/.test(text.slice(from, start)), read.spanEnd)
       close = read?.close ?? ''
     } else {
       end = namedValueEnd(text, start)
@@ -1404,7 +1458,7 @@ function redactOptionWords(text: string, stats: SanitizeStats): string {
       start = word.value
       const read = nested ? null : readValue(text, start, at, scan.states(), option.alone)
       if (read !== null) {
-        end = valueStop(text, start, read.end, /^\$?["']*-/.test(text.slice(at, start)), read.span)
+        end = valueStop(text, start, read.end, /^\$?["']*-/.test(text.slice(at, start)), read.spanEnd)
         close = read.close
       }
     } else {
@@ -1911,7 +1965,7 @@ function redactListNames(text: string, stats: SanitizeStats): string {
     // A value that is one redaction marker is done; one with more of its
     // word after the marker (`[REDACTED:github-token]:x`) is not.
     if (read === null ? ((MARKER_WORD.lastIndex = start), MARKER_WORD.test(text)) : wholeMarker(text.slice(start, read.end), read.close)) continue
-    const end = read === null ? text.length : valueStop(text, start, read.end, /^\$?["']*-/.test(text.slice(from, start)), read.span)
+    const end = read === null ? text.length : valueStop(text, start, read.end, /^\$?["']*-/.test(text.slice(from, start)), read.spanEnd)
     const close = read?.close ?? ''
     const value = text.slice(start, end)
     if (value.trim() === '' || wholeMarker(value, close)) continue

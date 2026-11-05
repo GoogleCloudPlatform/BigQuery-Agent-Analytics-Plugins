@@ -212,6 +212,9 @@ export class Tracer {
   private sessionStartedAt: number | null = null
   private turnCount = 0
   private sessionHasActivity = false
+  // Whether this session wrote its session_start row: a managed CLI that
+  // keeps classic hooks from a user plugin raises no classic.SessionStart.
+  private sessionHasStart = false
   private main: TurnCtx | null = null
   // Turns seen only through their model requests (this module loaded after
   // their turn.start), kept apart so they never replace the current turn.
@@ -236,12 +239,17 @@ export class Tracer {
     return this.sessionHasActivity
   }
 
+  get hasSessionStart(): boolean {
+    return this.sessionHasStart
+  }
+
   setSession(info: { sessionId?: string | null; cwd?: string | null; engineVersion?: string | null; hostName?: string | null }): void {
     if (info.sessionId) {
       if (this.sessionId !== null && info.sessionId !== this.sessionId) {
         this.sessionStartedAt = this.deps.now()
         this.turnCount = 0
         this.sessionHasActivity = false
+        this.sessionHasStart = false
         this.main = null
         this.others.clear()
         this.loops.clear()
@@ -268,7 +276,7 @@ export class Tracer {
       this.turnCount = 0
       this.sessionHasActivity = false
     }
-    this.emit({
+    const written = this.emit({
       eventType: 'STATE_DELTA',
       timestampMs: at,
       ids: this.sessionIds(),
@@ -283,6 +291,7 @@ export class Tracer {
         session_metadata: this.sessionMetadata(),
       },
     })
+    if (written) this.sessionHasStart = true
   }
 
   sessionEnded(e: { reason: string; sessionId?: string }, opts?: { suppressRow?: boolean }): void {
@@ -306,6 +315,7 @@ export class Tracer {
       })
     }
     this.sessionHasActivity = false
+    this.sessionHasStart = false
     this.main = null
     this.others.clear()
     this.loops.clear()
@@ -911,6 +921,7 @@ export class Tracer {
     }
   }
 
+  // True when the row was handed on (capture is on).
   private emit(args: {
     eventType: string
     agent?: string
@@ -922,9 +933,9 @@ export class Tracer {
     latencyMs?: Record<string, number | undefined>
     status?: 'OK' | 'ERROR'
     errorMessage?: string | null
-  }): void {
+  }): boolean {
     const config = this.deps.config()
-    if (!config.enabled) return
+    if (!config.enabled) return false
     const isUnidentified = args.unidentifiedLoop !== undefined ? args.unidentifiedLoop : this.unidentified(args.attributes.agent_id)
     const built = buildRow({
       eventType: args.eventType,
@@ -957,6 +968,7 @@ export class Tracer {
       maxPayloadChars: config.maxPayloadChars,
     })
     this.deps.emit(built.row, built.redactions)
+    return true
   }
 }
 

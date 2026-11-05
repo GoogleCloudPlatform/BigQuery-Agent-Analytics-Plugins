@@ -35,6 +35,7 @@ Exit 0: every check passed; 1: a check failed
 """
 
 import argparse
+import builtins
 import contextlib
 import dataclasses
 import datetime
@@ -1685,6 +1686,105 @@ def clean_dead_letter_checks():
         check('symlinked files, symlinked dirs, and their targets survive --execute',
               symlink_file.is_symlink() and symlink_dir.is_symlink() and ext_file.exists(),
               f'{symlink_file.is_symlink()} {symlink_dir.is_symlink()} {ext_file.exists()}')
+
+    # 6. A file unlink() cannot remove is reported on stderr, never as
+    #    deleted; the files after it are still deleted, the count is of the
+    #    files really deleted, and the exit status is 1. The dry run before
+    #    it reports the same plan as ever.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'spill-006.jsonl'
+        source.write_bytes(b'')
+        outcome = d / 'outcome-spill-006.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        status, out, err = call(clean.main, '--dir', str(d))
+        check('dry-run: each planned file, then the count, exit 0',
+              status == 0 and err == '' and out.splitlines() == [
+                  'would delete: outcome-spill-006.jsonl', 'would delete: spill-006.jsonl', '2 file(s) would delete'],
+              f'{status} {out!r} {err!r}')
+        real_unlink = pathlib.Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path.name == outcome.name:
+                raise PermissionError(13, 'Permission denied', str(path))
+            return real_unlink(path, *args, **kwargs)
+
+        with patched(pathlib.Path, unlink=unlink):
+            status, out, err = call(clean.main, '--dir', str(d), '--execute')
+        check('under --execute: a file unlink() cannot remove is an ERROR on stderr, not "deleted", and the exit status is 1',
+              status == 1 and 'ERROR: outcome-spill-006.jsonl: ' in err and 'deleted: outcome-spill-006.jsonl' not in out
+              and out.splitlines() == ['deleted: spill-006.jsonl', '1 file(s) deleted'],
+              f'{status} {out!r} {err!r}')
+        check('under --execute: the file that could not be removed stays and the one after it is deleted',
+              outcome.exists() and not source.exists(), f'{outcome.exists()} {source.exists()}')
+
+    # 7-9. A non-empty source file whose completion record cannot be read may
+    #    name any source as parent: nothing in its partition directory is
+    #    deletable, so the empty parent it names and that parent's outcome
+    #    file stay (and so does the file itself).
+    def unreadable_leftover(leftover: pathlib.Path):
+        leftover.write_text(seal('{"row":1}\n', parent='spill-parent.jsonl'), encoding='utf-8')
+        real_open = builtins.open
+
+        def guarded(file, *args, **kwargs):
+            if isinstance(file, (str, os.PathLike)) and pathlib.Path(file).name == leftover.name:
+                raise PermissionError(13, 'Permission denied', str(file))
+            return real_open(file, *args, **kwargs)
+
+        return patched(builtins, open=guarded)
+
+    def unsealed_leftover(leftover: pathlib.Path):
+        leftover.write_text('{"row":1}\n{"row":2', encoding='utf-8')
+        return contextlib.nullcontext()
+
+    def undecodable_leftover(leftover: pathlib.Path):
+        sealed = seal('{"row":1}\n', parent='spill-parent.jsonl').encode('utf-8')
+        leftover.write_bytes(sealed.replace(b'spill-parent.jsonl"', b'spill-parent.jsonl\xff"'))
+        return contextlib.nullcontext()
+
+    for case, what, prepare in (
+        (7, 'an unreadable non-empty leftover', unreadable_leftover),
+        (8, 'an unsealed non-empty leftover (no completion record)', unsealed_leftover),
+        (9, 'a non-empty leftover whose completion record is not valid UTF-8', undecodable_leftover),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp) / 'dead-letter'
+            d = make_dir(pathlib.Path(tmp))
+            parent = d / 'spill-parent.jsonl'
+            parent.write_bytes(b'')
+            outcome = d / 'outcome-spill-parent.jsonl'
+            outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+            leftover = d / 'retry-leftover.jsonl'
+            with prepare(leftover):
+                to_delete = clean.plan_deletions(base)
+                status, out, err = call(clean.main, '--dir', str(base), '--execute')
+            check(f'{case}. {what}: nothing in its partition directory is deletable',
+                  to_delete == [], str(sorted(p.name for p in to_delete)))
+            check(f'{case}. {what}: under --execute the empty parent, its outcome and the leftover all stay, exit 0',
+                  status == 0 and out.splitlines() == ['nothing to clean'] and parent.exists() and outcome.exists() and leftover.exists(),
+                  f'{status} {out!r} {err!r}')
+
+    # 10. A partition directory that cannot be listed plans nothing; the other
+    #     partitions are planned as ever.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = pathlib.Path(tmp) / 'dead-letter'
+        d = make_dir(pathlib.Path(tmp))
+        (d / 'spill-010.jsonl').write_bytes(b'')
+        other = base / 'proj.ds.other'
+        other.mkdir()
+        (other / 'spill-011.jsonl').write_bytes(b'')
+        real_iterdir = pathlib.Path.iterdir
+
+        def iterdir(path):
+            if path == d:
+                raise PermissionError(13, 'Permission denied', str(path))
+            return real_iterdir(path)
+
+        with patched(pathlib.Path, iterdir=iterdir):
+            to_delete = clean.plan_deletions(base)
+        check('10. a partition directory that cannot be listed plans nothing, and the others are planned',
+              [p.relative_to(base).as_posix() for p in to_delete] == ['proj.ds.other/spill-011.jsonl'],
+              str(to_delete))
 
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
