@@ -162,7 +162,9 @@ ORDER BY started_at DESC;
 --     window: the people enrolled (a table of their login names that you
 --     keep, team_roster, with one user_id column), how many of them have
 --     rows, their sessions and turns, and the sessions from no one on the
---     roster or with no user_id. A person with no rows is "not seen", not
+--     roster or with no user_id. Includes all rows (unidentified_loop rows
+--     are kept here; they are left out of V1, V2, V5, V6 and V7 that count
+--     turns, tools and agents). A person with no rows is "not seen", not
 --     zero use: they may not have used the agent, or their sessions may not
 --     be recorded. A day with no rows at all is listed too, every enrolled
 --     person not seen, and no_rows_that_day says so: absent telemetry, not
@@ -215,7 +217,9 @@ ORDER BY d.day DESC;
 --     row has no cost (NULL), not zero; nor has a session and model with a
 --     response that recorded no usage (responses_without_usage counts
 --     them), as its tokens are unknown. Discounts and other charges are
---     not counted.
+--     not counted. Reads all of this mod's LLM_RESPONSE rows; loops the mod
+--     saw no start for (unidentified_loop) do not record LLM_RESPONSE today,
+--     so no filter is needed here (V1, V2, V5, V6 and V7 do filter them).
 WITH rates AS (
   -- rates: begin
   SELECT * FROM UNNEST([

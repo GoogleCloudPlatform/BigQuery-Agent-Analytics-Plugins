@@ -97,6 +97,7 @@ export type StepCtx = {
   invocationId: string | null
   agent: string
   agentId?: string
+  loop?: LoopCtx
   index: number
   model: string
   startedAt: number
@@ -109,6 +110,7 @@ export type ToolCtx = {
   invocationId: string | null
   agent: string
   agentId?: string
+  loop?: LoopCtx
   tool: string
   toolUseId: string | null
   origin: string
@@ -395,6 +397,7 @@ export class Tracer {
         invocationId: loop.invocationId ?? e.turnId,
         agent: loop.agentType,
         agentId: e.agentId,
+        loop,
         index: e.index,
         model: e.model,
         startedAt,
@@ -420,6 +423,7 @@ export class Tracer {
     this.emit({
       eventType: 'LLM_REQUEST',
       agent: ctx.agent,
+      unidentifiedLoop: ctx.loop ? !ctx.loop.seen : false,
       ids: ctx,
       content: { prompt },
       attributes: {
@@ -434,6 +438,9 @@ export class Tracer {
   }
 
   stepFinished(ctx: StepCtx, result: StepResult, firstContentAt?: number): void {
+    this.sessionHasActivity = true
+    const agent = ctx.loop ? ctx.loop.agentType : ctx.agent
+    const unidentifiedLoop = ctx.loop ? !ctx.loop.seen : false
     const now = this.deps.now()
     const latency = {
       total_ms: now - ctx.startedAt,
@@ -443,7 +450,8 @@ export class Tracer {
     if (noResponse) {
       this.emit({
         eventType: 'LLM_ERROR',
-        agent: ctx.agent,
+        agent,
+        unidentifiedLoop,
         ids: ctx,
         content: null,
         attributes: { model: ctx.model, step_index: ctx.index, agent_id: ctx.agentId },
@@ -458,7 +466,8 @@ export class Tracer {
     if (result.stopReason === 'model_context_window_exceeded') note = 'the model context window was exceeded'
     this.emit({
       eventType: 'LLM_RESPONSE',
-      agent: ctx.agent,
+      agent,
+      unidentifiedLoop,
       ids: ctx,
       content: {
         tool_uses: result.toolUses.length > 0 ? result.toolUses.map(t => t.name) : undefined,
@@ -479,9 +488,12 @@ export class Tracer {
   }
 
   stepFailed(ctx: StepCtx, error: unknown): void {
+    this.sessionHasActivity = true
+    const agent = ctx.loop ? ctx.loop.agentType : ctx.agent
     this.emit({
       eventType: 'LLM_ERROR',
-      agent: ctx.agent,
+      agent,
+      unidentifiedLoop: ctx.loop ? !ctx.loop.seen : false,
       ids: ctx,
       content: null,
       attributes: { model: ctx.model, step_index: ctx.index, agent_id: ctx.agentId },
@@ -502,8 +514,9 @@ export class Tracer {
     let traceId: string | null = null
     let invocationId: string | null = null
     let agent = this.deps.config().agentName
+    let loop: LoopCtx | undefined
     if (agentId) {
-      const loop = this.loopFor(agentId, null)
+      loop = this.loopFor(agentId, null)
       parentSpanId = loop.lastStepSpan ?? loop.spanId
       traceId = loop.traceId
       invocationId = loop.invocationId
@@ -522,6 +535,7 @@ export class Tracer {
       invocationId,
       agent,
       agentId,
+      loop,
       tool,
       toolUseId,
       origin: toolOrigin(tool),
@@ -538,6 +552,7 @@ export class Tracer {
     this.emit({
       eventType: 'TOOL_STARTING',
       agent,
+      unidentifiedLoop: loop ? !loop.seen : false,
       ids: ctx,
       content: { tool, tool_origin: ctx.origin, args },
       attributes: { tool_use_id: ctx.toolUseId, agent_id: agentId },
@@ -549,6 +564,7 @@ export class Tracer {
   // when it is known. Once decisions arrive, a call whose decision has not
   // come yet waits up to DECISION_WAIT_MS for it, keeping the time it ended.
   toolFinished(ctx: ToolCtx, outcome: ToolOutcome): void {
+    this.sessionHasActivity = true
     this.inflightTools.delete(ctx)
     const endedAt = this.deps.now()
     const id = ctx.toolUseId
@@ -623,6 +639,8 @@ export class Tracer {
         turn.lastMainToolDecisionSource = decision?.source ?? null
       }
     }
+    const agent = ctx.loop ? ctx.loop.agentType : ctx.agent
+    const unidentifiedLoop = ctx.loop ? !ctx.loop.seen : false
     const latencyMs = { total_ms: endedAt - ctx.startedAt }
     const attributes: Record<string, unknown> = {
       tool_use_id: ctx.toolUseId,
@@ -634,7 +652,8 @@ export class Tracer {
     if ('deny' in outcome && typeof outcome.deny === 'string') {
       this.emit({
         eventType: 'TOOL_COMPLETED',
-        agent: ctx.agent,
+        agent,
+        unidentifiedLoop,
         timestampMs: endedAt,
         ids: ctx,
         content: { tool: ctx.tool, tool_origin: ctx.origin, result: null },
@@ -648,7 +667,8 @@ export class Tracer {
     if ('isError' in outcome && outcome.isError === true) {
       this.emit({
         eventType: 'TOOL_COMPLETED',
-        agent: ctx.agent,
+        agent,
+        unidentifiedLoop,
         timestampMs: endedAt,
         ids: ctx,
         content: { tool: ctx.tool, tool_origin: ctx.origin, result: null },
@@ -662,7 +682,8 @@ export class Tracer {
     const ok = outcome as { result?: unknown; text?: string; isReadOnly?: true }
     this.emit({
       eventType: 'TOOL_COMPLETED',
-      agent: ctx.agent,
+      agent,
+      unidentifiedLoop,
       timestampMs: endedAt,
       ids: ctx,
       content: { tool: ctx.tool, tool_origin: ctx.origin, result: ok.text ?? ok.result ?? null },
@@ -672,12 +693,14 @@ export class Tracer {
   }
 
   toolFailed(ctx: ToolCtx, error: unknown): void {
+    this.sessionHasActivity = true
     this.toolFinished(ctx, { isError: true, text: errorText(error) })
   }
 
   // classic.PermissionRequest: marks the in-flight call that is waiting on
   // the person, so its latency can be read as including that wait.
   permissionRequested(e: { tool_name?: string; tool_input?: unknown; agent_id?: string }): void {
+    this.sessionHasActivity = true
     const tool = String(e.tool_name ?? '')
     const fingerprint = fingerprintOf(tool, e.tool_input)
     let fallback: ToolCtx | null = null
@@ -711,6 +734,7 @@ export class Tracer {
   }
 
   turnCompleted(e: TurnEnd, onComplete?: () => void): void {
+    this.sessionHasActivity = true
     const isFailure = e.reason === 'error' || e.reason === 'refusal'
     const refusal = e.refusal ? ['model refused', e.refusal.category, e.refusal.explanation].filter(Boolean).join(': ') : 'model refused'
     const errorMessage = !isFailure ? null : e.reason === 'refusal' ? refusal : 'the turn ended on an API error'
@@ -720,6 +744,7 @@ export class Tracer {
       this.emit({
         eventType: isFailure ? 'AGENT_ERROR' : 'AGENT_COMPLETED',
         agent: loop.agentType,
+        unidentifiedLoop: !loop.seen,
         ids: { traceId: loop.traceId, spanId: loop.spanId, parentSpanId: loop.parentSpanId, invocationId: loop.invocationId ?? e.turnId },
         content: {},
         attributes: { agent_id: e.agentId, finish_reason: e.reason, is_aborted: e.isAborted, usage_metadata: usage, model: e.usage?.model, subagent_turn_id: e.turnId },
@@ -861,6 +886,7 @@ export class Tracer {
     this.emit({
       eventType: 'AGENT_STARTING',
       agent: loop.agentType,
+      unidentifiedLoop: !loop.seen,
       ids: { traceId: loop.traceId, spanId: loop.spanId, parentSpanId: loop.parentSpanId, invocationId: loop.invocationId },
       content: { agent_type: loop.agentType, agent_id: loop.agentId },
       attributes: { agent_id: loop.agentId, inferred: inferred || undefined },
@@ -888,6 +914,7 @@ export class Tracer {
   private emit(args: {
     eventType: string
     agent?: string
+    unidentifiedLoop?: boolean
     timestampMs?: number
     ids: { traceId: string | null; spanId: string; parentSpanId: string | null; invocationId: string | null }
     content: unknown
@@ -898,6 +925,7 @@ export class Tracer {
   }): void {
     const config = this.deps.config()
     if (!config.enabled) return
+    const isUnidentified = args.unidentifiedLoop !== undefined ? args.unidentifiedLoop : this.unidentified(args.attributes.agent_id)
     const built = buildRow({
       eventType: args.eventType,
       timestampMs: args.timestampMs ?? this.deps.now(),
@@ -914,7 +942,7 @@ export class Tracer {
         root_agent_name: config.agentName,
         source: 'coding_agent',
         ...args.attributes,
-        unidentified_loop: this.unidentified(args.attributes.agent_id) || undefined,
+        unidentified_loop: isUnidentified ? true : undefined,
         writer: {
           plugin: PLUGIN_NAME,
           version: PLUGIN_VERSION,

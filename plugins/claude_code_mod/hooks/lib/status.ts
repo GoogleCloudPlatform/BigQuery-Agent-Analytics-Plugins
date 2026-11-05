@@ -24,7 +24,17 @@ import type { BackfillReport, Writer } from './writer.ts'
 // dead-letter directory (other tables' subdirectories, an older flat
 // layout), and files too large to read back.
 export type DeadLetterSummary =
-  | { dir: string; files: number; bytes: number; byKind: Record<string, number>; oversized: string[]; elsewhere: number; retiredFiles?: number }
+  | {
+      dir: string
+      files: number
+      bytes: number
+      byKind: Record<string, number>
+      oversized: string[]
+      elsewhere: number
+      emptyFiles?: number
+      recordFiles?: number
+      retiredFiles?: number
+    }
   | { error: string }
 
 const ago = (now: number, at: number | null): string => {
@@ -80,13 +90,17 @@ export function formatStatus(args: {
   if ('error' in args.deadLetter) lines.push(`dead-letter: ${args.deadLetter.error}`)
   else {
     const d = args.deadLetter
-    const retired = d.retiredFiles ?? 0
+    const emptyFiles = d.emptyFiles ?? 0
+    const recordFiles = d.recordFiles ?? 0
+    const retired = d.retiredFiles ?? emptyFiles + recordFiles
     const configuredTarget = Boolean(c.project && c.dataset)
     if (configuredTarget || d.files > 0 || retired > 0) {
       const kinds = Object.entries(d.byKind)
         .map(([kind, n]) => `${n} ${kind}`)
         .join(', ')
-      const retiredNote = retired > 0 ? `; ${retired} replayed/retired file(s) (0-byte or outcome-*, expected leftovers; host fs cannot delete)` : ''
+      const counts =
+        d.emptyFiles !== undefined || d.recordFiles !== undefined ? `: ${emptyFiles} empty file(s); ${recordFiles} replay record(s), kept on purpose` : ''
+      const retiredNote = retired > 0 ? `; ${retired} replayed/retired file(s) (0-byte or outcome-*, expected leftovers; host fs cannot delete)${counts}` : ''
       lines.push(`dead-letter: ${d.files} file(s), ${kb(d.bytes)}${kinds ? ` (${kinds})` : ''} in ${d.dir}${retiredNote}`)
     }
     if (d.oversized.length > 0) lines.push(`dead-letter: ${d.oversized.length} file(s) over the 4 MiB read limit, not replayed: ${names(d.oversized)}`)

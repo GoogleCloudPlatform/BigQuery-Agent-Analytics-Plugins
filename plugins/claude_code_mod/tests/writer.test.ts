@@ -1069,4 +1069,56 @@ test('/bqaa-status reports replayed row count, replay request batches, and retir
   expect(status).toContain('sent 2 (2 replayed)')
   expect(status).toMatch(/requests: 1 ok, 0 retried/)
   expect(status).toMatch(/dead-letter: 0 file\(s\), 0 B in .*; \d+ replayed\/retired file\(s\) \(0-byte or outcome-\*, expected leftovers; host fs cannot delete\)/)
+  expect(status).toContain('1 empty file(s); 3 replay record(s), kept on purpose')
+})
+
+test('when the token arrives during the exit wait, no insertAll starts after session.end began: rows are spilled once and replayed once', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // Make the initial token command resolve at t=5200 ms (200 ms after the 5000 ms flush + session.end).
+  world.processDelayMs = 5200
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  // Start the 5s flush: it takes the 3 rows and waits on the in-flight getToken().
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(0)
+  // Now session.end begins while the flush is waiting on getToken().
+  const ending = $.session.end({ ...END, reason: 'other' })
+  await world.clock.settle()
+  // The token arrives 200 ms into the exit wait: deliver must NOT start insertAll.
+  await world.clock.advance(200)
+  await ending
+  expect(world.insertCalls().length).toBe(0)
+  const spilled = deadLetterRows(world)
+  expect(spilled.map(r => r.event_type).sort()).toEqual(['STATE_DELTA', 'STATE_DELTA', 'TOOL_COMPLETED', 'TOOL_STARTING'])
+  expect(new Set(spilled.map(r => r.event_id)).size).toBe(4)
+  // Next session replays: every row is sent once.
+  world.processDelayMs = 0
+  await startSession($)
+  await world.clock.advance(15_000)
+  await world.clock.settle()
+  const replayedIds = world.acceptedRows().filter(r => spilled.some(s => s.event_id === r.event_id)).map(r => r.event_id)
+  expect(replayedIds.length).toBe(4)
+  expect(new Set(replayedIds).size).toBe(4)
+})
+
+test('when an in-flight post gets 401 and the refreshed token arrives during the exit wait, no retry insertAll starts after session.end began', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [UNAUTHENTICATED, OK_INSERT]
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  // Prefetch already fetched the first token at t=0; now delay the 401 refresh token by 200 ms.
+  world.processDelayMs = 200
+  // First post gets 401; deliver drops token and waits 200 ms on the second getToken().
+  await world.clock.advance(5000)
+  await world.clock.settle()
+  expect(world.insertCalls().length).toBe(1)
+  const ending = $.session.end({ ...END, reason: 'other' })
+  await world.clock.settle()
+  await world.clock.advance(200)
+  await ending
+  // No second insertAll was started after session.end began.
+  expect(world.insertCalls().length).toBe(1)
+  const spilled = deadLetterRows(world)
+  expect(spilled.length).toBe(4)
+  expect(new Set(spilled.map(r => r.event_id)).size).toBe(4)
 })

@@ -1494,7 +1494,7 @@ def repo_checks():
           shipped and shipped.group(1))
 
     scripts = sorted(path.name for path in SCRIPTS.iterdir() if path.is_file() and path.suffix == '.py')
-    check('the scripts folder holds the runner and the bootstrap', scripts == ['run_bq.py', 'setup_gcp_prereqs.py'], scripts)
+    check('the scripts folder holds the runner, the bootstrap, and the dead-letter cleaner', scripts == ['clean_dead_letter.py', 'run_bq.py', 'setup_gcp_prereqs.py'], scripts)
     for name in scripts:
         text = (SCRIPTS / name).read_text(encoding='utf-8')
         check(f'{name}: a python3 shebang, then the Apache license and the copyright of Google LLC, before the docstring',
@@ -1578,9 +1578,98 @@ def setup_sh_checks():
         check('  ... which the bootstrap takes: a dry run, exit 0', status == 0 and 'DRY RUN' in out, f'{status} {err!r}')
 
 
+# ---------------------------------------------------------------------------
+# clean_dead_letter.py
+# ---------------------------------------------------------------------------
+
+def clean_dead_letter_checks():
+    """The offline helper removes a (source, outcome-*) group only when the
+    source is empty and no non-empty leftover file names it as parent."""
+    clean = load('clean_dead_letter')
+
+    def make_dir(tmp: pathlib.Path) -> pathlib.Path:
+        d = tmp / 'dead-letter' / 'proj.ds.tbl'
+        d.mkdir(parents=True)
+        return d
+
+    def seal(text: str, parent: str | None = None) -> str:
+        """A dead-letter file: its content lines, then a completion record."""
+        record = {"v": 1, "complete": True, "lines": text.count("\n"), "fnv1a": "deadbeef"}
+        if parent is not None:
+            record["parent"] = parent
+        return text + json.dumps(record) + "\n"
+
+    # 1. Empty source + outcome variants (outcome-, outcome-b-, outcome-done-<writer>-): all removed under --execute.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'spill-001.jsonl'
+        source.write_bytes(b'')
+        outcome = d / 'outcome-spill-001.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        outcome_done = d / 'outcome-done-w1a2b3-spill-001.jsonl'
+        outcome_done.write_text(seal('{"journal":true,"retired":true}\n'), encoding='utf-8')
+        orphan_outcome = d / 'outcome-done-w1a2b3-missing.jsonl'
+        orphan_outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        to_delete = clean.plan_deletions(pathlib.Path(tmp) / 'dead-letter')
+        check('empty source and its outcome/outcome-done files in partition subdir are deletable (orphan outcome kept)',
+              set(p.name for p in to_delete) == {'spill-001.jsonl', 'outcome-spill-001.jsonl', 'outcome-done-w1a2b3-spill-001.jsonl'},
+              str(sorted(p.name for p in to_delete)))
+        status, out, err = call(clean.main, '--dir', str(pathlib.Path(tmp) / 'dead-letter'), '--execute')
+        check('under --execute: empty source and its outcome files are deleted while orphan outcome stays, exit 0',
+              status == 0 and not source.exists() and not outcome.exists() and not outcome_done.exists() and orphan_outcome.exists(),
+              f'{status} {out!r}')
+
+    # 2. Non-empty source + outcome: both kept.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'retry-002.jsonl'
+        source.write_text(seal('{"row":1}\n'), encoding='utf-8')
+        outcome = d / 'outcome-retry-002.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        to_delete = clean.plan_deletions(d)
+        check('non-empty source: nothing is deletable', to_delete == [], str(sorted(p.name for p in to_delete)))
+        call(clean.main, '--dir', str(d), '--execute')
+        check('non-empty source and its outcome are kept', source.exists() and outcome.exists(),
+              f'{source.exists()} {outcome.exists()}')
+
+    # 3. Empty source referenced as parent by a non-empty leftover: kept
+    #    until the leftover is empty too.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'rejected-003.jsonl'
+        source.write_bytes(b'')
+        leftover = d / 'rejected-003-leftover.jsonl'
+        leftover.write_text(seal('{"row":1}\n', parent='rejected-003.jsonl'), encoding='utf-8')
+        to_delete = clean.plan_deletions(d)
+        check('empty source with a non-empty leftover: nothing is deletable', to_delete == [], str(sorted(p.name for p in to_delete)))
+        call(clean.main, '--dir', str(d), '--execute')
+        check('empty source and its non-empty leftover are kept', source.exists() and leftover.exists(),
+              f'{source.exists()} {leftover.exists()}')
+        # Now empty the leftover: the source becomes deletable.
+        leftover.write_bytes(b'')
+        to_delete = clean.plan_deletions(d)
+        check('once the leftover is empty too: the source is deletable', any(p.name == 'rejected-003.jsonl' for p in to_delete),
+              str(sorted(p.name for p in to_delete)))
+        call(clean.main, '--dir', str(d), '--execute')
+        check('empty source is deleted', not source.exists(), f'{source.exists()}')
+
+    # 4. Dry-run default: nothing is deleted.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'spill-004.jsonl'
+        source.write_bytes(b'')
+        outcome = d / 'outcome-spill-004.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        status, out, err = call(clean.main, '--dir', str(d))
+        check('dry-run: exit 0 and says "would delete"', status == 0 and 'would delete' in out, f'{status} {out!r} {err!r}')
+        check('dry-run: nothing is actually deleted', source.exists() and outcome.exists(),
+              f'{source.exists()} {outcome.exists()}')
+
+
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
           writer_grants_checks, row_writer_role_checks, resources_checks, readers_checks, api_checks,
-          dataset_access_checks, execute_stop_checks, execute_apply_checks, repo_checks, setup_sh_checks)
+          dataset_access_checks, execute_stop_checks, execute_apply_checks, repo_checks, setup_sh_checks,
+          clean_dead_letter_checks)
 
 
 def main():

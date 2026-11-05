@@ -616,6 +616,83 @@ test('a session that runs only /bqaa-status and exits emits and spills no sessio
   expect(deadLetterRows(world)).toEqual([])
 })
 
+test('a session that runs only /bqaa-status and lasts past a 5000 ms flush tick still emits and spills 0 rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await world.clock.advance(5000)
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  expect(world.sentRows()).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('completion-only activity (mid-turn load) followed by /bqaa-status keeps session_start and emits session_end', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.turn.complete({ turnId: 'turn-mid', answer: 'done', durationMs: 100, isAborted: false, reason: 'answer' })
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  const allRows = [...world.sentRows(), ...deadLetterRows(world)]
+  const deltas = byType(allRows, 'STATE_DELTA').map(r => json(r.content))
+  expect(deltas).toEqual([{ session_start: true }, { session_end: true }])
+})
+
+test('writer takeover after /bqaa-status after session_start already flushed still emits session_end', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(byType(world.sentRows(), 'STATE_DELTA').map(r => json(r.content))).toEqual([{ session_start: true }])
+  // session.start fires again (writer takeover), resetting counters on the new writer.
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  const allRows = [...world.sentRows(), ...deadLetterRows(world)]
+  const ends = byType(allRows, 'STATE_DELTA').filter(r => json(r.content).session_end === true)
+  expect(ends.length).toBe(1)
+})
+
+test('an in-flight subagent model step and tool call started before SubagentStart pick up agent_type and clear unidentified_loop on completion', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.turn.start({ turnId: 'main-turn', text: 'delegate' })
+  world.steps.push({
+    chunks: [{ kind: 'text', index: 0, text: 'found' }],
+    result: { answer: 'found', toolUses: [{ name: 'Grep', input: { pattern: 'foo' } }], stopReason: 'end_turn', usage: USAGE },
+  })
+  let releaseTool = (): void => undefined
+  const toolWait = new Promise<void>(resolve => {
+    releaseTool = resolve
+  })
+  world.toolReply = async () => {
+    await toolWait
+    return { result: 'ok', text: 'ok' }
+  }
+  const stream = $.turn.step({ turnId: 'sub-turn-late', index: 0, model: 'claude-haiku-4-5', messageCount: 1, agentId: 'sub-loop-late' })
+  // First next() starts the step (emits LLM_REQUEST) and yields chunk 0 while keeping the step in flight:
+  await stream.next()
+  const toolPromise = $.tool.call({ tool: 'Grep', pattern: 'foo', agentId: 'sub-loop-late', tool_use_id: 'toolu_late_1' })
+  await world.clock.settle()
+  // Now SubagentStart arrives while both the step and the tool call are in flight:
+  await $.classic.SubagentStart({ agent_id: 'sub-loop-late', agent_type: 'Explore' })
+  releaseTool()
+  await Promise.all([stream.next(), toolPromise])
+  await $.turn.complete({ turnId: 'sub-turn-late', agentId: 'sub-loop-late', answer: 'done', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+  const rows = world.sentRows()
+  const req = byType(rows, 'LLM_REQUEST').find(r => json(r.attributes).agent_id === 'sub-loop-late')
+  const res = byType(rows, 'LLM_RESPONSE').find(r => json(r.attributes).agent_id === 'sub-loop-late')
+  const toolStart = byType(rows, 'TOOL_STARTING').find(r => json(r.attributes).agent_id === 'sub-loop-late')
+  const toolDone = byType(rows, 'TOOL_COMPLETED').find(r => json(r.attributes).agent_id === 'sub-loop-late')
+  const agentDone = byType(rows, 'AGENT_COMPLETED').find(r => json(r.attributes).agent_id === 'sub-loop-late')
+  expect([req?.agent, json(req?.attributes ?? null).unidentified_loop]).toEqual(['unidentified_loop', true])
+  expect([toolStart?.agent, json(toolStart?.attributes ?? null).unidentified_loop]).toEqual(['unidentified_loop', true])
+  expect([res?.agent, json(res?.attributes ?? null).unidentified_loop]).toEqual(['Explore', undefined])
+  expect([toolDone?.agent, json(toolDone?.attributes ?? null).unidentified_loop]).toEqual(['Explore', undefined])
+  expect([agentDone?.agent, json(agentDone?.attributes ?? null).unidentified_loop]).toEqual(['Explore', undefined])
+})
+
 test('the offline test shim rejects a session.end handler that returns no { sessionId }', { options: OPTIONS }, async ($, on) => {
   setUp(on)
   on('session.end', async (_$, _e, _next) => ({}) as never)

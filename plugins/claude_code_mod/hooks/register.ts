@@ -785,13 +785,29 @@ function closeWelcome($: EngineInterface, landedOnly = false): void {
 async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary> {
   if (config.deadLetterDir === '') return { error: 'no dead-letter directory configured' }
   const dir = deadLetterPartition(config)
-  const summary = { dir, files: 0, bytes: 0, byKind: {} as Record<string, number>, oversized: [] as string[], elsewhere: 0, retiredFiles: 0 }
+  const summary = {
+    dir,
+    files: 0,
+    bytes: 0,
+    byKind: {} as Record<string, number>,
+    oversized: [] as string[],
+    elsewhere: 0,
+    emptyFiles: 0,
+    recordFiles: 0,
+    retiredFiles: 0,
+  }
   try {
     if (!(await $.fs.exists(config.deadLetterDir))) return summary
     if (await $.fs.exists(dir)) {
       for (const entry of await $.fs.list(dir)) {
         const kind = kindOf(entry.name)
-        if (entry.kind === 'file' && (entry.name.startsWith('outcome-') || (kind !== null && entry.size === 0))) {
+        if (entry.kind === 'file' && entry.name.startsWith('outcome-')) {
+          summary.recordFiles += 1
+          summary.retiredFiles += 1
+          continue
+        }
+        if (entry.kind === 'file' && kind !== null && entry.size === 0) {
+          summary.emptyFiles += 1
           summary.retiredFiles += 1
           continue
         }
@@ -839,6 +855,7 @@ export const register: Register = (on, registered) => {
     try {
       config = resolveConfig(options, await readEnv($))
       clockAfter = (ms, fn) => $.clock.after(ms, fn)
+      let autoBackfillStarted = false
       const io: Io = {
         now: () => Date.now(),
         after: (ms, fn) => $.clock.after(ms, fn),
@@ -871,6 +888,10 @@ export const register: Register = (on, registered) => {
         // Where setup.sh is, for the fix when BigQuery cannot find the dataset.
         pluginRoot: $.plugin.root,
         sent: (rows, to) => {
+          if (rows > 0 && !e.isInteractive && !autoBackfillStarted && config.autoBackfill && canDeliver(config) && !config.dryRun) {
+            autoBackfillStarted = true
+            void own.backfill(['spill', 'retry'], 'auto')
+          }
           const key = destinationKey(to)
           if (key === null || rows <= 0) return
           const id = countKey(ownerOf(start), key)
@@ -893,6 +914,10 @@ export const register: Register = (on, registered) => {
       tracer.setSession({ sessionId, cwd: e.cwd, engineVersion: version?.version ?? null })
       flushTimer?.cancel()
       flushTimer = $.clock.every(config.flushIntervalMs, () => {
+        if (ranModCommand && !tracer.hasActivity && writer !== null && writer.hasOnlyUnsentSessionStart(tracer.sessionId)) {
+          saveClose($)
+          return
+        }
         void writer?.flush()
         saveClose($)
       })
@@ -902,6 +927,8 @@ export const register: Register = (on, registered) => {
         $.clock.after(0, () => writer?.prefetchToken())
         if (config.autoBackfill) {
           $.clock.after(15_000, () => {
+            if (autoBackfillStarted) return
+            autoBackfillStarted = true
             void writer?.backfill(['spill', 'retry'], 'auto')
           })
         }
@@ -1013,15 +1040,7 @@ export const register: Register = (on, registered) => {
     const current = writer
     if (current === null || e.props.hasSurvey) return theirs
     if (current.problem === null) {
-      // The card as the session's state has it: this read redraws the band
-      // whenever any load changes it.
-      let shown: Welcome | null = null
-      try {
-        shown = (await $.state.get(WELCOME_STATE)).value ?? null
-      } catch {
-        shown = null
-      }
-      if (shown === null || shown.version !== PLUGIN_VERSION || shown.sessionId !== tracer.sessionId) {
+      const withTargetWarning = () => {
         if (configured && config.enabled && !config.dryRun && (!config.project || !config.dataset)) {
           const { Box, Text } = $.ui.resolve(e)
           const line = Box({
@@ -1036,9 +1055,20 @@ export const register: Register = (on, registered) => {
         }
         return theirs
       }
-      if (shown.closed) return theirs
+      // The card as the session's state has it: this read redraws the band
+      // whenever any load changes it.
+      let shown: Welcome | null = null
+      try {
+        shown = (await $.state.get(WELCOME_STATE)).value ?? null
+      } catch {
+        shown = null
+      }
+      if (shown === null || shown.version !== PLUGIN_VERSION || shown.sessionId !== tracer.sessionId) {
+        return withTargetWarning()
+      }
+      if (shown.closed) return withTargetWarning()
       const id = cardId(shown.version, shown.sessionId)
-      if (id === closedCard || id !== cardReady) return theirs
+      if (id === closedCard || id !== cardReady) return withTargetWarning()
       // A close another load wrote late hides it at a later draw.
       const { version, sessionId } = shown
       if (sessionId !== null) safely(() => checkClosed($, version, sessionId))

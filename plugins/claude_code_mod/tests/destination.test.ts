@@ -527,3 +527,16 @@ test('when project or dataset is unset, /bqaa-setup prints a template command, /
   const shown = await band($)
   expect(shown.line).toBe('rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-setup.')
 })
+
+test('dismissing the welcome card via Got it when project or dataset is unset immediately shows the target not set warning in AbovePrompt', { options: {} }, async ($, on) => {
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.settle()
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...BAND })
+  const gotIt = await ui.find({ type: 'Button', key: 'bqaa-welcome-close' })
+  expect(gotIt).toBeDefined()
+  await ui.press({ key: 'bqaa-welcome-close' })
+  const line = (await ui.find({ type: 'Text', text: /^rows are not being written/ }))?.text
+  await ui.unmount()
+  expect(line).toBe('rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-setup.')
+})

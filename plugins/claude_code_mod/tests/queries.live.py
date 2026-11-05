@@ -144,6 +144,25 @@ FIXTURE = [
         attributes={"agent_id": "afork1", "unidentified_loop": True,
                     "denied": True, "permission_decision": "reject", "permission_decision_source": "hook"},
         latency={"total_ms": 0}, status="ERROR"),
+    # A loop inside turn I1 the mod saw no start for (an engine fork during
+    # the turn, as for compaction or memory): its rows carry I1's
+    # invocation_id and trace, so only the unidentified_loop filter keeps
+    # them out of V2 and sample 5. Its tool call has a nonzero duration and
+    # asked for permission, as a real fork's would.
+    row("g01", D1 + "06Z", "AGENT_STARTING", "S1", **I1, agent="unidentified_loop",
+        attributes={"agent_id": "afork2", "unidentified_loop": True}),
+    row("g02", D1 + "06Z", "TOOL_STARTING", "S1", **I1, agent="unidentified_loop",
+        content={"tool": "Bash"},
+        attributes={"agent_id": "afork2", "unidentified_loop": True}),
+    row("g03", D1 + "07Z", "TOOL_COMPLETED", "S1", **I1, agent="unidentified_loop",
+        content={"tool": "Bash", "tool_origin": "builtin"},
+        attributes={"agent_id": "afork2", "unidentified_loop": True,
+                    "permission_requested": True, "permission_decision": "reject",
+                    "permission_decision_source": "hook"},
+        latency={"total_ms": 300}, status="ERROR"),
+    row("g04", D1 + "07Z", "AGENT_COMPLETED", "S1", **I1, agent="unidentified_loop",
+        attributes={"agent_id": "afork2", "unidentified_loop": True},
+        latency={"total_ms": 300}),
     # S2: bob, day 2: a rejected prompt, a hook's denial, a subagent run, a
     # failed model request and a failed turn.
     row("e12", D2 + "00Z", "USER_MESSAGE_RECEIVED", "S2", user="bob", invocation="I2"),
@@ -503,6 +522,19 @@ def checks(name: str, rows: list[dict]):
         yield "each day's refusal kinds add up to its refused calls (5 distinct refused calls on day 2)", all(r["rejected_at_prompt"] + r["denied_by_hook"] + r["denied_by_rule"] + r["refused_other"] == r["refused_tool_calls"] for r in rows) and d["2026-10-20"]["refused_tool_calls"] == len({x["event_id"] for x in FIXTURE if x["event_type"] == "TOOL_COMPLETED" and x["timestamp"].startswith("2026-10-20") and x["attributes"].get("writer") == MOD_WRITER and not x["attributes"].get("unidentified_loop") and (x["attributes"].get("permission_decision") == "reject" or x["attributes"].get("denied"))})
     elif name == "V7":
         p = by(rows, "producer", "agent")
+        yield "the complete set of (producer, agent) groups excludes the in-turn unidentified_loop", set(p) == {
+            ("bigquery-agent-analytics-mod", "coding-agent"),
+            ("bigquery-agent-analytics-mod", "general-purpose"),
+            ("adk (no writer)", "adk-agent"),
+            ("adk (no writer)", "adk-legacy"),
+            ("adk (no writer)", "adk-fanout"),
+            ("adk (no writer)", "adk-fanout-legacy"),
+            ("adk (no writer)", "adk-shared-interleaved"),
+            ("adk (no writer)", "adk-workers-interleaved"),
+            ("adk (no writer)", "adk-staggered"),
+            ("adk (no writer)", "adk-staggered-three"),
+            ("adk (no writer)", "adk-later-error"),
+        } and ("bigquery-agent-analytics-mod", "unidentified_loop") not in p
         mod = p[("bigquery-agent-analytics-mod", "coding-agent")]
         yield "the mod (main loop): 3 sessions, 5 model requests, 465 tokens, 34.8% rows in error", (mod["sessions"], mod["model_requests"], mod["tokens"], mod["error_row_pct"]) == (3, 5, 465, 34.8)
         yield "the mod's subagent: 1 request, 50 tokens; unidentified loops left out", (p[("bigquery-agent-analytics-mod", "general-purpose")]["model_requests"], p[("bigquery-agent-analytics-mod", "general-purpose")]["tokens"]) == (1, 50) and ("bigquery-agent-analytics-mod", "unidentified_loop") not in p
@@ -553,7 +585,7 @@ def checks(name: str, rows: list[dict]):
         legacy = p[("adk (no writer)", "adk-legacy")]
         yield "from just after the first call's request: that call is still one, matched from before the window: 2 model requests, 150 tokens, 25.0% of the 4 rows inside", (legacy["model_requests"], legacy["model_requests_unmatched"], legacy["tokens"], legacy["error_row_pct"]) == (2, 0, 150, 25.0)
     elif name == "1":
-        yield "the mod's rows, each once: 29", len(rows) == 29
+        yield "the mod's rows, each once: 33", len(rows) == 33
     elif name == "2":
         c = by(rows, "session_id", "model")
         yield "S1 model-a: 2 requests, 25 output tokens, cache-read share 0.294", (c[("S1", "model-a")]["model_requests"], c[("S1", "model-a")]["output_tokens"], c[("S1", "model-a")]["cache_read_share"]) == (2, 25, 0.294)
@@ -576,15 +608,15 @@ def checks(name: str, rows: list[dict]):
         t = by(rows, "invocation_id")
         yield "I9: prompt keeps only the user message and ignores task-notification", "I9" in t and t["I9"]["prompt"] == "run the suite" and t["I9b"]["prompt"] is None
     elif name == "6":
-        yield "trace-1: 10 rows, each once", len(rows) == 10
+        yield "trace-1: 14 rows, each once", len(rows) == 14
         bash = [r for r in rows if r["event_type"] == "TOOL_COMPLETED" and r["detail"] == "Bash"]
-        yield "the Bash call hangs under its model request", len(bash) == 1 and bash[0]["parent_event_type"] == "LLM_REQUEST"
+        yield "the main loop's Bash call hangs under its model request; the fork's has no parent", len(bash) == 2 and any(b["parent_event_type"] == "LLM_REQUEST" for b in bash) and any(b["parent_event_type"] is None for b in bash)
     elif name == "7":
         a = by(rows, "subagent_type")
         yield "general-purpose: 1 run, 2.0 s, 50 tokens", set(a) == {"general-purpose"} and (a["general-purpose"]["runs"], a["general-purpose"]["avg_seconds"], a["general-purpose"]["total_tokens"]) == (1, 2.0, 50)
     elif name == "8":
         d = by(rows, "day")
-        yield "day 1: 1 session, 14 rows (the replay once, the fork's 3 rows), 2 errors", (d["2026-10-19"]["sessions"], d["2026-10-19"]["rows_written"], d["2026-10-19"]["error_rows"]) == (1, 14, 2)
+        yield "day 1: 1 session, 18 rows (the replay once, both forks' rows), 3 errors", (d["2026-10-19"]["sessions"], d["2026-10-19"]["rows_written"], d["2026-10-19"]["error_rows"]) == (1, 18, 3)
         yield "day 2: 2 sessions, 15 rows, 7 errors", (d["2026-10-20"]["sessions"], d["2026-10-20"]["rows_written"], d["2026-10-20"]["error_rows"]) == (2, 15, 7)
 
 

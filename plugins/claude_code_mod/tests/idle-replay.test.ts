@@ -79,7 +79,7 @@ const idsOf = (body: string): string[] => (JSON.parse(body) as { rows: { json: {
 
 // Until no row is queued and the rows are parked: a session left idle.
 async function leaveIdle($: Engine, world: World): Promise<void> {
-  for (let t = 0; t < 30 && !(/queue: 0 rows/.test(await statusText($)) && deadLetterRows(world).length > 0); t += 1) await world.clock.advance(5000)
+  for (let t = 0; t < 30 && !(deadLetterRows(world).length > 0 && /queue: 0 rows/.test(await statusText($))); t += 1) await world.clock.advance(5000)
 }
 
 async function idleFor(world: World, minutes: number): Promise<void> {
@@ -3372,4 +3372,102 @@ test('another writer\'s mark cut off part-way, with no outcome recorded, is take
   }
   await w.writer('a-session').backfill(['spill', 'retry', 'rejected'], 'force')
   expect([w.sentOf(a), w.files.get(source)]).toEqual([1, ''])
+})
+
+test('a non-interactive (-p) session ending at 3s (< 15s) replays an earlier session\'s spill file right after its first send', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const [spilled1, spilled2] = ['1'.repeat(32), '2'.repeat(32)]
+  const spilled = packFiles([line(spilled1, 'spill'), line(spilled2, 'spill')])[0] as string
+  world.files.set(`${PARTITION_DIR}/spill-1700000000000-aa.jsonl`, spilled)
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: 'p-session', cwd: '/work/my-repo' })
+  await $.turn.start({ turnId: 'p-turn', text: 'one-shot' })
+  await $.turn.complete({ turnId: 'p-turn', answer: 'done', durationMs: 100, isAborted: false, reason: 'answer' })
+  // Session lasts only 3s (< 15s); flush happens or bqaa-flush sends first batch.
+  await world.clock.advance(3000)
+  await $.command.run({ command: 'bqaa-flush', args: '', ...COMMAND })
+  await world.clock.settle()
+  await $.session.end({ reason: 'other', sessionId: 'p-session', resume: { id: 'p-session' } })
+  const ids = world.acceptedRows().map(r => r.event_id)
+  expect(ids).toContain(spilled1)
+  expect(ids).toContain(spilled2)
+  expect(world.files.get(`${PARTITION_DIR}/spill-1700000000000-aa.jsonl`)).toBe('')
+})
+
+test('adopt adds inherited queued rows to captured so sent - replayed never exceeds captured, and an empty auto-backfill preserves a previous non-empty backfillReport', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const [a, b, c] = ['a'.repeat(32), 'b'.repeat(32), 'c'.repeat(32)]
+  const source = `/dl/${TABLE_REF}/spill-20261013T200102003Z-earlier-1.jsonl`
+  w.files.set(source, packFiles([line(a, 'spill')])[0] as string)
+  const before = w.writer('a-session')
+  before.enqueue((JSON.parse(line(b, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  const after = w.writer('a-session')
+  after.enqueue((JSON.parse(line(c, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  after.adopt(before)
+  await after.flush()
+  const snap1 = after.snapshot()
+  expect(snap1.counters.captured).toBe(2)
+  expect(snap1.counters.sent - snap1.counters.replayed).toBe(2)
+  // First backfill replays 1 file (1 row); second auto-backfill finds nothing to do.
+  const firstReport = await after.backfill(['spill', 'retry'], 'command')
+  expect([firstReport.files, firstReport.rowsSent]).toEqual([1, 1])
+  const emptyAutoReport = await after.backfill(['spill', 'retry'], 'auto')
+  expect([emptyAutoReport.files, emptyAutoReport.rowsSent]).toEqual([0, 0])
+  expect(after.backfillReport).toMatchObject({ trigger: 'command', files: 1, rowsSent: 1 })
+})
+
+test('a replay interrupted by session.end while waiting for its sending mark, before a 401 retry, or after an earlier chunk landed sends no post after closing and lets the next session replay each row once', async () => {
+  // Case 1: waiting for sending mark when spillForExit begins
+  {
+    const w = twoWriters(() => OK_INSERT)
+    const a = 'a'.repeat(32)
+    const source = `/dl/${TABLE_REF}/spill-20261013T200102003Z-earlier-1.jsonl`
+    w.files.set(source, packFiles([line(a, 'spill')])[0] as string)
+    let releaseMark = (): void => undefined
+    let atMark = (): void => undefined
+    const markReached = new Promise<void>(resolve => (atMark = resolve))
+    const markGate = new Promise<void>(resolve => (releaseMark = resolve))
+    w.holdWrites((_session, path) => {
+      if (!path.includes('/outcome-sending-')) return undefined
+      w.holdWrites(null)
+      atMark()
+      return markGate
+    })
+    const first = w.writer('first-session')
+    const replaying = first.backfill(['spill', 'retry'], 'auto')
+    await markReached
+    await first.spillForExit(800)
+    releaseMark()
+    await replaying
+    expect(w.sentOf(a)).toBe(0)
+    await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+    expect([w.sentOf(a), w.files.get(source)]).toEqual([1, ''])
+  }
+  // Case 2: after an earlier chunk already landed when spillForExit begins
+  {
+    const w = twoWriters(() => OK_INSERT)
+    const [a, b] = ['a'.repeat(32), 'b'.repeat(32)]
+    const source = `/dl/${TABLE_REF}/spill-20261013T200102003Z-earlier-1.jsonl`
+    w.files.set(source, packFiles([line(a, 'spill'), line(b, 'spill')])[0] as string)
+    const oneRowBatch = { ...w.config, maxBatchRows: 1 }
+    const first = w.writer('first-session', oneRowBatch)
+    let releaseChunk1 = (): void => undefined
+    let atChunk1 = (): void => undefined
+    const chunk1Reached = new Promise<void>(resolve => (atChunk1 = resolve))
+    const chunk1Gate = new Promise<void>(resolve => (releaseChunk1 = resolve))
+    w.hold(() => {
+      w.hold(null)
+      atChunk1()
+      return chunk1Gate
+    })
+    const replaying = first.backfill(['spill', 'retry'], 'command')
+    await chunk1Reached
+    // Begin exit while chunk 1's response is about to settle, so chunk 2 sees closing=true before its post.
+    const exiting = first.spillForExit(800)
+    releaseChunk1()
+    await Promise.all([replaying, exiting])
+    expect([w.sentOf(a), w.sentOf(b)]).toEqual([1, 0])
+    await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+    expect([w.sentOf(a), w.sentOf(b)]).toEqual([1, 1])
+  }
 })

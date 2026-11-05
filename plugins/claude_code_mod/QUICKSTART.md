@@ -41,10 +41,17 @@ The installer may print `11 userConfig options not yet set — ...`; that's fine
 
 ### 4. Create the BigQuery dataset and table
 
-The installed mod includes `setup.sh` and `scripts/`, so you do not need to clone the repository. Print the ready-to-run `setup.sh` command for your installed copy with `/bqaa-setup` (or `/bqaa-status`), then run the printed `BQAA_PROJECT_ID=... setup.sh` command in your shell:
+The installed mod includes `setup.sh` and `scripts/`, so you do not need to clone the repository. Print the ready-to-run `setup.sh` command for your installed copy with `/bqaa-setup` (added in `0.1.1`; in `0.1.0+` `/bqaa-status` prints the same command), then run the printed `BQAA_PROJECT_ID=... setup.sh` command in your shell:
 
 ```bash
 claude -p /bqaa-setup < /dev/null
+```
+
+If `/bqaa-setup` is unavailable (e.g. running `0.1.0`), use `/bqaa-status` instead, or run `setup.sh` directly from the installed mod cache:
+
+```bash
+BQAA_PROJECT_ID=YOUR_PROJECT BQAA_DATASET=agent_analytics \
+  ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/setup.sh
 ```
 
 *(Optional: if you prefer to run `setup.sh` or `scripts/` from a local checkout, run `git clone --depth 1 --filter=blob:none --sparse https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins && git -C BigQuery-Agent-Analytics-Plugins sparse-checkout set plugins/claude_code_mod`.)*

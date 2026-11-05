@@ -498,6 +498,9 @@ export class Writer {
   // path: how long a write may still be under way where the listing gives no
   // time (`writtenSince`).
   private seenSince = new Map<string, number>()
+  // Sessions for which at least one row has already been sent, written in a
+  // dry run, or parked to a dead-letter file (shared across writer takeovers).
+  private sentSessions = new Set<string>()
   // Problem kinds already announced with a toast and a transcript line.
   private announced = new Set<ProblemKind>()
   // Where the last token came from: the fix differs.
@@ -543,11 +546,15 @@ export class Writer {
   // writer's paced replays going. Every writer that takes over shares them.
   adopt(previous: Writer): void {
     const c = this.config()
+    const inherited = previous.queue.length
     // Any rows this writer queued already are newer: they go behind, under
     // this writer's bounds.
     previous.queue.limit(c.maxQueueRows, c.maxQueueBytes)
     previous.queue.append(this.queue.takeAll())
     this.queue = previous.queue
+    this.counters.captured += inherited
+    for (const s of previous.sentSessions) this.sentSessions.add(s)
+    previous.sentSessions = this.sentSessions
     // The status line too (session.start clears it after the takeover,
     // `clearStatus`): a line the writer before sets late is then one this
     // writer's next landing clears.
@@ -644,6 +651,7 @@ export class Writer {
         this.batchOpen = false
       }
       if (!delivered) {
+        if (this.closing) return
         // Backing off now: keep the queue from filling while we wait.
         await this.relievePressure()
         return
@@ -662,6 +670,10 @@ export class Writer {
     }
     // This process's rows carry the account of the token they go out with.
     await this.stampFor(batch, token, c)
+    if (this.closing) {
+      this.queue.unshift(batch)
+      return false
+    }
     let body = insertAllBody(batch.map(q => q.row))
     let answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
     if ('error' in answer) {
@@ -681,6 +693,10 @@ export class Writer {
       }
       // The fresh token can be another account's: the rows go out under it.
       await this.stampFor(batch, token, c)
+      if (this.closing) {
+        this.queue.unshift(batch)
+        return false
+      }
       body = insertAllBody(batch.map(q => q.row))
       answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
       if ('error' in answer) {
@@ -692,11 +708,13 @@ export class Writer {
     }
     switch (outcome.kind) {
       case 'ok':
+        this.noteSessions(batch)
         this.succeeded(batch.length, c)
         return true
       case 'partial': {
         const rejected: Queued[] = []
         const retry: Queued[] = []
+        const landed: Queued[] = []
         const reasons: string[] = []
         batch.forEach((q, i) => {
           const reason = outcome.rejected.get(i)
@@ -704,7 +722,9 @@ export class Writer {
             rejected.push(q)
             reasons.push(reason)
           } else if (outcome.retry.has(i)) retry.push(q)
+          else landed.push(q)
         })
+        this.noteSessions(landed)
         this.succeeded(batch.length - rejected.length - retry.length, c)
         // Every row handed on before either write is waited for: the refused
         // to their file, those asked for again back to the queue.
@@ -1189,6 +1209,12 @@ export class Writer {
     return false
   }
 
+  private noteSessions(rows: readonly Queued[]): void {
+    for (const q of rows) {
+      if (typeof q.row.session_id === 'string' && q.row.session_id !== '') this.sentSessions.add(q.row.session_id)
+    }
+  }
+
   // Dry run: the rows as JSONL files beside the dead-letter directory, each
   // file within the file limit in bytes.
   private async writeDryRunFiles(rows: readonly Queued[], c: Config): Promise<void> {
@@ -1196,6 +1222,7 @@ export class Writer {
       const name = fileName('spill', this.io.now(), this.sessionId(), ++this.seq, this.mark).replace(/^spill-/, 'dry-run-')
       await this.io.writeFile(joinPath(c.dryRunDir, name), text)
     }
+    this.noteSessions(rows)
   }
 
   private async writeDryRun(batch: Queued[], c: Config): Promise<boolean> {
@@ -1238,7 +1265,8 @@ export class Writer {
     let lost = 0
     for (const body of packBodies(lines.map(lineText))) {
       const count = body.split('\n').length - 1
-      const ids = rows.slice(first, first + count).map(q => q.row.event_id)
+      const slice = rows.slice(first, first + count)
+      const ids = slice.map(q => q.row.event_id)
       first += count
       const path = joinPath(dir, fileName(kind, at, this.sessionId(), ++this.seq, this.mark))
       try {
@@ -1246,6 +1274,7 @@ export class Writer {
         // The completion record goes last: a replay reads the file only once
         // the record is there and matches every row above it.
         await this.io.writeFile(path, sealFile(body))
+        this.noteSessions(slice)
         this.counters.deadLetterFiles += 1
         if (kind !== 'rejected') {
           this.parked.recoverable = true
@@ -1265,15 +1294,33 @@ export class Writer {
 
   // ---- session end -------------------------------------------------------
 
+  // True when `sessionId` has not sent, dry-run-written or parked any row yet,
+  // and the queue holds only its `session_start` row(s).
+  hasOnlyUnsentSessionStart(sessionId: string | null): boolean {
+    if (sessionId === null || this.sentSessions.has(sessionId) || this.queue.length === 0) return false
+    const items = this.queue.takeAll()
+    this.queue.append(items)
+    return items.every(q => q.row.session_id === sessionId && q.row.event_type === 'STATE_DELTA' && q.row.content === '{"session_start":true}')
+  }
+
   // Drops a single unsent `session_start` row for `sessionId` when the session
   // ran only mod slash commands and has not sent or in-flight-flushed any row
   // for this session yet. Returns true when the session can end silently.
   dropUnsentSessionStart(sessionId: string | null): boolean {
-    if (sessionId === null) return false
+    if (sessionId === null || this.sentSessions.has(sessionId)) return false
     const writers = [...this.before, this]
     if (writers.some(w => w.inFlightRows.some(q => q.row.session_id === sessionId))) return false
-    if (this.counters.sent - this.counters.replayed > 0) return false
     const items = this.queue.takeAll()
+    if (
+      items.some(
+        item =>
+          item.row.session_id === sessionId &&
+          !(item.row.event_type === 'STATE_DELTA' && item.row.content === '{"session_start":true}'),
+      )
+    ) {
+      this.queue.append(items)
+      return false
+    }
     const kept: Queued[] = []
     let removed = 0
     for (const item of items) {
@@ -1285,7 +1332,7 @@ export class Writer {
     }
     this.queue.append(kept)
     this.counters.captured = Math.max(0, this.counters.captured - removed)
-    return true
+    return removed > 0
   }
 
   // Called from session.end when the process is ending, inside the engine's
@@ -1408,7 +1455,21 @@ export class Writer {
     const tally: ReplayTally = { waiting: 0, requests: 0 }
     const finish = (): BackfillReport => {
       report.finishedAt = this.io.now()
-      this.backfillReport = report
+      const emptyAuto =
+        trigger === 'auto' &&
+        report.files === 0 &&
+        report.rowsSent === 0 &&
+        report.rowsLeft === 0 &&
+        report.rowsRefused === 0 &&
+        report.skippedFiles === 0 &&
+        report.incompleteFiles.length === 0 &&
+        report.oversizedFiles.length === 0 &&
+        report.held === null &&
+        report.error === null
+      const hasPrevious =
+        this.backfillReport !== null &&
+        (this.backfillReport.files > 0 || this.backfillReport.rowsSent > 0 || this.backfillReport.error !== null)
+      if (!emptyAuto || !hasPrevious) this.backfillReport = report
       return report
     }
     if (!canDeliver(c) || c.dryRun) {
@@ -1684,11 +1745,11 @@ export class Writer {
     return now
   }
 
-  // A replay that runs by itself stops between requests, once it has sent
-  // one, for rows queued meanwhile (the flush it holds sends them first) or
-  // for the session ending. What it did not send stays due.
+  // A replay stops once the session is ending, and a recovery replay stops
+  // between requests once it has sent one when rows are queued meanwhile (the
+  // flush it holds sends them first). What it did not send stays due.
   private replayStops(trigger: BackfillReport['trigger'], tally: ReplayTally): boolean {
-    return trigger === 'recovery' && (this.closing || (tally.requests > 0 && this.queue.length > 0))
+    return this.closing || (trigger === 'recovery' && tally.requests > 0 && this.queue.length > 0)
   }
 
   // Rows one replay request had refused: on the status line, and among the
@@ -2182,10 +2243,12 @@ export class Writer {
         report.error = diagnostic(`authentication: ${messageOf(err)}`)
         continue
       }
+      if (this.closing) break
       if (!marked) {
         if (!(await this.markSending(path, source, trigger, report))) break
         marked = true
       }
+      if (this.closing) break
       const body = insertAllBody(chunk.map(l => l.row))
       tally.requests += 1
       let answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
@@ -2205,6 +2268,7 @@ export class Writer {
           report.error = diagnostic(`authentication: ${messageOf(err)}`)
           continue
         }
+        if (this.closing) break
         tally.requests += 1
         answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
         if ('error' in answer) {

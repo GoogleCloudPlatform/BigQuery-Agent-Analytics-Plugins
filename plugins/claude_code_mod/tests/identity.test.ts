@@ -348,7 +348,8 @@ test('a token that expires and cannot be refreshed takes its account with it: ro
   // Another account's credential replays them: they keep the user_id they
   // were parked with.
   printed = SECOND_TOKEN
-  await writer.backfill(['retry', 'spill'], 'command')
+  const replayWriter = new Writer(io, () => config, () => 'replay-session')
+  await replayWriter.backfill(['retry', 'spill'], 'command')
   expect(sent.slice(1)).toEqual([
     { credential: 'second', users: ['configured-user'] },
     { credential: 'second', users: ['configured-user'] },

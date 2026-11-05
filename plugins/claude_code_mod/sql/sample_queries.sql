@@ -35,7 +35,10 @@ WHERE timestamp BETWEEN @start AND @end
   AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
 QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1;
 
--- 2. Tokens per session and model, with the prompt-cache share.
+-- 2. Tokens per session and model, with the prompt-cache share. Includes
+--    all rows (unidentified_loop rows are kept here; they are left out of
+--    queries 4, 5 and 7 and V1, V2, V5, V6 and V7 that count turns, tools
+--    and agents).
 WITH responses AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
@@ -64,6 +67,7 @@ GROUP BY session_id, model
 ORDER BY output_tokens DESC;
 
 -- 3. Model request latency by model: total and time to first token.
+--    Includes all rows (unidentified_loop rows are kept here).
 WITH responses AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
@@ -131,12 +135,16 @@ ORDER BY failures DESC, calls DESC;
 -- 5. One line per turn: the prompt (excluding host-injected
 --    task-notification messages), how long it took, how many model
 --    requests and tool calls it made, its tokens (including subagents' and
---    responses_without_usage) and how it ended.
+--    responses_without_usage) and how it ended. Rows of a loop the mod saw
+--    no start for (unidentified_loop, such as the host's own fork that
+--    proposes the next prompt) are left out; an engine fork inside a turn
+--    would add to both model_requests and tool_calls.
 WITH events AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN @start AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 )
 SELECT
@@ -196,12 +204,14 @@ QUALIFY child.event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY child.event_id
 ORDER BY child.timestamp;
 
 -- 7. Subagents: how often each type ran, for how long, and what it cost.
+--    Rows of a loop the mod saw no start for (unidentified_loop) are left out.
 WITH agents AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE event_type IN ('AGENT_COMPLETED', 'AGENT_ERROR')
     AND timestamp BETWEEN @start AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 )
 SELECT

@@ -221,7 +221,11 @@ test('not set up: the card says what to set, stays after a prompt, and Got it cl
   expect((await band($)).texts).toEqual([...card, 'drawn beneath'])
   const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...BAND })
   await ui.press({ key: CLOSE })
-  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['drawn beneath'])
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([
+    '⚠ BQAA: ',
+    'rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-setup.',
+    'drawn beneath',
+  ])
   await ui.unmount()
   await world.clock.settle()
   expect(closedMark(world)).toBe(true)
