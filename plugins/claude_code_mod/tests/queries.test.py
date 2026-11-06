@@ -221,6 +221,10 @@ for filename, qmap in (('value_queries.sql', value_qs), ('sample_queries.sql', s
         if name == 'V4':
             sql = re.sub(r'-- rates: begin.*?-- rates: end', live.RATES, sql, flags=re.S)
         runs.append((f'{filename} {name}', name, sql, live.START, live.END))
+        if name == 'V1':
+            runs.append((f'{filename} V1 notifications', 'V1 notifications', sql, '2026-10-22', '2026-10-22'))
+        if name == '5':
+            runs.append((f'{filename} 5 notifications', '5 notifications', sql, '2026-10-22', '2026-10-22'))
         if name == 'V7':
             runs.append((f'{filename} V7 clipped', 'V7 clipped', sql, '2026-10-20T15:00:01Z', live.END))
             runs.append((f'{filename} V7 later finals only', 'V7 later finals only', sql, '2026-10-20T19:00:05Z', '2026-10-20T19:00:08Z'))

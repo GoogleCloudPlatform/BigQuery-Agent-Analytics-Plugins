@@ -65,8 +65,8 @@ declare module 'claude-code' {
 
   export interface SessionEndInput {
     reason: 'clear' | 'resume' | 'fork' | 'prompt_input_exit' | 'exit' | 'other' | string
-    sessionId?: string
-    resume?: { id: string }
+    sessionId: string
+    resume: { id: string }
   }
 
   export interface ClassicSessionStartInput {

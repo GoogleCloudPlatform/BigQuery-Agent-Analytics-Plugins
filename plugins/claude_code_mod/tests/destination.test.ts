@@ -22,7 +22,7 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
-import { resolveConfig } from '../hooks/lib/config.ts'
+import { PLUGIN_VERSION, resolveConfig } from '../hooks/lib/config.ts'
 import { parseFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
@@ -91,7 +91,7 @@ test('a dataset BigQuery cannot find is a notice with the setup.sh command, not 
   expect(shown.waiting).toBe(' 3 row(s) waiting.')
   expect(shown.beneath).toBe(true)
   expect(world.toasts).toEqual([`BQAA: ${LINE}`])
-  expect(world.statusLines.at(-1)).toBe(`BQAA: ${HEADLINE}. To fix, ${FIX} (3 row(s) waiting)`)
+  expect(world.statusLines.at(-1)).toBeUndefined()
   const [notice = ''] = noticeLines(world)
   expect(notice).toContain(`${HEADLINE} (HTTP 404: Not found: Dataset my-gcp-project:agent_analytics). To fix, ${FIX}. Run: BQAA_PROJECT_ID=my-gcp-project `)
   expect(notice.endsWith("/setup.sh'; this clears once rows are written again.")).toBe(true)
@@ -200,7 +200,8 @@ test('while BigQuery cannot find the dataset, the backoff before the next retry 
 test('session.start clears the status line an earlier load pinned: the host keeps it across a reload', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [DATASET_MISSING]
-  await startSession($)
+  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: BigQuery cannot find the dataset /)
   // The mod loads again (an edit under --plugin-dir, /reload-plugins, an
@@ -408,7 +409,8 @@ test('a project the redaction mistakes for a credential name still gets the setu
   // BigQuery names the dataset project:dataset, which the redaction takes,
   // with the rest of the line, for a credential.
   world.replies = [{ status: 404, text: '{"error":{"code":404,"message":"Not found: Dataset auth-service-123:agent_analytics","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}' }]
-  await startSession($)
+  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   const command = /^bqaa: Run: BQAA_PROJECT_ID=auth-service-123 BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '\/[^']*\/setup\.sh'$/
   expect(world.transcript.filter(line => command.test(line)).length).toBe(1)
@@ -498,4 +500,43 @@ test('the status line counts every row refused since rows last landed', { option
   await $.tool.call({ tool: 'Read', file_path: 'd.ts' })
   await world.clock.advance(5000)
   expect(world.statusLines.at(-1)).toBe('BQAA: 2 row(s) refused (HTTP 400: Invalid value for the table schema); fix, then /bqaa-backfill')
+})
+
+test('/bqaa-setup prints the ready-to-run setup.sh command when configured, and a template when unconfigured', { options: OPTIONS }, async ($, on) => {
+  setUp(on)
+  await startSession($)
+  const res = await $.command.run({ command: 'bqaa-setup', args: '', ...COMMAND })
+  expect(res.text ?? '').toMatch(/no repo clone needed/)
+  expect(res.text ?? '').toMatch(/setup: BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '\/[^']*\/setup\.sh'/)
+})
+
+test('when project or dataset is unset, /bqaa-setup prints a template command, /bqaa-status omits ..agent_events, and subsequent sessions show a 1-line AbovePrompt warning', { options: {} }, async ($, on) => {
+  const world = setUp(on)
+  // Pretend the welcome card was already shown in an earlier session so this session is a subsequent session.
+  world.store.set('welcome', { version: PLUGIN_VERSION, sessionId: 'earlier-session', previous: null })
+  world.store.set(`welcome:${PLUGIN_VERSION}`, { sessionId: 'earlier-session', previous: null })
+  await startSession($)
+  await world.clock.settle()
+  const setupRes = await $.command.run({ command: 'bqaa-setup', args: '', ...COMMAND })
+  expect(setupRes.text ?? '').toContain('target not configured')
+  expect(setupRes.text ?? '').toMatch(/setup: BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics /)
+  const status = await statusText($)
+  expect(status).toContain('target not configured')
+  expect(status).not.toContain('..agent_events')
+  expect(status).not.toMatch(/^dead-letter:/m)
+  const shown = await band($)
+  expect(shown.line).toBe('rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-setup.')
+})
+
+test('dismissing the welcome card via Got it when project or dataset is unset immediately shows the target not set warning in AbovePrompt', { options: {} }, async ($, on) => {
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.settle()
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...BAND })
+  const gotIt = await ui.find({ type: 'Button', key: 'bqaa-welcome-close' })
+  expect(gotIt).toBeDefined()
+  await ui.press({ key: 'bqaa-welcome-close' })
+  const line = (await ui.find({ type: 'Text', text: /^rows are not being written/ }))?.text
+  await ui.unmount()
+  expect(line).toBe('rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-setup.')
 })

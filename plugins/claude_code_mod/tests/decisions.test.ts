@@ -20,7 +20,7 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
-import { COMMAND, OPTIONS, SESSION_ID, type ToolReply, type World, byType, deadLetterRows, json, setUp, startSession } from './helpers.ts'
+import { COMMAND, OPTIONS, SESSION_ID, type ToolReply, type World, byType, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
 
 const LOGGED_AT = '2026-10-14T05:00:00.000Z'
 
@@ -164,4 +164,45 @@ test("a subagent's call gets its decision the same way", { options: OPTIONS }, a
   await world.clock.advance(5000)
   const [row] = completed(world)
   expect(json(row?.attributes ?? null)).toMatchObject({ agent_id: 'agent-3', permission_decision: 'accept' })
+})
+
+test('when the last main-loop tool call is rejected by the user and the turn ends with an empty answer, INVOCATION_COMPLETED carries ended_on_rejection: true (even when turn.complete arrives before tool_decision)', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await otherRecord($)
+
+  // Case 1: turn.complete arrives BEFORE telemetry.log tool_decision for the rejected tool.
+  await $.turn.start({ turnId: 'turn-rej-race', text: 'delete everything' })
+  world.toolReply = () => ({ result: { is_error: true }, text: 'Rejected by user', isError: true })
+  await $.tool.call({ tool: 'Bash', command: 'rm -rf /tmp/demo', tool_use_id: 'toolu_rej_1' })
+  await $.turn.complete({ turnId: 'turn-rej-race', answer: '', durationMs: 250, isAborted: false, reason: 'answer' })
+  // Now telemetry.log arrives slightly after turn.complete.
+  await decision($, 'toolu_rej_1', 'reject', 'user_reject')
+  await world.clock.advance(5000)
+
+  const rows1 = world.sentRows().filter(r => r.invocation_id === 'turn-rej-race')
+  expect(rows1.map(r => r.event_type)).toEqual(['INVOCATION_STARTING', 'TOOL_STARTING', 'TOOL_COMPLETED', 'INVOCATION_COMPLETED'])
+  const inv1 = rows1.find(r => r.event_type === 'INVOCATION_COMPLETED')
+  expect(json(inv1?.attributes ?? null).ended_on_rejection).toBe(true)
+
+  // Case 2: user rejects a tool, but the model replies with a non-empty answer -> ended_on_rejection is omitted.
+  await $.turn.start({ turnId: 'turn-rej-answered', text: 'try again' })
+  await $.tool.call({ tool: 'Bash', command: 'rm -rf /tmp/demo2', tool_use_id: 'toolu_rej_2' })
+  await decision($, 'toolu_rej_2', 'reject', 'user_reject')
+  await $.turn.complete({ turnId: 'turn-rej-answered', answer: 'Understood, I will not run that command.', durationMs: 300, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+
+  const inv2 = world.sentRows().find(r => r.invocation_id === 'turn-rej-answered' && r.event_type === 'INVOCATION_COMPLETED')
+  expect(json(inv2?.attributes ?? null).ended_on_rejection).toBeUndefined()
+
+  // Case 3: user rejects a tool, then a subsequent main-loop step starts and is aborted with an empty answer -> ended_on_rejection is omitted.
+  await $.turn.start({ turnId: 'turn-rej-later-step', text: 'try another step' })
+  await $.tool.call({ tool: 'Bash', command: 'rm -rf /tmp/demo3', tool_use_id: 'toolu_rej_3' })
+  await decision($, 'toolu_rej_3', 'reject', 'user_reject')
+  await runStep($, { turnId: 'turn-rej-later-step', index: 1 })
+  await $.turn.complete({ turnId: 'turn-rej-later-step', answer: '', durationMs: 400, isAborted: true, reason: 'interrupted' })
+  await world.clock.advance(5000)
+
+  const inv3 = world.sentRows().find(r => r.invocation_id === 'turn-rej-later-step' && r.event_type === 'INVOCATION_COMPLETED')
+  expect(json(inv3?.attributes ?? null).ended_on_rejection).toBeUndefined()
 })

@@ -17,7 +17,8 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
-import { ACCESS_TOKEN, DRY_RUN_DIR, OPTIONS, type Row, SESSION_ID, USAGE, type World, byType, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
+import { PLUGIN_VERSION } from '../hooks/lib/config.ts'
+import { ACCESS_TOKEN, COMMAND, DRY_RUN_DIR, OK_INSERT, OPTIONS, type Row, SESSION_ID, USAGE, type World, byType, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
 
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX16 = /^[0-9a-f]{16}$/
@@ -87,7 +88,13 @@ test('a turn becomes rows under one trace, with spans, tokens and latency', { op
     expect(row.is_truncated).toBe(false)
     expect(Number.isNaN(Date.parse(row.timestamp))).toBe(false)
     const writer = json(row.attributes).writer as Record<string, unknown>
-    expect(writer).toEqual({ plugin: 'bigquery-agent-analytics-mod', version: '0.1.0', label: 'bigquery-agent-analytics-mod/0.1.0', agent: 'coding-agent', mode: 'insert_all' })
+    expect(writer).toEqual({
+      plugin: 'bigquery-agent-analytics-mod',
+      version: PLUGIN_VERSION,
+      label: `bigquery-agent-analytics-mod/${PLUGIN_VERSION}`,
+      agent: 'coding-agent',
+      mode: 'insert_all',
+    })
   }
   expect(new Set(rows.map(r => r.event_id)).size).toBe(rows.length)
 
@@ -295,6 +302,59 @@ test('a subagent run whose SubagentStart never comes gets one inferred AGENT_STA
   expect(byType(rows, 'LLM_REQUEST').map(r => r.parent_span_id)).toEqual([starts[0]?.span_id])
 })
 
+test('a loop seen first at a tool call, with no run start, is unidentified_loop: each of its rows says so, and the queries leave them out', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // The host's fork that proposes the next prompt after a turn: no
+  // turn.start and no SubagentStart, and the host refuses its tools.
+  world.toolReply = () => ({ deny: 'No tools needed for suggestion' })
+  await startSession($)
+  await $.turn.start({ turnId: 'main-turn', text: 'list the files' })
+  await runStep($, { turnId: 'main-turn', index: 0 })
+  await $.turn.complete({ turnId: 'main-turn', answer: 'Done.', durationMs: 400, isAborted: false, reason: 'answer', usage: USAGE })
+  await $.tool.call({ tool: 'ScheduleWakeup', agentId: 'afork0000000001', stop: true } as never)
+  await world.clock.advance(5000)
+  const rows = world.sentRows().filter(r => json(r.attributes).agent_id === 'afork0000000001')
+  expect(rows.map(r => [r.event_type, r.agent, r.status])).toEqual([
+    ['AGENT_STARTING', 'unidentified_loop', 'OK'],
+    ['TOOL_STARTING', 'unidentified_loop', 'OK'],
+    ['TOOL_COMPLETED', 'unidentified_loop', 'ERROR'],
+  ])
+  expect(rows.every(r => json(r.attributes).unidentified_loop === true)).toBe(true)
+  // The main loop's rows and a subagent whose run was seen to start carry no mark.
+  expect(world.sentRows().filter(r => json(r.attributes).agent_id === undefined).some(r => 'unidentified_loop' in json(r.attributes))).toBe(false)
+})
+
+test('a SubagentStart that comes for an unidentified loop names it: its later rows are the subagent\'s, unmarked', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.turn.start({ turnId: 'main-turn', text: 'delegate' })
+  // Its run was under way when the mod loaded: its first row is a tool call.
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts', agentId: 'agent-5' } as never)
+  await $.classic.SubagentStart({ agent_id: 'agent-5', agent_type: 'Explore' } as never)
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts', agentId: 'agent-5' } as never)
+  await world.clock.advance(5000)
+  const rows = world.sentRows().filter(r => json(r.attributes).agent_id === 'agent-5' && r.event_type === 'TOOL_STARTING')
+  expect(rows.map(r => [r.agent, json(r.attributes).unidentified_loop])).toEqual([
+    ['unidentified_loop', true],
+    ['Explore', undefined],
+  ])
+})
+
+test('a turn.start that arrives for an open unidentified loop without SubagentStart promotes its later rows to subagent, unmarked', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.turn.start({ turnId: 'main-turn', text: 'delegate' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts', agentId: 'agent-5b' } as never)
+  await $.turn.start({ turnId: 'sub-run-5b', text: 'continue', agentId: 'agent-5b' })
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts', agentId: 'agent-5b' } as never)
+  await world.clock.advance(5000)
+  const rows = world.sentRows().filter(r => json(r.attributes).agent_id === 'agent-5b' && r.event_type === 'TOOL_STARTING')
+  expect(rows.map(r => [r.agent, json(r.attributes).unidentified_loop])).toEqual([
+    ['unidentified_loop', true],
+    ['subagent', undefined],
+  ])
+})
+
 test('a SubagentStart that comes after the run\'s first row names the run without opening a second span', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)
@@ -487,7 +547,7 @@ test('when classic.SessionStart is skipped, turns, tools and session end still r
   await runStep($, { turnId: 'turn-s1', index: 0 })
   await $.tool.call({ tool: 'Read', file_path: 'README.md' })
   await $.turn.complete({ turnId: 'turn-s1', answer: 'First answer.', durationMs: 500, isAborted: false, reason: 'answer', usage: USAGE })
-  await $.session.end({ reason: 'clear' })
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
   await world.clock.advance(5000)
 
   // Second session after /clear, again without classic.SessionStart.
@@ -496,7 +556,7 @@ test('when classic.SessionStart is skipped, turns, tools and session end still r
   await $.turn.start({ turnId: 'turn-s2', text: 'second prompt' })
   await runStep($, { turnId: 'turn-s2', index: 0 })
   await $.turn.complete({ turnId: 'turn-s2', answer: 'Second answer.', durationMs: 400, isAborted: false, reason: 'answer', usage: USAGE })
-  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'second-session-id' })
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'second-session-id', resume: { id: 'second-session-id' } })
 
   const sentEnds = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
   const spilledEnds = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
@@ -525,7 +585,7 @@ test('when classic.SessionStart is skipped and the session id changes on /branch
   await $.turn.start({ turnId: 'turn-b3', text: 'after branch' })
   await $.turn.complete({ turnId: 'turn-b3', answer: 'branched', durationMs: 200, isAborted: false, reason: 'answer' })
   await world.clock.advance(5000)
-  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'branched-session-id' })
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'branched-session-id', resume: { id: 'branched-session-id' } })
 
   const ends = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
   expect(ends.length).toBe(1)
@@ -533,4 +593,189 @@ test('when classic.SessionStart is skipped and the session id changes on /branch
   expect(json(ends[0]?.attributes ?? null)).toMatchObject({
     state_delta: { source: 'coding_agent_session_end', reason: 'prompt_input_exit', trace_count: 1 },
   })
+})
+
+test('session_start omits model and permission_mode when classic.SessionStart does not provide them', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+  const [start] = byType(world.sentRows(), 'STATE_DELTA')
+  const delta = (json(start?.attributes ?? null).state_delta ?? {}) as Record<string, unknown>
+  expect('model' in delta).toBe(false)
+  expect('permission_mode' in delta).toBe(false)
+})
+
+test('a session that runs only /bqaa-status and exits emits and spills no session_start or session_end rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  expect(world.sentRows()).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('a session that runs only /bqaa-status and lasts past a 5000 ms flush tick still emits and spills 0 rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await world.clock.advance(5000)
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  expect(world.sentRows()).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('with no classic.SessionStart (a managed CLI), a session that runs only /bqaa-status and exits emits and spills 0 rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  expect(world.sentRows()).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('a session that runs only /bqaa-flush sends nothing for it, and emits and spills 0 rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  const reply = await $.command.run({ command: 'bqaa-flush', args: '', ...COMMAND })
+  expect(reply.text ?? '').toMatch(/nothing to flush/)
+  await world.clock.settle()
+  expect(world.insertCalls().length).toBe(0)
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  expect(world.sentRows()).toEqual([])
+  expect(world.acceptedRows()).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('with no classic.SessionStart (a managed CLI), a session that runs only /bqaa-flush emits and spills 0 rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  const reply = await $.command.run({ command: 'bqaa-flush', args: '', ...COMMAND })
+  expect(reply.text ?? '').toMatch(/nothing to flush/)
+  await world.clock.settle()
+  expect(world.insertCalls().length).toBe(0)
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  expect(world.sentRows()).toEqual([])
+  expect(world.acceptedRows()).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('/bqaa-flush right after /clear still sends what the session before it left queued', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-clear-session'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-session' })
+  // The new session has done nothing yet, but the queue holds the earlier
+  // session's rows: they are sent.
+  const reply = await $.command.run({ command: 'bqaa-flush', args: '', ...COMMAND })
+  expect(reply.text ?? '').toMatch(/flush requested for [1-9]\d* queued row/)
+  await world.clock.settle()
+  expect(byType(world.acceptedRows(), 'TOOL_COMPLETED').length).toBe(1)
+})
+
+test('completion-only activity (mid-turn load) followed by /bqaa-status keeps session_start and emits session_end', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.turn.complete({ turnId: 'turn-mid', answer: 'done', durationMs: 100, isAborted: false, reason: 'answer' })
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(5000)
+  const allRows = [...world.sentRows(), ...deadLetterRows(world)]
+  const deltas = byType(allRows, 'STATE_DELTA').map(r => json(r.content))
+  expect(deltas).toEqual([{ session_start: true }, { session_end: true }])
+})
+
+test('writer takeover after /bqaa-status after session_start already flushed still emits session_end', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(byType(world.sentRows(), 'STATE_DELTA').map(r => json(r.content))).toEqual([{ session_start: true }])
+  // session.start fires again (writer takeover), resetting counters on the new writer.
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  const allRows = [...world.sentRows(), ...deadLetterRows(world)]
+  const ends = byType(allRows, 'STATE_DELTA').filter(r => json(r.content).session_end === true)
+  expect(ends.length).toBe(1)
+})
+
+test('a session_start the first writer had out lands after two takeovers: a later SessionStart and /bqaa-status still end with session_end', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [{ hang: true }, OK_INSERT]
+  await startSession($)
+  // The first writer's request for the session_start row is out, unanswered.
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+  // session.start fires twice more: each writer takes over from the one before.
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  // Only then does BigQuery take the first writer's row.
+  world.releaseHung(OK_INSERT.status, OK_INSERT.text)
+  await world.clock.settle()
+  expect(byType(world.sentRows(), 'STATE_DELTA').map(r => json(r.content))).toEqual([{ session_start: true }])
+  await $.classic.SessionStart({ source: 'compact', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  // The session sent a row: its end is written, and the later start with it.
+  const spilled = byType(deadLetterRows(world), 'STATE_DELTA').map(r => json(r.content))
+  expect(spilled).toEqual([{ session_start: true }, { session_end: true }])
+})
+
+test('an in-flight subagent model step and tool call started before SubagentStart pick up agent_type and clear unidentified_loop on completion', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await $.turn.start({ turnId: 'main-turn', text: 'delegate' })
+  world.steps.push({
+    chunks: [{ kind: 'text', index: 0, text: 'found' }],
+    result: { answer: 'found', toolUses: [{ name: 'Grep', input: { pattern: 'foo' } }], stopReason: 'end_turn', usage: USAGE },
+  })
+  let releaseTool = (): void => undefined
+  const toolWait = new Promise<void>(resolve => {
+    releaseTool = resolve
+  })
+  world.toolReply = async () => {
+    await toolWait
+    return { result: 'ok', text: 'ok' }
+  }
+  const stream = $.turn.step({ turnId: 'sub-turn-late', index: 0, model: 'claude-haiku-4-5', messageCount: 1, agentId: 'sub-loop-late' })
+  // First next() starts the step (emits LLM_REQUEST) and yields chunk 0 while keeping the step in flight:
+  await stream.next()
+  const toolPromise = $.tool.call({ tool: 'Grep', pattern: 'foo', agentId: 'sub-loop-late', tool_use_id: 'toolu_late_1' })
+  await world.clock.settle()
+  // Now SubagentStart arrives while both the step and the tool call are in flight:
+  await $.classic.SubagentStart({ agent_id: 'sub-loop-late', agent_type: 'Explore' })
+  releaseTool()
+  await Promise.all([stream.next(), toolPromise])
+  await $.turn.complete({ turnId: 'sub-turn-late', agentId: 'sub-loop-late', answer: 'done', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+  const rows = world.sentRows()
+  const req = byType(rows, 'LLM_REQUEST').find(r => json(r.attributes).agent_id === 'sub-loop-late')
+  const res = byType(rows, 'LLM_RESPONSE').find(r => json(r.attributes).agent_id === 'sub-loop-late')
+  const toolStart = byType(rows, 'TOOL_STARTING').find(r => json(r.attributes).agent_id === 'sub-loop-late')
+  const toolDone = byType(rows, 'TOOL_COMPLETED').find(r => json(r.attributes).agent_id === 'sub-loop-late')
+  const agentDone = byType(rows, 'AGENT_COMPLETED').find(r => json(r.attributes).agent_id === 'sub-loop-late')
+  expect([req?.agent, json(req?.attributes ?? null).unidentified_loop]).toEqual(['unidentified_loop', true])
+  expect([toolStart?.agent, json(toolStart?.attributes ?? null).unidentified_loop]).toEqual(['unidentified_loop', true])
+  expect([res?.agent, json(res?.attributes ?? null).unidentified_loop]).toEqual(['Explore', undefined])
+  expect([toolDone?.agent, json(toolDone?.attributes ?? null).unidentified_loop]).toEqual(['Explore', undefined])
+  expect([agentDone?.agent, json(agentDone?.attributes ?? null).unidentified_loop]).toEqual(['Explore', undefined])
+})
+
+test('the offline test shim rejects a session.end handler that returns no { sessionId }', { options: OPTIONS }, async ($, on) => {
+  setUp(on)
+  on('session.end', async (_$, _e, _next) => ({}) as never)
+  let caught: Error | null = null
+  try {
+    await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  } catch (err) {
+    caught = err as Error
+  }
+  expect(caught?.message ?? '').toContain('no implementation for session.end: returned no { sessionId }')
 })

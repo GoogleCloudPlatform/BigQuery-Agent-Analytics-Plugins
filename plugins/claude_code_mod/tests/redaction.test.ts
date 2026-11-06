@@ -20,7 +20,7 @@
 
 import { expect, test } from 'claude-code/testing'
 
-import { OPTIONS, type Row, type World, deadLetterFiles, deadLetterRows, setUp, startSession } from './helpers.ts'
+import { COMMAND, OPTIONS, type Row, type World, deadLetterFiles, deadLetterRows, setUp, startSession } from './helpers.ts'
 
 const CANARY = ['canary', 'value', 'r'.repeat(12)].join('-')
 const REFUSED = { status: 403, text: '{"error":{"message":"permission denied","errors":[{"reason":"accessDenied"}]}}' }
@@ -163,4 +163,21 @@ test('key names: a credential-bearing argument name leaves neither in the reques
   for (const row of [...sent, ...parked]) {
     expect((JSON.parse(row.content ?? '{}') as { args: Record<string, unknown> }).args).toEqual({ '[REDACTED_KEY:1]': '[REDACTED]', '[REDACTED_KEY:2]': '[REDACTED]', description: 'fetch the report' })
   }
+})
+
+test('/bqaa-status shows truncated rows when a row loses text past a credential line', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [REFUSED]
+  await startSession($)
+  await $.prompt.submit({ text: 'Use a 27" screen:\n--password=hunter2\nline three', wait: false, origin: { kind: 'composer' } })
+  await world.clock.advance(5000)
+  const { sent, parked } = rows(world, 'USER_MESSAGE_RECEIVED')
+  expect([sent.length, parked.length]).toEqual([1, 1])
+  for (const row of [...sent, ...parked]) {
+    expect(row.is_truncated).toBe(true)
+    expect(JSON.stringify(row)).not.toContain('hunter2')
+    expect(JSON.stringify(row)).not.toContain('line three')
+  }
+  const status = (await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })).text ?? ''
+  expect(status).toMatch(/truncated rows [1-9]/)
 })

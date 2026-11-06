@@ -1,9 +1,10 @@
 # Moving to this marketplace
 
-For people who installed the mod from the marketplace it came from
-(`bigquery-agent-analytics-plugin`, in the
-`haiyuan-eng-google/bigquery_agent_analytics_skill` repository), or who use
-the settings-hook tracing plugin, `bigquery-agent-analytics-tracing`.
+For people who installed the mod from `GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK`
+or from the earlier marketplace it came from (`bigquery-agent-analytics-plugin`, in the
+`haiyuan-eng-google/bigquery_agent_analytics_skill` repository), who use
+the settings-hook tracing plugin (`bigquery-agent-analytics-tracing`), or
+who roll the mod out via managed settings.
 
 Run one tracer per table. The mod and the settings-hook tracing plugin
 write the same events, so with both on, every event is written twice.
@@ -31,6 +32,52 @@ write the same events, so with both on, every event is written twice.
    sent by this one: the folder and its format are the same.
 4. Check: `/bqaa-status` names your table, with no `notice` line, and
    `/plugin` lists one mod.
+
+## From the SDK repository's marketplace
+
+`GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK` previously served a
+marketplace with the same name (`bqaa-tracing`) and plugin version (`0.1.0`),
+so `claude plugin marketplace add` refuses a second `bqaa-tracing` source and
+`claude plugin update` reports `already at the latest version (0.1.0)`. To
+move to this repository's marketplace:
+
+1. Check where `bqaa-tracing` currently comes from:
+
+   ```bash
+   claude plugin marketplace list
+   ```
+
+2. If it points at `GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK`, note
+   your current options (`claude -p /bqaa-status < /dev/null`, or
+   `pluginConfigs["bigquery-agent-analytics-mod@bqaa-tracing"]` in
+   `~/.claude/settings.json`), then uninstall the old copy and remove the
+   old marketplace:
+
+   ```bash
+   claude plugin uninstall bigquery-agent-analytics-mod@bqaa-tracing
+   claude plugin marketplace remove bqaa-tracing
+   ```
+
+3. Add this repository's marketplace with the sparse paths and reinstall
+   with the same options:
+
+   ```bash
+   claude plugin marketplace add GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins \
+     --sparse .claude-plugin plugins/claude_code_dist
+   claude plugin install bigquery-agent-analytics-mod@bqaa-tracing \
+     --config project=YOUR_PROJECT_ID \
+     --config dataset=agent_analytics
+   ```
+
+4. Verify with `claude -p /bqaa-status < /dev/null` (or `/bqaa-status`
+   inside an interactive session). Rows the earlier copy left on disk
+   (`~/.bqaa-mod/dead-letter`) are sent by this one.
+
+If your organization's managed settings list `bqaa-tracing` under
+`extraKnownMarketplaces` with `"repo": "GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK"`,
+update `repo` to `"GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins"` and
+`ref` to `"mod-dist-v0.1.0"` (or a newer `mod-dist-vX.Y.Z` tag); see
+[This repository as the marketplace](#this-repository-as-the-marketplace) below.
 
 ## From the settings-hook tracing plugin
 
@@ -107,8 +154,8 @@ first session, ahead of anything a person installed, under
    ```
 
    Move the policy's `pluginConfigs` to the new id: options under the old id
-   no longer apply. On a pilot machine, `claude -p /bqaa-status` names the
-   policy's table, and `claude -p --debug-file /tmp/bqaa.log /bqaa-status`
+   no longer apply. On a pilot machine, `claude -p /bqaa-status < /dev/null` names the
+   policy's table, and `claude -p --debug-file /tmp/bqaa.log /bqaa-status < /dev/null`
    logs `hooks module bigquery-agent-analytics-mod@org-tools loaded (...
    tier prepend)`. The mod under its earlier ids does not load beside it, but
    the settings-hook tracer keeps running: on a machine that has it, every
@@ -168,7 +215,7 @@ enabled on a machine, it keeps recording, and the new one, once installed,
 does not load: the host loads one plugin of a name, and the earlier install
 comes first. The new mod is installed on a pilot machine when
 `claude plugin list` lists `bigquery-agent-analytics-mod@bqaa-tracing` with
-`Version: X.Y.Z`, and its debug log, from `claude -p --debug-file /tmp/bqaa.log /bqaa-status`,
+`Version: X.Y.Z`, and its debug log, from `claude -p --debug-file /tmp/bqaa.log /bqaa-status < /dev/null`,
 says
 `hooks module bigquery-agent-analytics-mod@bqaa-tracing not loaded: another plugin of that name loads first`.
 On a machine that had only the

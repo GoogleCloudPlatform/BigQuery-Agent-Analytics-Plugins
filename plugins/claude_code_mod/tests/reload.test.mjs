@@ -774,7 +774,7 @@ const tests = {
     assert.equal(await c.shown(), true)
   },
   ...Object.fromEntries(
-    [NEXT, '0.1.0'].map(landsFirst => [
+    [NEXT, PLUGIN_VERSION].map(landsFirst => [
       `of the first card writes of the versions before and after an update, ${landsFirst === NEXT ? 'the later one\'s landing first' : 'the earlier one\'s landing first'}, the later version's card shows, with its own greeting`,
       async () => {
         let holding = true
@@ -791,7 +791,7 @@ const tests = {
         }
         release(landsFirst)
         await settle()
-        release(landsFirst === NEXT ? '0.1.0' : NEXT)
+        release(landsFirst === NEXT ? PLUGIN_VERSION : NEXT)
         await settle()
         assert.equal(h.card().version, NEXT)
         assert.equal(await b.shown(), true)

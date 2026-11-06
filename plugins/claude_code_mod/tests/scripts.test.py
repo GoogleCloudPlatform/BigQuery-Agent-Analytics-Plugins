@@ -35,6 +35,7 @@ Exit 0: every check passed; 1: a check failed
 """
 
 import argparse
+import builtins
 import contextlib
 import dataclasses
 import datetime
@@ -348,13 +349,50 @@ def run_bq_checks():
     for what, argv in (('a start after the end', ['--start', '2026-10-31', '--end', '2026-10-01', 'SELECT 1']),
                        ('a limit of 0', ['--max-gb', '0', 'SELECT 1']),
                        ('a start that is no date', ['--start', 'yesterday', 'SELECT 1']),
-                       ('no query', [])):
+                       ('no query', []),
+                       ('both positional query and --query', ['--query', '1', 'SELECT 1']),
+                       ('an unknown --query ID', ['--query', 'V99'])):
         fake = FakeBigQuery()
         status, out, err = run_bq_with(fake, *base, *argv)
         check(f'{what}: exit 2 with the usage', status == 2 and 'usage:' in err and fake.clients == [], f'{status} {err!r}')
+    # Named queries via --query / -q (1..8 and V1..V7, case-insensitive) and ADC quota-project warning filter.
+    named_map = run_bq.load_named_queries()
+    check('load_named_queries loads 1..8 and V1..V7',
+          list(named_map) == ['1', '2', '3', '4', '5', '6', '7', '8', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'V7'],
+          list(named_map))
+    for flag, qid, expected_id in (('--query', '4', '4'), ('-q', 'V5', 'V5'), ('--query', 'v1', 'V1')):
+        fake = FakeBigQuery(rows=[{'ok': 1}])
+        status, out, err = run_bq_with(fake, *base, flag, qid)
+        expected_sql = run_bq.inject_placeholders(named_map[expected_id], 'my-gcp-project', 'agent_analytics', 'agent_events')
+        check(f'{flag} {qid} resolves to query {expected_id} and runs it',
+              status == 0 and len(fake.queries) == 1 and fake.queries[0][0] == expected_sql, f'{status} {err!r}')
+
+    class QuotaWarningBigQuery(FakeBigQuery):
+        def __init__(self):
+            super().__init__(rows=[{'ok': 1}])
+            orig_client = self.Client
+
+            class WarnClient(orig_client):
+                def __init__(self, project=None):
+                    import warnings as _w
+                    _w.warn(
+                        'Your application has authenticated using end user credentials from Google Cloud SDK '
+                        'without a quota project. You might receive a "quota exceeded" or "API not enabled" error.',
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    super().__init__(project=project)
+
+            self.Client = WarnClient
+
+    status, out, err = run_bq_with(QuotaWarningBigQuery(), *base, '--query', '1')
+    check('run_bq suppresses the Google Cloud SDK ADC quota-project UserWarning on stderr',
+          status == 0 and 'without a quota project' not in err and err == '', f'{status} {err!r}')
     with environment(), modules(NO_CLIENT):
         status, out, err = call(run_bq.main, '--help')
-    check('--help needs no BigQuery client', status == 0 and '--max-gb' in out, f'{status} {err!r}')
+    check('--help needs no BigQuery client and documents --query and set-quota-project',
+          status == 0 and '--max-gb' in out and '--query' in out and 'set-quota-project' in out.replace('-\n', '-'),
+          f'{status} {out!r} {err!r}')
     with environment(), modules(NO_CLIENT):
         status, out, err = call(run_bq.main, *base, 'SELECT 1')
     check('without the BigQuery client: exit 1, and how to install it',
@@ -480,8 +518,10 @@ def setup_dry_run_checks():
     status, out, err = attempt(*DOCUMENTED, '--dry-run', '--execute')
     check('--dry-run with --execute: exit 2', status == 2 and 'not allowed with argument' in err, f'{status} {err!r}')
     status, out, err = attempt('--help')
-    check('--help: exit 0, and it needs no program and no client', status == 0 and '--writer-role' in out,
-          f'{status} {err!r}')
+    check('--help: exit 0, needs no program and no client, and describes --project, --dataset, --table and --location defaults',
+          status == 0 and '--writer-role' in out and 'BQAA_PROJECT_ID' in out and 'BQAA_DATASET' in out
+          and 'BQAA_TABLE' in out and 'BQAA_LOCATION' in out,
+          f'{status} {out!r} {err!r}')
     status, out, err = attempt(*BASE, '--no-create-dataset', '--no-create-table')
     check('--no-create-dataset and --no-create-table are accepted, and change nothing',
           status == 0 and plan(*BASE) == steps_of(out), f'{status} {err!r}')
@@ -1455,7 +1495,7 @@ def repo_checks():
           shipped and shipped.group(1))
 
     scripts = sorted(path.name for path in SCRIPTS.iterdir() if path.is_file() and path.suffix == '.py')
-    check('the scripts folder holds the runner and the bootstrap', scripts == ['run_bq.py', 'setup_gcp_prereqs.py'], scripts)
+    check('the scripts folder holds the runner, the bootstrap, and the dead-letter cleaner', scripts == ['clean_dead_letter.py', 'run_bq.py', 'setup_gcp_prereqs.py'], scripts)
     for name in scripts:
         text = (SCRIPTS / name).read_text(encoding='utf-8')
         check(f'{name}: a python3 shebang, then the Apache license and the copyright of Google LLC, before the docstring',
@@ -1493,8 +1533,12 @@ def repo_checks():
         else:
             fake = FakeBigQuery()
             status, out, err = run_bq_with(fake, *argv, BQAA_PROJECT_ID=PROJECT, BQAA_DATASET=DATASET)
-            check(f'{where}: the runner command it shows runs, with its last word as the query',
-                  status == 0 and fake.queries and fake.queries[-1][0] == argv[-1], f'{status} {err!r}')
+            with environment(BQAA_PROJECT_ID=PROJECT, BQAA_DATASET=DATASET):
+                parsed_args = run_bq.parse_args(argv) if status == 0 else None
+            expected = (run_bq.inject_placeholders(parsed_args.query, parsed_args.project, parsed_args.dataset, parsed_args.table)
+                        if parsed_args is not None else None)
+            check(f'{where}: the runner command it shows runs, with its last word or --query as the query',
+                  status == 0 and fake.queries and fake.queries[-1][0] in (argv[-1], expected), f'{status} {err!r}')
 
 
 def setup_sh_checks():
@@ -1502,6 +1546,13 @@ def setup_sh_checks():
     if bash is None:
         check('setup.sh prints a bootstrap command that the bootstrap takes (skipped: no bash)', True)
         return
+    solo = subprocess.run([bash, str(PLUGIN / 'setup.sh'), '--dry-run'], capture_output=True, text=True,
+                          env={**clean_environment(), 'BQAA_PROJECT_ID': PROJECT, 'BQAA_DATASET': DATASET},
+                          cwd=tempfile.gettempdir())
+    check('setup.sh --dry-run (solo default) points to setup.sh --team and docs/service-account-auth.md without the full bootstrap command',
+          solo.returncode == 0 and 'setup.sh --team' in solo.stdout and 'docs/service-account-auth.md' in solo.stdout
+          and 'scripts/setup_gcp_prereqs.py' not in solo.stdout,
+          f'{solo.returncode} {solo.stdout!r} {solo.stderr!r}')
     for what, env, wanted in (
         ('with the variables the docs name', {'BQAA_PROJECT_ID': PROJECT, 'BQAA_DATASET': DATASET},
          (PROJECT, DATASET, TABLE, '', 'US')),
@@ -1510,14 +1561,15 @@ def setup_sh_checks():
           'BQAA_LOCATION': 'EU', 'BQAA_VIEWS_DATASET': 'reports'},
          ('other-project', 'events', 'coding_events', 'reports', 'EU')),
     ):
-        result = subprocess.run([bash, str(PLUGIN / 'setup.sh'), '--dry-run'], capture_output=True, text=True,
+        result = subprocess.run([bash, str(PLUGIN / 'setup.sh'), '--dry-run', '--team'], capture_output=True, text=True,
                                 env={**clean_environment(), **env}, cwd=tempfile.gettempdir())
         line = next((line for line in result.stdout.replace('\\\n', ' ').splitlines()
                      if 'scripts/setup_gcp_prereqs.py' in line), '')
         words = shlex.split(line)
-        check(f'setup.sh --dry-run, {what}: it prints a command that runs the bootstrap of the scripts folder',
+        check(f'setup.sh --dry-run --team, {what}: it prints a command that runs the bootstrap of the scripts folder',
               result.returncode == 0 and len(words) > 2 and words[0] == 'python3'
-              and pathlib.Path(words[1]).resolve() == (SCRIPTS / 'setup_gcp_prereqs.py').resolve(),
+              and pathlib.Path(words[1]).resolve() == (SCRIPTS / 'setup_gcp_prereqs.py').resolve()
+              and 'google-cloud-bigquery' in result.stdout,
               f'{result.returncode} {line!r} {result.stderr!r}')
         args = parsed(*words[2:])
         check('  ... naming the project, dataset, table, views dataset and location it was given',
@@ -1527,9 +1579,218 @@ def setup_sh_checks():
         check('  ... which the bootstrap takes: a dry run, exit 0', status == 0 and 'DRY RUN' in out, f'{status} {err!r}')
 
 
+# ---------------------------------------------------------------------------
+# clean_dead_letter.py
+# ---------------------------------------------------------------------------
+
+def clean_dead_letter_checks():
+    """The offline helper removes a (source, outcome-*) group only when the
+    source is empty and no non-empty leftover file names it as parent."""
+    clean = load('clean_dead_letter')
+
+    def make_dir(tmp: pathlib.Path) -> pathlib.Path:
+        d = tmp / 'dead-letter' / 'proj.ds.tbl'
+        d.mkdir(parents=True)
+        return d
+
+    def seal(text: str, parent: str | None = None) -> str:
+        """A dead-letter file: its content lines, then a completion record."""
+        record = {"v": 1, "complete": True, "lines": text.count("\n"), "fnv1a": "deadbeef"}
+        if parent is not None:
+            record["parent"] = parent
+        return text + json.dumps(record) + "\n"
+
+    # 1. Empty source + outcome variants (outcome-, outcome-b-, outcome-done-<writer>-): all removed under --execute.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'spill-001.jsonl'
+        source.write_bytes(b'')
+        outcome = d / 'outcome-spill-001.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        outcome_done = d / 'outcome-done-w1a2b3-spill-001.jsonl'
+        outcome_done.write_text(seal('{"journal":true,"retired":true}\n'), encoding='utf-8')
+        orphan_outcome = d / 'outcome-done-w1a2b3-missing.jsonl'
+        orphan_outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        to_delete = clean.plan_deletions(pathlib.Path(tmp) / 'dead-letter')
+        check('empty source and its outcome/outcome-done files in partition subdir are deletable (orphan outcome kept)',
+              set(p.name for p in to_delete) == {'spill-001.jsonl', 'outcome-spill-001.jsonl', 'outcome-done-w1a2b3-spill-001.jsonl'},
+              str(sorted(p.name for p in to_delete)))
+        status, out, err = call(clean.main, '--dir', str(pathlib.Path(tmp) / 'dead-letter'), '--execute')
+        check('under --execute: empty source and its outcome files are deleted while orphan outcome stays, exit 0',
+              status == 0 and not source.exists() and not outcome.exists() and not outcome_done.exists() and orphan_outcome.exists(),
+              f'{status} {out!r}')
+
+    # 2. Non-empty source + outcome: both kept.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'retry-002.jsonl'
+        source.write_text(seal('{"row":1}\n'), encoding='utf-8')
+        outcome = d / 'outcome-retry-002.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        to_delete = clean.plan_deletions(d)
+        check('non-empty source: nothing is deletable', to_delete == [], str(sorted(p.name for p in to_delete)))
+        call(clean.main, '--dir', str(d), '--execute')
+        check('non-empty source and its outcome are kept', source.exists() and outcome.exists(),
+              f'{source.exists()} {outcome.exists()}')
+
+    # 3. Empty source referenced as parent by a non-empty leftover: kept
+    #    until the leftover is empty too.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'rejected-003.jsonl'
+        source.write_bytes(b'')
+        leftover = d / 'rejected-003-leftover.jsonl'
+        leftover.write_text(seal('{"row":1}\n', parent='rejected-003.jsonl'), encoding='utf-8')
+        to_delete = clean.plan_deletions(d)
+        check('empty source with a non-empty leftover: nothing is deletable', to_delete == [], str(sorted(p.name for p in to_delete)))
+        call(clean.main, '--dir', str(d), '--execute')
+        check('empty source and its non-empty leftover are kept', source.exists() and leftover.exists(),
+              f'{source.exists()} {leftover.exists()}')
+        # Now empty the leftover: the source becomes deletable.
+        leftover.write_bytes(b'')
+        to_delete = clean.plan_deletions(d)
+        check('once the leftover is empty too: the source is deletable', any(p.name == 'rejected-003.jsonl' for p in to_delete),
+              str(sorted(p.name for p in to_delete)))
+        call(clean.main, '--dir', str(d), '--execute')
+        check('empty source is deleted', not source.exists(), f'{source.exists()}')
+
+    # 4. Dry-run default: nothing is deleted.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'spill-004.jsonl'
+        source.write_bytes(b'')
+        outcome = d / 'outcome-spill-004.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        status, out, err = call(clean.main, '--dir', str(d))
+        check('dry-run: exit 0 and says "would delete"', status == 0 and 'would delete' in out, f'{status} {out!r} {err!r}')
+        check('dry-run: nothing is actually deleted', source.exists() and outcome.exists(),
+              f'{source.exists()} {outcome.exists()}')
+
+    # 5. Symlinked files and symlinked subdirectories are ignored and kept.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        base = tmp_path / 'dead-letter'
+        d = make_dir(tmp_path)
+        ext_dir = tmp_path / 'external'
+        ext_dir.mkdir()
+        ext_file = ext_dir / 'spill-ext.jsonl'
+        ext_file.write_bytes(b'')
+        symlink_file = d / 'spill-link.jsonl'
+        symlink_file.symlink_to(ext_file)
+        symlink_dir = base / 'linked.ds.tbl'
+        symlink_dir.symlink_to(ext_dir, target_is_directory=True)
+        to_delete = clean.plan_deletions(base)
+        check('symlinked files and symlinked subdirectories are ignored by plan_deletions',
+              to_delete == [], str(to_delete))
+        call(clean.main, '--dir', str(base), '--execute')
+        check('symlinked files, symlinked dirs, and their targets survive --execute',
+              symlink_file.is_symlink() and symlink_dir.is_symlink() and ext_file.exists(),
+              f'{symlink_file.is_symlink()} {symlink_dir.is_symlink()} {ext_file.exists()}')
+
+    # 6. A file unlink() cannot remove is reported on stderr, never as
+    #    deleted; the files after it are still deleted, the count is of the
+    #    files really deleted, and the exit status is 1. The dry run before
+    #    it reports the same plan as ever.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'spill-006.jsonl'
+        source.write_bytes(b'')
+        outcome = d / 'outcome-spill-006.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        status, out, err = call(clean.main, '--dir', str(d))
+        check('dry-run: each planned file, then the count, exit 0',
+              status == 0 and err == '' and out.splitlines() == [
+                  'would delete: outcome-spill-006.jsonl', 'would delete: spill-006.jsonl', '2 file(s) would delete'],
+              f'{status} {out!r} {err!r}')
+        real_unlink = pathlib.Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path.name == outcome.name:
+                raise PermissionError(13, 'Permission denied', str(path))
+            return real_unlink(path, *args, **kwargs)
+
+        with patched(pathlib.Path, unlink=unlink):
+            status, out, err = call(clean.main, '--dir', str(d), '--execute')
+        check('under --execute: a file unlink() cannot remove is an ERROR on stderr, not "deleted", and the exit status is 1',
+              status == 1 and 'ERROR: outcome-spill-006.jsonl: ' in err and 'deleted: outcome-spill-006.jsonl' not in out
+              and out.splitlines() == ['deleted: spill-006.jsonl', '1 file(s) deleted'],
+              f'{status} {out!r} {err!r}')
+        check('under --execute: the file that could not be removed stays and the one after it is deleted',
+              outcome.exists() and not source.exists(), f'{outcome.exists()} {source.exists()}')
+
+    # 7-9. A non-empty source file whose completion record cannot be read may
+    #    name any source as parent: nothing in its partition directory is
+    #    deletable, so the empty parent it names and that parent's outcome
+    #    file stay (and so does the file itself).
+    def unreadable_leftover(leftover: pathlib.Path):
+        leftover.write_text(seal('{"row":1}\n', parent='spill-parent.jsonl'), encoding='utf-8')
+        real_open = builtins.open
+
+        def guarded(file, *args, **kwargs):
+            if isinstance(file, (str, os.PathLike)) and pathlib.Path(file).name == leftover.name:
+                raise PermissionError(13, 'Permission denied', str(file))
+            return real_open(file, *args, **kwargs)
+
+        return patched(builtins, open=guarded)
+
+    def unsealed_leftover(leftover: pathlib.Path):
+        leftover.write_text('{"row":1}\n{"row":2', encoding='utf-8')
+        return contextlib.nullcontext()
+
+    def undecodable_leftover(leftover: pathlib.Path):
+        sealed = seal('{"row":1}\n', parent='spill-parent.jsonl').encode('utf-8')
+        leftover.write_bytes(sealed.replace(b'spill-parent.jsonl"', b'spill-parent.jsonl\xff"'))
+        return contextlib.nullcontext()
+
+    for case, what, prepare in (
+        (7, 'an unreadable non-empty leftover', unreadable_leftover),
+        (8, 'an unsealed non-empty leftover (no completion record)', unsealed_leftover),
+        (9, 'a non-empty leftover whose completion record is not valid UTF-8', undecodable_leftover),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp) / 'dead-letter'
+            d = make_dir(pathlib.Path(tmp))
+            parent = d / 'spill-parent.jsonl'
+            parent.write_bytes(b'')
+            outcome = d / 'outcome-spill-parent.jsonl'
+            outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+            leftover = d / 'retry-leftover.jsonl'
+            with prepare(leftover):
+                to_delete = clean.plan_deletions(base)
+                status, out, err = call(clean.main, '--dir', str(base), '--execute')
+            check(f'{case}. {what}: nothing in its partition directory is deletable',
+                  to_delete == [], str(sorted(p.name for p in to_delete)))
+            check(f'{case}. {what}: under --execute the empty parent, its outcome and the leftover all stay, exit 0',
+                  status == 0 and out.splitlines() == ['nothing to clean'] and parent.exists() and outcome.exists() and leftover.exists(),
+                  f'{status} {out!r} {err!r}')
+
+    # 10. A partition directory that cannot be listed plans nothing; the other
+    #     partitions are planned as ever.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = pathlib.Path(tmp) / 'dead-letter'
+        d = make_dir(pathlib.Path(tmp))
+        (d / 'spill-010.jsonl').write_bytes(b'')
+        other = base / 'proj.ds.other'
+        other.mkdir()
+        (other / 'spill-011.jsonl').write_bytes(b'')
+        real_iterdir = pathlib.Path.iterdir
+
+        def iterdir(path):
+            if path == d:
+                raise PermissionError(13, 'Permission denied', str(path))
+            return real_iterdir(path)
+
+        with patched(pathlib.Path, iterdir=iterdir):
+            to_delete = clean.plan_deletions(base)
+        check('10. a partition directory that cannot be listed plans nothing, and the others are planned',
+              [p.relative_to(base).as_posix() for p in to_delete] == ['proj.ds.other/spill-011.jsonl'],
+              str(to_delete))
+
+
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
           writer_grants_checks, row_writer_role_checks, resources_checks, readers_checks, api_checks,
-          dataset_access_checks, execute_stop_checks, execute_apply_checks, repo_checks, setup_sh_checks)
+          dataset_access_checks, execute_stop_checks, execute_apply_checks, repo_checks, setup_sh_checks,
+          clean_dead_letter_checks)
 
 
 def main():

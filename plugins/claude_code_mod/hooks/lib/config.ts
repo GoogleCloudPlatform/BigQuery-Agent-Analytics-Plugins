@@ -17,7 +17,7 @@
 // already uses. Pure: no `$` calls here, so it can be unit tested directly.
 
 export const PLUGIN_NAME = 'bigquery-agent-analytics-mod'
-export const PLUGIN_VERSION = '0.1.0'
+export const PLUGIN_VERSION = '0.1.1'
 export const WRITER_LABEL = `${PLUGIN_NAME}/${PLUGIN_VERSION}`
 
 export const DEFAULT_TABLE = 'agent_events'

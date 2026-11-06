@@ -147,11 +147,9 @@ tests run on Python 3.10 through 3.14 in
 python3 plugins/claude_code/tests/tracing_plugin.test.py
 ```
 
-Until the first `mod-vX.Y.Z` release is tagged, rebuild the served copy after
-changing the mod's source, with
-`bash plugins/claude_code_mod/build_dist.sh plugins/claude_code_dist/bigquery-agent-analytics-mod`,
-so `build_dist.sh --check` passes. Once a release is tagged, the copy moves only
-with a release sync (see
+The served copy in `plugins/claude_code_dist/bigquery-agent-analytics-mod` is
+updated by [`plugins/claude_code_mod/sync_dist.sh`](plugins/claude_code_mod/sync_dist.sh)
+on each tagged `mod-vX.Y.Z` release (see
 [Where a change goes](CONTRIBUTING.md#where-a-change-goes)). The mod's
 [README](plugins/claude_code_mod/README.md#testing) lists the remaining checks,
 which need the host CLI or a Google Cloud project. The tracing plugin's Python
@@ -163,8 +161,10 @@ package lives in the SDK repository; offline parity and hook tests run here in
 - **Mod**: push a `mod-vX.Y.Z` tag whose version is the one in
   `plugins/claude_code_mod/.claude-plugin/plugin.json`. The
   [`release-mod.yml`](.github/workflows/release-mod.yml) workflow verifies it
-  and drafts a pre-release holding `bigquery-agent-analytics-mod-X.Y.Z.tar.gz`
-  and `SHA256SUMS`. The served copy is then synced from that archive and the
+  and drafts a GitHub release (initially marked pre-release) holding
+  `bigquery-agent-analytics-mod-X.Y.Z.tar.gz` and `SHA256SUMS`. Once
+  published (for example `mod-v0.1.0`, published as Latest), the served copy is
+  synced from that archive with `plugins/claude_code_mod/sync_dist.sh` and the
   merge commit tagged `mod-dist-vX.Y.Z`, the ref for organizations that
   register this repository as their marketplace.
 - **Tracing plugin**: released from the SDK repository as `tracing-vX.Y.Z`; its
