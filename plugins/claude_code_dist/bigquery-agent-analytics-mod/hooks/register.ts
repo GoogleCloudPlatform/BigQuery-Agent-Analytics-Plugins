@@ -44,13 +44,15 @@ import { redactDiagnostic } from './lib/sanitize.ts'
 import { type DeadLetterSummary, formatStatus } from './lib/status.ts'
 import { type StepCtx, type StepResult, type ToolCtx, type ToolOutcome, Tracer, errorText } from './lib/tracer.ts'
 import { CardRecords, WELCOME_KEY, type Welcome, cardKey, closedKey, destinationKey, greetedBy, greetedKey, greetedVersions, landedToast, openWelcome, reopenWelcome, welcomeCard, welcomeNotice } from './lib/welcome.ts'
-import { COMMAND_LINE_CHARS, type Io, Writer } from './lib/writer.ts'
+import { COMMAND_LINE_CHARS, type Io, Writer, buildSetupCommand } from './lib/writer.ts'
 
 let options: Options = {}
 let config: Config = resolveConfig({}, {})
 let writer: Writer | null = null
 let flushTimer: { cancel: () => void } | null = null
 let internalErrors = 0
+let canShowBand = false
+let ranModCommand = false
 // The host's timer, from session.start's `$`, for work that waits briefly
 // outside any hook (a finished tool call waiting for its decision).
 let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null = null
@@ -266,7 +268,10 @@ async function readEnv($: EngineInterface): Promise<EnvSnapshot> {
 async function readSessionId($: EngineInterface): Promise<void> {
   try {
     const next = await $.session.id()
-    if (next && tracer.sessionId !== null && next !== tracer.sessionId) resets += 1
+    if (next && tracer.sessionId !== null && next !== tracer.sessionId) {
+      resets += 1
+      ranModCommand = false
+    }
     tracer.setSession({ sessionId: next })
   } catch {
     // The tracer keeps what it has.
@@ -780,12 +785,32 @@ function closeWelcome($: EngineInterface, landedOnly = false): void {
 async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary> {
   if (config.deadLetterDir === '') return { error: 'no dead-letter directory configured' }
   const dir = deadLetterPartition(config)
-  const summary = { dir, files: 0, bytes: 0, byKind: {} as Record<string, number>, oversized: [] as string[], elsewhere: 0 }
+  const summary = {
+    dir,
+    files: 0,
+    bytes: 0,
+    byKind: {} as Record<string, number>,
+    oversized: [] as string[],
+    elsewhere: 0,
+    emptyFiles: 0,
+    recordFiles: 0,
+    retiredFiles: 0,
+  }
   try {
     if (!(await $.fs.exists(config.deadLetterDir))) return summary
     if (await $.fs.exists(dir)) {
       for (const entry of await $.fs.list(dir)) {
         const kind = kindOf(entry.name)
+        if (entry.kind === 'file' && entry.name.startsWith('outcome-')) {
+          summary.recordFiles += 1
+          summary.retiredFiles += 1
+          continue
+        }
+        if (entry.kind === 'file' && kind !== null && entry.size === 0) {
+          summary.emptyFiles += 1
+          summary.retiredFiles += 1
+          continue
+        }
         if (entry.kind !== 'file' || kind === null || entry.size === 0) continue
         summary.files += 1
         summary.bytes += entry.size
@@ -823,11 +848,14 @@ export const register: Register = (on, registered) => {
     cardReady = null
     // Its rank, in a session a person sees (a `-p` run draws no card).
     cardSession = e.isInteractive && e.surface !== null
+    canShowBand = Boolean(e.isInteractive && e.surface === 'terminal')
+    ranModCommand = false
     const ranked = cardSession ? nextLoad($).catch(() => null) : Promise.resolve(null)
     const admitted = admit($, ranked).catch(() => null)
     try {
       config = resolveConfig(options, await readEnv($))
       clockAfter = (ms, fn) => $.clock.after(ms, fn)
+      let autoBackfillStarted = false
       const io: Io = {
         now: () => Date.now(),
         after: (ms, fn) => $.clock.after(ms, fn),
@@ -856,9 +884,14 @@ export const register: Register = (on, registered) => {
         toast: text => $.ui.toast(clean(text, 500), { timeoutMs: 15_000 }),
         notice: text => $.ui.log(clean(text)),
         redraw: () => $.ui.invalidate('ui.render'),
+        canShowBand: () => canShowBand,
         // Where setup.sh is, for the fix when BigQuery cannot find the dataset.
         pluginRoot: $.plugin.root,
         sent: (rows, to) => {
+          if (rows > 0 && !e.isInteractive && !autoBackfillStarted && config.autoBackfill && canDeliver(config) && !config.dryRun) {
+            autoBackfillStarted = true
+            void own.backfill(['spill', 'retry'], 'auto')
+          }
           const key = destinationKey(to)
           if (key === null || rows <= 0) return
           const id = countKey(ownerOf(start), key)
@@ -881,6 +914,10 @@ export const register: Register = (on, registered) => {
       tracer.setSession({ sessionId, cwd: e.cwd, engineVersion: version?.version ?? null })
       flushTimer?.cancel()
       flushTimer = $.clock.every(config.flushIntervalMs, () => {
+        if (ranModCommand && !tracer.hasActivity && writer !== null && writer.hasOnlyUnsentSessionStart(tracer.sessionId)) {
+          saveClose($)
+          return
+        }
         void writer?.flush()
         saveClose($)
       })
@@ -890,6 +927,8 @@ export const register: Register = (on, registered) => {
         $.clock.after(0, () => writer?.prefetchToken())
         if (config.autoBackfill) {
           $.clock.after(15_000, () => {
+            if (autoBackfillStarted) return
+            autoBackfillStarted = true
             void writer?.backfill(['spill', 'retry'], 'auto')
           })
         }
@@ -917,6 +956,11 @@ export const register: Register = (on, registered) => {
     } catch {
       internalErrors += 1
     }
+    try {
+      await $.command.register({ name: 'bqaa-setup', description: 'BigQuery Agent Analytics: print the setup.sh command to create the dataset, table and views', immediate: true })
+    } catch {
+      internalErrors += 1
+    }
     // In the background: neither the first prompt nor anything above waits
     // on the store for the welcome card.
     void startWelcome($, e, tracer.sessionId, start, admitted).catch(() => {
@@ -931,7 +975,10 @@ export const register: Register = (on, registered) => {
   on('classic.SessionStart', ($, e, next) => {
     // /clear, /resume and /branch reset the session's state: a card a run
     // began before stays the session's before (`startWelcome`).
-    if (RESET_SOURCES.has(String(e.source))) resets += 1
+    if (RESET_SOURCES.has(String(e.source))) {
+      resets += 1
+      ranModCommand = false
+    }
     const pending = next(e)
     // Its row carries what session.start loads (the user, the agent name,
     // the writer mode, the host version): written now if that is done, else
@@ -993,6 +1040,21 @@ export const register: Register = (on, registered) => {
     const current = writer
     if (current === null || e.props.hasSurvey) return theirs
     if (current.problem === null) {
+      const withTargetWarning = () => {
+        if (configured && config.enabled && !config.dryRun && (!config.project || !config.dataset)) {
+          const { Box, Text } = $.ui.resolve(e)
+          const line = Box({
+            flexDirection: 'row',
+            flexWrap: 'wrap',
+            children: [
+              Text({ color: 'warning', bold: true, children: '⚠ BQAA: ' }),
+              Text({ children: 'rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-setup.' }),
+            ],
+          })
+          return Box({ flexDirection: 'column', children: [line, theirs] })
+        }
+        return theirs
+      }
       // The card as the session's state has it: this read redraws the band
       // whenever any load changes it.
       let shown: Welcome | null = null
@@ -1001,9 +1063,12 @@ export const register: Register = (on, registered) => {
       } catch {
         shown = null
       }
-      if (shown === null || shown.closed || shown.version !== PLUGIN_VERSION || shown.sessionId !== tracer.sessionId) return theirs
+      if (shown === null || shown.version !== PLUGIN_VERSION || shown.sessionId !== tracer.sessionId) {
+        return withTargetWarning()
+      }
+      if (shown.closed) return withTargetWarning()
       const id = cardId(shown.version, shown.sessionId)
-      if (id === closedCard || id !== cardReady) return theirs
+      if (id === closedCard || id !== cardReady) return withTargetWarning()
       // A close another load wrote late hides it at a later draw.
       const { version, sessionId } = shown
       if (sessionId !== null) safely(() => checkClosed($, version, sessionId))
@@ -1114,25 +1179,34 @@ export const register: Register = (on, registered) => {
     await readSessionId($)
     const pending = next(e)
     safely(() => {
-      tracer.turnCompleted({
-        turnId: e.turnId,
-        agentId: e.agentId,
-        answer: e.answer,
-        durationMs: e.durationMs,
-        isAborted: e.isAborted,
-        reason: e.reason,
-        refusal: e.reason === 'refusal' ? e.refusal : undefined,
-        usage: e.usage,
-      })
-      // A finished main-loop turn is a natural moment to send.
-      if (!e.agentId) writer?.requestFlush(0)
+      tracer.turnCompleted(
+        {
+          turnId: e.turnId,
+          agentId: e.agentId,
+          answer: e.answer,
+          durationMs: e.durationMs,
+          isAborted: e.isAborted,
+          reason: e.reason,
+          refusal: e.reason === 'refusal' ? e.refusal : undefined,
+          usage: e.usage,
+        },
+        () => {
+          // A finished main-loop turn is a natural moment to send.
+          if (!e.agentId) writer?.requestFlush(0)
+        },
+      )
     })
     return pending
   })
 
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' || e.reason === 'resume') resets += 1
-    safely(() => tracer.sessionEnded(e))
+    const suppressEmpty =
+      ranModCommand &&
+      !tracer.hasActivity &&
+      (writer === null || writer.dropUnsentSessionStart(e.sessionId ?? tracer.sessionId, tracer.hasSessionStart))
+    ranModCommand = false
+    safely(() => tracer.sessionEnded(e, { suppressRow: suppressEmpty }))
     if (writer) {
       if (e.reason === 'clear' || e.reason === 'resume') {
         // The process goes on under another session: send as usual.
@@ -1154,6 +1228,7 @@ export const register: Register = (on, registered) => {
   })
 
   on('command.run', { command: 'bqaa-status' }, async ($, e) => {
+    ranModCommand = true
     if (!writer) return say('BigQuery Agent Analytics mod: not started (session.start has not run).')
     const summary = await deadLetterSummary($)
     const text = formatStatus({
@@ -1169,14 +1244,22 @@ export const register: Register = (on, registered) => {
   })
 
   on('command.run', { command: 'bqaa-flush' }, async () => {
+    ranModCommand = true
     if (!writer) return say('BigQuery Agent Analytics mod: not started.')
     if (!canDeliver(config)) return say(`BigQuery Agent Analytics mod: nothing to flush to (${config.problems.join('; ') || 'disabled'}).`)
+    // A session that has run only mod commands queues at most its own
+    // session_start row, which session.end drops: sent now, it would keep a
+    // session of commands alone (the flush tick holds it back too).
+    if (!tracer.hasActivity && (writer.queue.length === 0 || writer.hasOnlyUnsentSessionStart(tracer.sessionId))) {
+      return say('BigQuery Agent Analytics mod: nothing to flush (this session has recorded no activity yet).')
+    }
     const queued = writer.queue.length
     writer.requestFlush(0)
     return say(`BigQuery Agent Analytics mod: flush requested for ${queued} queued row(s); /bqaa-status shows the result.`)
   })
 
   on('command.run', { command: 'bqaa-backfill' }, async ($, e) => {
+    ranModCommand = true
     const current = writer
     if (!current) return say('BigQuery Agent Analytics mod: not started.')
     if (current.isBackfilling) return say('BigQuery Agent Analytics mod: a backfill is already running; /bqaa-status shows progress.')
@@ -1204,5 +1287,31 @@ export const register: Register = (on, registered) => {
         internalErrors += 1
       })
     return say(`BigQuery Agent Analytics mod: backfill started for ${summary.files} file(s) in ${summary.dir}; /bqaa-status shows progress.`)
+  })
+
+  on('command.run', { command: 'bqaa-setup' }, async ($) => {
+    ranModCommand = true
+    const root = $.plugin.root
+    const configuredTarget = Boolean(config.project && config.dataset)
+    const command = buildSetupCommand(
+      configuredTarget ? config : { ...config, project: config.project || 'my-gcp-project', dataset: config.dataset || 'agent_analytics' },
+      root,
+    )
+    if (!configuredTarget) {
+      const hint = command
+        ? `\nTemplate command (replace my-gcp-project / agent_analytics as needed):\nsetup: ${command}`
+        : ''
+      return say(
+        `BigQuery Agent Analytics mod: target not configured. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), then run the setup.sh command below to create the dataset, table, and views (no repo clone needed).${hint}`,
+      )
+    }
+    if (command === null) {
+      return say(
+        `BigQuery Agent Analytics mod: cannot build a single-line setup.sh command for ${tableRef(config)} (${config.location}). Check that project, dataset, table, and location use standard BigQuery identifiers and that the plugin path contains no control characters.`,
+      )
+    }
+    return say(
+      `BigQuery Agent Analytics mod: run this command in a shell to create the dataset, ${config.table} table, and ${config.dataset}_reporting views (no repo clone needed):\nsetup: ${command}`,
+    )
   })
 }

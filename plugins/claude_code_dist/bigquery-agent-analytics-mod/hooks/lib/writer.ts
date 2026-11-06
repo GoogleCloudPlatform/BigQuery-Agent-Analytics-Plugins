@@ -66,6 +66,10 @@ export type Io = {
   toast?: (text: string) => void
   notice?: (text: string) => void
   redraw?: () => void
+  // True when the AbovePrompt band renders in this session, so problem
+  // notices already visible in the band are not duplicated onto the persistent
+  // status line.
+  canShowBand?: () => boolean
   // The mod's own directory, where setup.sh is: the fix for a dataset
   // BigQuery cannot find names the script there. Absent, the fix is told
   // without a command.
@@ -90,6 +94,8 @@ export type Counters = {
   captured: number
   // Rows BigQuery accepted (or, in a dry run, written to the dry-run files).
   sent: number
+  // Of `sent`, rows replayed from dead-letter / spill files via backfill.
+  replayed: number
   // Rows moved to dead-letter files after a failure (retry + rejected).
   failed: number
   // Of those, rows BigQuery or the configuration refused.
@@ -254,6 +260,18 @@ const PLAIN_LOCATION = /^[A-Za-z0-9-]+$/
 // escaped and reopened.
 const shellQuote = (text: string): string => `'${text.replace(/'/g, `'\\''`)}'`
 
+// Builds the shell command to run the mod's setup.sh for `c`, or null when
+// `root` is unknown or not a POSIX path without control characters, any name
+// is one setup.sh would refuse, or the command would be cut or redacted.
+export function buildSetupCommand(c: Config, root: string | undefined): string | null {
+  if (root === undefined || !root.startsWith('/') || /[\u0000-\u001f\u007f]/.test(root)) return null
+  const views = `${c.dataset}_reporting`
+  if (!PLAIN_PROJECT.test(c.project) || ![c.dataset, views, c.table].every(name => PLAIN_NAME.test(name)) || !PLAIN_LOCATION.test(c.location)) return null
+  const script = root.endsWith('/') ? `${root}setup.sh` : `${root}/setup.sh`
+  const command = `BQAA_PROJECT_ID=${c.project} BQAA_DATASET=${c.dataset} BQAA_TABLE=${c.table} BQAA_VIEWS_DATASET=${views} BQAA_LOCATION=${c.location} bash ${shellQuote(script)}`
+  return diagnostic(`Run: ${command}`, SETUP_COMMAND_CHARS + 5) === `Run: ${command}` ? command : null
+}
+
 // How the refused and parked counts know a line's row: its event_id; for one
 // with none (in a file another writer made), the key a replay gave the line
 // as it rewrote it, else the file (`name`) and the line's place there, which
@@ -393,6 +411,7 @@ export class Writer {
   readonly counters: Counters = {
     captured: 0,
     sent: 0,
+    replayed: 0,
     failed: 0,
     rejected: 0,
     spilled: 0,
@@ -479,6 +498,9 @@ export class Writer {
   // path: how long a write may still be under way where the listing gives no
   // time (`writtenSince`).
   private seenSince = new Map<string, number>()
+  // Sessions for which at least one row has already been sent, written in a
+  // dry run, or parked to a dead-letter file (shared across writer takeovers).
+  private sentSessions = new Set<string>()
   // Problem kinds already announced with a toast and a transcript line.
   private announced = new Set<ProblemKind>()
   // Where the last token came from: the fix differs.
@@ -524,11 +546,18 @@ export class Writer {
   // writer's paced replays going. Every writer that takes over shares them.
   adopt(previous: Writer): void {
     const c = this.config()
+    const inherited = previous.queue.length
     // Any rows this writer queued already are newer: they go behind, under
     // this writer's bounds.
     previous.queue.limit(c.maxQueueRows, c.maxQueueBytes)
     previous.queue.append(this.queue.takeAll())
     this.queue = previous.queue
+    this.counters.captured += inherited
+    // The sessions with a row sent or parked: the same set too, so a batch
+    // any writer before still has out that lands counts here, after any
+    // number of takeovers.
+    for (const s of this.sentSessions) previous.sentSessions.add(s)
+    this.sentSessions = previous.sentSessions
     // The status line too (session.start clears it after the takeover,
     // `clearStatus`): a line the writer before sets late is then one this
     // writer's next landing clears.
@@ -575,7 +604,8 @@ export class Writer {
     const c = this.config()
     if (!canDeliver(c) || c.dryRun) return
     void this.getToken()
-      .then(token => this.identityFor(token, c))
+      // Once the exit began, no lookup starts.
+      .then(token => (this.closing ? null : this.identityFor(token, c)))
       .catch(err => this.recordError(`authentication: ${messageOf(err)}`))
   }
 
@@ -625,6 +655,7 @@ export class Writer {
         this.batchOpen = false
       }
       if (!delivered) {
+        if (this.closing) return
         // Backing off now: keep the queue from filling while we wait.
         await this.relievePressure()
         return
@@ -642,7 +673,13 @@ export class Writer {
       return false
     }
     // This process's rows carry the account of the token they go out with.
-    await this.stampFor(batch, token, c)
+    // Once the exit began, no lookup starts: the batch goes back to the
+    // queue the exit spills.
+    if (!this.closing) await this.stampFor(batch, token, c)
+    if (this.closing) {
+      this.queue.unshift(batch)
+      return false
+    }
     let body = insertAllBody(batch.map(q => q.row))
     let answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
     if ('error' in answer) {
@@ -650,9 +687,10 @@ export class Writer {
       return false
     }
     let outcome = classifyInsert(answer, batch.length)
-    if (outcome.kind === 'auth') {
+    if (outcome.kind === 'auth' && !this.closing) {
       // The token may have run out early: one more try at once, with a fresh
       // one. A second 401 means BigQuery refuses the credentials themselves.
+      // Once the exit began, no fresh token is fetched: the batch waits.
       this.dropToken()
       try {
         token = await this.getToken()
@@ -661,7 +699,11 @@ export class Writer {
         return false
       }
       // The fresh token can be another account's: the rows go out under it.
-      await this.stampFor(batch, token, c)
+      if (!this.closing) await this.stampFor(batch, token, c)
+      if (this.closing) {
+        this.queue.unshift(batch)
+        return false
+      }
       body = insertAllBody(batch.map(q => q.row))
       answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
       if ('error' in answer) {
@@ -673,11 +715,13 @@ export class Writer {
     }
     switch (outcome.kind) {
       case 'ok':
+        this.noteSessions(batch)
         this.succeeded(batch.length, c)
         return true
       case 'partial': {
         const rejected: Queued[] = []
         const retry: Queued[] = []
+        const landed: Queued[] = []
         const reasons: string[] = []
         batch.forEach((q, i) => {
           const reason = outcome.rejected.get(i)
@@ -685,7 +729,9 @@ export class Writer {
             rejected.push(q)
             reasons.push(reason)
           } else if (outcome.retry.has(i)) retry.push(q)
+          else landed.push(q)
         })
+        this.noteSessions(landed)
         this.succeeded(batch.length - rejected.length - retry.length, c)
         // Every row handed on before either write is waited for: the refused
         // to their file, those asked for again back to the queue.
@@ -700,7 +746,9 @@ export class Writer {
         await this.retryLater(batch, `authentication: ${outcome.message}`)
         return false
       case 'not-found': {
-        if (c.autoCreateTable && !this.createAttempted && !isDatasetMissing(outcome.message)) {
+        // Once the exit began, no table is created: the batch waits, and the
+        // exit spills it.
+        if (!this.closing && c.autoCreateTable && !this.createAttempted && !isDatasetMissing(outcome.message)) {
           this.createAttempted = true
           if (await this.createTable(c, token)) {
             this.queue.unshift(batch)
@@ -735,10 +783,11 @@ export class Writer {
     this.tookRequest(rows)
     if (rows > 0) this.call(() => this.io.sent?.(rows, c))
     // BigQuery is reachable again: replay what this session parked on disk.
-    if (hadFailures && this.parked.recoverable && this.config().autoBackfill) {
+    // Not once the exit began: the next session replays it.
+    if (!this.closing && hadFailures && this.parked.recoverable && this.config().autoBackfill) {
       this.parked.recoverable = false
       this.io.after(1000, () => {
-        void this.backfill(['spill', 'retry'], 'recovery')
+        if (!this.closing) void this.backfill(['spill', 'retry'], 'recovery')
       })
     }
   }
@@ -847,8 +896,9 @@ export class Writer {
 
   // A line the surface does not take leaves the one shown as it was, and the
   // next status is written again.
-  private setStatus(text: string | undefined): void {
-    const clean = text === undefined ? undefined : diagnostic(text, 300)
+  private setStatus(text: string | undefined, opts?: { inBand?: boolean }): void {
+    const raw = opts?.inBand && this.io.canShowBand?.() ? undefined : text
+    const clean = raw === undefined ? undefined : diagnostic(raw, 300)
     if (clean === this.status.text) return
     this.call(() => {
       this.io.status(clean)
@@ -935,7 +985,7 @@ export class Writer {
   private showProblem(): void {
     if (this.problem === null) return
     const { headline, fix } = this.problemText()
-    this.setStatus(`BQAA: ${headline}. To fix, ${fix} (${this.waitingText()} row(s) waiting)`)
+    this.setStatus(`BQAA: ${headline}. To fix, ${fix} (${this.waitingText()} row(s) waiting)`, { inBand: true })
     this.call(() => this.io.redraw?.())
   }
 
@@ -968,20 +1018,7 @@ export class Writer {
   // long, or holds text redaction would change, to be shown as it is.
   setupCommand(): string | null {
     if (this.problem?.kind !== 'destination') return null
-    const c = this.config()
-    const root = this.io.pluginRoot
-    // A path with a control character (a line break, say) cannot be copied
-    // whole from a line.
-    if (root === undefined || !root.startsWith('/') || /[\u0000-\u001f\u007f]/.test(root)) return null
-    // The views go to `<dataset>_reporting`, held to the same rule.
-    const views = `${c.dataset}_reporting`
-    if (!PLAIN_PROJECT.test(c.project) || ![c.dataset, views, c.table].every(name => PLAIN_NAME.test(name)) || !PLAIN_LOCATION.test(c.location)) return null
-    // A POSIX path: a backslash in it is part of a name, not a separator.
-    const script = root.endsWith('/') ? `${root}setup.sh` : `${root}/setup.sh`
-    const command = `BQAA_PROJECT_ID=${c.project} BQAA_DATASET=${c.dataset} BQAA_TABLE=${c.table} BQAA_VIEWS_DATASET=${views} BQAA_LOCATION=${c.location} bash ${shellQuote(script)}`
-    // Redaction also cuts a text past its limit, so a longer command fails
-    // the same check.
-    return diagnostic(`Run: ${command}`, SETUP_COMMAND_CHARS + 5) === `Run: ${command}` ? command : null
+    return buildSetupCommand(this.config(), this.io.pluginRoot)
   }
 
   // The band's and the transcript's line for the setup command: the command
@@ -1182,6 +1219,12 @@ export class Writer {
     return false
   }
 
+  private noteSessions(rows: readonly Queued[]): void {
+    for (const q of rows) {
+      if (typeof q.row.session_id === 'string' && q.row.session_id !== '') this.sentSessions.add(q.row.session_id)
+    }
+  }
+
   // Dry run: the rows as JSONL files beside the dead-letter directory, each
   // file within the file limit in bytes.
   private async writeDryRunFiles(rows: readonly Queued[], c: Config): Promise<void> {
@@ -1189,6 +1232,7 @@ export class Writer {
       const name = fileName('spill', this.io.now(), this.sessionId(), ++this.seq, this.mark).replace(/^spill-/, 'dry-run-')
       await this.io.writeFile(joinPath(c.dryRunDir, name), text)
     }
+    this.noteSessions(rows)
   }
 
   private async writeDryRun(batch: Queued[], c: Config): Promise<boolean> {
@@ -1231,7 +1275,8 @@ export class Writer {
     let lost = 0
     for (const body of packBodies(lines.map(lineText))) {
       const count = body.split('\n').length - 1
-      const ids = rows.slice(first, first + count).map(q => q.row.event_id)
+      const slice = rows.slice(first, first + count)
+      const ids = slice.map(q => q.row.event_id)
       first += count
       const path = joinPath(dir, fileName(kind, at, this.sessionId(), ++this.seq, this.mark))
       try {
@@ -1239,6 +1284,7 @@ export class Writer {
         // The completion record goes last: a replay reads the file only once
         // the record is there and matches every row above it.
         await this.io.writeFile(path, sealFile(body))
+        this.noteSessions(slice)
         this.counters.deadLetterFiles += 1
         if (kind !== 'rejected') {
           this.parked.recoverable = true
@@ -1258,52 +1304,109 @@ export class Writer {
 
   // ---- session end -------------------------------------------------------
 
+  // True when `sessionId` has not sent, dry-run-written or parked any row yet,
+  // and the queue holds only its `session_start` row(s).
+  hasOnlyUnsentSessionStart(sessionId: string | null): boolean {
+    if (sessionId === null || this.sentSessions.has(sessionId) || this.queue.length === 0) return false
+    const items = this.queue.takeAll()
+    this.queue.append(items)
+    return items.every(q => q.row.session_id === sessionId && q.row.event_type === 'STATE_DELTA' && q.row.content === '{"session_start":true}')
+  }
+
+  // Drops the unsent `session_start` row(s) for `sessionId` when the session
+  // ran only mod slash commands and has not sent or in-flight-flushed any row
+  // for this session yet. `startCaptured` says whether the session wrote a
+  // `session_start` row at all: a managed CLI that keeps classic hooks from
+  // a user plugin raises no classic.SessionStart, and with none to drop such
+  // a session ends silently too. Returns true when the session can end
+  // silently.
+  dropUnsentSessionStart(sessionId: string | null, startCaptured = true): boolean {
+    if (sessionId === null || this.sentSessions.has(sessionId)) return false
+    const writers = [...this.before, this]
+    if (writers.some(w => w.inFlightRows.some(q => q.row.session_id === sessionId))) return false
+    const items = this.queue.takeAll()
+    if (
+      items.some(
+        item =>
+          item.row.session_id === sessionId &&
+          !(item.row.event_type === 'STATE_DELTA' && item.row.content === '{"session_start":true}'),
+      )
+    ) {
+      this.queue.append(items)
+      return false
+    }
+    const kept: Queued[] = []
+    let removed = 0
+    for (const item of items) {
+      if (item.row.session_id === sessionId && item.row.event_type === 'STATE_DELTA' && item.row.content === '{"session_start":true}') {
+        removed += 1
+      } else {
+        kept.push(item)
+      }
+    }
+    this.queue.append(kept)
+    this.counters.captured = Math.max(0, this.counters.captured - removed)
+    return startCaptured ? removed > 0 : true
+  }
+
   // Called from session.end when the process is ending, inside the engine's
-  // short end-of-session bound. Starts no request: the rows still queued, and
-  // rows whose request has not answered (it may yet land; event_id dedups),
-  // go to a spill file the next session sends, or in a dry run to the dry-run
-  // files. Waits at most `budgetMs` for those writes, and for the dead-letter
-  // writes already under way. Never throws.
+  // short end-of-session bound. Starts no request: the rows still queued go
+  // at once to a spill file the next session sends, or in a dry run to the
+  // dry-run files. A batch whose request is out may yet be answered: the exit
+  // waits for that answer up to half its budget, so rows BigQuery took are
+  // not sent again from a spill file, then spills the rows no answer took
+  // (they may yet land; event_id dedups). Waits at most `budgetMs` in all,
+  // for those writes and for the dead-letter writes under way. Never throws.
   async spillForExit(budgetMs: number): Promise<{ spilled: number }> {
     const c = this.config()
-    const until = this.io.now() + budgetMs
+    const start = this.io.now()
+    const until = start + budgetMs
     this.closing = true
     this.soon?.cancel()
     this.soon = null
     // The writers this one took over from start nothing more either, and a
-    // batch one still has out, its answer not come, goes with the rest. Rows
-    // an answer refused, or parks after their retries, are in a file being
-    // written already: a copy here would send them again, so the exit waits
-    // for that write instead, within the same bound.
-    const out: Queued[] = []
-    for (const writer of [...this.before, this]) {
-      writer.closing = true
-      out.push(...writer.inFlightRows)
-    }
-    const pending = [...this.persisting]
-    const rows = [...out, ...this.queue.takeAll()]
-    if (rows.length === 0) {
-      if (pending.length > 0) await this.raceUntil(Promise.all(pending), until)
-      return { spilled: 0 }
-    }
+    // batch one still has out goes with the rest once its wait is over.
+    const writers = [...this.before, this]
+    for (const writer of writers) writer.closing = true
     const toDryRun = c.dryRun && c.dryRunDir !== ''
-    const write = (async (): Promise<void> => {
-      if (!toDryRun) {
-        this.counters.spilled += rows.length
-        await this.deadLetter('spill', rows, 'session ended before these rows were confirmed sent')
-        return
-      }
-      try {
-        await this.writeDryRunFiles(rows, c)
-        this.counters.sent += rows.length
-        this.call(() => this.io.sent?.(rows.length, c))
-      } catch (err) {
-        this.counters.dropped += rows.length
-        this.recordError(`dry run write at exit failed (${rows.length} rows lost): ${errorText(err)}`)
-      }
-    })()
-    await this.raceUntil(Promise.all([write, ...pending]), until)
-    return { spilled: toDryRun ? 0 : rows.length }
+    const writes: Promise<void>[] = []
+    let spilled = 0
+    const park = (rows: Queued[]): void => {
+      if (rows.length === 0) return
+      if (!toDryRun) spilled += rows.length
+      writes.push(this.exitWrite(rows, c, toDryRun))
+    }
+    park(this.queue.takeAll())
+    const flights = writers.flatMap(writer => (writer.inFlightRows.length > 0 && writer.inFlight !== null ? [writer.inFlight] : []))
+    if (flights.length > 0 && budgetMs > 0) await this.raceUntil(Promise.all(flights), start + Math.floor(budgetMs / 2))
+    // What no answer took: the rows still out, and those an answer asked
+    // for again. Rows an answer refused, or parks after their retries, are
+    // in a file being written already: a copy here would send them again,
+    // so the exit waits for that write instead, within the same bound.
+    const out: Queued[] = []
+    for (const writer of writers) out.push(...writer.inFlightRows)
+    park([...out, ...this.queue.takeAll()])
+    const pending = [...writes, ...this.persisting]
+    if (pending.length > 0) await this.raceUntil(Promise.all(pending), until)
+    return { spilled }
+  }
+
+  // The rows of an exit: to a spill file, or in a dry run to the dry-run
+  // files.
+  private async exitWrite(rows: Queued[], c: Config, toDryRun: boolean): Promise<void> {
+    if (!toDryRun) {
+      this.counters.spilled += rows.length
+      await this.deadLetter('spill', rows, 'session ended before these rows were confirmed sent')
+      return
+    }
+    try {
+      await this.writeDryRunFiles(rows, c)
+      this.counters.sent += rows.length
+      this.call(() => this.io.sent?.(rows.length, c))
+    } catch (err) {
+      this.counters.dropped += rows.length
+      this.recordError(`dry run write at exit failed (${rows.length} rows lost): ${errorText(err)}`)
+    }
   }
 
   private raceUntil(work: Promise<unknown>, until: number): Promise<unknown> {
@@ -1366,7 +1469,21 @@ export class Writer {
     const tally: ReplayTally = { waiting: 0, requests: 0 }
     const finish = (): BackfillReport => {
       report.finishedAt = this.io.now()
-      this.backfillReport = report
+      const emptyAuto =
+        trigger === 'auto' &&
+        report.files === 0 &&
+        report.rowsSent === 0 &&
+        report.rowsLeft === 0 &&
+        report.rowsRefused === 0 &&
+        report.skippedFiles === 0 &&
+        report.incompleteFiles.length === 0 &&
+        report.oversizedFiles.length === 0 &&
+        report.held === null &&
+        report.error === null
+      const hasPrevious =
+        this.backfillReport !== null &&
+        (this.backfillReport.files > 0 || this.backfillReport.rowsSent > 0 || this.backfillReport.error !== null)
+      if (!emptyAuto || !hasPrevious) this.backfillReport = report
       return report
     }
     if (!canDeliver(c) || c.dryRun) {
@@ -1642,11 +1759,11 @@ export class Writer {
     return now
   }
 
-  // A replay that runs by itself stops between requests, once it has sent
-  // one, for rows queued meanwhile (the flush it holds sends them first) or
-  // for the session ending. What it did not send stays due.
+  // A replay stops once the session is ending, and a recovery replay stops
+  // between requests once it has sent one when rows are queued meanwhile (the
+  // flush it holds sends them first). What it did not send stays due.
   private replayStops(trigger: BackfillReport['trigger'], tally: ReplayTally): boolean {
-    return trigger === 'recovery' && (this.closing || (tally.requests > 0 && this.queue.length > 0))
+    return this.closing || (trigger === 'recovery' && tally.requests > 0 && this.queue.length > 0)
   }
 
   // Rows one replay request had refused: on the status line, and among the
@@ -2140,10 +2257,12 @@ export class Writer {
         report.error = diagnostic(`authentication: ${messageOf(err)}`)
         continue
       }
+      if (this.closing) break
       if (!marked) {
         if (!(await this.markSending(path, source, trigger, report))) break
         marked = true
       }
+      if (this.closing) break
       const body = insertAllBody(chunk.map(l => l.row))
       tally.requests += 1
       let answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
@@ -2152,10 +2271,11 @@ export class Writer {
         continue
       }
       let outcome = classifyInsert(answer, chunk.length)
-      if (outcome.kind === 'auth') {
+      if (outcome.kind === 'auth' && !this.closing) {
         // As for a send: one more try at once with a fresh token, and a
         // second 401 is the credentials notice. The rows keep the user_id
-        // they were parked with.
+        // they were parked with. Once the exit began, no fresh token is
+        // fetched.
         this.dropToken()
         try {
           token = await this.getToken()
@@ -2163,6 +2283,7 @@ export class Writer {
           report.error = diagnostic(`authentication: ${messageOf(err)}`)
           continue
         }
+        if (this.closing) break
         tally.requests += 1
         answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
         if ('error' in answer) {
@@ -2198,7 +2319,9 @@ export class Writer {
           }
         })
         report.rowsSent += landed
+        this.counters.batches += 1
         this.counters.sent += landed
+        this.counters.replayed += landed
         // In the order they came, as for a send: rows landing end the count,
         // then this request's refusals start it again.
         this.tookRequest(landed)

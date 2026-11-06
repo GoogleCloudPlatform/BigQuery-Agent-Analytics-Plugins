@@ -14,7 +14,10 @@ For all configuration options, event schemas, and redaction details, see [README
 
 - Claude Code CLI v2.1.296 or newer (`claude --version`) in a macOS or Linux terminal (Windows, the desktop app, and editor extensions are not tested)
 - Google Cloud CLI (`gcloud` and `bq`)
-- A Google Cloud project where you can create BigQuery datasets
+- A Google Cloud project where you can create BigQuery datasets, with the BigQuery API enabled:
+  ```bash
+  gcloud services enable bigquery.googleapis.com --project=YOUR_PROJECT
+  ```
 
 ### 2. Sign in to Google Cloud
 
@@ -23,19 +26,7 @@ gcloud auth login                         # for gcloud and bq CLI commands
 gcloud auth application-default login     # for the mod's default token command
 ```
 
-### 3. Create the BigQuery dataset and table
-
-Replace `YOUR_PROJECT` with your real Google Cloud project ID:
-
-```bash
-git clone --depth 1 --filter=blob:none --sparse \
-  https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins
-git -C BigQuery-Agent-Analytics-Plugins sparse-checkout set plugins/claude_code_mod
-BQAA_PROJECT_ID=YOUR_PROJECT BQAA_DATASET=agent_analytics \
-  ./BigQuery-Agent-Analytics-Plugins/plugins/claude_code_mod/setup.sh
-```
-
-### 4. Install the mod
+### 3. Install the mod
 
 Replace `YOUR_PROJECT` with your Google Cloud project ID:
 
@@ -48,6 +39,23 @@ claude plugin install bigquery-agent-analytics-mod@bqaa-tracing \
 
 The installer may print `11 userConfig options not yet set — ...`; that's fine because every other option has a default. If you already have a `claude` session open, run `/reload-plugins` or start a new session.
 
+### 4. Create the BigQuery dataset and table
+
+The installed mod includes `setup.sh` and `scripts/`, so you do not need to clone the repository. Print the ready-to-run `setup.sh` command for your installed copy with `/bqaa-setup` (added in `0.1.1`; in `0.1.0+` `/bqaa-status` prints the same command), then run the printed `BQAA_PROJECT_ID=... setup.sh` command in your shell:
+
+```bash
+claude -p /bqaa-setup < /dev/null
+```
+
+If `/bqaa-setup` is unavailable (e.g. running `0.1.0`), use `/bqaa-status` instead, or run `setup.sh` directly from the installed mod cache:
+
+```bash
+BQAA_PROJECT_ID=YOUR_PROJECT BQAA_DATASET=agent_analytics \
+  ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/setup.sh
+```
+
+*(Optional: if you prefer to run `setup.sh` or `scripts/` from a local checkout, run `git clone --depth 1 --filter=blob:none --sparse https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins && git -C BigQuery-Agent-Analytics-Plugins sparse-checkout set plugins/claude_code_mod`.)*
+
 ### 5. Verify and query your rows
 
 Start a session and send a short prompt (for example, `"list the files here"`). In the first session after installing a new mod version, a welcome card names your table and shows **✓ First rows landed in BigQuery** after a successful upload. The card may be absent in later sessions. In any session, wait a few seconds and run `/bqaa-status`: confirm the correct table (`BigQuery Agent Analytics mod: enabled, target YOUR_PROJECT.agent_analytics.agent_events (US)`), no `notice` line, and at least `1 ok` request. If the table was just created and you see `BigQuery cannot find the table`, wait a few minutes; queued rows retry automatically.
@@ -56,7 +64,7 @@ Then query your logged events in BigQuery (replace `YOUR_PROJECT` in both places
 
 ```bash
 bq --project_id=YOUR_PROJECT query --use_legacy_sql=false \
-  'SELECT event_type, COUNT(*) AS events
+  'SELECT event_type, COUNT(DISTINCT event_id) AS events
    FROM `YOUR_PROJECT.agent_analytics.agent_events`
    WHERE timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
      AND JSON_VALUE(attributes, "$.writer.plugin") = "bigquery-agent-analytics-mod"
@@ -114,7 +122,7 @@ When rows cannot reach BigQuery, the mod buffers them on disk and shows the caus
 
 Because `--config project=...` (or `/config`) saves `"project"` in `~/.claude/settings.json` under `pluginConfigs["bigquery-agent-analytics-mod@bqaa-tracing"].options`, exporting a new `BQAA_PROJECT_ID` or running `gcloud config set project NEW_PROJECT` alone will not change where the mod writes. To switch to `NEW_PROJECT`:
 
-1. **Provision the dataset, table, and views in the new project**:
+1. **Provision the dataset, table, and views in the new project** (run `/bqaa-setup` after updating `project`, or run `setup.sh` from your installed mod directory or a checkout):
    ```bash
    BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics \
      ./BigQuery-Agent-Analytics-Plugins/plugins/claude_code_mod/setup.sh
@@ -131,8 +139,8 @@ Because `--config project=...` (or `/config`) saves `"project"` in `~/.claude/se
 
 ## For administrators
 
-1. **Create the dataset, table, and views**: Run `setup.sh` (see [Step A.3](#3-create-the-bigquery-dataset-and-table)) in a dedicated GCP project where regular users do not hold project-wide BigQuery read roles. This creates `<dataset>.agent_events` and two aggregate views (`daily_usage_by_user`, `daily_usage_by_model`) in `<dataset>_reporting`.
-2. **Create the writer service account and grant your two groups**: The bootstrap script comes with this plugin (`scripts/setup_gcp_prereqs.py`, in the checkout from Step A.3). Run it from the plugin folder; applying its plan needs `google-cloud-bigquery`, so use a Python virtual environment:
+1. **Create the dataset, table, and views**: Run `setup.sh` (see [Step A.4](#4-create-the-bigquery-dataset-and-table)) in a dedicated GCP project where regular users do not hold project-wide BigQuery read roles. This creates `<dataset>.agent_events` and two aggregate views (`daily_usage_by_user`, `daily_usage_by_model`) in `<dataset>_reporting`.
+2. **Create the writer service account and grant your two groups**: The bootstrap script (`scripts/setup_gcp_prereqs.py`) is included inside the installed mod directory (shown by `/bqaa-setup`) as well as in a repository checkout. Run it from that folder; applying its plan needs `google-cloud-bigquery`, so use a Python virtual environment:
    ```bash
    cd BigQuery-Agent-Analytics-Plugins/plugins/claude_code_mod
    python3 -m venv .venv && .venv/bin/pip install google-cloud-bigquery

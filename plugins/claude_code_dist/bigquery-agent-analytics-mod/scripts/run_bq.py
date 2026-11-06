@@ -29,8 +29,13 @@ settings) and prints one JSON object per row, a line each. Pass one query at a
 time:
 
     python3 scripts/run_bq.py --project my-gcp-project --dataset agent_analytics \\
+      --start 2026-10-01 --end 2026-10-31 --query V1
+
+    python3 scripts/run_bq.py --project my-gcp-project --dataset agent_analytics \\
       --start 2026-10-01 --end 2026-10-31 "<one query>"
 
+  -q, --query ID  Run a named query from sql/sample_queries.sql (1..8) or
+                  sql/value_queries.sql (V1..V7) instead of passing SQL text.
   --start, --end  Bind @start and @end: a date (UTC; a bare --start is that
                   day's first instant and a bare --end its last, so both days
                   are counted) or an ISO 8601 timestamp.
@@ -47,7 +52,8 @@ names are taken.
 
 Needs the Python BigQuery client (python3 -m pip install google-cloud-bigquery,
 or run it with uv) and Application Default Credentials (gcloud auth
-application-default login) that may run queries and read the table. Exit
+application-default login; optionally gcloud auth application-default
+set-quota-project PROJECT) that may run queries and read the table. Exit
 status: 0 on success; 1 when the query or the setup fails, with an ERROR line
 on stderr; 2 for a bad argument.
 """
@@ -59,7 +65,9 @@ import json
 import os
 import re
 import sys
+import warnings
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # A project id is 6 to 30 lowercase letters, digits and hyphens, starting with
 # a letter; a domain-scoped one has its domain and a colon in front. A dataset
@@ -69,6 +77,31 @@ PROJECT_PATTERN = re.compile(r"([a-z0-9.-]+:)?[a-z][-a-z0-9]{4,28}[a-z0-9]")
 NAME_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 MAX_NAME_LENGTH = 1024
 GB = 1 << 30
+SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
+QUERY_HEADER = re.compile(r"^-- (V?\d+)\. ")
+
+
+def load_named_queries() -> dict[str, str]:
+    """Each numbered query in sql/sample_queries.sql (1..8) and
+    sql/value_queries.sql (V1..V7), keyed by its uppercase ID."""
+    found: dict[str, str] = {}
+    for filename in ("sample_queries.sql", "value_queries.sql"):
+        path = SQL_DIR / filename
+        if not path.is_file():
+            continue
+        name: str | None = None
+        lines: list[str] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = QUERY_HEADER.match(line)
+            if match:
+                if name is not None:
+                    found[name] = "\n".join(lines).strip()
+                name, lines = match.group(1).upper(), []
+            if name is not None:
+                lines.append(line)
+        if name is not None:
+            found[name] = "\n".join(lines).strip()
+    return found
 
 
 def first_env(*names: str, default: str = "") -> str:
@@ -167,9 +200,26 @@ def load_bigquery():
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run one query over the agent_events table, with a billing limit.",
-        epilog="Placeholders in the query: {PROJECT}, {DATASET}, {TABLE}; parameters: @start, @end, @trace_id.",
+        epilog=(
+            "Placeholders in the query: {PROJECT}, {DATASET}, {TABLE}; parameters: @start, @end, @trace_id. "
+            "Uses Application Default Credentials (gcloud auth application-default login; "
+            "gcloud auth application-default set-quota-project PROJECT)."
+        ),
     )
-    parser.add_argument("query", help="one SQL query (see sql/sample_queries.sql, sql/value_queries.sql)")
+    parser.add_argument(
+        "query",
+        nargs="?",
+        default=None,
+        help="one SQL query (see sql/sample_queries.sql, sql/value_queries.sql), or omit when using --query",
+    )
+    parser.add_argument(
+        "-q",
+        "--query",
+        dest="query_id",
+        metavar="ID",
+        default=None,
+        help="named query ID from sql/sample_queries.sql (1..8) or sql/value_queries.sql (V1..V7), e.g. --query 4 or --query V5",
+    )
     parser.add_argument(
         "--project",
         default=first_env("BQAA_PROJECT_ID", "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT"),
@@ -206,6 +256,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="estimate the bytes the query would scan and run nothing")
     args = parser.parse_args(argv)
+    if args.query is not None and args.query_id is not None:
+        parser.error("pass either a SQL query or --query ID, not both")
+    if args.query is None and args.query_id is None:
+        parser.error("pass a SQL query or --query ID (1..8, V1..V7)")
+    if args.query_id is not None:
+        named = load_named_queries()
+        key = args.query_id.strip().upper()
+        if key not in named:
+            choices = ", ".join(named) if named else "1..8, V1..V7"
+            parser.error(f"unknown --query {args.query_id!r} (choose from {choices})")
+        args.query = named[key]
     if args.start is not None and args.end is not None and args.start > args.end:
         parser.error(f"--start {args.start.isoformat()} is after --end {args.end.isoformat()}")
     return args
@@ -228,6 +289,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     limit = int(args.max_gb * GB)
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Your application has authenticated using end user credentials from Google Cloud SDK without a quota project.*",
+        category=UserWarning,
+    )
     try:
         client = bigquery.Client(project=args.project)
         parameters = build_query_parameters(bigquery, args)
