@@ -35,16 +35,18 @@
 -- tests/queries.live.py runs each one on a synthetic fixture.
 
 -- V1. Developer: my sessions at a glance. Per session: when it started, how
---     long it was open, its prompts, turns, model requests, tool calls, the
---     tool calls that failed, the tokens recorded, and the responses that
---     recorded none (their tokens are unknown, not zero). Add
---     AND user_id = 'you' for yours (user_id is the login name the machine
---     reported).
+--     long it was open, its prompts (excluding host-injected
+--     task-notification messages, which are counted in notifications),
+--     turns, model requests, tool calls, the tool calls that failed, the
+--     tokens recorded, and the responses that recorded none (their tokens
+--     are unknown, not zero). Add AND user_id = 'you' for yours (user_id
+--     is the login name the machine reported).
 WITH events AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN @start AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 )
 SELECT
@@ -52,7 +54,14 @@ SELECT
   ANY_VALUE(user_id) AS user_id,
   MIN(timestamp) AS started_at,
   ROUND(TIMESTAMP_DIFF(MAX(timestamp), MIN(timestamp), SECOND) / 60, 1) AS minutes_open,
-  COUNTIF(event_type = 'USER_MESSAGE_RECEIVED') AS prompts,
+  COUNTIF(
+    event_type = 'USER_MESSAGE_RECEIVED'
+    AND IFNULL(JSON_VALUE(attributes, '$.prompt_origin'), '') != 'task-notification'
+  ) AS prompts,
+  COUNTIF(
+    event_type = 'USER_MESSAGE_RECEIVED'
+    AND JSON_VALUE(attributes, '$.prompt_origin') = 'task-notification'
+  ) AS notifications,
   COUNTIF(event_type = 'INVOCATION_STARTING') AS turns,
   COUNTIF(event_type = 'LLM_RESPONSE') AS model_requests,
   COUNTIF(event_type = 'TOOL_COMPLETED') AS tool_calls,
@@ -80,7 +89,12 @@ ORDER BY started_at DESC;
 --     earlier calls may be missing, so its model and tool time and its
 --     permission prompts are NULL, and started_at comes from its end row
 --     (its end less its total; NULL without one). The parts can add up to
---     more than the turn: a tool call can run beside a model request.
+--     more than the turn, or exceed turn_ms individually: tool calls can
+--     run in parallel with model requests, a permission prompt's wait is
+--     included in TOOL_COMPLETED's duration while the host leaves that
+--     wait out of INVOCATION_COMPLETED's turn_ms, and background subagent
+--     model requests carry the launching turn's invocation_id even when
+--     they finish after the foreground turn.
 WITH events AS (
   SELECT
     *,
@@ -88,6 +102,7 @@ WITH events AS (
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN TIMESTAMP_SUB(@start, INTERVAL 1 DAY) AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
     AND invocation_id IS NOT NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 ),
@@ -147,7 +162,9 @@ ORDER BY started_at DESC;
 --     window: the people enrolled (a table of their login names that you
 --     keep, team_roster, with one user_id column), how many of them have
 --     rows, their sessions and turns, and the sessions from no one on the
---     roster or with no user_id. A person with no rows is "not seen", not
+--     roster or with no user_id. Includes all rows (unidentified_loop rows
+--     are kept here; they are left out of V1, V2, V5, V6 and V7 that count
+--     turns, tools and agents). A person with no rows is "not seen", not
 --     zero use: they may not have used the agent, or their sessions may not
 --     be recorded. A day with no rows at all is listed too, every enrolled
 --     person not seen, and no_rows_that_day says so: absent telemetry, not
@@ -200,7 +217,9 @@ ORDER BY d.day DESC;
 --     row has no cost (NULL), not zero; nor has a session and model with a
 --     response that recorded no usage (responses_without_usage counts
 --     them), as its tokens are unknown. Discounts and other charges are
---     not counted.
+--     not counted. Reads all of this mod's LLM_RESPONSE rows; loops the mod
+--     saw no start for (unidentified_loop) do not record LLM_RESPONSE today,
+--     so no filter is needed here (V1, V2, V5, V6 and V7 do filter them).
 WITH rates AS (
   -- rates: begin
   SELECT * FROM UNNEST([
@@ -252,6 +271,9 @@ ORDER BY r.session_id, r.model;
 --     (refused_other_pct: one the host did not give, which the mod records
 --     as unknown, or one not named here). Those four add up to refused_pct.
 --     A call that a rule blocks before the host records it leaves no row.
+--     Rows of a loop the mod saw no start for (unidentified_loop, such as
+--     the host's own fork that proposes the next prompt) are left out here
+--     and in V1, V2, V6 and V7.
 WITH tools AS (
   SELECT
     *,
@@ -267,6 +289,7 @@ WITH tools AS (
   WHERE event_type = 'TOOL_COMPLETED'
     AND timestamp BETWEEN @start AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 )
 SELECT
@@ -304,6 +327,7 @@ WITH events AS (
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN @start AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 )
 SELECT
@@ -356,6 +380,7 @@ WITH events AS (
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN TIMESTAMP_SUB(@start, INTERVAL 1 DAY) AND @end
     AND IFNULL(JSON_VALUE(attributes, '$.writer.plugin'), 'bigquery-agent-analytics-mod') = 'bigquery-agent-analytics-mod'
+    AND JSON_VALUE(attributes, '$.unidentified_loop') IS NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 ),
 spans AS (

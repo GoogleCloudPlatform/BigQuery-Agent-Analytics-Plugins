@@ -212,9 +212,9 @@ command empty, and gcloud still printed a token with each.
 refuses to run ("The provided path must exist"). Pins apply to every process
 a session starts, the person's own gcloud commands included.
 
-To check a machine: `claude -p /bqaa-status` (no model call) prints
+To check a machine: `claude -p /bqaa-status < /dev/null` (no model call) prints
 `enabled, target my-gcp-project.agent_analytics.agent_events (US)`, and
-`claude -p --debug-file /tmp/bqaa.log /bqaa-status` leaves
+`claude -p --debug-file /tmp/bqaa.log /bqaa-status < /dev/null` leaves
 `hooks module bigquery-agent-analytics-mod@org-tools loaded (... tier prepend)`
 in the log. In an interactive session, `/status` shows which managed
 sources are in effect, as above.
@@ -396,10 +396,10 @@ with the sparse paths:
 - It runs in the user tier, with the differences in
   [Choose the tier](#choose-the-tier).
 
-Until this repository's first mod release (`mod-v0.1.0`, with its
-`mod-dist-v0.1.0` tag), there is no version to pin on either route; a fork
-your organization controls can hold one. `ref` takes a branch or a tag, not
-a commit (checked: a commit is "not found in upstream origin").
+With `mod-v0.1.0` (and its `mod-dist-v0.1.0` tag) published, organizations can
+pin `mod-dist-v0.1.0` (or a newer `mod-dist-vX.Y.Z` tag) directly, or use a
+fork their organization controls. `ref` takes a branch or a tag, not a commit
+(checked: a commit is "not found in upstream origin").
 
 To deploy a tag, the first one and every move after it:
 
@@ -585,7 +585,7 @@ earlier ways in off:
    loads and no tracer hook runs.
 
    Before going on, check on pilot machines that it is in effect:
-   `claude -p --debug-file /tmp/bqaa.log /bqaa-status` leaves no
+   `claude -p --debug-file /tmp/bqaa.log /bqaa-status < /dev/null` leaves no
    `hooks module bigquery-agent-analytics-mod` line in the log. Where
    several managed sources apply, `/status` in an interactive session
    lists the one you changed under "Setting sources". Not checked here: the

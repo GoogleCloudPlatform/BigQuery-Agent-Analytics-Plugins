@@ -24,10 +24,11 @@
 #   4. The views in sql/views/: daily_usage_by_model and daily_usage_by_user.
 #
 # Safe to run again: it creates what is missing, replaces the two views and
-# removes nothing. --dry-run prints the bq commands and the SQL and runs none.
+# removes nothing. --dry-run prints the bq commands and the SQL and runs none;
+# --team prints the scripts/setup_gcp_prereqs.py command for a shared team table.
 #
 # Usage:
-#   BQAA_PROJECT_ID=my-project BQAA_DATASET=agent_analytics ./setup.sh [--dry-run]
+#   BQAA_PROJECT_ID=my-project BQAA_DATASET=agent_analytics ./setup.sh [--dry-run] [--team]
 #
 # Settings, read from the same environment variables as the mod:
 #   BQAA_PROJECT_ID     the project (or GCP_PROJECT_ID, GOOGLE_CLOUD_PROJECT)
@@ -44,15 +45,17 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 dry_run=0
+team=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=1 ;;
+    --team) team=1 ;;
     -h | --help)
       awk 'NR > 1 && /^$/ { if (++block > 1) exit; next } block == 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
-      echo "setup.sh: unknown argument \"$arg\" (try --dry-run or --help)" >&2
+      echo "setup.sh: unknown argument \"$arg\" (try --dry-run, --team or --help)" >&2
       exit 2
       ;;
   esac
@@ -94,22 +97,22 @@ query() {
   local sql
   sql="$(render "$1")"
   if ((dry_run)); then
-    printf '+ bq --project_id=%s query --use_legacy_sql=false --location=%s <<SQL\n%s\nSQL\n' "$project" "$location" "$sql"
+    printf '+ bq --quiet --project_id=%s query --use_legacy_sql=false --location=%s <<SQL\n%s\nSQL\n' "$project" "$location" "$sql"
   else
-    printf '%s\n' "$sql" | bq --project_id="$project" query --use_legacy_sql=false --location="$location" >/dev/null
+    printf '%s\n' "$sql" | bq --quiet --project_id="$project" query --use_legacy_sql=false --location="$location" >/dev/null
   fi
 }
 
 # Creates a dataset unless it exists.
 dataset_ready() {
   if ((dry_run)); then
-    printf '+ bq --project_id=%s show --dataset %s:%s || bq --project_id=%s --location=%s mk --dataset --description=%q %s:%s\n' \
+    printf '+ bq --project_id=%s show --dataset %s:%s || bq --quiet --project_id=%s --location=%s mk --dataset --description=%q %s:%s\n' \
       "$project" "$project" "$1" "$project" "$location" "$2" "$project" "$1"
   elif bq --project_id="$project" show --dataset "$project:$1" >/dev/null 2>&1; then
     echo "==> $project:$1 is there already"
   else
     echo "==> $project:$1 is missing: making it, in $location"
-    bq --project_id="$project" --location="$location" mk --dataset --description="$2" "$project:$1" >/dev/null
+    bq --quiet --project_id="$project" --location="$location" mk --dataset --description="$2" "$project:$1" >/dev/null
   fi
 }
 
@@ -131,17 +134,24 @@ echo "Done. The mod writes to $project.$dataset.$table with these options:"
 echo "  project: $project"
 echo "  dataset: $dataset"
 if [[ "$table" != agent_events ]]; then echo "  table: $table"; fi
-# The bootstrap's names for what is not its default: the table, the views
-# dataset and the location.
-names=""
-if [[ "$table" != agent_events ]]; then names+=" --table $table"; fi
-if [[ "$views_dataset" != "${dataset}_reporting" ]]; then names+=" --views-dataset $views_dataset"; fi
-if [[ "$location" != US ]]; then names+=" --location $location"; fi
-echo "Next, who writes and who reads (docs/service-account-auth.md). For a team, the"
-echo "bootstrap in this plugin's scripts folder prints its plan; --execute applies it:"
-printf '  python3 %q \\\n' "$here/scripts/setup_gcp_prereqs.py"
-echo "    --project $project --dataset $dataset$names --no-create-dataset --no-create-table \\"
-echo "    --service-account bqaa-row-writer --writer-role row-writer \\"
-echo "    --token-creator group:WRITERS --reader group:READERS"
-echo "sets up a writer service account that may only insert rows into the table, and"
-echo "readers of the views in $project:$views_dataset who need no access to the table."
+if ((team)); then
+  # The bootstrap's names for what is not its default: the table, the views
+  # dataset and the location.
+  names=""
+  if [[ "$table" != agent_events ]]; then names+=" --table $table"; fi
+  if [[ "$views_dataset" != "${dataset}_reporting" ]]; then names+=" --views-dataset $views_dataset"; fi
+  if [[ "$location" != US ]]; then names+=" --location $location"; fi
+  echo "Next, who writes and who reads (docs/service-account-auth.md). For a team, the"
+  echo "bootstrap in this plugin's scripts folder prints its plan; --execute applies it:"
+  printf '  python3 %q \\\n' "$here/scripts/setup_gcp_prereqs.py"
+  echo "    --project $project --dataset $dataset$names --no-create-dataset --no-create-table \\"
+  echo "    --service-account bqaa-row-writer --writer-role row-writer \\"
+  echo "    --token-creator group:WRITERS --reader group:READERS"
+  echo "sets up a writer service account that may only insert rows into the table, and"
+  echo "readers of the views in $project:$views_dataset who need no access to the table."
+  echo "Previewing the plan above uses only the Python standard library; applying it"
+  echo "(--execute) requires a virtual environment with google-cloud-bigquery installed"
+  echo "(python3 -m venv .venv && .venv/bin/pip install google-cloud-bigquery)."
+else
+  echo "For a shared team table (write-only service account + view readers), run setup.sh --team or see docs/service-account-auth.md."
+fi
