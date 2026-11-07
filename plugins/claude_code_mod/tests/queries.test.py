@@ -253,6 +253,12 @@ for label, name, sql, start, end in runs:
 check('sample_queries.sql 5: I1 has 195 turn_tokens and 0 responses_without_usage', (q5_rows.get('I1', {}).get('turn_tokens'), q5_rows.get('I1', {}).get('responses_without_usage')) == (195, 0), json.dumps(q5_rows.get('I1')))
 check('sample_queries.sql 5: I2 sums main (240) + subagent (50) = 290 turn_tokens (0 missing)', (q5_rows.get('I2', {}).get('turn_tokens'), q5_rows.get('I2', {}).get('responses_without_usage')) == (290, 0), json.dumps(q5_rows.get('I2')))
 check('sample_queries.sql 5: I3 has 30 turn_tokens and flags 1 responses_without_usage', (q5_rows.get('I3', {}).get('turn_tokens'), q5_rows.get('I3', {}).get('responses_without_usage')) == (30, 1), json.dumps(q5_rows.get('I3')))
+check(
+    'sample_queries.sql 5 projects trace_id per turn (preserving NULL when absent) and feeds directly into Query 6',
+    (q5_rows.get('I1', {}).get('trace_id'), q5_rows.get('I2', {}).get('trace_id'), q5_rows.get('I3', {}).get('trace_id')) == ('trace-1', None, None)
+    and len(exec_query(db_live, sample_qs['6'], live.START, live.END, trace_id=q5_rows['I1']['trace_id'])) == 14,
+    json.dumps({k: v.get('trace_id') for k, v in q5_rows.items()}),
+)
 
 # 2. Canonical examples/sample-rows.jsonl + duplicate event_id replay.
 sample_rows = [json.loads(line) for line in (PLUGIN / 'examples' / 'sample-rows.jsonl').read_text().splitlines() if line.strip()]
@@ -263,9 +269,12 @@ q5_ex = exec_query(db_examples, sample_qs['5'], '2026-10-14', '2026-10-14')
 v1_ex = exec_query(db_examples, value_qs['V1'], '2026-10-14', '2026-10-14')
 check('examples/sample-rows.jsonl: Query 1 deduplicates replayed event_id to 26 rows', len(q1_ex) == 26)
 check(
-    'examples/sample-rows.jsonl: Query 5 turn_tokens (90798) and responses_without_usage (0) match V1',
-    len(q5_ex) == 1 and (q5_ex[0]['model_requests'], q5_ex[0]['subagents'], q5_ex[0]['turn_tokens'], q5_ex[0].get('responses_without_usage')) == (5, 1, 90798, 0)
-    and (v1_ex[0]['tokens'], v1_ex[0]['responses_without_usage']) == (90798, 0),
+    'examples/sample-rows.jsonl: Query 5 turn_tokens (90798), responses_without_usage (0), and trace_id match V1 and Query 6',
+    len(q5_ex) == 1
+    and (q5_ex[0]['model_requests'], q5_ex[0]['subagents'], q5_ex[0]['turn_tokens'], q5_ex[0].get('responses_without_usage'), q5_ex[0].get('trace_id'))
+    == (5, 1, 90798, 0, 'a4db76890e3b711d381938f9c05e0935')
+    and (v1_ex[0]['tokens'], v1_ex[0]['responses_without_usage']) == (90798, 0)
+    and len(exec_query(db_examples, sample_qs['6'], '2026-10-14', '2026-10-14', trace_id=q5_ex[0]['trace_id'])) == 24,
     json.dumps(q5_ex),
 )
 for name, sql in {**sample_qs, **value_qs}.items():

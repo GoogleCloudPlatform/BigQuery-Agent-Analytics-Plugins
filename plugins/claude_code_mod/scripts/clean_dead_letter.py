@@ -42,7 +42,7 @@ delete. With ``--execute``, a file that cannot be deleted is reported on
 stderr and the exit status is 1.
 
 Usage:
-  python3 scripts/clean_dead_letter.py [--dir DIR] [--execute]
+  python3 scripts/clean_dead_letter.py [DIR | --dir DIR] [--execute]
 """
 
 from __future__ import annotations
@@ -175,7 +175,7 @@ def plan_deletions(directory: Path) -> list[Path]:
     as ``parent``; nothing is in a partition directory that cannot be read
     whole (see ``_plan_single_dir``).
     """
-    if not directory.is_dir():
+    if directory.is_symlink() or not directory.is_dir():
         return []
 
     dirs = [directory, *[d for d in sorted(directory.iterdir()) if d.is_dir() and not d.is_symlink()]]
@@ -188,13 +188,20 @@ def plan_deletions(directory: Path) -> list[Path]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Remove dead-letter files that no longer guard any rows.")
-    parser.add_argument("--dir", type=Path, default=DEFAULT_DIR,
+    parser.add_argument("path", nargs="?", type=Path, default=None,
+                        help=f"dead-letter directory (default: {DEFAULT_DIR})")
+    parser.add_argument("--dir", type=Path, default=None,
                         help=f"dead-letter directory (default: {DEFAULT_DIR})")
     parser.add_argument("--execute", action="store_true",
                         help="delete the files; without it, only report them.")
     args = parser.parse_args(argv)
+    if args.path is not None and args.dir is not None:
+        parser.error("pass either positional path or --dir, not both")
 
-    base = args.dir
+    base = (args.path if args.path is not None else args.dir if args.dir is not None else DEFAULT_DIR).expanduser()
+    if base.is_symlink():
+        print(f"ERROR: refusing symlinked dead-letter directory: {base}", file=sys.stderr)
+        return 1
     if not base.is_dir():
         print(f"dead-letter directory not found: {base}")
         return 0

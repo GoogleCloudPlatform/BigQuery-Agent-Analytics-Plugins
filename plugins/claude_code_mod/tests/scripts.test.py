@@ -367,6 +367,65 @@ def run_bq_checks():
         check(f'{flag} {qid} resolves to query {expected_id} and runs it',
               status == 0 and len(fake.queries) == 1 and fake.queries[0][0] == expected_sql, f'{status} {err!r}')
 
+    # @trace_id pre-client validation and @start/@end 7-day UTC defaults when referenced.
+    check('referenced_params ignores comments, strings, backticks and mid-word @, while matching real @params',
+          run_bq.referenced_params(
+              "-- @trace_id @start\n# @end\n/* @trace_id */\n"
+              "SELECT '@start', \"a\\\" @trace_id b\", '''@end''', \"\"\"@start\"\"\", `@trace_id`, 'foo@end.com', "
+              "'trailing\\\\' WHERE timestamp BETWEEN @START AND @end"
+          ) == {'start', 'end'})
+    check('referenced_params detects @trace_id outside literals',
+          run_bq.referenced_params('SELECT * FROM t WHERE trace_id = @trace_id') == {'trace_id'})
+    fake = FakeBigQuery()
+    status, out, err = run_bq_with(fake, *base, '--query', '6')
+    check('--query 6 without --trace-id: exit 2 naming query 6, with no BigQuery client made',
+          status == 2 and 'usage:' in err and 'query 6 needs --trace-id' in err and fake.clients == [],
+          f'{status} {err!r}')
+    fake = FakeBigQuery()
+    status, out, err = run_bq_with(fake, *base, 'SELECT * FROM `{PROJECT}.{DATASET}.{TABLE}` WHERE trace_id = @trace_id')
+    check('custom SQL with @trace_id and no --trace-id: exit 2 before creating a BigQuery client',
+          status == 2 and 'usage:' in err and 'query needs --trace-id' in err and fake.clients == [],
+          f'{status} {err!r}')
+    fake = FakeBigQuery(rows=[{'ok': 1}])
+    status, out, err = run_bq_with(fake, *base, "SELECT '-- @trace_id', '@trace_id' -- @trace_id")
+    check('SQL mentioning @trace_id only in strings or comments needs no --trace-id and binds nothing',
+          status == 0 and parameters(fake.queries[0][1]) == {}, f'{status} {err!r}')
+    fixed_now = dt(2026, 11, 6, 12, 30)
+    with patched(run_bq, _utc_now=lambda: fixed_now):
+        fake = FakeBigQuery(rows=[{'ok': 1}])
+        status, out, err = run_bq_with(fake, *base, '--query', '4')
+        check('--query 4 with no --start/--end defaults @end to UTC now and @start to 7 days earlier',
+              status == 0 and parameters(fake.queries[0][1]) == {
+                  'start': ('TIMESTAMP', dt(2026, 10, 30, 12, 30)),
+                  'end': ('TIMESTAMP', fixed_now),
+              }, f'{status} {err!r} {fake.queries and parameters(fake.queries[0][1])}')
+        fake = FakeBigQuery(rows=[{'ok': 1}])
+        status, out, err = run_bq_with(fake, *base, '--query', '4', '--start', '2026-11-01')
+        check('--query 4 with --start only defaults @end to UTC now',
+              status == 0 and parameters(fake.queries[0][1]) == {
+                  'start': ('TIMESTAMP', dt(2026, 11, 1)),
+                  'end': ('TIMESTAMP', fixed_now),
+              }, f'{status} {err!r}')
+        fake = FakeBigQuery(rows=[{'ok': 1}])
+        status, out, err = run_bq_with(fake, *base, '--query', '4', '--end', '2026-11-06')
+        check('--query 4 with --end only defaults @start to 7 days before @end',
+              status == 0 and parameters(fake.queries[0][1]) == {
+                  'start': ('TIMESTAMP', dt(2026, 10, 30, 23, 59, 59, 999999)),
+                  'end': ('TIMESTAMP', dt(2026, 11, 6, 23, 59, 59, 999999)),
+              }, f'{status} {err!r}')
+        fake = FakeBigQuery()
+        status, out, err = run_bq_with(fake, *base, '--query', '4', '--start', '2026-11-10')
+        check('future --start without --end fails with exit 2 after @end defaults to UTC now',
+              status == 2 and 'is after --end' in err and fake.clients == [], f'{status} {err!r}')
+        fake = FakeBigQuery(rows=[{'span_id': 's1'}])
+        status, out, err = run_bq_with(fake, *base, '--query', '6', '--trace-id', 'trace-1')
+        check('--query 6 with --trace-id binds trace_id alongside defaulted @start and @end',
+              status == 0 and parameters(fake.queries[0][1]) == {
+                  'start': ('TIMESTAMP', dt(2026, 10, 30, 12, 30)),
+                  'end': ('TIMESTAMP', fixed_now),
+                  'trace_id': ('STRING', 'trace-1'),
+              }, f'{status} {err!r}')
+
     class QuotaWarningBigQuery(FakeBigQuery):
         def __init__(self):
             super().__init__(rows=[{'ok': 1}])
@@ -1785,6 +1844,60 @@ def clean_dead_letter_checks():
         check('10. a partition directory that cannot be listed plans nothing, and the others are planned',
               [p.relative_to(base).as_posix() for p in to_delete] == ['proj.ds.other/spill-011.jsonl'],
               str(to_delete))
+
+    # 11. Positional path, DEFAULT_DIR fallback, mutual exclusion with --dir, and symlinked root rejection.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        d = make_dir(tmp_path)
+        source = d / 'spill-012.jsonl'
+        source.write_bytes(b'')
+        outcome = d / 'outcome-spill-012.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        status, out, err = call(clean.main, str(d))
+        check('11a. positional path dry-run lists deletable files without deleting, exit 0',
+              status == 0 and '2 file(s) would delete' in out and source.exists() and outcome.exists(),
+              f'{status} {out!r} {err!r}')
+        status, out, err = call(clean.main, str(d), '--dir', str(d))
+        check('11b. passing both positional path and --dir exits 2 with usage error',
+              status == 2 and 'pass either positional path or --dir, not both' in err and source.exists(),
+              f'{status} {out!r} {err!r}')
+        status, out, err = call(clean.main, str(d), '--execute')
+        check('11c. positional path with --execute deletes empty source and outcome, exit 0',
+              status == 0 and not source.exists() and not outcome.exists(),
+              f'{status} {out!r} {err!r}')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        d = make_dir(tmp_path)
+        source = d / 'spill-013.jsonl'
+        source.write_bytes(b'')
+        with patched(clean, DEFAULT_DIR=tmp_path / 'dead-letter'):
+            status, out, err = call(clean.main, '--execute')
+        check('11d. omitting both positional path and --dir uses DEFAULT_DIR',
+              status == 0 and not source.exists() and '1 file(s) deleted' in out,
+              f'{status} {out!r} {err!r}')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        real_base = tmp_path / 'dead-letter'
+        d = make_dir(tmp_path)
+        source = d / 'spill-014.jsonl'
+        source.write_bytes(b'')
+        outcome = d / 'outcome-spill-014.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        sym_root = tmp_path / 'symlink-dead-letter'
+        sym_root.symlink_to(real_base, target_is_directory=True)
+        check('11e. plan_deletions refuses a symlinked root directory',
+              clean.plan_deletions(sym_root) == [], str(clean.plan_deletions(sym_root)))
+        status_pos, out_pos, err_pos = call(clean.main, str(sym_root), '--execute')
+        status_flag, out_flag, err_flag = call(clean.main, '--dir', str(sym_root), '--execute')
+        check('11f. main refuses a symlinked root directory (positional and --dir) with exit 1 and keeps target files',
+              status_pos == 1 and status_flag == 1
+              and 'refusing symlinked dead-letter directory' in err_pos
+              and 'refusing symlinked dead-letter directory' in err_flag
+              and out_pos == '' and out_flag == ''
+              and source.exists() and outcome.exists(),
+              f'{status_pos} {err_pos!r} / {status_flag} {err_flag!r}')
 
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,

@@ -44,6 +44,11 @@ The BigQuery dataset must exist before the mod can write. [`setup.sh`](setup.sh)
 - **Reporting views**: Creates `<dataset>_reporting` with two daily aggregate views—[`daily_usage_by_model`](sql/views/daily_usage_by_model.sql) and [`daily_usage_by_user`](sql/views/daily_usage_by_user.sql)—filtered to this mod's `LLM_RESPONSE` rows, deduplicated on `(timestamp, event_id)`, and grouped by UTC `day`.
 
 ```bash
+# Installed from the marketplace (or run `claude -p /bqaa-mod-setup < /dev/null` to print the path):
+SETUP_SH="$(ls -d ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | sort -V | tail -1)setup.sh"
+BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics bash "$SETUP_SH"
+
+# Or from a local repository checkout:
 BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics \
   ./plugins/claude_code_mod/setup.sh
 ```
@@ -83,7 +88,7 @@ Advanced tuning (environment variables only):
 | `BQAA_USER_ID` | `$USER` / `$USERNAME` | Overrides `user_id` (unless `userIdFromCredentials` is enabled and resolved). |
 | `BQAA_REQUEST_TIMEOUT_MS` | `10000` (`1000`–`30000`) | Client timeout (ms) per `insertAll` HTTP request. |
 | `BQAA_MAX_QUEUE_ROWS` | `5000` (`10`–`100000`) | Max rows buffered in memory (also bounded at `8 MiB` UTF-8). |
-| `BQAA_EXIT_FLUSH_MS` | `800` (`0`–`1200`) | Max wait (ms) at `session.end` to write queued rows to a local spill file; up to half of it waits for the answer to a request already out, so rows BigQuery took are not spilled (`0` = fire-and-forget). |
+| `BQAA_EXIT_FLUSH_MS` | `800` (`0`–`1200`) | Max wait (ms) at `session.end`: up to half waits for an `insertAll` request already in flight; within the remaining budget, when healthy and a token is already available in memory or `BQAA_ACCESS_TOKEN` (never spawning a credential subprocess), sends queued rows in one bounded `insertAll` request (and replays waiting spills in non-interactive `-p` runs), spilling unsent rows to disk otherwise (`0` = spill immediately without an exit request). |
 | `BQAA_AUTO_CREATE_TABLE` | `true` | Create the `agent_events` table automatically when `insertAll` returns `404` for the table. |
 | `BQAA_AUTO_BACKFILL` | `true` | Automatically replay local `spill` and `retry` files at session start and after recovery. |
 
@@ -93,10 +98,10 @@ Advanced tuning (environment variables only):
 
 To move capture to `NEW_PROJECT`:
 
-1. **Create the dataset, `agent_events` table, and `<dataset>_reporting` views in the new project**:
+1. **Create the dataset, `agent_events` table, and `<dataset>_reporting` views in the new project** (using `/bqaa-mod-setup`, the installed cache `setup.sh`, or `./plugins/claude_code_mod/setup.sh` in a checkout):
    ```bash
-   BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics \
-     ./plugins/claude_code_mod/setup.sh
+   SETUP_SH="$(ls -d ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | sort -V | tail -1)setup.sh"
+   BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics bash "$SETUP_SH"
    ```
 2. **Update the saved plugin setting**:
    - Update `project` via `/config` (or `/plugin configure`), or re-run:
@@ -121,7 +126,7 @@ The background writer uploads over HTTPS using a Google OAuth access token obtai
 All slash commands run immediately—even mid-turn—and display only safe operational counters (never prompts, payloads, or tokens):
 
 - `/bqaa-status` — Shows the target table, queue depth, row counters (`captured`, `sent`, `dead-lettered`, `spilled`, `dropped`), request health, active troubleshooting notices (including a ready-to-run `setup.sh` command when the dataset is missing), and local dead-letter file counts (including any `incomplete` files).
-- `/bqaa-setup` — Prints the ready-to-run `setup.sh` command for this installed copy so you can create the BigQuery dataset, `agent_events` table, and `<dataset>_reporting` views without cloning the repository.
+- `/bqaa-mod-setup` — Prints the ready-to-run `setup.sh` command for this installed copy so you can create the BigQuery dataset, `agent_events` table, and `<dataset>_reporting` views without cloning the repository (`/bqaa-setup` remains a compatibility alias in `0.1.x` and is deprecated for `0.2.0` to avoid colliding with `bigquery-agent-analytics-tracing`).
 - `/bqaa-flush` — Flushes queued rows to BigQuery immediately instead of waiting for the next `flushIntervalMs` tick.
 - `/bqaa-backfill` — Replays local dead-letter files (`spill`, `retry`, and `rejected`) for the configured table in the background. Pass `/bqaa-backfill force` to reclaim a file left behind by a terminated session once its 10-minute lease expires; files missing their completion record (listed as `incomplete` in `/bqaa-status`) are skipped so truncated rows are never sent.
 
@@ -138,10 +143,10 @@ Host hook ──► sanitize & enqueue (in-memory, <= 5,000 rows / 8 MiB) ──
                  └── error / exit ──► ~/.bqaa-mod/dead-letter/<project.dataset.table>/*.jsonl ──► auto-backfill (spill & retry)
 ```
 
-- **In-process, fail-open capture**: Hooks never wait on network requests. Turn, model, and tool hooks sanitize and enqueue rows synchronously in memory (`<= 5,000` rows / `8 MiB`), `session.start` and `session.end` perform bounded local setup and spill work, and internal errors are caught so your CLI session is never interrupted.
+- **In-process, fail-open capture**: Turn, model, and tool hooks never wait on network requests: they sanitize and enqueue rows synchronously in memory (`<= 5,000` rows / `8 MiB`), `session.start` performs local setup, `session.end` runs a bounded exit flush (`BQAA_EXIT_FLUSH_MS`) with local spill fallback, and internal errors are caught so your CLI session is never interrupted.
 - **Background batching**: Every `flushIntervalMs` (default `5 s`) and at the end of each main-loop turn, the background writer sends batches of up to `500` rows or `3 MiB` UTF-8 to BigQuery `tabledata.insertAll` with `insertId = event_id`.
 - **Retries and queue protection**: Transient errors (`408`, `429`, `5xx`, network timeouts, quota `403`s, and `404`s while a dataset or table propagates) retry up to 3 times with exponential backoff (`1 s`–`60 s`, capped at `30 s` for credential or missing-dataset pauses). If the queue fills up (`5,000` rows or `8 MiB`), the oldest queued rows are dropped; while BigQuery is failing in backoff, each flush tick spills the oldest half to disk once the queue passes 80% capacity so drops stay rare.
-- **Local dead-letter and exit spill**: Exhausted batches write to `retry-*.jsonl`, rejected rows (`400`, `403`, invalid row) write to `rejected-*.jsonl`, and rows still queued at process exit, or whose request had no answer within half of `BQAA_EXIT_FLUSH_MS`, write to `spill-*.jsonl` (waiting up to `BQAA_EXIT_FLUSH_MS`) under `~/.bqaa-mod/dead-letter/<project.dataset.table>/`.
+- **Local dead-letter and exit flush**: Exhausted batches write to `retry-*.jsonl`, rejected rows (`400`, `403`, invalid row) write to `rejected-*.jsonl`, and at `session.end` queued rows first attempt one bounded `insertAll` flush when healthy with an already-available token (within `BQAA_EXIT_FLUSH_MS`), spilling any remaining or unacknowledged rows to `spill-*.jsonl` under `~/.bqaa-mod/dead-letter/<project.dataset.table>/`.
 - **Automatic backfill**: Fifteen seconds after session start—and whenever BigQuery recovers from an outage—the writer automatically replays complete `spill` and `retry` files belonging to the configured table (`rejected` files wait for `/bqaa-backfill`).
 
 ## What it writes
@@ -199,7 +204,7 @@ GROUP BY event_type
 ORDER BY row_count DESC;
 ```
 
-See [`sql/sample_queries.sql`](sql/sample_queries.sql) for query templates (fill in `{PROJECT}`, `{DATASET}`, and `{TABLE}`), and [`docs/value.md`](docs/value.md) (with [`sql/value_queries.sql`](sql/value_queries.sql)) for team adoption and cost estimates. [`scripts/run_bq.py`](scripts/run_bq.py) fills those placeholders in, binds `@start`, `@end`, and `@trace_id`, and runs one query with a billing limit (`--dry-run` first estimates the bytes it would scan).
+See [`sql/sample_queries.sql`](sql/sample_queries.sql) for query templates (fill in `{PROJECT}`, `{DATASET}`, and `{TABLE}`), and [`docs/value.md`](docs/value.md) (with [`sql/value_queries.sql`](sql/value_queries.sql)) for team adoption and cost estimates. [`scripts/run_bq.py`](scripts/run_bq.py) fills those placeholders in, binds `@start`, `@end` (defaulting to the last 7 UTC days when referenced and omitted), and `@trace_id` (required when referenced, such as query 6), and runs one query with a billing limit (`--dry-run` first estimates the bytes it would scan).
 
 ### Sample rows
 
@@ -241,10 +246,10 @@ Run each block from the repository root of a full checkout (the marketplace copy
   npm ci --ignore-scripts --prefix tests   # installs the pinned TypeScript only
   ./tests/node_modules/.bin/tsc -p tsconfig.ci.json --noEmit
   node --import ./tests/shim/register.mjs --test --test-concurrency=1 tests/*.test.ts tests/state-contract/state.contract.ts
-  python3 -m venv .venv && .venv/bin/pip install duckdb==2.0.0
+  python3 -m venv .venv && .venv/bin/pip install duckdb==2.0.0   # requires Python 3.11+
   .venv/bin/python tests/views.test.py
   .venv/bin/python tests/queries.test.py
-  python3 tests/scripts.test.py     # the bootstrap and query scripts, with no GCP calls
+  python3 tests/scripts.test.py     # Python 3.10+; the bootstrap and query scripts, with no GCP calls
 )
 ```
 
@@ -272,7 +277,7 @@ The CI suite verifies marketplace sync against release tags, tests `setup.sh` wi
 - **Subagent parent span and detection**: A subagent's span attaches directly under the main turn rather than under the `Agent` tool call that launched it, and subagent turns are distinguished from main turns via `turn.start`'s `agentId` (from `2.1.299`).
 - **Loops with no run start (`unidentified_loop`)**: The host also runs model loops of its own, such as the fork that proposes the next prompt after a turn, whose tool calls it refuses. Such a loop has an `agentId` but no `turn.start` or `SubagentStart`, so its rows are written with `agent = 'unidentified_loop'` and `attributes.unidentified_loop = true` until a `SubagentStart` names it; a subagent already running when the mod loaded (`/reload-plugins`) is marked the same way. The sample and value queries that count tool calls, refusals and agents (4, V1, V2, V5, V6, V7) leave these rows out.
 - **Permission decision window (`2 s`)**: No separate `HITL_*` rows are written; tool permission answers come from the `tool_decision` collector record on `TOOL_COMPLETED`, and rejections arriving more than 2 seconds after the tool returned are not recorded.
-- **Exit spill, table-scoped dead letters, and completion records**: `session.end` writes queued rows to a spill file rather than starting network requests. Dead-letter and spill files are replayed only by a session configured for that exact `<project.dataset.table>`, and files without a matching completion record (such as an interrupted write) stay on disk as `incomplete` in `/bqaa-status` for manual inspection. `scripts/clean_dead_letter.py` (dry-run by default, `--execute` to delete) removes a `(source, outcome-*)` group when the source file is `0` bytes and no non-empty leftover file names it as `parent` in its completion record; run it only while no session is running.
+- **Exit flush, table-scoped dead letters, and completion records**: At `session.end`, the writer waits up to half of `BQAA_EXIT_FLUSH_MS` for any in-flight request, attempts one bounded `insertAll` upload (plus spill replay in non-interactive `-p` runs) when healthy and a cached or `BQAA_ACCESS_TOKEN` bearer token is already available without spawning a credential subprocess, and spills any remaining rows to disk when offline, unhealthy, out of budget, or `BQAA_EXIT_FLUSH_MS=0`. Dead-letter and spill files are replayed only by a session configured for that exact `<project.dataset.table>`, and files without a matching completion record (such as an interrupted write) stay on disk as `incomplete` in `/bqaa-status` for manual inspection. `scripts/clean_dead_letter.py [DIR]` (accepting a positional path or `--dir DIR`, dry-run by default, `--execute` to delete, and refusing symlinked root directories) removes a `(source, outcome-*)` group when the source file is `0` bytes and no non-empty leftover file names it as `parent` in its completion record; run it only while no session is running.
 - **Mid-session reload or crash**: Reloading mods mid-session (`/reload-plugins` or `--plugin-dir` edits) or a worker crash can lose up to one `flushIntervalMs` window of buffered in-memory rows, plus any batch currently in retry backoff.
 - **User-tier classic hooks on managed CLIs (`cc-plugin-sec-default`)**: On organization-managed CLIs (`claude-labs`), the built-in `cc-plugin-sec-default` security plugin runs at the `prepend` tier and intercepts `classic.SessionStart`, `classic.SubagentStart`, and `classic.PermissionRequest` before a user-installed mod sees them, displaying `bigquery-agent-analytics-mod its classic.SessionStart hook was skipped. "cc-plugin-sec-default" runs first and sent the event on past it.` (and a first-turn model side-note). Native mod hooks (`session.start`, `prompt.submit`, `turn.start`, `turn.step`, `tool.call`, `turn.complete`, `telemetry.log`, and `session.end`) still run normally: prompts, model steps, tool calls, permission decisions (`tool_decision` collector records), inferred subagent starts, and `session.end` (`trace_count` and `duration_ms`, including across `/clear`, `/resume`, and `/branch`) are all recorded; only the `classic.SessionStart` `STATE_DELTA` (`session_start`) row and `permission_requested` flag are omitted (`allowManagedModsOnly` or web-fetch policies can still block user mods; see [docs/managed-settings.md](docs/managed-settings.md)).
 - **Best-effort free-text redaction**: Structured JSON keys use a strict allowlist (redacting unlisted keys such as MCP tool arguments), whereas free-text shell and URL scrubbing uses bounded heuristics rather than full shell parsing. Known open edge cases pinned in `tests/units.test.ts` (see [#546](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/546)) include:
@@ -281,7 +286,7 @@ The CI suite verifies marketplace sync against release tags, tests `setup.sh` wi
   - URL user-info containing extra `@` characters (`https://u:p@secret@host`) or URL query parameters containing shell expansions (`?token=$(...)`, `?token=${...}`, `?token=$'...'`).
   - Declared custom delimiters (`^delim^...`) hidden by delimiter-looking earlier values, splitting an allowlisted name (`^.^...max.tokens=...`), spelled with ANSI-C quotes, following a quoted flag name, or `>= 256` characters long.
   - Over-redaction when a credential follows a non-`/` `sed` delimiter after an assignment (`x=1 sed 's#pass"word"=.*#x#' file`) or when allowlisted entries follow a redacted list entry (`DB_PASSWORD=x,max_tokens=1024`).
-  - Over-redaction of the rest of a credential's line after a `--flag=value` or `NAME=value` value (`mysql --password=x mydb` keeps `mysql --password=[REDACTED]`) or a `name: value` value (`-H "Authorization: Bearer x" https://…` loses the URL), and of the rest of the text after an odd quote that is no apostrophe in a word (`a 27" screen`). A contraction's apostrophe (`It's`) is read as prose; where the shell, reading it as a quote that a later `'` can close, would start a credential value in a different quote, the value runs to the end of the text (`is_truncated = true`), unless it is one quoted string and the shell's own reading leaves a quote open from the value's end through the end of the text without closing around following text (`It's set up: cli '--password x' --verbose` keeps `' --verbose`), or it is unquoted and only a later contraction's apostrophe could close the shell's quote around it (`It's set: --password=x` keeps a next line that holds `don't`, not one that holds `done'`). A row that lost text past the credential's line has `is_truncated = true`.
+  - Over-redaction of the rest of a credential's line after a `--flag=value` or `NAME=value` value (`mysql --password=x mydb` keeps `mysql --password=[REDACTED]`) or a `name: value` value (`-H "Authorization: Bearer x" https://…` loses the URL), and of the rest of the text after an odd quote that is no apostrophe in a word (`a 27" screen`). A contraction's apostrophe (`It's`) is read as prose; where the shell, reading it as a quote that a later `'` can close, would start a credential value in a different quote, the value runs to the end of the text (`is_truncated = true`), unless it is one quoted string and the shell's own reading leaves a quote open from the value's end through the end of the text without closing around following text (`It's set up: cli '--password x' --verbose` keeps `' --verbose`), or it is unquoted and only a later contraction's apostrophe could close the shell's quote around it (`It's set: --password=x` keeps a next line that holds `don't`, not one that holds `done'`). Whenever fail-closed redaction drops non-whitespace characters after the credential value—whether on the same line or across later lines—the row is marked `is_truncated = true`, and any row where redaction occurred records `attributes.redaction` (`{"values": <count>, "dropped_chars": <count>}`).
 
 ## Files
 

@@ -60,9 +60,10 @@ Notes:
 - **`bigquery-agent-analytics-mod`**: Passing `--config project=...` (or setting
   `project` in `/config`) saves `"project"` in `~/.claude/settings.json`
   (`pluginConfigs`), which takes precedence over `BQAA_PROJECT_ID` and
-  `gcloud config set project`. To switch to `NEW_PROJECT`, run
-  `BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics ./plugins/claude_code_mod/setup.sh`,
-  update `project` via `/config` or
+  `gcloud config set project`. To switch to `NEW_PROJECT`, provision the new
+  project with `/bqaa-mod-setup` (or run `setup.sh` from your installed mod
+  cache or `./plugins/claude_code_mod/setup.sh` in a checkout), update
+  `project` via `/config` or
   `claude plugin install bigquery-agent-analytics-mod@bqaa-tracing --config project=NEW_PROJECT --config dataset=agent_analytics`
   (or set `"project": ""` in `~/.claude/settings.json` to fall back to
   `BQAA_PROJECT_ID`), and run `/reload-plugins` (see
@@ -106,8 +107,9 @@ developed and released here (`mod-vX.Y.Z`).
 ## Development and testing
 
 The mod's offline checks are the ones Mod CI runs. They need a full clone with
-tags (`git fetch --unshallow --tags` on a shallow one), Node 24 or newer, and
-Python 3 with DuckDB:
+tags (`git fetch --unshallow --tags` on a shallow one), Node 24 or newer,
+Python 3.11 or newer for DuckDB SQL validation, and Python 3.10 or newer for
+helper-script checks:
 
 ```bash
 cd plugins/claude_code_mod
@@ -119,7 +121,7 @@ node tests/reload.test.mjs
 npm ci --ignore-scripts --prefix tests
 ./tests/node_modules/.bin/tsc -p tsconfig.ci.json --noEmit
 node --import ./tests/shim/register.mjs --test --test-concurrency=1 tests/*.test.ts tests/state-contract/state.contract.ts
-python3 -m venv .venv && .venv/bin/pip install duckdb==2.0.0
+python3 -m venv .venv && .venv/bin/pip install duckdb==2.0.0   # requires Python 3.11+
 .venv/bin/python tests/views.test.py
 .venv/bin/python tests/queries.test.py
 python3 tests/scripts.test.py
@@ -140,7 +142,7 @@ git ls-files -z '*.sh' | xargs -0 shellcheck -S warning
 
 [Repo CI](.github/workflows/repo-ci.yml) runs them on every pull request and
 every push to `main`. The tracing plugin's offline parity, hook and drainer
-tests run on Python 3.10 through 3.14 in
+tests run on Python 3.10 through 3.15 in
 [Tracing CI](.github/workflows/tracing-ci.yml):
 
 ```bash

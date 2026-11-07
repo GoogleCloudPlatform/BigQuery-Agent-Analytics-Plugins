@@ -34,6 +34,7 @@
 #     repository at, holds the copy and the catalog entry at <version>.
 # The tags need a full checkout (fetch-depth: 0): a shallow one fails.
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 dist="$repo/plugins/claude_code_dist/bigquery-agent-analytics-mod"
@@ -43,12 +44,22 @@ build() { # source folder, out folder
   rm -rf "$2"
   mkdir -p "$2/.claude-plugin"
   for item in "${FILES[@]}"; do cp -Rp "$1/$item" "$2/$item"; done
+  python3 -B - "$2" <<'PY'
+import os, shutil, sys
+for folder, dirs, files in os.walk(sys.argv[1], topdown=False):
+    for name in files:
+        if name.endswith((".pyc", ".pyo")):
+            os.unlink(os.path.join(folder, name))
+    for d in dirs:
+        if d == "__pycache__":
+            shutil.rmtree(os.path.join(folder, d))
+PY
 }
-version_of() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "$1/.claude-plugin/plugin.json"; }
+version_of() { python3 -B -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "$1/.claude-plugin/plugin.json"; }
 # Whether the first version is lower than the second (X.Y.Z, numerically):
 # 0 when it is, 1 when it is not, 2 when either is not X.Y.Z.
 lower() {
-  python3 - "$1" "$2" <<'PY'
+  python3 -B - "$1" "$2" <<'PY'
 import re, sys
 def parse(v):
     m = re.match(r"^(\d+)\.(\d+)\.(\d+)", v)
@@ -60,16 +71,21 @@ sys.exit(0 if parse(sys.argv[1]) < parse(sys.argv[2]) else 1)
 PY
 }
 # Whether two folders hold the same files, contents and executable bits
-# (the host CLI's .claude-plugin/types left out).
+# (the host CLI's .claude-plugin/types and Python bytecode left out).
 same_tree() {
-  python3 - "$1" "$2" <<'PY'
+  python3 -B - "$1" "$2" <<'PY'
 import os, stat, sys
 def walk(root):
     found = {}
     for folder, dirs, files in os.walk(root):
-        if os.path.relpath(folder, root) == ".claude-plugin":
-            dirs[:] = [d for d in dirs if d != "types"]
+        rel_folder = os.path.relpath(folder, root)
+        dirs[:] = [
+            d for d in dirs
+            if d != "__pycache__" and not (rel_folder == ".claude-plugin" and d == "types")
+        ]
         for name in files:
+            if name.endswith((".pyc", ".pyo")):
+                continue
             path = os.path.join(folder, name)
             with open(path, "rb") as handle:
                 found[os.path.relpath(path, root)] = (handle.read(), bool(os.lstat(path).st_mode & stat.S_IXUSR))
@@ -90,7 +106,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 source_version="$(version_of "$here")"
 dist_version="$(version_of "$dist")"
-catalog_version="$(python3 -c 'import json, sys; print(next(p["version"] for p in json.load(open(sys.argv[1]))["plugins"] if p["name"] == "bigquery-agent-analytics-mod"))' "$repo/.claude-plugin/marketplace.json")"
+catalog_version="$(python3 -B -c 'import json, sys; print(next(p["version"] for p in json.load(open(sys.argv[1]))["plugins"] if p["name"] == "bigquery-agent-analytics-mod"))' "$repo/.claude-plugin/marketplace.json")"
 status=0
 if [[ "$catalog_version" != "$dist_version" ]]; then
   echo "not ok - the catalog entry says $catalog_version, the committed copy is $dist_version"
@@ -143,9 +159,9 @@ fi
 for dist_tag in $(git -C "$repo" tag -l 'mod-dist-v*'); do
   want="${dist_tag#mod-dist-v}"
   at_copy="$(git -C "$repo" show "$dist_tag:plugins/claude_code_dist/bigquery-agent-analytics-mod/.claude-plugin/plugin.json" 2>/dev/null \
-    | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || echo none)"
+    | python3 -B -c 'import json, sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || echo none)"
   at_catalog="$(git -C "$repo" show "$dist_tag:.claude-plugin/marketplace.json" 2>/dev/null \
-    | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["plugins"] if p["name"] == "bigquery-agent-analytics-mod"))' 2>/dev/null || echo none)"
+    | python3 -B -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["plugins"] if p["name"] == "bigquery-agent-analytics-mod"))' 2>/dev/null || echo none)"
   if [[ "$at_copy" == "$want" && "$at_catalog" == "$want" ]]; then
     echo "ok - $dist_tag holds the copy and the catalog entry at $want"
   else

@@ -38,8 +38,12 @@ time:
                   sql/value_queries.sql (V1..V7) instead of passing SQL text.
   --start, --end  Bind @start and @end: a date (UTC; a bare --start is that
                   day's first instant and a bare --end its last, so both days
-                  are counted) or an ISO 8601 timestamp.
-  --trace-id ID   Bind @trace_id (sample query 6, the span tree of one turn).
+                  are counted) or an ISO 8601 timestamp. When the query
+                  references @end or @start and the flag is omitted, @end
+                  defaults to now (UTC) and @start defaults to 7 days before
+                  @end.
+  --trace-id ID   Bind @trace_id (required when the query references @trace_id,
+                  such as sample query 6, the span tree of one turn).
   --max-gb N      Refuse a query that would bill more than N GB (default 1).
   --dry-run       Run nothing: print, as one JSON object, the bytes the query
                   would scan (BigQuery estimates it; nothing is billed).
@@ -79,6 +83,54 @@ MAX_NAME_LENGTH = 1024
 GB = 1 << 30
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 QUERY_HEADER = re.compile(r"^-- (V?\d+)\. ")
+PARAM_AT_RE = re.compile(r"@(start|end|trace_id)\b", re.IGNORECASE)
+
+
+def _utc_now() -> datetime:
+    """Current UTC timestamp, factored out for deterministic tests."""
+    return datetime.now(timezone.utc)
+
+
+def referenced_params(sql: str) -> set[str]:
+    """Lowercase names from {start, end, trace_id} referenced as @param in SQL
+    outside comments, string literals, and backticked identifiers."""
+    found: set[str] = set()
+    i, n = 0, len(sql)
+    while i < n:
+        if sql.startswith("--", i):
+            nl = sql.find("\n", i + 2)
+            i = n if nl < 0 else nl + 1
+            continue
+        if sql[i] == "#":
+            nl = sql.find("\n", i + 1)
+            i = n if nl < 0 else nl + 1
+            continue
+        if sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if sql.startswith("'''", i) or sql.startswith('"""', i):
+            delim = sql[i : i + 3]
+            i += 3
+            while i < n and not sql.startswith(delim, i):
+                i += 2 if sql[i] == "\\" else 1
+            i += 3
+            continue
+        if sql[i] in ("'", '"', "`"):
+            quote = sql[i]
+            i += 1
+            while i < n and sql[i] != quote:
+                i += 2 if sql[i] == "\\" else 1
+            i += 1
+            continue
+        if sql[i] == "@" and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == "_")):
+            match = PARAM_AT_RE.match(sql, i)
+            if match:
+                found.add(match.group(1).lower())
+                i = match.end()
+                continue
+        i += 1
+    return found
 
 
 def load_named_queries() -> dict[str, str]:
@@ -239,15 +291,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--start",
         type=parse_ts,
         default=None,
-        help="bind @start: an ISO 8601 timestamp or a date (UTC)",
+        help="bind @start: an ISO 8601 timestamp or a date (UTC; defaults to 7 days before --end when @start is referenced)",
     )
     parser.add_argument(
         "--end",
         type=parse_end_ts,
         default=None,
-        help="bind @end: an ISO 8601 timestamp or a date (UTC; a bare date is the end of that day)",
+        help="bind @end: an ISO 8601 timestamp or a date (UTC; a bare date is the end of that day; defaults to now when @end is referenced)",
     )
-    parser.add_argument("--trace-id", default=None, help="bind @trace_id (a string)")
+    parser.add_argument("--trace-id", default=None, help="bind @trace_id (required when @trace_id is referenced)")
     parser.add_argument(
         "--max-gb",
         type=positive_float,
@@ -267,6 +319,19 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
             choices = ", ".join(named) if named else "1..8, V1..V7"
             parser.error(f"unknown --query {args.query_id!r} (choose from {choices})")
         args.query = named[key]
+    refs = referenced_params(args.query)
+    if "trace_id" in refs and not args.trace_id:
+        if args.query_id is not None:
+            qid = args.query_id.strip()
+            label = qid.upper() if qid.lower().startswith("v") else qid
+            parser.error(f"query {label} needs --trace-id")
+        parser.error("query needs --trace-id")
+    now = _utc_now()
+    if "end" in refs and args.end is None:
+        args.end = now
+    if "start" in refs and args.start is None:
+        anchor = args.end if args.end is not None else now
+        args.start = anchor - timedelta(days=7)
     if args.start is not None and args.end is not None and args.start > args.end:
         parser.error(f"--start {args.start.isoformat()} is after --end {args.end.isoformat()}")
     return args

@@ -132,13 +132,13 @@ FROM tools
 GROUP BY tool_name, tool_origin
 ORDER BY failures DESC, calls DESC;
 
--- 5. One line per turn: the prompt (excluding host-injected
---    task-notification messages), how long it took, how many model
---    requests and tool calls it made, its tokens (including subagents' and
---    responses_without_usage) and how it ended. Rows of a loop the mod saw
---    no start for (unidentified_loop, such as the host's own fork that
---    proposes the next prompt) are left out; an engine fork inside a turn
---    would add to both model_requests and tool_calls.
+-- 5. One line per turn: its trace_id (pass to query 6 for the full span tree),
+--    the prompt (excluding host-injected task-notification messages), how long
+--    it took, how many model requests and tool calls it made, its tokens
+--    (including subagents' and responses_without_usage) and how it ended. Rows
+--    of a loop the mod saw no start for (unidentified_loop, such as the host's
+--    own fork that proposes the next prompt) are left out; an engine fork
+--    inside a turn would add to both model_requests and tool_calls.
 WITH events AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
@@ -150,6 +150,7 @@ WITH events AS (
 SELECT
   session_id,
   invocation_id,
+  ANY_VALUE(trace_id) AS trace_id,
   MIN(timestamp) AS started_at,
   STRING_AGG(
     IF(

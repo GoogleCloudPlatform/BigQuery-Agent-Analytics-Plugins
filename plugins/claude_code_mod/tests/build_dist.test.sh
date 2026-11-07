@@ -106,6 +106,19 @@ release() { # tag, version, folder
 tree() { (cd "$dist" && find . -type f -exec shasum {} + | sort | shasum); }
 
 check 'the first release, before its tag: the copy is what the source builds now' checked
+mkdir -p "$src/scripts/__pycache__" "$dist/scripts/__pycache__"
+printf 'pyc' >"$src/scripts/__pycache__/stale.cpython-312.pyc"
+printf 'pyo' >"$src/scripts/stale.pyo"
+printf 'pyc' >"$dist/scripts/__pycache__/stale.cpython-312.pyc"
+pyc_clean_build() {
+  bash "$src/build_dist.sh" "$work/pyc-built" &&
+    test -f "$work/pyc-built/scripts/run_bq.py" &&
+    ! test -e "$work/pyc-built/scripts/__pycache__" &&
+    ! test -e "$work/pyc-built/scripts/stale.pyo"
+}
+check 'build_dist.sh strips __pycache__ and .pyc/.pyo files from built output' pyc_clean_build
+check 'build_dist.sh --check ignores __pycache__ and .pyc/.pyo files in source and dist' checked
+rm -rf "$src/scripts/__pycache__" "$src/scripts/stale.pyo" "$dist/scripts/__pycache__" "$work/pyc-built"
 git clone -q --depth 1 "file://$repo" "$work/shallow"
 check 'a shallow checkout fails: it cannot see the tags' fails bash "$work/shallow/plugins/claude_code_mod/build_dist.sh" --check
 git -C "$repo" tag mod-v0.1.0

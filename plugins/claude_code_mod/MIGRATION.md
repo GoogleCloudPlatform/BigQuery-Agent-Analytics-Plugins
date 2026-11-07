@@ -71,7 +71,12 @@ move to this repository's marketplace:
 
 4. Verify with `claude -p /bqaa-status < /dev/null` (or `/bqaa-status`
    inside an interactive session). Rows the earlier copy left on disk
-   (`~/.bqaa-mod/dead-letter`) are sent by this one.
+   (`~/.bqaa-mod/dead-letter`) are sent by this one. Once all buffered rows
+   have replayed and **no `claude` session is running**, you can clean up
+   retired `0`-byte source files and their `outcome-*` records from `0.1.0` /
+   `0.1.1` with `scripts/clean_dead_letter.py` inside the installed mod
+   directory (dry-run by default; pass `--execute` to delete, and pass an
+   optional `[DIR]` or `--dir DIR` if `deadLetterDir` was customized).
 
 If your organization's managed settings list `bqaa-tracing` under
 `extraKnownMarketplaces` with `"repo": "GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK"`,
@@ -91,6 +96,11 @@ claude plugin disable bigquery-agent-analytics-tracing@bigquery-agent-analytics-
 
 Hooks pasted into your own `~/.claude/settings.json` that run the tracer's
 scripts have no plugin to disable: take them out.
+
+Use `/bqaa-mod-setup` for the mod's BigQuery dataset and view setup command so
+it does not collide with `bigquery-agent-analytics-tracing`'s `/bqaa-setup`
+while both plugins are installed during migration (`/bqaa-setup` remains a
+compatibility alias in the mod through `0.1.x` and is deprecated for `0.2.0`).
 
 ## With managed settings
 
