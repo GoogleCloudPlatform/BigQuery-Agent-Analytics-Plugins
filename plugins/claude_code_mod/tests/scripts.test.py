@@ -1579,6 +1579,12 @@ def repo_checks():
           made is not None and sorted(made.group(1).split()) == files == sorted(setup.VIEW_NAMES) and len(files) == 2,
           f'{made and made.group(1)} {files} {setup.VIEW_NAMES}')
 
+    markdown_files = sorted({*PLUGIN.glob('*.md'), *PLUGIN.glob('docs/*.md'), PLUGIN.parent.parent / 'README.md'})
+    non_portable_sort = [p.relative_to(PLUGIN.parent.parent).as_posix() for p in markdown_files
+                         if p.is_file() and 'sort -V' in p.read_text(encoding='utf-8')]
+    check('no Markdown file in the repository uses GNU-only sort -V',
+          non_portable_sort == [], str(non_portable_sort))
+
     # Every command the docs and the SQL headers show is one the scripts take.
     commands = documented_commands()
     check('the docs and the SQL headers show at least five commands, for both scripts',

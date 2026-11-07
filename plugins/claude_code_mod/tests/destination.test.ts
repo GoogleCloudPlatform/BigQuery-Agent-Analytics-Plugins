@@ -589,6 +589,17 @@ test('headless /bqaa-status and interactive /bqaa-status check probe tables.get 
   const checked404 = await statusText($)
   expect(checked404).toContain('BigQuery cannot find the dataset my-gcp-project.agent_analytics')
   expect(checked404).toMatch(/setup: BQAA_PROJECT_ID=my-gcp-project /)
+
+  // Explicit interactive `/bqaa-status check` still probes tables.get after an earlier 404 or 200 and clears a healed 404 when the table now exists:
+  await startSession($)
+  world.replies = [DATASET_MISSING]
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(await statusText($)).toContain('BigQuery cannot find the dataset my-gcp-project.agent_analytics')
+  world.replies = [{ status: 200, text: '{"tableReference":{"projectId":"my-gcp-project","datasetId":"agent_analytics","tableId":"agent_events"}}' }]
+  const healed = (await $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND })).text ?? ''
+  expect(healed).toContain('destination check: BigQuery found my-gcp-project.agent_analytics.agent_events')
+  expect(healed).not.toContain('BigQuery cannot find the dataset')
 })
 
 test('headless session.end writes a single redacted diagnostic line to stderr when rows could not be sent, and stays silent when healthy or interactive', { options: OPTIONS }, async ($, on) => {

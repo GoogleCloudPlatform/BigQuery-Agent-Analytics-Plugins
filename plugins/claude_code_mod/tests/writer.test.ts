@@ -35,6 +35,7 @@ import {
   SESSION_ID,
   TABLE_REF,
   type World,
+  byType,
   deadLetterFiles,
   deadLetterRows,
   json,
@@ -44,6 +45,10 @@ import {
 } from './helpers.ts'
 
 const UNAVAILABLE = { status: 503, text: '{"error":{"code":503,"message":"The service is currently unavailable.","status":"UNAVAILABLE"}}' }
+const BAD_REQUEST = {
+  status: 400,
+  text: '{"error":{"code":400,"message":"Invalid value at rows[0]","errors":[{"reason":"invalid"}],"status":"INVALID_ARGUMENT"}}',
+}
 const TABLE_MISSING = {
   status: 404,
   text: '{"error":{"code":404,"message":"Not found: Table my-gcp-project:agent_analytics.agent_events","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}',
@@ -1332,4 +1337,99 @@ test('/bqaa-status passes custom deadLetterDir with shell quoting in the cleanup
   await startSession($)
   const status = await statusText($)
   expect(status).toMatch(/^cleanup \(run while no session is running\): python3 '\/[^']*\/scripts\/clean_dead_letter\.py' '\/tmp\/custom dir\/it'\\''s-bqaa' --execute$/m)
+})
+
+test('an HTTP 400 or partial rejection at session.end awaits the rejected file write and leaves zero uncancelled backoff timers', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+
+  world.replies = [BAD_REQUEST]
+  await $.tool.call({ tool: 'Read', file_path: 'bad.ts' })
+  await $.session.end({ ...END, reason: 'other' })
+  const rejected = [...world.files.keys()].filter(k => k.includes('/rejected-'))
+  expect(rejected.length).toBe(1)
+  expect(deadLetterRows(world).length).toBe(3)
+  const fetchesAtExit = world.fetches.length
+  await world.clock.advance(60_000)
+  expect(world.fetches.length).toBe(fetchesAtExit)
+
+  // Direct Writer timer check: neither HTTP 400 nor 200 partial-rejection at spillForExit leaves an uncancelled timer.
+  for (const answer of [
+    BAD_REQUEST,
+    { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: 'bad row' }] }] }) },
+  ]) {
+    const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/exit-timers' }, {})
+    const timers: { ms: number; cancelled: boolean }[] = []
+    const files = new Map<string, string>()
+    const io: Io = {
+      now: () => 1000,
+      after: ms => {
+        const entry = { ms, cancelled: false }
+        timers.push(entry)
+        return { cancel: () => { entry.cancelled = true } }
+      },
+      fetch: async () => answer,
+      runCommand: async () => ({ exitCode: 0, stdout: 'a'.repeat(24), stderr: '' }),
+      envToken: async () => 'env-token-for-exit-check',
+      readFile: async p => files.get(p) ?? '',
+      writeFile: async (p, text) => { files.set(p, text) },
+      listDir: async () => [],
+      storeGet: async () => undefined,
+      storeSet: async () => undefined,
+      storeDelete: async () => undefined,
+      status: () => undefined,
+      debug: () => undefined,
+    }
+    const writer = new Writer(io, () => config, () => 'exit-timer-session')
+    writer.enqueue(
+      buildRow({
+        eventType: 'STATE_DELTA',
+        timestampMs: 1000,
+        eventId: '0'.repeat(32),
+        agent: 'coding-agent',
+        sessionId: 'exit-timer-session',
+        invocationId: null,
+        userId: 'u',
+        traceId: null,
+        spanId: null,
+        parentSpanId: null,
+        content: { session_end: true },
+        attributes: {},
+        maxPayloadChars: 16384,
+      }).row,
+      0,
+    )
+    await writer.spillForExit(1500, { sendQueued: true })
+    expect(timers.filter(t => !t.cancelled)).toEqual([])
+    expect([...files.keys()].some(k => k.includes('/rejected-'))).toBe(true)
+  }
+})
+
+test('a short non-interactive session where autoBackfill is already running at session.end still sends session_end and finishes replaying the spill', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const earlierFile = `${PARTITION_DIR}/spill-20261013T200102003Z-earlier-active.jsonl`
+  world.files.set(earlierFile, parkedFile(parkedLine(TABLE_REF, 'f'.repeat(32), 'earlier-session')))
+  world.replies = [OK_INSERT, { hang: true }, OK_INSERT]
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  // At 5s session_start lands (200 OK), which in `-p` mode immediately starts autoBackfill whose insertAll hangs in flight when session.end arrives.
+  await world.clock.advance(5000)
+  await world.clock.settle()
+  expect(world.insertCalls().length).toBe(2)
+  const ending = $.session.end({ ...END, reason: 'other' })
+  await world.clock.advance(50)
+  world.releaseHung(OK_INSERT.status, OK_INSERT.text)
+  await ending
+  expect(world.insertCalls().length).toBe(3)
+  expect(deadLetterFiles(world)).toEqual([])
+  expect(world.files.get(earlierFile)).toBe('')
+  const sentIds = world.sentRows().map(r => r.event_id)
+  expect(sentIds.includes('f'.repeat(32))).toBe(true)
+  expect(
+    byType(world.sentRows(), 'STATE_DELTA')
+      .filter(r => r.session_id === SESSION_ID)
+      .map(r => JSON.parse(r.content ?? '{}')),
+  ).toEqual([{ session_start: true }, { session_end: true }])
 })

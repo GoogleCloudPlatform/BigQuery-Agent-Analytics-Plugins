@@ -702,9 +702,9 @@ export class Writer {
   // so is no answer in `timeoutMs`. A missing table that the first send
   // makes (autoCreateTable) is no notice. What it found, for /bqaa-status,
   // or null where it did not ask. Never throws.
-  async probeDestination(timeoutMs = 3000): Promise<string | null> {
+  async probeDestination(timeoutMs = 3000, explicit = false): Promise<string | null> {
     const c = this.config()
-    if (!canDeliver(c) || c.dryRun || this.closing || this.problem !== null || this.lastSuccessAt !== null || this.lastError !== null) return null
+    if (!canDeliver(c) || c.dryRun || this.closing || (!explicit && (this.problem !== null || this.lastSuccessAt !== null || this.lastError !== null))) return null
     const timers: Timer[] = []
     const deadline = this.moment(timeoutMs, timers)
     const url = `${tablesUrl(c)}/${encodeURIComponent(c.table)}?fields=tableReference`
@@ -877,6 +877,7 @@ export class Writer {
       }
       case 'auth':
         this.dropToken()
+        if (this.closing) this.noteProblem('credentials', `authentication: ${outcome.message}`)
         await this.retryLater(batch, `authentication: ${outcome.message}`)
         return false
       case 'not-found': {
@@ -952,6 +953,7 @@ export class Writer {
   }
 
   private pause(): void {
+    if (this.closing) return
     const quick = this.problem?.kind === 'credentials' || this.problem?.kind === 'destination'
     const ms = quick ? Math.min(QUICK_RETRY_CAP_MS, this.backoffMs()) : this.backoffMs()
     this.pauseTimer?.cancel()
@@ -1512,7 +1514,7 @@ export class Writer {
     // batch one still has out goes with the rest once its wait is over.
     const writers = [...this.before, this]
     // Read before the exit changes anything.
-    const sending = opts.sendQueued === true && budgetMs >= EXIT_SEND_MIN_MS && this.canSendAtExit(c, writers)
+    const sending = opts.sendQueued === true && budgetMs >= EXIT_SEND_MIN_MS && this.canSendAtExit(c, writers, opts.replaySpills === true)
     this.closing = true
     this.soon?.cancel()
     this.soon = null
@@ -1520,6 +1522,9 @@ export class Writer {
       writer.closing = true
       writer.recoveryTimer?.cancel()
       writer.recoveryTimer = null
+      writer.pauseTimer?.cancel()
+      writer.pauseTimer = null
+      writer.pausedUntil = 0
     }
     const toDryRun = c.dryRun && c.dryRunDir !== ''
     const writes: Promise<void>[] = []
@@ -1550,7 +1555,7 @@ export class Writer {
     // Every batch out answered and landed whole: the exit sends. Any other
     // answer (or none) leaves BigQuery's state in doubt, and the rows wait.
     if (marks !== null && out.length === 0 && this.persisting.size === 0 && writers.every(w => w.problem === null && w.consecutiveFailures === 0 && !w.heldAtExit)) {
-      if ((await this.sendAtExit(c, marks, park, until)) && opts.replaySpills === true && spilled === 0) await this.replayAtExit(c, marks, until)
+      if ((await this.sendAtExit(c, marks, park, writes, until)) && opts.replaySpills === true && spilled === 0) await this.replayAtExit(c, marks, until)
     } else park([...out, ...this.queue.takeAll()])
     const pending = [...writes, ...this.persisting]
     if (pending.length > 0) {
@@ -1568,9 +1573,18 @@ export class Writer {
 
   // Whether session end may send (spillForExit): BigQuery is to be written
   // to, and no writer has anything that leaves its answer in doubt.
-  private canSendAtExit(c: Config, writers: readonly Writer[]): boolean {
+  private canSendAtExit(c: Config, writers: readonly Writer[], replaySpills = false): boolean {
     if (!canDeliver(c) || c.dryRun || this.persisting.size > 0 || this.parked.recoverable) return false
-    return writers.every(w => !w.closing && w.problem === null && w.pauseTimer === null && w.consecutiveFailures === 0 && w.recoveryTimer === null && w.backfilling === null && !w.heldAtExit)
+    return writers.every(
+      w =>
+        !w.closing &&
+        w.problem === null &&
+        w.pauseTimer === null &&
+        w.consecutiveFailures === 0 &&
+        w.recoveryTimer === null &&
+        (w.backfilling === null || (replaySpills && w.lastSuccessAt !== null)) &&
+        !w.heldAtExit,
+    )
   }
 
   // A moment `ms` from now on the host's clock, its timer added to `timers`.
@@ -1592,7 +1606,7 @@ export class Writer {
   // (`exitToken`), answered by the `post` mark at the latest. What it does
   // not land is parked by `park` (refused rows to a `rejected` file), in the
   // time left after that mark. True when every row landed (or none waited).
-  private async sendAtExit(c: Config, marks: ExitMarks, park: (rows: Queued[]) => void, until: number): Promise<boolean> {
+  private async sendAtExit(c: Config, marks: ExitMarks, park: (rows: Queued[]) => void, writes: Promise<void>[], until: number): Promise<boolean> {
     if (this.queue.length === 0) return true
     const token = await this.exitToken(marks.token)
     if (token === null || marks.token.passed() || until - this.io.now() < EXIT_SEND_MIN_MS) {
@@ -1635,14 +1649,14 @@ export class Writer {
         this.noteSessions(landed)
         this.succeeded(landed.length, c)
         // Its write is one of those under way, which the exit waits for.
-        if (refused.length > 0) void this.reject(refused, `BigQuery rejected ${refused.length} row(s): ${reason}`)
+        if (refused.length > 0) writes.push(this.reject(refused, `BigQuery rejected ${refused.length} row(s): ${reason}`))
         park(again)
         return refused.length === 0 && again.length === 0
       }
       case 'rejected':
         if (outcome.permission) this.noteProblem('permission', outcome.message)
         else this.tableAnswered()
-        void this.reject(batch, outcome.message)
+        writes.push(this.reject(batch, outcome.message))
         return false
       case 'not-found':
         // No table is made now: the next session's send makes it.
@@ -1651,6 +1665,7 @@ export class Writer {
       case 'auth':
         // No fresh token now: the next session's send gets one.
         this.dropToken()
+        this.noteProblem('credentials', `authentication: ${outcome.message}`)
         break
       case 'retry':
         break
@@ -1686,10 +1701,13 @@ export class Writer {
   // the rows of a request not answered in time (they may yet land; event_id
   // dedups).
   private async replayAtExit(c: Config, marks: ExitMarks, until: number): Promise<void> {
-    if (!c.autoBackfill || this.lastSuccessAt === null || this.backfilling !== null || marks.replay.passed() || until - this.io.now() < EXIT_REPLAY_MIN_MS) return
+    if (!c.autoBackfill || this.lastSuccessAt === null || marks.replay.passed() || until - this.io.now() < EXIT_REPLAY_MIN_MS) return
     this.exitReplay = { until: until - EXIT_REPLAY_RESERVE_MS, cutoff: marks.replay }
     try {
-      await Promise.race([this.backfill(['spill', 'retry'], 'auto'), marks.end.at])
+      if (this.backfilling !== null) await Promise.race([this.backfilling, marks.end.at])
+      if (!marks.replay.passed() && until - this.io.now() >= EXIT_REPLAY_MIN_MS && this.backfilling === null) {
+        await Promise.race([this.backfill(['spill', 'retry'], 'auto'), marks.end.at])
+      }
     } finally {
       this.exitReplay = null
     }

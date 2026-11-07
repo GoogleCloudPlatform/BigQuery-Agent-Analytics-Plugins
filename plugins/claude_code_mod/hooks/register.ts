@@ -1289,7 +1289,8 @@ export const register: Register = (on, registered) => {
     // A `-p` run sends nothing before it prints this (and `check` asks
     // anywhere): BigQuery is asked for the table, up to 3 seconds, so a
     // refused token, denied access or a missing table shows now.
-    const destinationCheck = !isInteractiveSession || (e.args ?? '').trim() === 'check' ? await current.probeDestination(3000) : null
+    const explicitCheck = (e.args ?? '').trim() === 'check'
+    const destinationCheck = !isInteractiveSession || explicitCheck ? await current.probeDestination(3000, explicitCheck) : null
     const summary = await deadLetterSummary($)
     const text = formatStatus({
       config,

@@ -1000,11 +1000,13 @@ function redactNamedValues(text: string, stats: SanitizeStats): string {
     }
     const value = text.slice(start, end)
     if (value.trim() === '') continue
+    const alreadyRedactedScheme =
+      /^(?:Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|Bot)\s+\[REDACTED(?::[a-z-]+)?\]['"]?$/i.test(text.slice(start, valueEnd).trim())
     noteCut(text, start, valueEnd, end, stats)
     out += text.slice(copied, start) + MARKER + close
     copied = end
     next = end
-    if (value !== MARKER + close) stats.redactions += 1
+    if (value !== MARKER + close && !alreadyRedactedScheme) stats.redactions += 1
   }
   return copied === 0 ? text : out + text.slice(copied)
 }

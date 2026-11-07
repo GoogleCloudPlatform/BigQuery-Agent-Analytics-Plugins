@@ -45,8 +45,8 @@ The BigQuery dataset must exist before the mod can write. [`setup.sh`](setup.sh)
 
 ```bash
 # Installed from the marketplace (or run `claude -p /bqaa-mod-setup < /dev/null` to print the path):
-SETUP_SH="$(ls -d ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | sort -V | tail -1)setup.sh"
-BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics bash "$SETUP_SH"
+PLUGIN_DIR="$(ls -d ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
+BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics bash "${PLUGIN_DIR:?mod cache directory not found}setup.sh"
 
 # Or from a local repository checkout:
 BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics \
@@ -100,8 +100,8 @@ To move capture to `NEW_PROJECT`:
 
 1. **Create the dataset, `agent_events` table, and `<dataset>_reporting` views in the new project** (using `/bqaa-mod-setup`, the installed cache `setup.sh`, or `./plugins/claude_code_mod/setup.sh` in a checkout):
    ```bash
-   SETUP_SH="$(ls -d ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | sort -V | tail -1)setup.sh"
-   BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics bash "$SETUP_SH"
+   PLUGIN_DIR="$(ls -d ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
+   BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics bash "${PLUGIN_DIR:?mod cache directory not found}setup.sh"
    ```
 2. **Update the saved plugin setting**:
    - Update `project` via `/config` (or `/plugin configure`), or re-run:
@@ -286,7 +286,7 @@ The CI suite verifies marketplace sync against release tags, tests `setup.sh` wi
   - URL user-info containing extra `@` characters (`https://u:p@secret@host`) or URL query parameters containing shell expansions (`?token=$(...)`, `?token=${...}`, `?token=$'...'`).
   - Declared custom delimiters (`^delim^...`) hidden by delimiter-looking earlier values, splitting an allowlisted name (`^.^...max.tokens=...`), spelled with ANSI-C quotes, following a quoted flag name, or `>= 256` characters long.
   - Over-redaction when a credential follows a non-`/` `sed` delimiter after an assignment (`x=1 sed 's#pass"word"=.*#x#' file`) or when allowlisted entries follow a redacted list entry (`DB_PASSWORD=x,max_tokens=1024`).
-  - Over-redaction of the rest of a credential's line after a `--flag=value` or `NAME=value` value (`mysql --password=x mydb` keeps `mysql --password=[REDACTED]`) or a `name: value` value (`-H "Authorization: Bearer x" https://…` loses the URL), and of the rest of the text after an odd quote that is no apostrophe in a word (`a 27" screen`). A contraction's apostrophe (`It's`) is read as prose; where the shell, reading it as a quote that a later `'` can close, would start a credential value in a different quote, the value runs to the end of the text (`is_truncated = true`), unless it is one quoted string and the shell's own reading leaves a quote open from the value's end through the end of the text without closing around following text (`It's set up: cli '--password x' --verbose` keeps `' --verbose`), or it is unquoted and only a later contraction's apostrophe could close the shell's quote around it (`It's set: --password=x` keeps a next line that holds `don't`, not one that holds `done'`). Whenever fail-closed redaction drops non-whitespace characters after the credential value—whether on the same line or across later lines—the row is marked `is_truncated = true`, and any row where redaction occurred records `attributes.redaction` (`{"values": <count>, "dropped_chars": <count>}`).
+  - Over-redaction of the rest of a credential's line after a `--flag=value` or `NAME=value` value (`mysql --password=x mydb` keeps `mysql --password=[REDACTED]`) or a `name: value` value (`-H "Authorization: Bearer x" https://…` loses the URL), and of the rest of the text after an odd quote that is no apostrophe in a word (`a 27" screen`). A contraction's apostrophe (`It's`) is read as prose; where the shell, reading it as a quote that a later `'` can close, would start a credential value in a different quote, the value runs to the end of the text (`is_truncated = true`), unless it is one quoted string and the shell's own reading leaves a quote open from the value's end through the end of the text without closing around following text (`It's set up: cli '--password x' --verbose` keeps `' --verbose`), or it is unquoted and only a later contraction's apostrophe could close the shell's quote around it (`It's set: --password=x` keeps a next line that holds `don't`, not one that holds `done'`). Whenever fail-closed redaction drops non-whitespace characters after the credential value—whether on the same line or across later lines—the row is marked `is_truncated = true`, and any row where redaction occurred records `attributes.redaction` (`{"values": <count>, "dropped_chars": <count>}`, where `values` counts redacted credentials and `dropped_chars` counts characters removed past the credential value after pattern and URL scrubbing).
 
 ## Files
 

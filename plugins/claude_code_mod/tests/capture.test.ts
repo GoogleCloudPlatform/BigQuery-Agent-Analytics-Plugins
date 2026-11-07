@@ -781,3 +781,38 @@ test('the offline test shim rejects a session.end handler that returns no { sess
   }
   expect(caught?.message ?? '').toContain('no implementation for session.end: returned no { sessionId }')
 })
+
+test('a short (< 5 s) headless session with BQAA_ACCESS_TOKEN=bogus-token getting HTTP 401 at session.end prints a credential notice to stderr and spills cleanly', { options: OPTIONS }, async ($, on) => {
+  const bogusToken = ['bogus', 'token', 'canary', '401'].join('-')
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: bogusToken })
+  world.replies = [{ status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  expect(world.stderr).toEqual([
+    'BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, set a fresh BQAA_ACCESS_TOKEN, or unset it to use the token command).',
+  ])
+  expect(world.stderr[0]?.includes(bogusToken)).toBe(false)
+  expect(deadLetterRows(world).length).toBe(2)
+})
+
+test('a short (< 5 s) headless session whose in-flight turn flush gets HTTP 401 after session.end began prints a credential notice to stderr and spills cleanly', { options: OPTIONS }, async ($, on) => {
+  const bogusToken = ['bogus', 'token', 'canary', '401'].join('-')
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: bogusToken })
+  const unauth = { status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }
+  world.replies = [{ hang: true }, unauth]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.turn.start({ turnId: 't-headless-401', text: 'check' })
+  await $.turn.complete({ turnId: 't-headless-401', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(1)
+  expect(world.insertCalls().length).toBe(1)
+  const ending = $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(50)
+  world.releaseHung(unauth.status, unauth.text)
+  await ending
+  expect(world.stderr).toEqual([
+    'BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, set a fresh BQAA_ACCESS_TOKEN, or unset it to use the token command).',
+  ])
+  expect(world.stderr[0]?.includes(bogusToken)).toBe(false)
+  expect(deadLetterRows(world).length).toBe(4)
+})
