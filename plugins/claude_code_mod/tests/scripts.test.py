@@ -27,9 +27,12 @@ subprocess.run, and the plans and messages are the ones the scripts print.
     --execute run that stops before any change or applies only the narrow
     grants;
   - the repository: the docs, the SQL headers and setup.sh name scripts that
-    exist, the commands they show parse, and build_dist.sh ships the folder.
-Needs only the standard library (and bash, for the setup.sh check). Run from
-anywhere:
+    exist, the commands they show parse, and build_dist.sh ships the folder;
+    the docs' lookup of the installed copy picks the highest version under
+    CLAUDE_CONFIG_DIR (else ~/.claude), and no doc makes a virtual
+    environment in a shared /tmp path.
+Needs only the standard library (and bash, for the setup.sh check, and sh,
+for the lookup). Run from anywhere:
   python3 plugins/claude_code_mod/tests/scripts.test.py
 Exit 0: every check passed; 1: a check failed
 """
@@ -1645,6 +1648,64 @@ def setup_sh_checks():
 
 
 # ---------------------------------------------------------------------------
+# The docs' lookup of the installed copy, and where they make a virtualenv
+# ---------------------------------------------------------------------------
+
+# `PLUGIN_DIR="$(ls -d .../*/ ...)"`, a line of a shell block in the docs.
+LOOKUP = re.compile(r'^[ \t]*(PLUGIN_DIR="\$\(ls -d .*\)")[ \t]*$', re.M)
+CACHE = '"${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/'
+MOD_CACHE = pathlib.PurePosixPath('plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod')
+
+
+def markdown_files():
+    return sorted(path for path in {*PLUGIN.glob('*.md'), *PLUGIN.glob('docs/*.md'), PLUGIN.parent.parent / 'README.md'}
+                  if path.is_file())
+
+
+def cache_lookup_checks():
+    lookups = [(path.relative_to(PLUGIN.parent.parent).as_posix(), line)
+               for path in markdown_files() for line in LOOKUP.findall(path.read_text(encoding='utf-8'))]
+    check('the docs show the lookup of the installed copy at least five times', len(lookups) >= 5,
+          [where for where, _ in lookups])
+    stale = [where for where, line in lookups if CACHE not in line]
+    check('every lookup reads the cache under CLAUDE_CONFIG_DIR when it is set, else under ~/.claude', stale == [], stale)
+    shared = [path.name for path in markdown_files() if re.search(r'/tmp/\S*venv', path.read_text(encoding='utf-8'))]
+    check('no doc makes a virtual environment in a shared /tmp path another user could make first', shared == [], shared)
+    sh = shutil.which('sh')
+    if sh is None:
+        check('each lookup picks the highest version installed (skipped: no sh)', True)
+        return
+    for line in sorted({line for _, line in lookups}):
+        # As a person runs it: then the guard every snippet uses before the path.
+        script = line + '\nprintf "%s" "${PLUGIN_DIR:?mod cache directory not found}"\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / 'claude config'  # a space, as in a macOS home
+            home = pathlib.Path(tmp) / 'home'
+            for root, versions in ((config, ('0.1.2', '0.1.10', '0.1.9')), (home / '.claude', ('0.1.3', '0.1.1'))):
+                for version in versions:
+                    (root / MOD_CACHE / version).mkdir(parents=True)
+            (pathlib.Path(tmp) / 'empty').mkdir()
+
+            def lookup(**env):
+                return subprocess.run([sh, '-c', script], capture_output=True, text=True, cwd=tmp,
+                                      env={'PATH': os.environ.get('PATH', ''), 'LC_ALL': 'C', 'HOME': str(home), **env})
+
+            found = lookup(CLAUDE_CONFIG_DIR=str(config))
+            check('a lookup with CLAUDE_CONFIG_DIR set picks the highest version under it (0.1.10 over 0.1.9 and 0.1.2)',
+                  found.returncode == 0 and found.stdout == f'{config / MOD_CACHE / "0.1.10"}/',
+                  f'{found.returncode} {found.stdout!r} {found.stderr!r}')
+            for what, env in (('unset', {}), ('empty', {'CLAUDE_CONFIG_DIR': ''})):
+                found = lookup(**env)
+                check(f'a lookup with CLAUDE_CONFIG_DIR {what} picks the highest version under ~/.claude',
+                      found.returncode == 0 and found.stdout == f'{home / ".claude" / MOD_CACHE / "0.1.3"}/',
+                      f'{found.returncode} {found.stdout!r} {found.stderr!r}')
+            found = lookup(CLAUDE_CONFIG_DIR=str(pathlib.Path(tmp) / 'empty'))
+            check('a lookup that finds no installed copy stops at the guard, with nothing printed',
+                  found.returncode != 0 and found.stdout == '' and 'mod cache directory not found' in found.stderr,
+                  f'{found.returncode} {found.stdout!r} {found.stderr!r}')
+
+
+# ---------------------------------------------------------------------------
 # clean_dead_letter.py
 # ---------------------------------------------------------------------------
 
@@ -1909,7 +1970,7 @@ def clean_dead_letter_checks():
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
           writer_grants_checks, row_writer_role_checks, resources_checks, readers_checks, api_checks,
           dataset_access_checks, execute_stop_checks, execute_apply_checks, repo_checks, setup_sh_checks,
-          clean_dead_letter_checks)
+          cache_lookup_checks, clean_dead_letter_checks)
 
 
 def main():

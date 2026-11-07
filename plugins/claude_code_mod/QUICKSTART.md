@@ -47,10 +47,10 @@ The installed mod includes `setup.sh` and `scripts/`, so you do not need to clon
 claude -p /bqaa-mod-setup < /dev/null
 ```
 
-If you prefer to invoke `setup.sh` directly from the installed mod cache without opening `claude` (selecting the highest installed version when multiple versions are cached):
+If you prefer to invoke `setup.sh` directly from the installed mod cache without opening `claude` (selecting the highest installed version when multiple versions are cached; the cache is under `$CLAUDE_CONFIG_DIR` when you set it, else `~/.claude`):
 
 ```bash
-PLUGIN_DIR="$(ls -d ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
+PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
 BQAA_PROJECT_ID=YOUR_PROJECT BQAA_DATASET=agent_analytics bash "${PLUGIN_DIR:?mod cache directory not found}setup.sh"
 ```
 
@@ -125,7 +125,7 @@ Because `--config project=...` (or `/config`) saves `"project"` in `~/.claude/se
 
 1. **Provision the dataset, table, and views in the new project** (run `/bqaa-mod-setup` after updating `project`, or run `setup.sh` from your installed mod cache):
    ```bash
-   PLUGIN_DIR="$(ls -d ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
+   PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
    BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics bash "${PLUGIN_DIR:?mod cache directory not found}setup.sh"
    ```
 2. **Update the saved `project` option**:
@@ -141,12 +141,12 @@ Because `--config project=...` (or `/config`) saves `"project"` in `~/.claude/se
 ## For administrators
 
 1. **Create the dataset, table, and views**: Run `setup.sh` (see [Step A.4](#4-create-the-bigquery-dataset-and-table)) in a dedicated GCP project where regular users do not hold project-wide BigQuery read roles. This creates `<dataset>.agent_events` and two aggregate views (`daily_usage_by_user`, `daily_usage_by_model`) in `<dataset>_reporting`.
-2. **Create the writer service account and grant your two groups**: The bootstrap script (`scripts/setup_gcp_prereqs.py`) is included inside the installed mod directory (shown by `/bqaa-mod-setup`, or resolved from the cache below) as well as in a repository checkout. Applying its plan needs `google-cloud-bigquery`, so create a virtual environment outside the read-only plugin cache (for example `/tmp/bqaa-venv`):
+2. **Create the writer service account and grant your two groups**: The bootstrap script (`scripts/setup_gcp_prereqs.py`) is included inside the installed mod directory (shown by `/bqaa-mod-setup`, or resolved from the cache below) as well as in a repository checkout. Applying its plan needs `google-cloud-bigquery`, so create a virtual environment outside the read-only plugin cache, in your home directory rather than a shared directory such as `/tmp` that another user could create first (for example `~/.bqaa-mod/venv`):
    ```bash
-   PLUGIN_DIR="$(ls -d ~/.claude/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
+   PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
    cd "${PLUGIN_DIR:?mod cache directory not found}"
-   python3 -m venv /tmp/bqaa-venv && /tmp/bqaa-venv/bin/pip install google-cloud-bigquery
-   /tmp/bqaa-venv/bin/python scripts/setup_gcp_prereqs.py \
+   python3 -m venv ~/.bqaa-mod/venv && ~/.bqaa-mod/venv/bin/pip install google-cloud-bigquery
+   ~/.bqaa-mod/venv/bin/python scripts/setup_gcp_prereqs.py \
      --project YOUR_PROJECT --dataset agent_analytics --no-create-dataset --no-create-table \
      --service-account bqaa-row-writer --writer-role row-writer \
      --token-creator group:WRITERS@example.com --reader group:READERS@example.com
@@ -155,6 +155,6 @@ Because `--config project=...` (or `/config`) saves `"project"` in `~/.claude/se
 3. **Roll out to developers**: Share `project`, `dataset`, and `accessTokenCommand` (`gcloud auth print-access-token --impersonate-service-account=bqaa-row-writer@YOUR_PROJECT.iam.gserviceaccount.com`) for [Path B](#b-your-team-set-it-up), or deploy an organization policy with [docs/managed-settings.md](docs/managed-settings.md).
 4. **Query usage and traces**: Point stakeholders to `<dataset>_reporting` (`daily_usage_by_user`, `daily_usage_by_model`) for daily adoption and token counts, and use [`sql/sample_queries.sql`](sql/sample_queries.sql) (filling in `{PROJECT}`, `{DATASET}`, and `{TABLE}`, or running [`scripts/run_bq.py`](scripts/run_bq.py) from `"$PLUGIN_DIR"`, which defaults `@start` and `@end` to the last 7 UTC days when omitted) and [docs/value.md](docs/value.md) for admin-level latency, tool-error, and trace queries:
    ```bash
-   /tmp/bqaa-venv/bin/python scripts/run_bq.py \
+   ~/.bqaa-mod/venv/bin/python scripts/run_bq.py \
      --project YOUR_PROJECT --dataset agent_analytics --query 5
    ```

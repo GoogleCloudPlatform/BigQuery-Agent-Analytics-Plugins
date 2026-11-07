@@ -524,11 +524,25 @@ function fallbackValueEnd(text: string, start: number, limit: number, outerQuote
   return i
 }
 
+// Just past the quote that closes the quoted value that starts at `start`
+// (a backslash escapes the character after it, as in JSON, a dict or a log
+// line), else `limit`.
+function closingQuoteEnd(text: string, start: number, limit: number): number {
+  const quote = text[start]
+  for (let i = start + 1; i < limit; i += 1) {
+    if (text[i] === '\\') i += 1
+    else if (text[i] === quote) return i + 1
+  }
+  return limit
+}
+
 // The same for a `name:` or `name = ` value (namedValueEnd), which may be an
-// auth scheme and its token (`Bearer …`, `Basic …`).
+// auth scheme and its token (`Bearer …`, `Basic …`). A quoted value ends at
+// the quote that closes it: what follows (the `,` or `}` after a JSON or
+// dict value) is not the credential's.
 function namedTokenEnd(text: string, start: number, limit: number, outerQuote = ''): number {
   if (start >= limit) return limit
-  if ((text[start] === '"' || text[start] === "'") && text[start] !== outerQuote) return fallbackValueEnd(text, start, limit)
+  if ((text[start] === '"' || text[start] === "'") && text[start] !== outerQuote) return closingQuoteEnd(text, start, limit)
   if (text[start] === '$' && text[start + 1] === "'") return fallbackValueEnd(text, start, limit)
   const first = fallbackValueEnd(text, start, limit, outerQuote)
   if (/^(?:Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|Bot)$/i.test(text.slice(start, first))) {
@@ -570,10 +584,13 @@ const ANSI = 3
 const UNKNOWN = 4
 
 // The quote a credential value sits in, for fallbackValueEnd: the one its
-// first character is in (`state`, as quoteStates reads it), else a quote
-// just before its name (`boundary`).
-const outerQuoteOf = (state: number | undefined, boundary = ''): string =>
-  state === DOUBLE ? '"' : state === SINGLE ? "'" : boundary === '"' || boundary === "'" ? boundary : ''
+// first character is in (`state`, as quoteStates reads it). Where that scan
+// cannot tell (`$'…'`, past a here-document's `<<`), a quote just before
+// its name (`boundary`), while that quote is still open where the value
+// starts (`open`): the key's own quote in `"password": "…"` closes before
+// the value, so it is no quote around it. Outside quotes (NONE), none.
+const outerQuoteOf = (state: number | undefined, boundary = '', open = true): string =>
+  state === DOUBLE ? '"' : state === SINGLE ? "'" : state !== NONE && open && (boundary === '"' || boundary === "'") ? boundary : ''
 
 // The quote open at `to`, reading `text` from `from` by the shell's quoting
 // rules alone: single quotes, double quotes, `$'…'` and backslashes (a line
@@ -996,12 +1013,15 @@ function redactNamedValues(text: string, stats: SanitizeStats): string {
       close = read?.close ?? ''
     } else {
       end = namedValueEnd(text, start)
-      valueEnd = namedTokenEnd(text, start, end, outerQuoteOf((states ??= quoteStates(text))[start], m.boundary))
+      const open = !text.slice(m.index + 1, start).includes(m.boundary)
+      valueEnd = namedTokenEnd(text, start, end, outerQuoteOf((states ??= quoteStates(text))[start], m.boundary, open))
     }
     const value = text.slice(start, end)
     if (value.trim() === '') continue
+    // An auth scheme whose token a pattern already redacted (and counted),
+    // quoted or not (`"Bearer [REDACTED]"` in JSON, escaped in a log line).
     const alreadyRedactedScheme =
-      /^(?:Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|Bot)\s+\[REDACTED(?::[a-z-]+)?\]['"]?$/i.test(text.slice(start, valueEnd).trim())
+      /^\\?['"]?(?:Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|Bot)\s+\[REDACTED(?::[a-z-]+)?\]\\?['"]?$/i.test(text.slice(start, valueEnd).trim())
     noteCut(text, start, valueEnd, end, stats)
     out += text.slice(copied, start) + MARKER + close
     copied = end

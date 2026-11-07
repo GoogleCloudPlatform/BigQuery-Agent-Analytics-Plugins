@@ -88,8 +88,11 @@ export type Io = {
 // permission on the dataset, or BigQuery cannot find the dataset or table
 // (not made yet, or made so recently that streaming inserts do not see it).
 export type ProblemKind = 'credentials' | 'permission' | 'destination'
-// `missing` says which one BigQuery could not find, for a destination problem.
-export type Problem = { kind: ProblemKind; reason: string; since: number; missing?: 'dataset' | 'table' }
+// `missing` says which one BigQuery could not find, for a destination problem;
+// for a permission problem, `write` when BigQuery refused rows themselves
+// (insertAll: no bigquery.tables.updateData), which finding the table
+// (tables.get) does not clear.
+export type Problem = { kind: ProblemKind; reason: string; since: number; missing?: 'dataset' | 'table' | 'write' }
 
 export type Counters = {
   // Rows built and queued.
@@ -314,14 +317,16 @@ const shownWhole = (command: string): string | null => (diagnostic(`Run: ${comma
 
 // The command a project administrator runs once to set up who writes and who
 // reads the table: the mod's scripts/setup_gcp_prereqs.py for `c`'s names,
-// in a virtual environment of its own under /tmp (the script calls the
-// BigQuery Python client; nothing is installed in the mod's directory). A
-// dry run unless --execute is added. Null as for buildSetupCommand.
+// in a virtual environment of its own in the administrator's home directory
+// (the script calls the BigQuery Python client; nothing is installed in the
+// mod's directory, and no shared directory such as /tmp, where another user
+// could make the environment first, is used). A dry run unless --execute is
+// added. Null as for buildSetupCommand.
 export function buildPrereqsCommand(c: Config, root: string | undefined): string | null {
   if (!plainPath(root)) return null
   if (!PLAIN_PROJECT.test(c.project) || ![c.dataset, c.table].every(name => PLAIN_NAME.test(name)) || !PLAIN_LOCATION.test(c.location)) return null
   const script = root.endsWith('/') ? `${root}scripts/setup_gcp_prereqs.py` : `${root}/scripts/setup_gcp_prereqs.py`
-  const venv = '/tmp/bqaa-venv'
+  const venv = '"$HOME/.bqaa-mod/venv"'
   return shownWhole(`python3 -m venv ${venv} && ${venv}/bin/pip install -q google-cloud-bigquery && ${venv}/bin/python ${shellQuote(script)} --project ${c.project} --dataset ${c.dataset} --table ${c.table} --location ${c.location}`)
 }
 
@@ -696,12 +701,14 @@ export class Writer {
 
   // Asks BigQuery for the table (tables.get, which the row writer's role
   // grants too) while nothing has told this writer yet whether rows can be
-  // written: no request answered, no error, no notice. A refused token
-  // (again with a fresh one), denied access, or a missing dataset or table
-  // raises the notice a send would; any other answer is the last error, and
-  // so is no answer in `timeoutMs`. A missing table that the first send
-  // makes (autoCreateTable) is no notice. What it found, for /bqaa-status,
-  // or null where it did not ask. Never throws.
+  // written: no request answered, no error, no notice; or whenever asked
+  // (`explicit`, /bqaa-status check). A refused token (again with a fresh
+  // one), denied access, or a missing dataset or table raises the notice a
+  // send would; any other answer is the last error, and so is no answer in
+  // `timeoutMs`. A missing table that the first send makes (autoCreateTable)
+  // is no notice. The table found clears only what finding it proves fixed
+  // (see foundTable). What it found, for /bqaa-status, or null where it did
+  // not ask. Never throws.
   async probeDestination(timeoutMs = 3000, explicit = false): Promise<string | null> {
     const c = this.config()
     if (!canDeliver(c) || c.dryRun || this.closing || (!explicit && (this.problem !== null || this.lastSuccessAt !== null || this.lastError !== null))) return null
@@ -726,7 +733,7 @@ export class Writer {
           return `no answer (${diagnostic(answer.error, 200)})`
         }
         if (answer.status >= 200 && answer.status < 300) {
-          this.tableAnswered()
+          this.foundTable(c)
           return `BigQuery found ${tableRef(c)}`
         }
         const outcome = classifyInsert(answer, 0)
@@ -739,8 +746,11 @@ export class Writer {
         else if (outcome.kind === 'not-found') {
           if (!isDatasetMissing(outcome.message) && c.autoCreateTable && !this.createAttempted) return `${tableRef(c)} is not there yet; the first send makes it`
           this.missingDestination(outcome.message)
-        } else if (outcome.kind === 'rejected' && outcome.permission) this.noteProblem('permission', outcome.message)
-        else this.recordError(`destination check: ${'message' in outcome ? outcome.message : `HTTP ${answer.status}`}`)
+        } else if (outcome.kind === 'rejected' && outcome.permission) {
+          // Rows BigQuery refused already stay the reason: reading the table
+          // denied too does not make writing allowed.
+          this.noteProblem('permission', outcome.message, this.problem?.kind === 'permission' && this.problem.missing === 'write' ? 'write' : undefined)
+        } else this.recordError(`destination check: ${'message' in outcome ? outcome.message : `HTTP ${answer.status}`}`)
         return diagnostic(`HTTP ${answer.status}`, 200)
       }
       return null
@@ -900,7 +910,7 @@ export class Writer {
         return false
       }
       case 'rejected':
-        if (outcome.permission) this.noteProblem('permission', outcome.message)
+        if (outcome.permission) this.noteProblem('permission', outcome.message, 'write')
         else this.tableAnswered()
         await this.reject(batch, outcome.message)
         return false
@@ -919,14 +929,18 @@ export class Writer {
     if (rows > 0) this.call(() => this.io.sent?.(rows, c))
     // BigQuery is reachable again: replay what this session parked on disk.
     // Not once the exit began: the next session replays it.
-    if (!this.closing && hadFailures && this.parked.recoverable && this.config().autoBackfill) {
-      this.parked.recoverable = false
-      this.recoveryTimer?.cancel()
-      this.recoveryTimer = this.io.after(1000, () => {
-        this.recoveryTimer = null
-        if (!this.closing) void this.backfill(['spill', 'retry'], 'recovery')
-      })
-    }
+    if (!this.closing && hadFailures && this.parked.recoverable && this.config().autoBackfill) this.recoverSoon()
+  }
+
+  // A second from now, replays the spill and retry files this session
+  // parked, once BigQuery is reachable again.
+  private recoverSoon(): void {
+    this.parked.recoverable = false
+    this.recoveryTimer?.cancel()
+    this.recoveryTimer = this.io.after(1000, () => {
+      this.recoveryTimer = null
+      if (!this.closing) void this.backfill(['spill', 'retry'], 'recovery')
+    })
   }
 
   // BigQuery took a request, sent or replayed: the table is there and the
@@ -1094,6 +1108,28 @@ export class Writer {
     if (this.problem !== null) this.clearProblem()
   }
 
+  // tables.get found the table (probeDestination): the dataset and the table
+  // are there and the credentials work, so a notice about either clears, and
+  // with it the backoff and the status line it set; the rows queued go now,
+  // and rows parked meanwhile are replayed, as after a send BigQuery takes.
+  // Finding the table says nothing of writing to it
+  // (bigquery.tables.updateData): a denial BigQuery gave rows, or one under
+  // which rows were parked, stands until BigQuery takes a request. No row
+  // was written: the transcript is told what was found, never that rows are
+  // written again (clearProblem).
+  private foundTable(c: Config): void {
+    const was = this.problem
+    if (was === null || (was.kind === 'permission' && (was.missing === 'write' || this.parkedDuringProblem > 0))) return
+    const hadFailures = this.consecutiveFailures > 0
+    this.consecutiveFailures = 0
+    this.resume()
+    this.clearProblem({ fromProbe: true })
+    this.setStatus(undefined)
+    if (this.closing) return
+    if (this.queue.length > 0 && !this.hasOnlyUnsentSessionStart(this.sessionId())) this.requestFlush(0)
+    if (hadFailures && this.parked.recoverable && c.autoBackfill) this.recoverSoon()
+  }
+
   // A 404 from insertAll, sent or replayed: the notice for the dataset or
   // table, unless this writer made the table in the last two minutes.
   private missingDestination(message: string): void {
@@ -1103,8 +1139,10 @@ export class Writer {
 
   // The next successful send: the problem is gone. Rows refused while
   // access was denied stay parked until /bqaa-backfill, and the transcript
-  // says so; rows parked for want of credentials follow on their own.
-  private clearProblem(): void {
+  // says so; rows parked for want of credentials follow on their own. A
+  // table found (`fromProbe`) wrote no row: the transcript is told what was
+  // found, never that rows are written again.
+  private clearProblem(opts: { fromProbe?: boolean } = {}): void {
     const was = this.problem
     if (was === null) return
     const parked = this.parkedDuringProblem
@@ -1115,7 +1153,11 @@ export class Writer {
     this.parkedRough = false
     this.call(() => this.io.redraw?.())
     if (parked > 0 && (was.kind === 'permission' || !this.config().autoBackfill)) {
-      this.call(() => this.io.notice?.(`bqaa: rows are being written again; /bqaa-backfill sends the ${about}${parked} row(s) parked while they could not be.`))
+      const notice =
+        opts.fromProbe === true
+          ? `bqaa: BigQuery found the table; /bqaa-backfill sends the ${about}${parked} row(s) parked while rows could not be written.`
+          : `bqaa: rows are being written again; /bqaa-backfill sends the ${about}${parked} row(s) parked while they could not be.`
+      this.call(() => this.io.notice?.(notice))
     }
   }
 
@@ -1654,7 +1696,7 @@ export class Writer {
         return refused.length === 0 && again.length === 0
       }
       case 'rejected':
-        if (outcome.permission) this.noteProblem('permission', outcome.message)
+        if (outcome.permission) this.noteProblem('permission', outcome.message, 'write')
         else this.tableAnswered()
         writes.push(this.reject(batch, outcome.message))
         return false
@@ -2683,7 +2725,7 @@ export class Writer {
       if (outcome.kind === 'rejected') {
         // Refused whole, as a send would be: parked for /bqaa-backfill, and
         // access denied is the notice. The rest waits for the next replay.
-        if (outcome.permission) this.noteProblem('permission', outcome.message)
+        if (outcome.permission) this.noteProblem('permission', outcome.message, 'write')
         else this.tableAnswered()
         chunk.forEach((line, i) => refuse(first + i, outcome.message))
         this.refusedOnReplay(keys.slice(first, first + chunk.length), outcome.message)

@@ -208,12 +208,13 @@ function writeStderr(line: string): void {
   }
 }
 
-// At the end of a `-p` run that recorded something, while a problem keeps
-// rows from BigQuery: what is wrong and the fix, redacted, on one line of
-// standard error.
-function headlessNotice(current: Writer): void {
+// At the end of a `-p` run that recorded something (`hadActivity`, read
+// before session end resets it, or rows spilled or parked), while a problem
+// keeps rows from BigQuery: what is wrong and the fix, redacted, on one line
+// of standard error.
+function headlessNotice(current: Writer, hadActivity: boolean): void {
   const { counters } = current.snapshot()
-  if (current.problem === null || !(tracer.hasActivity || counters.spilled > 0 || counters.failed > 0)) return
+  if (current.problem === null || !(hadActivity || counters.spilled > 0 || counters.failed > 0)) return
   const { headline, fix } = current.problemText()
   writeStderr(clean(`BigQuery Agent Analytics: rows could not be sent (${headline}; to fix, ${fix}).`, 1000).replace(/[\r\n]+/g, ' '))
 }
@@ -1252,9 +1253,11 @@ export const register: Register = (on, registered) => {
 
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' || e.reason === 'resume') resets += 1
+    // Read before sessionEnded, which resets it.
+    const hadActivity = tracer.hasActivity
     const suppressEmpty =
       ranModCommand &&
-      !tracer.hasActivity &&
+      !hadActivity &&
       (writer === null || writer.dropUnsentSessionStart(e.sessionId ?? tracer.sessionId, tracer.hasSessionStart))
     ranModCommand = false
     safely(() => tracer.sessionEnded(e, { suppressRow: suppressEmpty }))
@@ -1276,7 +1279,7 @@ export const register: Register = (on, registered) => {
         } catch {
           internalErrors += 1
         }
-        if (!isInteractiveSession) safely(() => headlessNotice(ending))
+        if (!isInteractiveSession) safely(() => headlessNotice(ending, hadActivity))
       }
     }
     return next(e)
