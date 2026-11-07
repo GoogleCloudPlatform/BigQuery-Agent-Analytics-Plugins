@@ -112,6 +112,9 @@ export const TELEMETRY_KEYS: readonly string[] = [
   'version',
   'label',
   'mode',
+  // What redaction removed from the row (`attributes.redaction`): how many
+  // values, and how many characters past them.
+  'redaction',
   // Built-in tools' number and flag arguments.
   'limit',
   'offset',

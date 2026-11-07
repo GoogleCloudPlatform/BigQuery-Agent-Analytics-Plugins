@@ -332,18 +332,33 @@ test('rows BigQuery reports as invalid are parked; the rest land', { options: OP
   expect(await statusText($)).toMatch(/sent 2, dead-lettered 1 \(1 refused\)/)
 })
 
-test('session end starts no request: it spills what is queued, and the next session sends it', { options: OPTIONS }, async ($, on) => {
+test('session end sends what is still queued in one request, with the token in hand: no dead-letter file is written and no process runs', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)
   await world.clock.settle()
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
-  // A token is in hand and BigQuery answers, yet session end sends nothing.
+  const commands = world.commands.length
   await $.session.end(END)
-  expect(world.fetches.length).toBe(0)
+  expect(world.insertCalls().length).toBe(1)
+  expect(world.acceptedRows().map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  expect(world.commands.length).toBe(commands)
+  // Neither a spill file nor a replay record beside one.
+  expect([...world.files.keys()].filter(path => path.startsWith(`${DEAD_LETTER_DIR}/`))).toEqual([])
+})
+
+test('a session end whose request fails spills its rows within the budget, and the next session sends them', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [UNAVAILABLE, OK_INSERT]
+  await startSession($)
+  await world.clock.settle()
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await $.session.end(END)
+  expect(world.insertCalls().length).toBe(1)
   const [file] = deadLetterFiles(world)
   expect(file?.[0].startsWith(`${PARTITION_DIR}/spill-`)).toBe(true)
   const spilled = deadLetterRows(world)
   expect(spilled.map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  expect(await statusText($)).toMatch(/last error \([^)]*\): session end: HTTP 503/)
   // The next session replays the file 15 seconds after it starts.
   await startSession($)
   await world.clock.advance(15_000)
@@ -352,7 +367,30 @@ test('session end starts no request: it spills what is queued, and the next sess
   expect(world.files.get(file?.[0] ?? '')).toBe('')
 })
 
-test('session end waits no more than half its budget for a stuck request: its rows are spilled too', { options: OPTIONS }, async ($, on) => {
+test('a session end request that does not answer is given up 150 ms before the budget ends: its rows are spilled within the budget', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await world.clock.settle()
+  world.replies = [{ hang: true }]
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  let ended = false
+  const ending = $.session.end(END).then(() => {
+    ended = true
+  })
+  await world.clock.advance(600)
+  // Its request is out, and nothing is spilled yet.
+  expect([ended, world.insertCalls().length, deadLetterRows(world).length]).toEqual([false, 1, 0])
+  // BQAA_EXIT_FLUSH_MS defaults to 800 ms: at 650 ms the request is given up
+  // and the rows go to a spill file, well before the budget ends.
+  await world.clock.advance(100)
+  await ending
+  expect(ended).toBe(true)
+  expect(world.insertCalls().length).toBe(1)
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  world.releaseHung(200, '{}')
+})
+
+test('session end waits no more than half its budget for a stuck request: no request goes behind it, and every row is spilled', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [{ hang: true }]
   await startSession($)
@@ -364,8 +402,9 @@ test('session end waits no more than half its budget for a stuck request: its ro
     ended = true
   })
   await world.clock.settle()
-  // The rows queued after the request are on disk at once.
-  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  // The rows queued after the request wait for its answer: should it land,
+  // they go in one request of their own.
+  expect(deadLetterRows(world)).toEqual([])
   // BQAA_EXIT_FLUSH_MS defaults to 800 ms: the answer is waited for up to
   // half of it (the host's bound can leave a millisecond less).
   await world.clock.advance(300)
@@ -374,12 +413,12 @@ test('session end waits no more than half its budget for a stuck request: its ro
   await ending
   // No second request was started behind the stuck one.
   expect(world.insertCalls().length).toBe(1)
-  // The stuck batch (it may yet land; event_id dedups) follows.
-  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA', 'STATE_DELTA'])
+  // The stuck batch (it may yet land; event_id dedups), then the rows queued after it.
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
   world.releaseHung(200, '{}')
 })
 
-test('session end waits, inside half its budget, for a request already out: rows BigQuery took are not spilled and sent again', { options: OPTIONS }, async ($, on) => {
+test('session end waits, inside half its budget, for a request already out: once it lands, the rows queued after it go in one more request, and none is spilled', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [{ hang: true }, OK_INSERT]
   await startSession($)
@@ -391,19 +430,19 @@ test('session end waits, inside half its budget, for a request already out: rows
   await world.clock.advance(168)
   world.releaseHung(200, '{}')
   await ending
-  expect(world.insertCalls().length).toBe(1)
-  // Only the rows queued after the request are spilled.
-  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
-  // The next session replays them: every row went out once.
-  await startSession($)
-  await world.clock.advance(15_000)
+  expect(world.insertCalls().length).toBe(2)
+  expect(deadLetterRows(world)).toEqual([])
+  // Every row went out once.
   const ids = world.sentRows().map(r => r.event_id)
-  expect(ids.length).toBeGreaterThan(4)
+  expect(world.sentRows().map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
   expect(new Set(ids).size).toBe(ids.length)
 })
 
 test('a spill write that hangs holds session end no longer than its budget', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
+  // The token command started at session start does not answer: the exit
+  // waits for it until 200 ms before its budget ends, then spills.
+  world.processDelayMs = 100_000
   await startSession($)
   await world.clock.settle()
   world.hangWrites = true
@@ -419,6 +458,7 @@ test('a spill write that hangs holds session end no longer than its budget', { o
   expect(ended).toBe(true)
   expect(world.fetches.length).toBe(0)
   world.releaseWrites()
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['STATE_DELTA', 'STATE_DELTA'])
 })
 
 // The event types of the rows in this table's files of one kind.
@@ -521,7 +561,7 @@ test('replay sends only rows recorded for the configured table; other tables kee
   expect(moved.map(([, text]) => parseFile(text).complete)).toEqual([true])
   const status = await statusText($)
   expect(status).toMatch(/2 rows sent, 1 left, 1 of them for another table/)
-  expect(status).toMatch(/2 more file\(s\) in .* for other tables or an older layout/)
+  expect(status).toMatch(/dead-letter: 2 waiting file\(s\) in .* for other tables or an older layout, not replayed under this configuration/)
 })
 
 test('configured for the other table, replay sends its rows there and leaves this table\'s alone', { options: OTHER_OPTIONS }, async ($, on) => {
@@ -557,7 +597,11 @@ test('multibyte rows: dead-letter files stay within the limit in bytes, and ever
   await startSession($)
   await world.clock.settle()
   for (let i = 0; i < 120; i += 1) await $.tool.call({ tool: 'Read', file_path: `f${i}.ts` })
+  // BigQuery is unavailable as the session ends: every row goes to spill
+  // files, the overflow of the exit's one request and that request's batch.
+  world.replies = [UNAVAILABLE]
   await $.session.end(END)
+  world.replies = [OK_INSERT]
   const files = deadLetterFiles(world)
   expect(files.length > 1).toBe(true)
   for (const [, text] of files) expect(utf8Bytes(text) <= FILE_CAP).toBe(true)
@@ -1212,4 +1256,80 @@ test('a replay a send after failures set going does not start once the exit bega
   expect(world.insertCalls().length).toBe(2)
   expect(deadLetterRows(world).length).toBe(parked + 1)
   expect(await statusText($)).not.toMatch(/last backfill \(recovery/)
+})
+
+test('a short non-interactive session with an earlier spill on disk and an in-flight batch at session.end sends the batch, session_end, and earlier spill once each', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const earlierFile = `${PARTITION_DIR}/spill-20261013T200102003Z-earlier-1.jsonl`
+  world.files.set(earlierFile, parkedFile(parkedLine(TABLE_REF, 'e'.repeat(32), 'earlier-session')))
+  world.replies = [{ hang: true }, OK_INSERT, OK_INSERT]
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  // At 5s the session's turn batch is in flight when session.end arrives (well before 15s auto-backfill).
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+  const ending = $.session.end({ ...END, reason: 'other' })
+  await world.clock.advance(100)
+  world.releaseHung(OK_INSERT.status, OK_INSERT.text)
+  await ending
+  expect(world.insertCalls().length).toBe(3)
+  expect(deadLetterFiles(world)).toEqual([])
+  expect(world.files.get(earlierFile)).toBe('')
+  const sentIds = world.sentRows().map(r => r.event_id)
+  expect(sentIds.length).toBe(5)
+  expect(new Set(sentIds).size).toBe(5)
+  expect(sentIds.includes('e'.repeat(32))).toBe(true)
+})
+
+test('headless /bqaa-backfill and interactive /bqaa-backfill wait await completion and report skipped files that could not be replayed', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const file1 = `${PARTITION_DIR}/spill-20261013T200102003Z-one-1.jsonl`
+  world.files.set(file1, parkedFile(parkedLine(TABLE_REF, '1'.repeat(32), 's1'), parkedLine(TABLE_REF, '2'.repeat(32), 's1')))
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await world.clock.settle()
+  const res = await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  expect(res.text ?? '').toBe('bqaa backfill: 1 file(s), 2 row(s) sent, 0 left')
+  expect(deadLetterFiles(world)).toEqual([])
+
+  // Now seed a waiting file leased by another session (skipped before reading): /bqaa-backfill wait reports "1 waiting file(s) not replayed" and why it was left waiting.
+  await startSession($)
+  await world.clock.settle()
+  const leasedName = 'spill-20261013T200102003Z-leased-1.jsonl'
+  world.files.set(`${PARTITION_DIR}/${leasedName}`, parkedFile(parkedLine(TABLE_REF, '3'.repeat(32), 's2')))
+  world.store.set(`lease:${TABLE_REF}/${leasedName}`, { by: 'other-session', until: Date.now() + 60_000 })
+  const skippedRes = await $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND })
+  expect(skippedRes.text ?? '').toBe(`bqaa backfill: 0 file(s), 0 row(s) sent, 0 left, 1 waiting file(s) not replayed; left waiting: another session's lease holds ${leasedName} (ten minutes at most); it waits for the next replay`)
+  expect(await statusText($)).toMatch(/last backfill \(command, .*\): 0 file\(s\), 0 rows sent, 0 left, 1 skipped; left waiting: another session's lease holds spill-20261013T200102003Z-leased-1\.jsonl/)
+})
+
+test('/bqaa-status separates elsewhere waiting files from leftovers and shows clean_dead_letter.py --execute only at >= 100 retired files', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // 1 active file and 2 retired leftovers in another table's partition, plus 97 retired files in this table's partition (99 total retired < 100).
+  world.files.set(`${DEAD_LETTER_DIR}/${OTHER_TABLE}/spill-20261013T200102003Z-other-1.jsonl`, parkedFile(parkedLine(OTHER_TABLE, 'b'.repeat(32), 'other-s')))
+  world.files.set(`${DEAD_LETTER_DIR}/${OTHER_TABLE}/spill-20261013T200102003Z-retired-1.jsonl`, '')
+  world.files.set(`${DEAD_LETTER_DIR}/${OTHER_TABLE}/outcome-spill-20261013T200102003Z-retired-1.jsonl`, '{"fates":"L"}\n')
+  for (let i = 0; i < 97; i += 1) {
+    world.files.set(`${PARTITION_DIR}/spill-20261013T200102003Z-r${i}.jsonl`, '')
+  }
+  await startSession($)
+  const below100 = await statusText($)
+  expect(below100).toContain(`1 waiting file(s) (2 leftover(s)) in ${DEAD_LETTER_DIR} for other tables or an older layout, not replayed under this configuration`)
+  expect(below100).not.toContain('cleanup (run while no session is running):')
+
+  // Adding 1 more retired leftover reaches 100 total (98 here + 2 elsewhere) and surfaces the cleanup command.
+  world.files.set(`${PARTITION_DIR}/spill-20261013T200102003Z-r97.jsonl`, '')
+  const at100 = await statusText($)
+  expect(at100).toMatch(/^cleanup \(run while no session is running\): python3 '\/[^']*\/scripts\/clean_dead_letter\.py' --execute$/m)
+})
+
+test('/bqaa-status passes custom deadLetterDir with shell quoting in the cleanup command', { options: { ...OPTIONS, deadLetterDir: "/tmp/custom dir/it's-bqaa" } }, async ($, on) => {
+  const customDir = "/tmp/custom dir/it's-bqaa"
+  const world = setUp(on)
+  for (let i = 0; i < 100; i += 1) {
+    world.files.set(`${customDir}/${TABLE_REF}/spill-20261013T200102003Z-r${i}.jsonl`, '')
+  }
+  await startSession($)
+  const status = await statusText($)
+  expect(status).toMatch(/^cleanup \(run while no session is running\): python3 '\/[^']*\/scripts\/clean_dead_letter\.py' '\/tmp\/custom dir\/it'\\''s-bqaa' --execute$/m)
 })

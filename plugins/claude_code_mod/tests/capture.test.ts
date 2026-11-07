@@ -507,11 +507,11 @@ test('session end is recorded with its reason, turn count and duration', { optio
   await $.turn.start({ turnId: 'turn-1', text: 'hi' })
   await $.turn.complete({ turnId: 'turn-1', answer: 'Hello.', durationMs: 800, isAborted: false, reason: 'answer' })
   await world.clock.advance(5000)
-  // Session end starts no request: its row goes to a spill file the next
-  // session sends.
+  // Session end sends its row in one request, with the token in hand.
   await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
-  const ends = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
+  const ends = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
   expect(ends.length).toBe(1)
+  expect(deadLetterRows(world)).toEqual([])
   expect(json(ends[0]?.attributes ?? null)).toMatchObject({ state_delta: { source: 'coding_agent_session_end', reason: 'prompt_input_exit', trace_count: 1 } })
 })
 
@@ -558,16 +558,17 @@ test('when classic.SessionStart is skipped, turns, tools and session end still r
   await $.turn.complete({ turnId: 'turn-s2', answer: 'Second answer.', durationMs: 400, isAborted: false, reason: 'answer', usage: USAGE })
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'second-session-id', resume: { id: 'second-session-id' } })
 
+  // The first end row went with the flush after /clear; the second, at the
+  // process's end, in session end's own request.
   const sentEnds = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
-  const spilledEnds = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
-  expect(sentEnds.length).toBe(1)
-  expect(spilledEnds.length).toBe(1)
+  expect(sentEnds.length).toBe(2)
+  expect(deadLetterRows(world)).toEqual([])
   expect(sentEnds[0]?.session_id).toBe(SESSION_ID)
   expect(json(sentEnds[0]?.attributes ?? null)).toMatchObject({
     state_delta: { source: 'coding_agent_session_end', reason: 'clear', trace_count: 1 },
   })
-  expect(spilledEnds[0]?.session_id).toBe('second-session-id')
-  expect(json(spilledEnds[0]?.attributes ?? null)).toMatchObject({
+  expect(sentEnds[1]?.session_id).toBe('second-session-id')
+  expect(json(sentEnds[1]?.attributes ?? null)).toMatchObject({
     state_delta: { source: 'coding_agent_session_end', reason: 'prompt_input_exit', trace_count: 1 },
   })
 })
@@ -587,7 +588,7 @@ test('when classic.SessionStart is skipped and the session id changes on /branch
   await world.clock.advance(5000)
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'branched-session-id', resume: { id: 'branched-session-id' } })
 
-  const ends = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
+  const ends = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
   expect(ends.length).toBe(1)
   expect(ends[0]?.session_id).toBe('branched-session-id')
   expect(json(ends[0]?.attributes ?? null)).toMatchObject({
@@ -723,9 +724,10 @@ test('a session_start the first writer had out lands after two takeovers: a late
   await $.classic.SessionStart({ source: 'compact', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
   await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
   await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
-  // The session sent a row: its end is written, and the later start with it.
-  const spilled = byType(deadLetterRows(world), 'STATE_DELTA').map(r => json(r.content))
-  expect(spilled).toEqual([{ session_start: true }, { session_end: true }])
+  // The session sent a row: its end is written, and the later start with it
+  // (sent at session end, after the first writer's row).
+  const written = byType([...world.sentRows(), ...deadLetterRows(world)], 'STATE_DELTA').map(r => json(r.content))
+  expect(written).toEqual([{ session_start: true }, { session_start: true }, { session_end: true }])
 })
 
 test('an in-flight subagent model step and tool call started before SubagentStart pick up agent_type and clear unidentified_loop on completion', { options: OPTIONS }, async ($, on) => {

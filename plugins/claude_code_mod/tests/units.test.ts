@@ -1149,7 +1149,8 @@ test('where the scan and the word alone disagree on the quote a value starts in,
 })
 
 test('in prose, an apostrophe in a word or inline code before a credential costs no more than its line, and a loss past it marks the row cut', () => {
-  // Each text, what is kept, and whether text past the credential's line went.
+  // Each text, what is kept, and whether text past the credential went with
+  // it (more than blanks), which marks the row cut.
   const cases: [string, string, boolean][] = [
     [`It's done:\n--password=hunter2\nline three\nline four`, `It's done:\n--password=[REDACTED]\nline three\nline four`, false],
     [`It's done; don't worry:\n--password=hunter2\nline three`, `It's done; don't worry:\n--password=[REDACTED]\nline three`, false],
@@ -1162,11 +1163,11 @@ test('in prose, an apostrophe in a word or inline code before a credential costs
     [`\`\`\`\ncli --password=pre\`printf %s SecretSuffix\` --verbose\n\`\`\``, `\`\`\`\ncli --password=[REDACTED]`, true],
     [`\`\`\`\ncli --password pre\`printf %s SecretSuffix\` --verbose\n\`\`\``, `\`\`\`\ncli --password [REDACTED]`, true],
     [`\`\`\`sh\nexport API_TOKEN=abc\`SecretSuffix\n\`\`\`\nAfter.`, `\`\`\`sh\nexport API_TOKEN=[REDACTED]`, true],
-    [`Run \`echo a; cli --password=pre\`SecretSuffix\` --verbose\``, `Run \`echo a; cli --password=[REDACTED]`, false],
+    [`Run \`echo a; cli --password=pre\`SecretSuffix\` --verbose\``, `Run \`echo a; cli --password=[REDACTED]`, true],
     [`Run \`echo a; cli --password=pre\`SecretSuffix\` --verbose\`\nline two`, `Run \`echo a; cli --password=[REDACTED]`, true],
     [`Here is the snippet:\n\`\`\`sh\nexport API_TOKEN=hunter2\necho line2`, `Here is the snippet:\n\`\`\`sh\nexport API_TOKEN=[REDACTED]\necho line2`, false],
-    // The rest of the line still goes.
-    [`mysql -u root --password=hunter2 mydb < dump.sql\nline two`, `mysql -u root --password=[REDACTED]\nline two`, false],
+    // The rest of the line still goes, and the row says so.
+    [`mysql -u root --password=hunter2 mydb < dump.sql\nline two`, `mysql -u root --password=[REDACTED]\nline two`, true],
     // An odd quote that is no word's apostrophe: to the end of the text, and
     // the row says so.
     [`Use a 27" screen:\n--password=hunter2\nline three`, `Use a 27" screen:\n--password=[REDACTED]`, true],
@@ -1177,7 +1178,7 @@ test('in prose, an apostrophe in a word or inline code before a credential costs
     [`echo It's --password=Secret\nSuffix' done`, `echo It's --password=[REDACTED]`, true],
     [`echo It's DB_PASSWORD=Secret\nSuffix' done`, `echo It's DB_PASSWORD=[REDACTED]`, true],
     [`It's set: DB_PASSWORD=Secret\nSuffix' done`, `It's set: DB_PASSWORD=[REDACTED]`, true],
-    [`echo It's --password Secret Suffix' done`, `echo It's --password [REDACTED]`, false],
+    [`echo It's --password Secret Suffix' done`, `echo It's --password [REDACTED]`, true],
     // A value quoted the ordinary way after a contraction keeps the text after
     // it: read as shell, with the contraction a quote, the quotes would not
     // close. Where the shell's quote closes around text after the value (with
@@ -1186,18 +1187,18 @@ test('in prose, an apostrophe in a word or inline code before a credential costs
     [`It's set up. Run: cli '--password SecretSuffix' --verbose\nAFTER`, `It's set up. Run: cli '--password [REDACTED]' --verbose\nAFTER`, false],
     [`It's set up. Run: cli --password 'Secret Suffix' --verbose\nAFTER`, `It's set up. Run: cli --password [REDACTED] --verbose\nAFTER`, false],
     [`It's set up. Run: cli --password "Secret Suffix" --verbose\nAFTER`, `It's set up. Run: cli --password [REDACTED] --verbose\nAFTER`, false],
-    [`echo It's\ncli '--password Secret' Suffix' --verbose`, `echo It's\ncli '--password [REDACTED]`, false],
+    [`echo It's\ncli '--password Secret' Suffix' --verbose`, `echo It's\ncli '--password [REDACTED]`, true],
     [`echo It's\ncli '--password Secret' Suffix' --verbose\nAFTER`, `echo It's\ncli '--password [REDACTED]`, true],
-    [`echo It's\ncli --password 'Secret' 'Suffix' don't`, `echo It's\ncli --password [REDACTED]`, false],
+    [`echo It's\ncli --password 'Secret' 'Suffix' don't`, `echo It's\ncli --password [REDACTED]`, true],
     [`echo It's\ncli --password 'Secret' 'Suffix' don't\nAFTER`, `echo It's\ncli --password [REDACTED]`, true],
-    [`echo It's\ncli '--password Secret' 'Suffix' don't`, `echo It's\ncli '--password [REDACTED]`, false],
+    [`echo It's\ncli '--password Secret' 'Suffix' don't`, `echo It's\ncli '--password [REDACTED]`, true],
     [`echo It's\ncli '--password Secret' 'Suffix' don't\nAFTER`, `echo It's\ncli '--password [REDACTED]`, true],
     [`echo It's\ncli '--password Secret' Suffix' # '` + `\necho AFTER`, `echo It's\ncli '--password [REDACTED]`, true],
-    [`echo It's 'done'; cli --password "Sec'ret" Suffix" --verbose`, `echo It's 'done'; cli --password [REDACTED]`, false],
+    [`echo It's 'done'; cli --password "Sec'ret" Suffix" --verbose`, `echo It's 'done'; cli --password [REDACTED]`, true],
     [`echo It's 'done'; cli --password "Sec'ret" Suffix" --verbose\necho AFTER`, `echo It's 'done'; cli --password [REDACTED]`, true],
     [`echo It's 'done'; cli --password "Sec'ret" Suffix" # "` + `\necho AFTER`, `echo It's 'done'; cli --password [REDACTED]`, true],
     [`echo It's\ncli --password 'Secret' 'Suffix'\necho "done'"`, `echo It's\ncli --password [REDACTED]`, true],
-    [`echo It's 'done'; cli --password "Sec'ret" Suffix" "tail`, `echo It's 'done'; cli --password [REDACTED]`, false],
+    [`echo It's 'done'; cli --password "Sec'ret" Suffix" "tail`, `echo It's 'done'; cli --password [REDACTED]`, true],
     // Unicode contractions: a Unicode letter before the apostrophe is read as
     // prose, so the value costs no more than its line.
     [`Café's done:\n--password=CANARY7f9c2e\nAFTER`, `Café's done:\n--password=[REDACTED]\nAFTER`, false],
@@ -1235,24 +1236,26 @@ test('delimiter-run inline code spans redact the value and keep the suffix', () 
     [`Run \`\`cli --password=pre\` printf %s SecretSuffix\` --verbose\`\` then check.\nTAIL`, `Run \`\`cli --password=[REDACTED]`, true],
     [`Run \`export API_TOKEN=pre\` printf %s SecretSuffix\` and AFTER\nTAIL`, `Run \`export API_TOKEN=[REDACTED]`, true],
     // Odd-backtick lines (command substitution inside an unclosed backtick):
-    // no spans are recorded, so the value runs to the end of the text.
-    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\` and AFTER`, `Run \`export API_TOKEN=[REDACTED]`, false],
-    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`, and AFTER`, `Run \`export API_TOKEN=[REDACTED]`, false],
-    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`; and AFTER`, `Run \`export API_TOKEN=[REDACTED]`, false],
+    // no spans are recorded, so the value runs to the end of the text, and
+    // the text it takes past the value marks the row cut.
+    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\` and AFTER`, `Run \`export API_TOKEN=[REDACTED]`, true],
+    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`, and AFTER`, `Run \`export API_TOKEN=[REDACTED]`, true],
+    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`; and AFTER`, `Run \`export API_TOKEN=[REDACTED]`, true],
     [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\`\r\nand AFTER`, `Run \`export API_TOKEN=[REDACTED]`, true],
     // Runs that pair as no span (the middle two here hold a space at each
     // end and have letters outside) leave the pairing of the line unsure (the
     // value may be pre` CANARY7f9c2e): the line is unclosed, so the value
     // runs to the end of the text.
-    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\` and \`ok`, `Run \`export API_TOKEN=[REDACTED]`, false],
+    [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\` and \`ok`, `Run \`export API_TOKEN=[REDACTED]`, true],
     [`Run \`export API_TOKEN=pre\` CANARY7f9c2e\` and \`ok\nTAIL`, `Run \`export API_TOKEN=[REDACTED]`, true],
     // A value with more of the span's command after it: the redaction stops
     // at the backtick that closes the span, so the span stays closed and the
-    // text after it stays.
-    [`Run \`cli --password=CANARY7f9c2e --verbose\` and AFTER\nLine 2`, `Run \`cli --password=[REDACTED]\` and AFTER\nLine 2`, false],
+    // text after it stays; the rest of the span's command goes, and the row
+    // says so.
+    [`Run \`cli --password=CANARY7f9c2e --verbose\` and AFTER\nLine 2`, `Run \`cli --password=[REDACTED]\` and AFTER\nLine 2`, true],
     // An unclosed backtick run: no spans are recorded, so the value runs to
     // the end of the text.
-    [`Run \`export API_TOKEN=Secret\`Suffix more`, `Run \`export API_TOKEN=[REDACTED]`, false],
+    [`Run \`export API_TOKEN=Secret\`Suffix more`, `Run \`export API_TOKEN=[REDACTED]`, true],
     // A double-backtick span: the value redacts and the text after stays.
     [`Run \`\`export API_TOKEN=CANARY7f9c2e\`\` and AFTER`, `Run \`\`export API_TOKEN=[REDACTED]\`\` and AFTER`, false],
     // A fenced block and a comment with a backtick above a valid inline span:
@@ -1276,10 +1279,11 @@ test('delimiter-run inline code spans redact the value and keep the suffix', () 
   }
   // A value whose shell word runs past the backtick that closes its span
   // (the apostrophes of `it's` and a later `don't`, which the whole-text scan
-  // reads as prose and the word as a quote) keeps the end-of-line rule.
+  // reads as prose and the word as a quote) keeps the end-of-line rule, and
+  // the text it takes past the value marks the row cut.
   const stats = newStats()
   expect(redactText(`Run \`export TOKEN=it's\` and don't AFTER\nLine 2`, stats)).toBe(`Run \`export TOKEN=[REDACTED]\nLine 2`)
-  expect(stats.truncated).toBe(false)
+  expect(stats.truncated).toBe(true)
 })
 
 test('a value in a command string another shell runs, or after an escape its quoting leaves in, runs to the end of the text', () => {

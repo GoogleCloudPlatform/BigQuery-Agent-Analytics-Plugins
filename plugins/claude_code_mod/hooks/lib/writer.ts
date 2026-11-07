@@ -14,8 +14,10 @@
 
 // The background writer. Hooks only call `enqueue` (synchronous, in memory);
 // everything that touches the network, a process or the disk runs here, from
-// timers, never inside a hook's dispatch (session end's bounded spill write
-// aside, which starts no request).
+// timers, never inside a hook's dispatch (session end's bounded work aside:
+// its spill write and, while BigQuery takes this session's rows, one request
+// with a token already at hand, and in a `-p` run a replay of parked files,
+// all within its budget, none running a process).
 //
 // Delivery: batched tabledata.insertAll with a client-side timeout, retries
 // with exponential backoff, then a local dead-letter file. Every failure path
@@ -126,6 +128,9 @@ export type BackfillReport = {
   rowsRefused: number
   // Of rowsLeft, lines recorded for another table: kept as they were.
   otherTableRows: number
+  // Files with rows that wait, left unread (another session's lease, a
+  // record that cannot be read, the replay stopped first): their rows are in
+  // none of the counts above.
   skippedFiles: number
   // Files over the 4 MiB `$.fs.read` limit, which cannot be read back.
   oversizedFiles: string[]
@@ -142,6 +147,25 @@ export type BackfillReport = {
   error: string | null
   finishedAt: number | null
 }
+
+// What session end may do besides spilling (spillForExit).
+export type ExitFlushOptions = {
+  // Send the rows still queued in one request, while BigQuery takes this
+  // session's requests and a token is at hand.
+  sendQueued?: boolean
+  // Then replay this table's spill and retry files in what is left of the
+  // budget: for a run with no later moment to do it (`-p`).
+  replaySpills?: boolean
+}
+
+// A moment on the host's clock: settled when it comes, and whether it has.
+type Mark = { at: Promise<void>; passed: () => boolean }
+
+// The moments an exit keeps to, from its start: the last for a token to come
+// (EXIT_SEND_MIN_MS before the end), for its request to answer
+// (EXIT_SPILL_RESERVE_MS before), for its replay to send (EXIT_REPLAY_RESERVE_MS
+// before), and the end of its budget.
+type ExitMarks = { token: Mark; post: Mark; replay: Mark; end: Mark }
 
 // What a replay learns as it goes: how many of its rows still wait for a
 // replay that runs by itself (lines, and files it did not read), and how
@@ -226,6 +250,16 @@ const STORE_RECORD_BYTES = 64 * 1024
 export const COMMAND_LINE_CHARS = 1000
 // Longest setup command offered at all.
 const SETUP_COMMAND_CHARS = 4000
+// Session end's own request starts only with at least EXIT_SEND_MIN_MS of
+// its budget left, and is given up EXIT_SPILL_RESERVE_MS before the budget
+// ends, so the rows it did not land are spilled within it.
+const EXIT_SEND_MIN_MS = 200
+const EXIT_SPILL_RESERVE_MS = 150
+// Session end's replay starts only with at least EXIT_REPLAY_MIN_MS left,
+// and sends nothing in the last EXIT_REPLAY_RESERVE_MS, which the writes of
+// its outcome take.
+const EXIT_REPLAY_MIN_MS = 250
+const EXIT_REPLAY_RESERVE_MS = 100
 
 const diagnostic = (text: string, maxChars = DIAGNOSTIC_CHARS): string => redactDiagnostic(text, maxChars)
 // An error's own message, without the `Error: ` errorText puts first.
@@ -270,6 +304,37 @@ export function buildSetupCommand(c: Config, root: string | undefined): string |
   const script = root.endsWith('/') ? `${root}setup.sh` : `${root}/setup.sh`
   const command = `BQAA_PROJECT_ID=${c.project} BQAA_DATASET=${c.dataset} BQAA_TABLE=${c.table} BQAA_VIEWS_DATASET=${views} BQAA_LOCATION=${c.location} bash ${shellQuote(script)}`
   return diagnostic(`Run: ${command}`, SETUP_COMMAND_CHARS + 5) === `Run: ${command}` ? command : null
+}
+
+// A POSIX path without control characters, as a command may name it.
+const plainPath = (path: string | undefined): path is string => path !== undefined && path.startsWith('/') && !/[\u0000-\u001f\u007f]/.test(path)
+
+// `command`, or null where redaction would change it as shown.
+const shownWhole = (command: string): string | null => (diagnostic(`Run: ${command}`, SETUP_COMMAND_CHARS + 5) === `Run: ${command}` ? command : null)
+
+// The command a project administrator runs once to set up who writes and who
+// reads the table: the mod's scripts/setup_gcp_prereqs.py for `c`'s names,
+// in a virtual environment of its own under /tmp (the script calls the
+// BigQuery Python client; nothing is installed in the mod's directory). A
+// dry run unless --execute is added. Null as for buildSetupCommand.
+export function buildPrereqsCommand(c: Config, root: string | undefined): string | null {
+  if (!plainPath(root)) return null
+  if (!PLAIN_PROJECT.test(c.project) || ![c.dataset, c.table].every(name => PLAIN_NAME.test(name)) || !PLAIN_LOCATION.test(c.location)) return null
+  const script = root.endsWith('/') ? `${root}scripts/setup_gcp_prereqs.py` : `${root}/scripts/setup_gcp_prereqs.py`
+  const venv = '/tmp/bqaa-venv'
+  return shownWhole(`python3 -m venv ${venv} && ${venv}/bin/pip install -q google-cloud-bigquery && ${venv}/bin/python ${shellQuote(script)} --project ${c.project} --dataset ${c.dataset} --table ${c.table} --location ${c.location}`)
+}
+
+// The command that deletes the dead-letter files no replay needs any more
+// (the mod's scripts/clean_dead_letter.py, run while no session is running):
+// for the default directory, which the script cleans when given none, the
+// script alone; else with `c`'s directory named. Null when `root` or the
+// directory is not a POSIX path without control characters, or the command
+// would be redacted.
+export function buildCleanupCommand(c: Config, root: string | undefined): string | null {
+  if (!plainPath(root) || (!c.deadLetterDirIsDefault && !plainPath(c.deadLetterDir))) return null
+  const script = root.endsWith('/') ? `${root}scripts/clean_dead_letter.py` : `${root}/scripts/clean_dead_letter.py`
+  return shownWhole(`python3 ${shellQuote(script)}${c.deadLetterDirIsDefault ? '' : ` ${shellQuote(c.deadLetterDir)}`} --execute`)
 }
 
 // How the refused and parked counts know a line's row: its event_id; for one
@@ -473,6 +538,18 @@ export class Writer {
   private status: { text: string | undefined | null } = { text: undefined }
   // Set once the session is ending: no new batch starts after that.
   private closing = false
+  // The replay of parked rows that a send after failures set going
+  // (`succeeded`), due a second later: the exit cancels it, and sends
+  // nothing of its own while it is due.
+  private recoveryTimer: Timer | null = null
+  // Set once a batch this writer had taken went back to the queue because
+  // the exit began (it was waiting for its token or its account): the exit
+  // then sends nothing of its own, and spills that batch with the rest.
+  private heldAtExit = false
+  // While session end's own replay runs (`replayAtExit`): it goes on past
+  // `closing` until `until` or `cutoff`, whichever comes first, and takes no
+  // token but one already at hand.
+  private exitReplay: { until: number; cutoff: Mark } | null = null
   // Why rows cannot be written now, if credentials or permission stop them.
   problem: Problem | null = null
   // Rows parked on disk while the problem stood (sent once it clears), and
@@ -617,6 +694,61 @@ export class Writer {
     this.requestFlush(0)
   }
 
+  // Asks BigQuery for the table (tables.get, which the row writer's role
+  // grants too) while nothing has told this writer yet whether rows can be
+  // written: no request answered, no error, no notice. A refused token
+  // (again with a fresh one), denied access, or a missing dataset or table
+  // raises the notice a send would; any other answer is the last error, and
+  // so is no answer in `timeoutMs`. A missing table that the first send
+  // makes (autoCreateTable) is no notice. What it found, for /bqaa-status,
+  // or null where it did not ask. Never throws.
+  async probeDestination(timeoutMs = 3000): Promise<string | null> {
+    const c = this.config()
+    if (!canDeliver(c) || c.dryRun || this.closing || this.problem !== null || this.lastSuccessAt !== null || this.lastError !== null) return null
+    const timers: Timer[] = []
+    const deadline = this.moment(timeoutMs, timers)
+    const url = `${tablesUrl(c)}/${encodeURIComponent(c.table)}?fields=tableReference`
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const token = await Promise.race([this.getToken().catch(() => null), deadline.at.then(() => TIMED_OUT)])
+        // Null: getToken raised the credentials notice.
+        if (token === null) return 'no working credentials'
+        if (typeof token !== 'string') {
+          this.recordError(`destination check: no token within ${timeoutMs} ms`)
+          return `no token within ${timeoutMs} ms`
+        }
+        const answer = await Promise.race([
+          this.request(url, { method: 'GET', headers: { authorization: `Bearer ${token}` } }, timeoutMs),
+          deadline.at.then(() => ({ error: `request timed out after ${timeoutMs} ms` })),
+        ])
+        if ('error' in answer) {
+          this.recordError(`destination check: ${answer.error}`)
+          return `no answer (${diagnostic(answer.error, 200)})`
+        }
+        if (answer.status >= 200 && answer.status < 300) {
+          this.tableAnswered()
+          return `BigQuery found ${tableRef(c)}`
+        }
+        const outcome = classifyInsert(answer, 0)
+        if (outcome.kind === 'auth' && attempt === 0) {
+          // The token may have run out early: once more with a fresh one.
+          this.dropToken()
+          continue
+        }
+        if (outcome.kind === 'auth') this.noteProblem('credentials', `BigQuery refused a fresh token too: ${outcome.message}`)
+        else if (outcome.kind === 'not-found') {
+          if (!isDatasetMissing(outcome.message) && c.autoCreateTable && !this.createAttempted) return `${tableRef(c)} is not there yet; the first send makes it`
+          this.missingDestination(outcome.message)
+        } else if (outcome.kind === 'rejected' && outcome.permission) this.noteProblem('permission', outcome.message)
+        else this.recordError(`destination check: ${'message' in outcome ? outcome.message : `HTTP ${answer.status}`}`)
+        return diagnostic(`HTTP ${answer.status}`, 200)
+      }
+      return null
+    } finally {
+      for (const timer of timers) timer.cancel()
+    }
+  }
+
   private async flushLoop(): Promise<void> {
     // The band's count of waiting rows moves with every tick.
     if (this.problem !== null) this.showProblem()
@@ -677,6 +809,7 @@ export class Writer {
     // queue the exit spills.
     if (!this.closing) await this.stampFor(batch, token, c)
     if (this.closing) {
+      this.heldAtExit = true
       this.queue.unshift(batch)
       return false
     }
@@ -701,6 +834,7 @@ export class Writer {
       // The fresh token can be another account's: the rows go out under it.
       if (!this.closing) await this.stampFor(batch, token, c)
       if (this.closing) {
+        this.heldAtExit = true
         this.queue.unshift(batch)
         return false
       }
@@ -786,7 +920,9 @@ export class Writer {
     // Not once the exit began: the next session replays it.
     if (!this.closing && hadFailures && this.parked.recoverable && this.config().autoBackfill) {
       this.parked.recoverable = false
-      this.io.after(1000, () => {
+      this.recoveryTimer?.cancel()
+      this.recoveryTimer = this.io.after(1000, () => {
+        this.recoveryTimer = null
         if (!this.closing) void this.backfill(['spill', 'retry'], 'recovery')
       })
     }
@@ -1350,24 +1486,41 @@ export class Writer {
   }
 
   // Called from session.end when the process is ending, inside the engine's
-  // short end-of-session bound. Starts no request: the rows still queued go
-  // at once to a spill file the next session sends, or in a dry run to the
-  // dry-run files. A batch whose request is out may yet be answered: the exit
-  // waits for that answer up to half its budget, so rows BigQuery took are
-  // not sent again from a spill file, then spills the rows no answer took
-  // (they may yet land; event_id dedups). Waits at most `budgetMs` in all,
-  // for those writes and for the dead-letter writes under way. Never throws.
-  async spillForExit(budgetMs: number): Promise<{ spilled: number }> {
+  // short end-of-session bound. A batch whose request is out may yet be
+  // answered: the exit waits for that answer up to half its budget, so rows
+  // BigQuery took are not sent again from a spill file. Waits at most
+  // `budgetMs` in all, for those writes and for the dead-letter writes under
+  // way. Never throws.
+  //
+  // With `sendQueued`, while BigQuery takes this session's requests with
+  // nothing in the way (no notice, backoff, failure, replay, dead-letter
+  // write or recovery due), the rows still queued wait for that answer, then
+  // go in one request, with a token already at hand: no token command runs.
+  // What it does not land in time is spilled before the budget ends. With
+  // `replaySpills` too, once every row has landed, this table's spill and
+  // retry files are replayed with what is left of the budget (see
+  // replayAtExit).
+  //
+  // Otherwise it starts no request: the rows still queued go at once to a
+  // spill file the next session sends, or in a dry run to the dry-run files,
+  // and so do the rows no answer took (they may yet land; event_id dedups).
+  async spillForExit(budgetMs: number, opts: ExitFlushOptions = {}): Promise<{ spilled: number }> {
     const c = this.config()
     const start = this.io.now()
     const until = start + budgetMs
-    this.closing = true
-    this.soon?.cancel()
-    this.soon = null
     // The writers this one took over from start nothing more either, and a
     // batch one still has out goes with the rest once its wait is over.
     const writers = [...this.before, this]
-    for (const writer of writers) writer.closing = true
+    // Read before the exit changes anything.
+    const sending = opts.sendQueued === true && budgetMs >= EXIT_SEND_MIN_MS && this.canSendAtExit(c, writers)
+    this.closing = true
+    this.soon?.cancel()
+    this.soon = null
+    for (const writer of writers) {
+      writer.closing = true
+      writer.recoveryTimer?.cancel()
+      writer.recoveryTimer = null
+    }
     const toDryRun = c.dryRun && c.dryRunDir !== ''
     const writes: Promise<void>[] = []
     let spilled = 0
@@ -1376,7 +1529,16 @@ export class Writer {
       if (!toDryRun) spilled += rows.length
       writes.push(this.exitWrite(rows, c, toDryRun))
     }
-    park(this.queue.takeAll())
+    const timers: Timer[] = []
+    const marks: ExitMarks | null = sending
+      ? {
+          token: this.moment(budgetMs - EXIT_SEND_MIN_MS, timers),
+          post: this.moment(budgetMs - EXIT_SPILL_RESERVE_MS, timers),
+          replay: this.moment(budgetMs - EXIT_REPLAY_RESERVE_MS, timers),
+          end: this.moment(budgetMs, timers),
+        }
+      : null
+    if (marks === null) park(this.queue.takeAll())
     const flights = writers.flatMap(writer => (writer.inFlightRows.length > 0 && writer.inFlight !== null ? [writer.inFlight] : []))
     if (flights.length > 0 && budgetMs > 0) await this.raceUntil(Promise.all(flights), start + Math.floor(budgetMs / 2))
     // What no answer took: the rows still out, and those an answer asked
@@ -1385,10 +1547,152 @@ export class Writer {
     // so the exit waits for that write instead, within the same bound.
     const out: Queued[] = []
     for (const writer of writers) out.push(...writer.inFlightRows)
-    park([...out, ...this.queue.takeAll()])
+    // Every batch out answered and landed whole: the exit sends. Any other
+    // answer (or none) leaves BigQuery's state in doubt, and the rows wait.
+    if (marks !== null && out.length === 0 && this.persisting.size === 0 && writers.every(w => w.problem === null && w.consecutiveFailures === 0 && !w.heldAtExit)) {
+      if ((await this.sendAtExit(c, marks, park, until)) && opts.replaySpills === true && spilled === 0) await this.replayAtExit(c, marks, until)
+    } else park([...out, ...this.queue.takeAll()])
     const pending = [...writes, ...this.persisting]
-    if (pending.length > 0) await this.raceUntil(Promise.all(pending), until)
+    if (pending.length > 0) {
+      if (marks === null) await this.raceUntil(Promise.all(pending), until)
+      else await Promise.race([Promise.all(pending).catch(() => undefined), marks.end.at])
+    }
+    for (const timer of timers) timer.cancel()
     return { spilled }
+  }
+
+  // Set once the session is ending (spillForExit began).
+  get isClosing(): boolean {
+    return this.closing
+  }
+
+  // Whether session end may send (spillForExit): BigQuery is to be written
+  // to, and no writer has anything that leaves its answer in doubt.
+  private canSendAtExit(c: Config, writers: readonly Writer[]): boolean {
+    if (!canDeliver(c) || c.dryRun || this.persisting.size > 0 || this.parked.recoverable) return false
+    return writers.every(w => !w.closing && w.problem === null && w.pauseTimer === null && w.consecutiveFailures === 0 && w.recoveryTimer === null && w.backfilling === null && !w.heldAtExit)
+  }
+
+  // A moment `ms` from now on the host's clock, its timer added to `timers`.
+  private moment(ms: number, timers: Timer[]): Mark {
+    let passed = false
+    const at = new Promise<void>(resolve => {
+      timers.push(
+        this.io.after(Math.max(0, ms), () => {
+          passed = true
+          resolve()
+        }),
+      )
+    })
+    return { at, passed: () => passed }
+  }
+
+  // Session end's one request: the rows still queued, as many as a batch
+  // takes (any more are spilled at once), with a token at hand
+  // (`exitToken`), answered by the `post` mark at the latest. What it does
+  // not land is parked by `park` (refused rows to a `rejected` file), in the
+  // time left after that mark. True when every row landed (or none waited).
+  private async sendAtExit(c: Config, marks: ExitMarks, park: (rows: Queued[]) => void, until: number): Promise<boolean> {
+    if (this.queue.length === 0) return true
+    const token = await this.exitToken(marks.token)
+    if (token === null || marks.token.passed() || until - this.io.now() < EXIT_SEND_MIN_MS) {
+      park(this.queue.takeAll())
+      return false
+    }
+    const batch = this.queue.take(c.maxBatchRows, c.maxBatchBytes)
+    park(this.queue.takeAll())
+    // The rows carry the account of the token in use, where its lookup has
+    // answered, else the user_id they were built with: no lookup starts now.
+    if (c.userIdFromCredentials) for (const q of batch) this.stamp(q, this.currentIdentity())
+    const answer = await Promise.race([
+      this.post(insertAllUrl(c), insertAllBody(batch.map(q => q.row)), token, Math.max(50, until - this.io.now() - EXIT_SPILL_RESERVE_MS)),
+      marks.post.at.then(() => ({ error: 'no answer before the session ended' })),
+    ])
+    if ('error' in answer) {
+      this.recordError(`session end: ${answer.error}`)
+      park(batch)
+      return false
+    }
+    const outcome = classifyInsert(answer, batch.length)
+    switch (outcome.kind) {
+      case 'ok':
+        this.noteSessions(batch)
+        this.succeeded(batch.length, c)
+        return true
+      case 'partial': {
+        const landed: Queued[] = []
+        const again: Queued[] = []
+        const refused: Queued[] = []
+        let reason = ''
+        batch.forEach((q, i) => {
+          const why = outcome.rejected.get(i)
+          if (why !== undefined) {
+            refused.push(q)
+            reason ||= why
+          } else if (outcome.retry.has(i)) again.push(q)
+          else landed.push(q)
+        })
+        this.noteSessions(landed)
+        this.succeeded(landed.length, c)
+        // Its write is one of those under way, which the exit waits for.
+        if (refused.length > 0) void this.reject(refused, `BigQuery rejected ${refused.length} row(s): ${reason}`)
+        park(again)
+        return refused.length === 0 && again.length === 0
+      }
+      case 'rejected':
+        if (outcome.permission) this.noteProblem('permission', outcome.message)
+        else this.tableAnswered()
+        void this.reject(batch, outcome.message)
+        return false
+      case 'not-found':
+        // No table is made now: the next session's send makes it.
+        this.missingDestination(outcome.message)
+        break
+      case 'auth':
+        // No fresh token now: the next session's send gets one.
+        this.dropToken()
+        break
+      case 'retry':
+        break
+    }
+    this.recordError(`session end: ${outcome.message}`)
+    park(batch)
+    return false
+  }
+
+  // A token without running the token command: the one in hand, else the
+  // one a token command already running brings, else BQAA_ACCESS_TOKEN; by
+  // the mark `by` at the latest. Null when none comes.
+  private async exitToken(by: Mark): Promise<string | null> {
+    if (this.token && this.io.now() < this.token.expiresAt) return this.token.value
+    if (this.tokenPending !== null) return Promise.race([this.tokenPending.catch(() => null), by.at.then(() => null)])
+    let fromEnv: string | undefined
+    try {
+      fromEnv = (await Promise.race([this.io.envToken(), by.at.then(() => undefined)]))?.trim()
+    } catch {
+      return null
+    }
+    if (!fromEnv || by.passed()) return null
+    this.tokenSource = 'environment'
+    this.token = { value: fromEnv, expiresAt: this.io.now() + 5 * 60 * 1000 }
+    return fromEnv
+  }
+
+  // Session end's replay of this table's spill and retry files, in a run
+  // with no later moment for it (`-p`), once BigQuery took this session's
+  // rows: it sends nothing after the `replay` mark (or EXIT_REPLAY_RESERVE_MS
+  // before `until`), takes no token but one at hand, and is waited for until
+  // the budget ends. Files it does not reach wait for the next session, as do
+  // the rows of a request not answered in time (they may yet land; event_id
+  // dedups).
+  private async replayAtExit(c: Config, marks: ExitMarks, until: number): Promise<void> {
+    if (!c.autoBackfill || this.lastSuccessAt === null || this.backfilling !== null || marks.replay.passed() || until - this.io.now() < EXIT_REPLAY_MIN_MS) return
+    this.exitReplay = { until: until - EXIT_REPLAY_RESERVE_MS, cutoff: marks.replay }
+    try {
+      await Promise.race([this.backfill(['spill', 'retry'], 'auto'), marks.end.at])
+    } finally {
+      this.exitReplay = null
+    }
   }
 
   // The rows of an exit: to a spill file, or in a dry run to the dry-run
@@ -1759,11 +2063,37 @@ export class Writer {
     return now
   }
 
-  // A replay stops once the session is ending, and a recovery replay stops
-  // between requests once it has sent one when rows are queued meanwhile (the
-  // flush it holds sends them first). What it did not send stays due.
+  // A replay stops once the session is ending (unless it is session end's
+  // own, until its time is up), and a recovery replay stops between requests
+  // once it has sent one when rows are queued meanwhile (the flush it holds
+  // sends them first). What it did not send stays due.
   private replayStops(trigger: BackfillReport['trigger'], tally: ReplayTally): boolean {
-    return this.closing || (trigger === 'recovery' && tally.requests > 0 && this.queue.length > 0)
+    return this.replayHalted() || (trigger === 'recovery' && tally.requests > 0 && this.queue.length > 0)
+  }
+
+  // Whether a replay sends no more: once the session is ending, or, for
+  // session end's own replay, once its time is up.
+  private replayHalted(): boolean {
+    const exit = this.exitReplay
+    return exit === null ? this.closing : exit.cutoff.passed() || this.io.now() >= exit.until
+  }
+
+  // A replay's token: during session end's own replay, only one at hand
+  // (no token command runs), else as for a send.
+  private async replayToken(): Promise<string> {
+    const exit = this.exitReplay
+    if (exit === null) return this.getToken()
+    const token = await this.exitToken(exit.cutoff)
+    if (token === null) throw new Error('no token at hand as the session ended')
+    return token
+  }
+
+  // A replay's request: during session end's own replay, answered by its
+  // cutoff at the latest.
+  private replayPost(url: string, body: string, token: string, timeoutMs: number): Promise<HttpAnswer | { error: string }> {
+    const exit = this.exitReplay
+    if (exit === null) return this.post(url, body, token, timeoutMs)
+    return Promise.race([this.post(url, body, token, Math.max(50, Math.min(timeoutMs, exit.until - this.io.now()))), exit.cutoff.at.then(() => ({ error: 'no answer before the session ended' }))])
   }
 
   // Rows one replay request had refused: on the status line, and among the
@@ -2252,20 +2582,20 @@ export class Writer {
       index = end
       let token: string
       try {
-        token = await this.getToken()
+        token = await this.replayToken()
       } catch (err) {
         report.error = diagnostic(`authentication: ${messageOf(err)}`)
         continue
       }
-      if (this.closing) break
+      if (this.replayHalted()) break
       if (!marked) {
         if (!(await this.markSending(path, source, trigger, report))) break
         marked = true
       }
-      if (this.closing) break
+      if (this.replayHalted()) break
       const body = insertAllBody(chunk.map(l => l.row))
       tally.requests += 1
-      let answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
+      let answer = await this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs)
       if ('error' in answer) {
         report.error = diagnostic(answer.error)
         continue
@@ -2285,7 +2615,7 @@ export class Writer {
         }
         if (this.closing) break
         tally.requests += 1
-        answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
+        answer = await this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs)
         if ('error' in answer) {
           report.error = diagnostic(answer.error)
           continue

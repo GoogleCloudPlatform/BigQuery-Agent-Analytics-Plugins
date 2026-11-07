@@ -223,7 +223,7 @@ test('not set up: the card says what to set, stays after a prompt, and Got it cl
   await ui.press({ key: CLOSE })
   expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([
     '⚠ BQAA: ',
-    'rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-setup.',
+    'rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-mod-setup.',
     'drawn beneath',
   ])
   await ui.unmount()
@@ -318,7 +318,7 @@ for (const operation of ['get', 'set'] as const) {
     await world.clock.advance(5000)
     expect(started).toBe(true)
     expect(world.acceptedRows().length).toBe(1)
-    expect(world.registered).toEqual(['bqaa-status', 'bqaa-flush', 'bqaa-backfill', 'bqaa-setup'])
+    expect(world.registered).toEqual(['bqaa-status', 'bqaa-flush', 'bqaa-backfill', 'bqaa-mod-setup', 'bqaa-setup'])
     // Never read: no card. Read, but never recorded: the card, with its rows.
     expect(held).toBe(1)
     const texts = (await band($)).texts

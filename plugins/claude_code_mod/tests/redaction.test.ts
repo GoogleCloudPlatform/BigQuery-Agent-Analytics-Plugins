@@ -181,3 +181,52 @@ test('/bqaa-status shows truncated rows when a row loses text past a credential 
   const status = (await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })).text ?? ''
   expect(status).toMatch(/truncated rows [1-9]/)
 })
+
+test('single-line credential tail cuts mark row.is_truncated and record attributes.redaction { values, dropped_chars }, while pure value redactions keep is_truncated false', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  const tailCutCases: [string, string, number, number][] = [
+    ["It's done: --password=hunter2 and then line three", "It's done: --password=[REDACTED]", 1, ' and then line three'.length],
+    ['echo --password=hunter2 https://bob:s3cret@example.com && cat does-not-exist.txt', 'echo --password=[REDACTED]', 2, ' https://bob:s3cret@example.com && cat does-not-exist.txt'.length],
+    ['mysql -u root --password=hunter2 mydb -e "SELECT 1"', 'mysql -u root --password=[REDACTED]', 1, ' mydb -e "SELECT 1"'.length],
+    ['curl -H "Authorization: Bearer secret_token_123456" https://api.example.com/v1/health', 'curl -H "Authorization: [REDACTED]', 2, ' https://api.example.com/v1/health'.length],
+  ]
+  for (const [text] of tailCutCases) {
+    await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+  }
+  const pureValueCases = [
+    'mysql -u root --password=hunter2',
+    'GET https://api.example.test/v1/items?access_token=hunter2&page=2',
+    'ordinary prompt with no secrets at all',
+  ]
+  for (const text of pureValueCases) {
+    await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+  }
+  await world.clock.advance(5000)
+  const sent = world.acceptedRows().filter(r => r.event_type === 'USER_MESSAGE_RECEIVED')
+  expect(sent.length).toBe(tailCutCases.length + pureValueCases.length)
+  for (let i = 0; i < tailCutCases.length; i += 1) {
+    const [, expectedText, expectedValues, expectedDropped] = tailCutCases[i] as [string, string, number, number]
+    const row = sent[i] as Row
+    expect(row.is_truncated).toBe(true)
+    const content = JSON.parse(row.content ?? '{}') as { text_summary: string }
+    expect(content.text_summary).toBe(expectedText)
+    expect(JSON.stringify(row)).not.toContain('hunter2')
+    expect(JSON.stringify(row)).not.toContain('s3cret')
+    expect(JSON.stringify(row)).not.toContain('secret_token_123456')
+    const attrs = JSON.parse(row.attributes ?? '{}') as { redaction?: { values: number; dropped_chars: number } }
+    expect(attrs.redaction).toEqual({ values: expectedValues, dropped_chars: expectedDropped })
+  }
+  const eolRow = sent[tailCutCases.length] as Row
+  expect(eolRow.is_truncated).toBe(false)
+  expect((JSON.parse(eolRow.attributes ?? '{}') as { redaction?: unknown }).redaction).toEqual({ values: 1, dropped_chars: 0 })
+
+  const urlRow = sent[tailCutCases.length + 1] as Row
+  expect(urlRow.is_truncated).toBe(false)
+  expect((JSON.parse(urlRow.content ?? '{}') as { text_summary: string }).text_summary).toBe('GET https://api.example.test/v1/items?access_token=[REDACTED]&page=2')
+  expect((JSON.parse(urlRow.attributes ?? '{}') as { redaction?: unknown }).redaction).toEqual({ values: 1, dropped_chars: 0 })
+
+  const cleanRow = sent[tailCutCases.length + 2] as Row
+  expect(cleanRow.is_truncated).toBe(false)
+  expect((JSON.parse(cleanRow.attributes ?? '{}') as { redaction?: unknown }).redaction).toBeUndefined()
+})

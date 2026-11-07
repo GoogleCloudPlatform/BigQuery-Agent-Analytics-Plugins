@@ -1,6 +1,6 @@
 {
   "name": "bigquery-agent-analytics-mod",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Coding-agent mod that records sessions, turns, model requests and tool calls as BigQuery Agent Analytics agent_events rows, written from the background so no hook waits on BigQuery.",
   "author": {
     "name": "Google LLC"
