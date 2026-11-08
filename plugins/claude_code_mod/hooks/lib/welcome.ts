@@ -21,6 +21,7 @@
 
 import type { WelcomeState } from '../../types'
 import { type Config, PLUGIN_VERSION, canDeliver, tableRef } from './config.ts'
+import { redactDiagnostic } from './sanitize.ts'
 
 // The records the card keeps in `$.store`, each written by the session that
 // showed it, and only under keys of that version and session, so no write of
@@ -233,10 +234,23 @@ const arrival = (w: Welcome): string => (w.previous === null ? 'installed' : `${
 // Why nothing is recorded, when the configuration leaves nowhere to write.
 const unset = (c: Config): string => (c.dryRun ? (c.problems[0] ?? 'the dry run has nowhere to write') : `nothing is recorded until ${NOT_SET_UP}`)
 
+// The configuration's notices (a number clamped, a string coerced, a value
+// that fell back to its default), the first CONFIG_NOTICES of them, each as
+// /bqaa-status words it: shown with the card, so an option set wrong is seen
+// in the first session, without /bqaa-status.
+const CONFIG_NOTICES = 3
+const configNotices = (c: Config): string[] => c.warnings.slice(0, CONFIG_NOTICES).map(warning => redactDiagnostic(`config notice: ${warning}`, 200))
+
 // The card for this configuration, with `sent` rows landed where it counts
 // them (kept across a reload by `$.state`; a card rebuilt from the store's
-// records alone starts at none, as the store does not keep the count).
+// records alone starts at none, as the store does not keep the count), and
+// the configuration's notices under it.
 export function welcomeCard(w: Welcome, c: Config, sent: number): WelcomeCard {
+  const card = cardFor(w, c, sent)
+  return { ...card, lines: [...card.lines, ...configNotices(c).map(text => ({ text, tone: 'warning' as const, dim: true }))] }
+}
+
+function cardFor(w: Welcome, c: Config, sent: number): WelcomeCard {
   const title = `BigQuery Agent Analytics mod ${arrival(w)}`
   const tag = w.previous === null ? w.version : `was ${w.previous}`
   if (!c.enabled) {
@@ -274,8 +288,15 @@ export function welcomeCard(w: Welcome, c: Config, sent: number): WelcomeCard {
 }
 
 // The transcript line (dim, never sent to the model) when the card first
-// shows: what it says, kept in the scrollback.
+// shows: what it says, kept in the scrollback, the configuration's notices
+// after it.
 export function welcomeNotice(w: Welcome, c: Config): string {
+  const notices = configNotices(c)
+  const line = noticeFor(w, c)
+  return notices.length === 0 ? line : `${line} ${notices.join(' | ')}`
+}
+
+function noticeFor(w: Welcome, c: Config): string {
   const mod = `bqaa: BigQuery Agent Analytics mod ${w.previous === null ? `installed (${w.version})` : `${arrival(w)} (from ${w.previous})`}`
   if (!c.enabled) return `${mod}; capture is off (the enabled option, or BQAA_TRACE_ENABLED=false).`
   if (!canDeliver(c)) return `${mod}, not set up yet: ${unset(c)}.`

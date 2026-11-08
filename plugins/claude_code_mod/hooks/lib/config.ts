@@ -104,15 +104,21 @@ export type Config = {
   warnings: readonly string[]
 }
 
+// A value as an option notice shows it: a number or a boolean as it is; a
+// string only when it is a short plain word or number (`"false"`, `"maybe"`,
+// `"5000"`), else by its length alone, so a secret, a path or a token set as
+// an option by mistake never reaches a notice, /bqaa-status or a log; a list
+// or an object by its shape.
+const SAFE_OPTION_TEXT = /^(?:true|false|yes|no|on|off|-?\d{1,16}(?:\.\d{1,16})?|[a-z]{1,16})$/i
 const formatOptionValue = (value: unknown): string => {
-  if (typeof value === 'string') return JSON.stringify(value.slice(0, 64)).replace(/[\r\n]+/g, ' ')
+  if (typeof value === 'string') {
+    if (value === '') return '""'
+    return SAFE_OPTION_TEXT.test(value) ? JSON.stringify(value) : `<redacted string, ${value.length} chars>`
+  }
   if (typeof value === 'number' || typeof value === 'boolean') return String(value)
   if (value === null) return 'null'
-  try {
-    return (JSON.stringify(value) ?? String(value)).slice(0, 64).replace(/[\r\n]+/g, ' ')
-  } catch {
-    return String(value).slice(0, 64).replace(/[\r\n]+/g, ' ')
-  }
+  if (Array.isArray(value)) return `<list of ${value.length} item(s)>`
+  return `<${typeof value}>`
 }
 
 const clampEnvInt = (value: string | undefined, fallback: number, min: number, max: number): number => {
@@ -169,6 +175,12 @@ const isTrue = (value: string | undefined): boolean =>
 const readBoolOption = (name: string, value: unknown, fallback: boolean, warnings: string[]): boolean => {
   if (value === undefined) return fallback
   if (typeof value === 'boolean') return value
+  // 0 and 1, as a settings file may spell a switch: off and on. Any other
+  // number is no boolean.
+  if (value === 0 || value === 1) {
+    warnings.push(`option ${name} (${value}) coerced from number to boolean ${value === 1}`)
+    return value === 1
+  }
   if (typeof value === 'string') {
     if (isTrue(value)) {
       warnings.push(`option ${name} (${formatOptionValue(value)}) coerced from string to boolean true`)

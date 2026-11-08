@@ -64,12 +64,12 @@ test('a rejection that comes just after its call returned is on the row, which k
   const before = Date.now()
   await $.tool.call({ tool: 'Bash', command: 'rm -rf build', tool_use_id: 'toolu_reject' })
   const after = Date.now()
-  // The row waits for its decision; real time moves on meanwhile, so a row
-  // stamped when written would carry a later time.
+  // The row waits for its decision; real time moves on meanwhile (the test
+  // clock leaves Date.now alone), so a row stamped when written would carry
+  // a later time than the call's end.
   await world.clock.advance(1000)
-  const spinUntil = Date.now() + 15
-  while (Date.now() < spinUntil) {
-    // Waiting out 15 ms of real time.
+  while (Date.now() <= after) {
+    // Waiting for real time to pass the call's end.
   }
   await decision($, 'toolu_reject', 'reject', 'user_reject')
   await world.clock.advance(4000)
@@ -77,7 +77,8 @@ test('a rejection that comes just after its call returned is on the row, which k
   expect(row?.status).toBe('ERROR')
   expect(json(row?.attributes ?? null)).toMatchObject({ permission_decision: 'reject', permission_decision_source: 'user_reject' })
   const at = Date.parse(row?.timestamp ?? '')
-  expect(at >= before && at <= after).toBe(true)
+  // Within the call, and so before the decision came, which was later.
+  expect([at >= before, at <= after, after < Date.now()]).toEqual([true, true, true])
 })
 
 test('a call whose decision never comes is written without one after 2 s', { options: OPTIONS }, async ($, on) => {

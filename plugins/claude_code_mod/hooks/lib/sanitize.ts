@@ -1193,6 +1193,54 @@ function redactFlagValues(text: string, stats: SanitizeStats): string {
 const wholeMarker = (value: string, close: string): boolean =>
   WHOLE_MARKER.test(close !== '' && value.endsWith(close) ? value.slice(0, -close.length) : value)
 
+// The single-dash password options of the JDK's keytool and jarsigner
+// (`-storepass VALUE`, `-keypass`, `-srcstorepass`, `-deststorepass`,
+// `-srckeypass`, `-destkeypass`, `-truststorepass`), which the rule above
+// (two dashes) does not read: a list of their names, so `-keystore`,
+// `-storetype`, `-storepassword` and every other single-dash option keep
+// their values. After the name, blanks or line continuations (JOIN), then
+// the value: the whole shell argument (see readValue), never one that starts
+// with a dash and a letter (the next option, as in `-keypass -v`).
+// `-storepass:env NAME` and `-storepass:file PATH` name a variable or a file
+// and keep them, as does a value that is one shell variable alone (`$NAME`,
+// `${NAME}`, double-quoted or not): where the password comes from, not the
+// password. Names spelled in pieces (`"-storepass"`, `-store'pass'`) are
+// redactOptionWords'.
+const SINGLE_DASH_SECRET_FLAGS: ReadonlySet<string> = new Set(['storepass', 'keypass', 'srcstorepass', 'deststorepass', 'srckeypass', 'destkeypass', 'truststorepass'])
+const SINGLE_DASH_SECRET = new RegExp(String.raw`(^|[\s;|&()\x60"'])-(?:${[...SINGLE_DASH_SECRET_FLAGS].join('|')})(?![:=])(?:[ \t]|${JOIN})+(?![ \t]|${JOIN})(?!-[A-Za-z])(?=\S)`, 'gi')
+// A value that is one shell variable alone, as above, from its first
+// character to the end of its word.
+const VARIABLE_ALONE = /(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})|"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})")(?![^\s;&|<>)])/y
+const variableAlone = (text: string, start: number): boolean => {
+  VARIABLE_ALONE.lastIndex = start
+  return VARIABLE_ALONE.test(text)
+}
+
+function redactSingleDashSecrets(text: string, stats: SanitizeStats): string {
+  SINGLE_DASH_SECRET.lastIndex = 0
+  let states: Uint8Array | undefined
+  let out = ''
+  let copied = 0
+  for (let m = SINGLE_DASH_SECRET.exec(text); m !== null; m = SINGLE_DASH_SECRET.exec(text)) {
+    const dashes = m.index + (m[1] as string).length
+    const start = m.index + m[0].length
+    if (variableAlone(text, start)) continue
+    const read = readValue(text, start, wordStart(text, dashes), (states ??= quoteStates(text)))
+    // No value before an operator (`-storepass ;`).
+    if (read !== null && read.end === start) continue
+    const end = read !== null ? read.end : text.length
+    const close = read !== null ? read.close : ''
+    if (wholeMarker(text.slice(start, end), close)) continue
+    const valueEnd = read !== null ? read.end : fallbackValueEnd(text, start, end, outerQuoteOf(states[start]))
+    noteCut(text, start, valueEnd, end, stats)
+    out += text.slice(copied, start) + MARKER + close
+    copied = end
+    stats.redactions += 1
+    SINGLE_DASH_SECRET.lastIndex = end
+  }
+  return copied === 0 ? text : out + text.slice(copied)
+}
+
 // The start of the word whose first dash is at `p`, past the quotes before
 // it; -1 when other text comes first (the word is no option).
 function optionStart(text: string, p: number): number {
@@ -1644,6 +1692,17 @@ function credentialWord(text: string, at: number, scan: Scan): { word: OptionWor
 // a backtick and a list's separator (`VERSION=$(git rev-parse HEAD),…`).
 const OPTION_WORD = /(?:^|[\s;&|(]|[)`][,:@#/+%!~^])(?=["'\\$-]|[A-Za-z_][A-Za-z0-9_.-]*["'\\$=])/g
 
+// A word the shell passes as one of the listed single-dash password options
+// (see SINGLE_DASH_SECRET) once its quotes and backslashes are read
+// (`"-storepass"`, `-store'pass'`, `-store\pass`), with no `=` or `:` in it:
+// its value is the next shell argument, as a long option's is.
+function singleDashWord(text: string, at: number): { word: OptionWord; name: string; nested: boolean; single: boolean } | undefined {
+  const word = optionWord(text, at)
+  if (word === null || word.value !== -1 || !word.name.startsWith('-') || word.name.startsWith('--')) return undefined
+  const name = word.name.slice(1)
+  return SINGLE_DASH_SECRET_FLAGS.has(name.toLowerCase()) ? { word, name, nested: false, single: true } : undefined
+}
+
 // A word the shell passes as a long option once its quotes, backslashes,
 // ANSI-C escapes and line continuations are read (`"--pass"word`,
 // `--pass''word`, `--pa\ssword`, `-\-password`, `$'--pa\x73sword'`,
@@ -1652,7 +1711,8 @@ const OPTION_WORD = /(?:^|[\s;&|(]|[)`][,:@#/+%!~^])(?=["'\\$-]|[A-Za-z_][A-Za-z
 // above see only in pieces; also such a word of a command string another
 // shell runs (`\"--pass\"word`, `--pa\\ssword`, `'"'"'--password'"'"'`).
 // With `=`, its value as a flag's or an assignment's; else, if its name's
-// last part is a credential word, the next shell argument. A command
+// last part is a credential word, or it is one of the listed single-dash
+// password options (see singleDashWord), the next shell argument. A command
 // string's value runs to the end of the text.
 function redactOptionWords(text: string, stats: SanitizeStats): string {
   OPTION_WORD.lastIndex = 0
@@ -1672,6 +1732,9 @@ function redactOptionWords(text: string, stats: SanitizeStats): string {
     lists: () => (lists ??= new Map()),
     looseLists: sticky => sticky ? (stickyLists ??= new Map()) : (looseLists ??= new Map()),
   }
+  // Each listed single-dash option's name ends in `pass`: a text with none
+  // holds none of them.
+  const singleDash = /pass/i.test(text)
   let backslashes: ReturnType<typeof backslashReader> | undefined
   let out = ''
   let copied = 0
@@ -1680,7 +1743,7 @@ function redactOptionWords(text: string, stats: SanitizeStats): string {
     OPTION_WORD.lastIndex = at + 1
     // A line continuation's line break starts no word.
     if (m[0] === '\n' && (text[m.index - 1] === '\\' || (text[m.index - 1] === '\r' && text[m.index - 2] === '\\'))) continue
-    const option = credentialWord(text, at, scan)
+    const option: { word: OptionWord; name: string; nested: boolean; alone?: number | undefined; single?: boolean } | undefined = credentialWord(text, at, scan) ?? (singleDash ? singleDashWord(text, at) : undefined)
     if (option === undefined || !inPieces(text, option.word)) continue
     const { word, name, nested } = option
     // Undoing an outer command string must still respect a word's own
@@ -1711,7 +1774,7 @@ function redactOptionWords(text: string, stats: SanitizeStats): string {
         close = read.close
       } else valueEnd = fallbackValueEnd(text, start, end, outerQuoteOf(scan.states()[start]))
     } else {
-      if (!credentialOption(name)) continue
+      if (option.single !== true && !credentialOption(name)) continue
       start = word.end
       for (;;) {
         if (text[start] === ' ' || text[start] === '\t') start += 1
@@ -1719,6 +1782,9 @@ function redactOptionWords(text: string, stats: SanitizeStats): string {
         else break
       }
       if (start === word.end || start >= text.length || /\s/.test(text[start] as string) || text.startsWith('--', start)) continue
+      // A listed single-dash option's value is never the next option, nor a
+      // shell variable alone (see SINGLE_DASH_SECRET).
+      if (option.single === true && (/^-[A-Za-z]/.test(text.slice(start, start + 2)) || variableAlone(text, start))) continue
       const read = nested ? null : readValue(text, start, at, scan.states(), option.alone)
       if (read !== null) {
         if (read.end === start) continue
@@ -2235,8 +2301,9 @@ function redactListNames(text: string, stats: SanitizeStats): string {
 }
 
 // The free-text rules: credential shapes, URLs, credential-named values, then
-// credential-named command-line options, then option words the shell reads
-// in pieces, then the heuristic list-name fallback.
+// credential-named command-line options (long ones, then the listed
+// single-dash password options), then option words the shell reads in
+// pieces, then the heuristic list-name fallback.
 export function redactText(input: string, stats: SanitizeStats): string {
   let out = input
   for (const [pattern, replacement] of PATTERNS) {
@@ -2250,7 +2317,7 @@ export function redactText(input: string, stats: SanitizeStats): string {
     })
   }
   out = redactUrls(out, stats)
-  return redactListNames(redactOptionWords(redactFlagValues(redactNamedValues(out, stats), stats), stats), stats)
+  return redactListNames(redactOptionWords(redactSingleDashSecrets(redactFlagValues(redactNamedValues(out, stats), stats), stats), stats), stats)
 }
 
 // Error text, dead-letter reasons and status lines: redacted first, then held
