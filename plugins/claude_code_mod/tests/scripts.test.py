@@ -1833,6 +1833,9 @@ def cache_lookup_checks():
             for root, versions in ((config, ('0.1.2', '0.1.10', '0.1.9')), (home / '.claude', ('0.1.3', '0.1.1'))):
                 for version in versions:
                     (root / MOD_CACHE / version).mkdir(parents=True)
+            space_cfg = pathlib.Path(tmp) / 'cfg with spaces'
+            for version in ('0.2.0-rc1', '0.2.0', '0.2.0-alpha.1'):
+                (space_cfg / MOD_CACHE / version).mkdir(parents=True)
             (pathlib.Path(tmp) / 'empty').mkdir()
 
             def lookup(**env):
@@ -1842,6 +1845,10 @@ def cache_lookup_checks():
             found = lookup(CLAUDE_CONFIG_DIR=str(config))
             check('a lookup with CLAUDE_CONFIG_DIR set picks the highest version under it (0.1.10 over 0.1.9 and 0.1.2)',
                   found.returncode == 0 and found.stdout == f'{config / MOD_CACHE / "0.1.10"}/',
+                  f'{found.returncode} {found.stdout!r} {found.stderr!r}')
+            found = lookup(CLAUDE_CONFIG_DIR=str(space_cfg))
+            check('a lookup picks stable 0.2.0 over 0.2.0-rc1 even with spaces in CLAUDE_CONFIG_DIR',
+                  found.returncode == 0 and found.stdout == f'{space_cfg / MOD_CACHE / "0.2.0"}/',
                   f'{found.returncode} {found.stdout!r} {found.stderr!r}')
             for what, env in (('unset', {}), ('empty', {'CLAUDE_CONFIG_DIR': ''})):
                 found = lookup(**env)
@@ -1875,7 +1882,8 @@ def clean_dead_letter_checks():
             record["parent"] = parent
         return text + json.dumps(record) + "\n"
 
-    # 1. Empty source + outcome variants (outcome-, outcome-b-, outcome-done-<writer>-): all removed under --execute.
+    # 1. Empty source + outcome variants (outcome-, outcome-b-, outcome-done-<writer>-, legacy outcome-sending-<writer>-):
+    #    all removed under --execute; dry-run/ subdirectory is always ignored.
     with tempfile.TemporaryDirectory() as tmp:
         d = make_dir(pathlib.Path(tmp))
         source = d / 'spill-001.jsonl'
@@ -1884,15 +1892,28 @@ def clean_dead_letter_checks():
         outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
         outcome_done = d / 'outcome-done-w1a2b3-spill-001.jsonl'
         outcome_done.write_text(seal('{"journal":true,"retired":true}\n'), encoding='utf-8')
+        outcome_sending = d / 'outcome-sending-w0legacy-spill-001.jsonl'
+        outcome_sending.write_text(seal('{"sending":true}\n'), encoding='utf-8')
         orphan_outcome = d / 'outcome-done-w1a2b3-missing.jsonl'
         orphan_outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        dry_run_dir = pathlib.Path(tmp) / 'dead-letter' / 'dry-run'
+        dry_run_dir.mkdir(parents=True)
+        dry_run_file = dry_run_dir / 'dry-run-001.jsonl'
+        dry_run_file.write_text('{"row":1}\n', encoding='utf-8')
+        dry_run_empty = dry_run_dir / 'spill-ignored.jsonl'
+        dry_run_empty.write_bytes(b'')
         to_delete = clean.plan_deletions(pathlib.Path(tmp) / 'dead-letter')
-        check('empty source and its outcome/outcome-done files in partition subdir are deletable (orphan outcome kept)',
-              set(p.name for p in to_delete) == {'spill-001.jsonl', 'outcome-spill-001.jsonl', 'outcome-done-w1a2b3-spill-001.jsonl'},
+        check('empty source and its outcome/outcome-done/legacy outcome-sending files in partition subdir are deletable (orphan outcome and dry-run/ kept)',
+              set(p.name for p in to_delete) == {
+                  'spill-001.jsonl', 'outcome-spill-001.jsonl',
+                  'outcome-done-w1a2b3-spill-001.jsonl', 'outcome-sending-w0legacy-spill-001.jsonl',
+              },
               str(sorted(p.name for p in to_delete)))
         status, out, err = call(clean.main, '--dir', str(pathlib.Path(tmp) / 'dead-letter'), '--execute')
-        check('under --execute: empty source and its outcome files are deleted while orphan outcome stays, exit 0',
-              status == 0 and not source.exists() and not outcome.exists() and not outcome_done.exists() and orphan_outcome.exists(),
+        check('under --execute: empty source and its outcome files are deleted while orphan outcome and dry-run/ stay, exit 0',
+              status == 0 and not source.exists() and not outcome.exists() and not outcome_done.exists()
+              and not outcome_sending.exists() and orphan_outcome.exists()
+              and dry_run_file.exists() and dry_run_empty.exists(),
               f'{status} {out!r}')
 
     # 2. Non-empty source + outcome: both kept.

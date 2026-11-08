@@ -642,7 +642,7 @@ for s in pins pins-flags; do
   check "$s: rows carry the policy's agent name, the login name and no host name" rows_are "$s" "$ROWS"
 done
 check 'partial: what the policy leaves out is the person'"'"'s (capture off, a dry run in their folder, their table)' \
-  bash -c "grep -q 'disabled, target dry run -> /home/dev/repo/dry-run' '$out/partial/status.txt' && grep -q 'example-project.team_dataset.user_table' '$out/partial/status.txt'"
+  bash -c "grep -q 'disabled, target dry run -> /home/dev/repo/spool-user/dry-run' '$out/partial/status.txt' && grep -q 'example-project.team_dataset.user_table' '$out/partial/status.txt'"
 check 'unpinned: the shell and the repository turn capture off and a dry run on' has unpinned 'disabled, target dry run' status.txt
 check 'migration: the earlier install records (its tracer hooks run, the mod loads under the old id)' \
   bash -c "grep -qx before-policy '$out/tracer-ran' && grep -q 'hooks module $OLD loaded' '$out/before-policy/debug.log'"

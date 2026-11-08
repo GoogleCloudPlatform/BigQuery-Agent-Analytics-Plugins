@@ -876,7 +876,7 @@ async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary>
     const mine = destinationDir(tableRef(config))
     let dirs = 0
     for (const entry of await $.fs.list(config.deadLetterDir)) {
-      if (entry.kind === 'dir' && entry.name !== mine && dirs < 50) {
+      if (entry.kind === 'dir' && entry.name !== mine && entry.name !== 'dry-run' && dirs < 50) {
         dirs += 1
         for (const inner of await $.fs.list(joinPath(config.deadLetterDir, entry.name))) countElsewhere(inner)
       } else countElsewhere(entry)
@@ -1308,6 +1308,9 @@ export const register: Register = (on, registered) => {
     const explicitCheck = (e.args ?? '').trim() === 'check'
     const destinationCheck = !isInteractiveSession || explicitCheck ? await current.probeDestination(3000, explicitCheck) : null
     const summary = await deadLetterSummary($)
+    const snap = current.snapshot()
+    const maskTransientSessionStart =
+      !tracer.hasActivity && snap.consecutiveFailures === 0 && snap.inFlight === 0 && current.hasOnlyUnsentSessionStart(tracer.sessionId)
     const text = formatStatus({
       config,
       writer: current,
@@ -1318,6 +1321,7 @@ export const register: Register = (on, registered) => {
       isBackfilling: current.isBackfilling,
       cleanupCommand: buildCleanupCommand(config, $.plugin.root),
       destinationCheck,
+      maskTransientSessionStart,
     })
     return say(internalErrors > 0 ? `${text}\ninternal errors (skipped bookkeeping): ${internalErrors}` : text)
   })

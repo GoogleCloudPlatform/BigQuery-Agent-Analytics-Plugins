@@ -7,7 +7,7 @@ The mod records events inside the CLI and sends them to BigQuery in batches in t
 ## Install
 
 **Prerequisites:**
-- Claude Code CLI **v2.1.296+** (`claude --version`; tested with `2.1.296`, `2.1.299`, `2.1.302`, `2.1.304`, and `2.1.318` on macOS and Linux terminals)
+- Claude Code CLI **v2.1.296+** (`claude --version`; tested with `2.1.296`, `2.1.299`, `2.1.302`, `2.1.304`, `2.1.318`, and `2.1.319` on macOS and Linux terminals)
 - A BigQuery dataset in a Google Cloud project (see [The dataset](#the-dataset))
 - Google Cloud credentials (see [Authentication](#authentication))
 
@@ -36,7 +36,7 @@ Already have an installation (mod ID ending in `@bigquery-agent-analytics-plugin
 ### Updating and removing
 
 - **Update**: Run `claude plugin marketplace update bqaa-tracing`, then `claude plugin update bigquery-agent-analytics-mod@bqaa-tracing`. Releases bump the version (`0.1.0` → `0.1.1`), so `plugin update` picks up changes across releases. Reinstalling (uninstall and reinstall with the same `--config` flags) is only needed when testing unreleased commits at the same version number.
-- **Pause or uninstall**: Run `claude plugin disable bigquery-agent-analytics-mod@bqaa-tracing` to pause capture while keeping settings, or set `enabled` to `false` with `/plugin configure` or `/config` (use `--config enabled=false` when installing). Run `claude plugin uninstall bigquery-agent-analytics-mod@bqaa-tracing` to remove the mod. After uninstalling, delete `~/.bqaa-mod` if you also want to discard the mod's local files, including unsent rows. If you configured `deadLetterDir`, remove only the mod's files in that directory and its sibling `dry-run` directory. Keep the directories themselves, their parents, and any unrelated files.
+- **Pause or uninstall**: Run `claude plugin disable bigquery-agent-analytics-mod@bqaa-tracing` to pause capture while keeping settings, or set `enabled` to `false` with `/plugin configure` or `/config` (use `--config enabled=false` when installing). Run `claude plugin uninstall bigquery-agent-analytics-mod@bqaa-tracing` to remove the mod. After uninstalling, delete `~/.bqaa-mod` if you also want to discard the mod's local files, including unsent rows. If you configured `deadLetterDir`, remove only the mod's files in that directory and its `dry-run` subdirectory. Keep the directories themselves, their parents, and any unrelated files.
 
 ### The dataset
 
@@ -47,7 +47,7 @@ The BigQuery dataset must exist before the mod can write. [`setup.sh`](setup.sh)
 
 ```bash
 # Installed from the marketplace (or run `claude -p /bqaa-mod-setup < /dev/null` to print the path):
-PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
+PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{s=$(NF-1); sub(/\+.*/,"",s); p=index(s,"-"); pre=p?substr(s,p+1):""; core=p?substr(s,1,p-1):s; split(core,v,"."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (pre==""), pre, $0}' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
 BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics bash "${PLUGIN_DIR:?mod cache directory not found}setup.sh"
 
 # Or from a local repository checkout:
@@ -73,7 +73,7 @@ Set options with `--config key=value` at install time, `/plugin configure`, `/co
 | `table` | `BQAA_TABLE`, `BQ_TABLE` | `agent_events` | Target BigQuery events table. |
 | `location` | `BQAA_LOCATION` | `US` | Dataset location shown in `/bqaa-status` and its generated `setup.sh` command (manual `setup.sh` runs read `BQAA_LOCATION` from the environment). |
 | `enabled` | `BQAA_TRACE_ENABLED` (one-way disable: `false`/`0`/`no`/`off`) | `true` | Turn event capture on or off without uninstalling. |
-| `dryRun` | `BQAA_DRY_RUN` (one-way enable: `true`/`1`/`yes`/`on`) | `false` | Write JSONL batches locally to `<deadLetterDir>/../dry-run/` instead of BigQuery (a dry-run file can contain the same `event_id` twice if a session ends mid-write). |
+| `dryRun` | `BQAA_DRY_RUN` (one-way enable: `true`/`1`/`yes`/`on`) | `false` | Write JSONL batches locally to `<deadLetterDir>/dry-run/` instead of BigQuery (a dry-run file can contain the same `event_id` twice if a session ends mid-write). |
 | `maxPayloadChars` | — | `16384` (`1024`–`500000`) | Max characters per JSON payload column (`content`, `attributes`); excess sets `is_truncated = true`. Out-of-range numbers clamp to `1024`–`500000` and non-numeric values fall back to `16384` with a `config notice:` in `/bqaa-status`. |
 | `flushIntervalMs` | — | `5000` (`1000`–`300000`) | How often (ms) the background writer flushes queued rows. Out-of-range numbers clamp to `1000`–`300000` and non-numeric values fall back to `5000` with a `config notice:` in `/bqaa-status`. |
 | `deadLetterDir` | `BQAA_DEAD_LETTER_DIR` | `~/.bqaa-mod/dead-letter` | Local directory for unsent JSONL batches, partitioned per `<project.dataset.table>`. |
@@ -104,7 +104,7 @@ To move capture to `NEW_PROJECT`:
 
 1. **Create the dataset, `agent_events` table, and `<dataset>_reporting` views in the new project** (using `/bqaa-mod-setup`, the installed cache `setup.sh`, or `./plugins/claude_code_mod/setup.sh` in a checkout):
    ```bash
-   PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
+   PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{s=$(NF-1); sub(/\+.*/,"",s); p=index(s,"-"); pre=p?substr(s,p+1):""; core=p?substr(s,1,p-1):s; split(core,v,"."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (pre==""), pre, $0}' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
    BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics bash "${PLUGIN_DIR:?mod cache directory not found}setup.sh"
    ```
 2. **Update the saved plugin setting**:
@@ -274,7 +274,7 @@ The CI suite verifies marketplace sync against release tags, tests `setup.sh` wi
 
 ## Limitations
 
-- **Early-access mod API**: Host CLI mods are an early-access feature, tested with `2.1.296`, `2.1.299`, `2.1.302`, `2.1.304`, and `2.1.318` on macOS and Linux terminals; hook events and runtime APIs can change between CLI releases.
+- **Early-access mod API**: Host CLI mods are an early-access feature, tested with `2.1.296`, `2.1.299`, `2.1.302`, `2.1.304`, `2.1.318`, and `2.1.319` on macOS and Linux terminals; hook events and runtime APIs can change between CLI releases.
 - **Eventual deduplication (`tabledata.insertAll`)**: Uploads use HTTP `tabledata.insertAll` (gRPC Storage Write API is unavailable in the mod runtime), whose `insertId` deduplication is best-effort—always deduplicate on `event_id` in queries.
 - **Bounded queue**: Rows wait in memory (`5,000` rows or `8 MiB` by default). When the queue is full, the oldest rows are dropped and counted (`dropped` in `/bqaa-status`). While BigQuery is failing, the writer spills rows to disk once the queue passes 80%, so drops are rare. Rows can also be lost if that spill write fails.
 - **First-prompt-only `LLM_REQUEST` and empty `content_parts`**: Only a turn's first model request includes the user's prompt; prior conversation history and system prompts are omitted, and `content_parts` is always empty (attachments are listed by type only).

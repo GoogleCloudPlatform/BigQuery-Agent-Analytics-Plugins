@@ -277,7 +277,7 @@ test('the /bqaa-backfill transcript line says why a file was left waiting', { op
   await world.clock.advance(5000)
   expect(deadLetterFiles(world).length).toBe(1)
   // No mark can be written beside the file: none of it is sent.
-  world.refuseWrite = (path, text) => path.includes('/outcome-sending-') && text !== ''
+  world.refuseWrite = (path, text) => path.includes('/outcome-done-') && text !== ''
   await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
   await world.clock.settle()
   expect(world.acceptedRows().length).toBe(0)
@@ -1119,7 +1119,7 @@ test('/bqaa-status reports replayed row count, replay request batches, and retir
   expect(status).toContain('sent 2 (2 replayed)')
   expect(status).toMatch(/requests: 1 ok, 0 retried/)
   expect(status).toMatch(/dead-letter: 0 file\(s\), 0 B in .*; \d+ replayed\/retired file\(s\) \(0-byte or outcome-\*, expected leftovers; host fs cannot delete\)/)
-  expect(status).toContain('1 empty file(s); 3 replay record(s), kept on purpose')
+  expect(status).toContain('1 empty file(s); 2 replay record(s), kept on purpose')
 })
 
 test('when the token arrives during the exit wait, no insertAll starts after session.end began: rows are spilled once and replayed once', { options: OPTIONS }, async ($, on) => {
@@ -1309,24 +1309,27 @@ test('headless /bqaa-backfill and interactive /bqaa-backfill wait await completi
   expect(await statusText($)).toMatch(/last backfill \(command, .*\): 0 file\(s\), 0 rows sent, 0 left, 1 skipped; left waiting: another session's lease holds spill-20261013T200102003Z-leased-1\.jsonl/)
 })
 
-test('/bqaa-status separates elsewhere waiting files from leftovers and shows clean_dead_letter.py --execute only at >= 100 retired files', { options: OPTIONS }, async ($, on) => {
+test('/bqaa-status separates elsewhere waiting files from leftovers and shows clean_dead_letter.py (dry run by default) only at >= 100 retired files', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   // 1 active file and 2 retired leftovers in another table's partition, plus 97 retired files in this table's partition (99 total retired < 100).
   world.files.set(`${DEAD_LETTER_DIR}/${OTHER_TABLE}/spill-20261013T200102003Z-other-1.jsonl`, parkedFile(parkedLine(OTHER_TABLE, 'b'.repeat(32), 'other-s')))
   world.files.set(`${DEAD_LETTER_DIR}/${OTHER_TABLE}/spill-20261013T200102003Z-retired-1.jsonl`, '')
   world.files.set(`${DEAD_LETTER_DIR}/${OTHER_TABLE}/outcome-spill-20261013T200102003Z-retired-1.jsonl`, '{"fates":"L"}\n')
+  // dry-run/ inside deadLetterDir is completely skipped by deadLetterSummary.
+  world.files.set(`${DRY_RUN_DIR}/dry-run-20261013T200102003Z-1.jsonl`, '{"row":1}\n')
+  world.files.set(`${DRY_RUN_DIR}/spill-20261013T200102003Z-ignored.jsonl`, parkedFile(parkedLine(OTHER_TABLE, 'c'.repeat(32), 'dry-s')))
   for (let i = 0; i < 97; i += 1) {
     world.files.set(`${PARTITION_DIR}/spill-20261013T200102003Z-r${i}.jsonl`, '')
   }
   await startSession($)
   const below100 = await statusText($)
   expect(below100).toContain(`1 waiting file(s) (2 leftover(s)) in ${DEAD_LETTER_DIR} for other tables or an older layout, not replayed under this configuration`)
-  expect(below100).not.toContain('cleanup (run while no session is running):')
+  expect(below100).not.toContain('cleanup (run while no session is running; dry run by default, pass --execute to delete):')
 
   // Adding 1 more retired leftover reaches 100 total (98 here + 2 elsewhere) and surfaces the cleanup command.
   world.files.set(`${PARTITION_DIR}/spill-20261013T200102003Z-r97.jsonl`, '')
   const at100 = await statusText($)
-  expect(at100).toMatch(/^cleanup \(run while no session is running\): python3 '\/[^']*\/scripts\/clean_dead_letter\.py' --execute$/m)
+  expect(at100).toMatch(/^cleanup \(run while no session is running; dry run by default, pass --execute to delete\): python3 '\/[^']*\/scripts\/clean_dead_letter\.py'$/m)
 })
 
 test('/bqaa-status passes custom deadLetterDir with shell quoting in the cleanup command', { options: { ...OPTIONS, deadLetterDir: "/tmp/custom dir/it's-bqaa" } }, async ($, on) => {
@@ -1337,7 +1340,7 @@ test('/bqaa-status passes custom deadLetterDir with shell quoting in the cleanup
   }
   await startSession($)
   const status = await statusText($)
-  expect(status).toMatch(/^cleanup \(run while no session is running\): python3 '\/[^']*\/scripts\/clean_dead_letter\.py' '\/tmp\/custom dir\/it'\\''s-bqaa' --execute$/m)
+  expect(status).toMatch(/^cleanup \(run while no session is running; dry run by default, pass --execute to delete\): python3 '\/[^']*\/scripts\/clean_dead_letter\.py' '\/tmp\/custom dir\/it'\\''s-bqaa'$/m)
 })
 
 test('an HTTP 400 or partial rejection at session.end awaits the rejected file write and leaves zero uncancelled backoff timers', { options: OPTIONS }, async ($, on) => {

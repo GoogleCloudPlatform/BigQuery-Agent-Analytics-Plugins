@@ -50,7 +50,7 @@
     "dryRun": {
       "type": "boolean",
       "title": "Dry run",
-      "description": "Write rows as JSONL beside the dead-letter directory (dry-run/) instead of sending them. BQAA_DRY_RUN=true also turns it on.",
+      "description": "Write rows as JSONL inside the dead-letter directory (dry-run/) instead of sending them. BQAA_DRY_RUN=true also turns it on.",
       "default": false
     },
     "maxPayloadChars": {

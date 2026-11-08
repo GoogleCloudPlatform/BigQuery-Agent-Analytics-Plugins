@@ -196,7 +196,8 @@ def plan_deletions(directory: Path) -> list[Path]:
         return []
 
     try:
-        subdirs = [d for d in sorted(directory.iterdir()) if not d.is_symlink() and d.is_dir()]
+        subdirs = [d for d in sorted(directory.iterdir())
+                   if not d.is_symlink() and d.is_dir() and d.name != "dry-run"]
     except OSError:
         return []
 

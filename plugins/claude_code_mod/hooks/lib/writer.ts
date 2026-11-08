@@ -187,21 +187,22 @@ type Outcome = { fates: string; reasons: string[]; refusals: number[] }
 // `recordFiles` beside it (`outcome-` and the file's name, then `outcome-b-`
 // and it: no replay takes either for rows), which take the record's
 // updates in turn, so one cut off part-way leaves the one before it whole.
-// More files beside it, in `dir`, which no record is written to, each
-// writer's own: the mark that the file was done (`outcome-done-`, the
-// writer's name, then the file's: `doneFileOf`), and the mark before it sends
-// any of the file (`outcome-sending-` and the same: `markFileOf`). No writer
-// writes over or empties another's, so no late write of one takes another's
-// away. A file is written once, under a name of its own, so its name and
-// size tell it; `live` while it still holds its rows (a record of an emptied
-// file is read for the files it left).
+// A file beside it, in `dir`, which no record is written to, each writer's
+// own (`doneFileOf`: `outcome-done-`, the writer's name, then the file's):
+// written before it sends any of the file (`sending: true`), and overwritten
+// with the retired outcome (`retired: true`) once done. No writer writes over
+// or empties another's, so no late write of one takes another's away. A file
+// is written once, under a name of its own, so its name and size tell it;
+// `live` while it still holds its rows (a record of an emptied file is read
+// for the files it left).
 type Source = { dir: string; name: string; size: number; recordKey: string; recordFiles: readonly string[]; live: boolean }
 
 // A file a replay has an outcome for: the outcome, the files that hold what
 // is left of it under the names given them (`text` null once written),
 // whether any of those holds rows that wait for a replay, whether its record
-// may be in `recordFiles`, and the number of its last record (`seq`).
-type Rewrite = Outcome & Source & { files: { path: string; text: string | null }[]; waits: boolean; filed: boolean; seq: number }
+// may be in `recordFiles`, the number of its last record (`seq`), and whether
+// this write converted the writer's sending mark into a retired done mark.
+type Rewrite = Outcome & Source & { files: { path: string; text: string | null }[]; waits: boolean; filed: boolean; seq: number; wroteDone?: boolean }
 
 // The record of a Rewrite, which every writer reads: written before what is
 // left is, and updated as each file of it is written; once every one is,
@@ -344,7 +345,7 @@ export function buildPrereqsCommand(c: Config, root: string | undefined): string
 export function buildCleanupCommand(c: Config, root: string | undefined): string | null {
   if (!plainPath(root) || (!c.deadLetterDirIsDefault && !plainPath(c.deadLetterDir))) return null
   const script = root.endsWith('/') ? `${root}scripts/clean_dead_letter.py` : `${root}/scripts/clean_dead_letter.py`
-  return shownWhole(`python3 ${shellQuote(script)}${c.deadLetterDirIsDefault ? '' : ` ${shellQuote(c.deadLetterDir)}`} --execute`)
+  return shownWhole(`python3 ${shellQuote(script)}${c.deadLetterDirIsDefault ? '' : ` ${shellQuote(c.deadLetterDir)}`}`)
 }
 
 // How the refused and parked counts know a line's row: its event_id; for one
@@ -384,17 +385,14 @@ const sourceFor = (dir: string, name: string, size: number, c: Config): Source =
   recordFiles: [joinPath(dir, `outcome-${name}`), joinPath(dir, `outcome-b-${name}`)],
   live: true,
 })
-// The mark the writer `by` leaves beside the file `name` in `dir` before it
-// sends any of it, and the writer a file's name says left such a mark for
-// `name` (null for any other file).
-const markFileOf = (dir: string, name: string, by: string): string => joinPath(dir, `outcome-sending-${by}-${name}`)
+// The mark the writer `by` leaves before sending (`sending: true`) and once
+// finished (`retired: true`), in `doneFileOf`. `markerOf` also recognizes
+// legacy `outcome-sending-` markers from prior versions.
+const doneFileOf = (dir: string, name: string, by: string): string => joinPath(dir, `outcome-done-${by}-${name}`)
 const markerOf = (file: string, name: string): string | null => {
-  const marked = /^outcome-sending-([0-9a-z]+)-(.+)$/.exec(file)
+  const marked = /^outcome-(?:sending|done)-([0-9a-z]+)-(.+)$/.exec(file)
   return marked !== null && marked[2] === name ? (marked[1] as string) : null
 }
-// The mark the writer `by` leaves that the file `name` was done, and the
-// writer a file's name says left one for `name` (null for any other file).
-const doneFileOf = (dir: string, name: string, by: string): string => joinPath(dir, `outcome-done-${by}-${name}`)
 const doneMarkerOf = (file: string, name: string): string | null => {
   const marked = /^outcome-done-([0-9a-z]+)-(.+)$/.exec(file)
   return marked !== null && marked[2] === name ? (marked[1] as string) : null
@@ -439,9 +437,9 @@ const journalOf = (text: unknown): Partial<Journal> | 'torn' | undefined => {
 // writer may have sent). An empty one, which its writer let go, or one of
 // another size, does not.
 const markStands = (text: unknown, size: number): boolean => {
-  const mark = journalOf(text) as { size?: unknown; sending?: unknown } | 'torn' | undefined
+  const mark = journalOf(text) as { size?: unknown; sending?: unknown; retired?: unknown } | 'torn' | undefined
   if (mark === 'torn') return true
-  return mark !== undefined && mark.sending === true && (size < 0 || mark.size === size)
+  return mark !== undefined && mark.sending === true && mark.retired !== true && (size < 0 || mark.size === size)
 }
 
 // What a replay leaves of the file `name`, from its outcome, as the files to
@@ -577,7 +575,7 @@ export class Writer {
   // Replays whose outcome is not all written out yet, by the file's path: a
   // later replay finishes writing it and sends none of the file again.
   private rewrites = new Map<string, Rewrite>()
-  // The name this writer leaves in its marks (`markSending`), ten hex
+  // The name this writer leaves in its marks (`doneFileOf`), ten hex
   // characters from the same source as the row ids: a mark of its own is one
   // whose outcome it would hold, if it had one.
   private readonly mark = randomHex(5)
@@ -1961,12 +1959,20 @@ export class Writer {
     const files: string[] = []
     const sizes = new Map<string, number>()
     const stamps = new Map<string, number | undefined>()
-    // Files a replay emptied: its done mark, or a record file, beside it.
+    // Files a replay emptied: its retired done mark, or a record file, beside it.
+    const emptySources = new Set(entries.filter(e => e.kind === 'file' && e.size === 0 && kindOf(e.name) !== null).map(e => e.name))
     const replayed = new Set<string>()
-    for (const x of entries) {
-      if (x.size === 0 || x.name.startsWith('outcome-sending-')) continue
-      const of = recordOf(x.name)
-      if (of !== null) replayed.add(of)
+    if (emptySources.size > 0) {
+      for (const x of entries) {
+        if (x.kind !== 'file' || x.size === 0 || x.name.startsWith('outcome-sending-')) continue
+        const of = recordOf(x.name)
+        if (of === null || !emptySources.has(of) || replayed.has(of)) continue
+        if (!x.name.startsWith('outcome-done-')) replayed.add(of)
+        else {
+          const j = journalOf(await this.io.readFile(joinPath(dir, x.name)).catch(() => ''))
+          if (j !== undefined && j !== 'torn' && j.retired === true) replayed.add(of)
+        }
+      }
     }
     // First sights of files no longer there go.
     const listedPaths = new Set(entries.map(x => joinPath(dir, x.name)))
@@ -2564,7 +2570,9 @@ export class Writer {
       await record()
     }
     if (!(await stillOurs())) return false
-    const done = finished || (await this.markDone(rewrite))
+    const wroteDone = !finished && (await this.markDone(rewrite))
+    if (wroteDone) rewrite.wroteDone = true
+    const done = finished || wroteDone
     try {
       await this.io.writeFile(path, '')
     } catch (err) {
@@ -2609,17 +2617,17 @@ export class Writer {
   }
 
   // Before any of a file's rows go: the mark that this writer sends them, in
-  // a file of its own beside it (`markFileOf`), which tells a writer that
-  // finds no outcome recorded that one may yet be (`backfillRun`), and which
-  // no other writer writes over or empties. Then the record and the marks
-  // read again: another writer's outcome or done mark, the file emptied, or
-  // (unless /bqaa-backfill force asked for it afresh) another writer's mark,
-  // and none of it goes from here, this writer's own mark let go. False when the
-  // mark cannot be written (no later writer could tell then: none goes), or
-  // another writer has the file.
+  // its own file beside it (`doneFileOf`), which tells a writer that finds no
+  // outcome recorded that one may yet be (`backfillRun`), and which no other
+  // writer writes over or empties. Then the record and the marks read again:
+  // another writer's outcome or done mark, the file emptied, or (unless
+  // /bqaa-backfill force asked for it afresh) another writer's mark, and none
+  // of it goes from here, this writer's own mark let go. False when the mark
+  // cannot be written (no later writer could tell then: none goes), or another
+  // writer has the file.
   private async markSending(path: string, source: Source, trigger: BackfillReport['trigger'], report: BackfillReport): Promise<boolean> {
     try {
-      await this.io.writeFile(markFileOf(source.dir, source.name, this.mark), sealFile(`${JSON.stringify({ size: source.size, sending: true, by: this.mark })}\n`))
+      await this.io.writeFile(doneFileOf(source.dir, source.name, this.mark), sealFile(`${JSON.stringify({ size: source.size, sending: true, by: this.mark })}\n`))
     } catch (err) {
       report.held ??= diagnostic(`could not mark the replay of ${source.name} before sending, so none of it is sent: ${errorText(err)}`)
       return false
@@ -2666,7 +2674,7 @@ export class Writer {
   // this writer's own, which it replays past.
   private async unmark(source: Source): Promise<void> {
     try {
-      await this.io.writeFile(markFileOf(source.dir, source.name, this.mark), '')
+      await this.io.writeFile(doneFileOf(source.dir, source.name, this.mark), '')
     } catch {
       // Left.
     }
@@ -2849,9 +2857,11 @@ export class Writer {
     // Another writer that replayed the file at the same time may have
     // recorded its outcome meanwhile, or finished it: writeOut finds out
     // before it records this one.
-    const done = await this.writeOut(path, { ...source, ...outcome, files, waits: rest.some(f => f.kind !== 'rejected'), filed: false, seq: 0 })
-    // The file done, its outcome and all it left written: the mark goes.
-    if (done) await this.unmark(source)
+    const rewrite: Rewrite = { ...source, ...outcome, files, waits: rest.some(f => f.kind !== 'rejected'), filed: false, seq: 0 }
+    const done = await this.writeOut(path, rewrite)
+    // The file done, clear our sending mark only when this write did not
+    // replace it with a retired done mark (`wroteDone`).
+    if (done && !rewrite.wroteDone) await this.unmark(source)
     return done
   }
 

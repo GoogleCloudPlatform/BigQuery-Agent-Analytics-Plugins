@@ -227,12 +227,6 @@ export function splitArgv(line: string): string[] {
 export const joinPath = (dir: string, name: string): string =>
   dir.endsWith('/') || dir.endsWith('\\') ? dir + name : `${dir}/${name}`
 
-const parentDir = (dir: string): string => {
-  const trimmed = dir.replace(/[\\/]+$/, '')
-  const cut = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
-  return cut > 0 ? trimmed.slice(0, cut) : trimmed
-}
-
 export function resolveConfig(options: Options, env: EnvSnapshot): Config {
   const problems: string[] = []
   const warnings: string[] = []
@@ -282,7 +276,7 @@ export function resolveConfig(options: Options, env: EnvSnapshot): Config {
     exitFlushMs: clampEnvInt(env.BQAA_EXIT_FLUSH_MS, 800, 0, 1200),
     deadLetterDir,
     deadLetterDirIsDefault: text(options.deadLetterDir) === '' && (env.BQAA_DEAD_LETTER_DIR ?? '').trim() === '' && home !== '',
-    dryRunDir: deadLetterDir ? joinPath(parentDir(deadLetterDir), 'dry-run') : '',
+    dryRunDir: deadLetterDir ? joinPath(deadLetterDir, 'dry-run') : '',
     accessTokenCommand: splitArgv(tokenLine),
     tokenCommandTimeoutMs: 15_000,
     // Google access tokens last about an hour; refresh well before that.

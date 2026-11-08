@@ -610,7 +610,9 @@ test('session_start omits model and permission_mode when classic.SessionStart do
 test('a session that runs only /bqaa-status and exits emits and spills no session_start or session_end rows', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)
-  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  const status = (await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })).text ?? ''
+  expect(status).toContain('queue: 0 rows (0 B), 0 in flight')
+  expect(status).toContain('rows: captured 0, sent 0,')
   await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
   await world.clock.advance(5000)
   expect(world.sentRows()).toEqual([])

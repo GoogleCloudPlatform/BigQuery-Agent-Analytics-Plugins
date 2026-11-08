@@ -153,7 +153,7 @@ events dataset, where only the administrators hold project roles.
    `--execute`:
 
    ```bash
-   PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
+   PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{s=$(NF-1); sub(/\+.*/,"",s); p=index(s,"-"); pre=p?substr(s,p+1):""; core=p?substr(s,1,p-1):s; split(core,v,"."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (pre==""), pre, $0}' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
    cd "${PLUGIN_DIR:?mod cache directory not found}"
    python3 scripts/setup_gcp_prereqs.py \
      --project my-gcp-project --dataset agent_analytics \

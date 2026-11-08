@@ -118,7 +118,7 @@ export const DEAD_LETTER_DIR = `${HOME}/.bqaa-mod/dead-letter`
 // The table OPTIONS point at, and the dead-letter subdirectory its files go to.
 export const TABLE_REF = 'my-gcp-project.agent_analytics.agent_events'
 export const PARTITION_DIR = `${DEAD_LETTER_DIR}/${TABLE_REF}`
-export const DRY_RUN_DIR = `${HOME}/.bqaa-mod/dry-run`
+export const DRY_RUN_DIR = `${DEAD_LETTER_DIR}/dry-run`
 export const OPTIONS = { project: 'my-gcp-project', dataset: 'agent_analytics' } as const
 export const COMMAND = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
 export const OK_INSERT = { status: 200, text: '{"kind":"bigquery#tableDataInsertAllResponse"}' }
