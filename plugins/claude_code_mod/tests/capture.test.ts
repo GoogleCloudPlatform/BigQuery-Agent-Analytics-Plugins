@@ -18,7 +18,7 @@
 import { type Engine, expect, test } from 'claude-code/testing'
 
 import { PLUGIN_VERSION } from '../hooks/lib/config.ts'
-import { ACCESS_TOKEN, COMMAND, DRY_RUN_DIR, OK_INSERT, OPTIONS, type Row, SESSION_ID, USAGE, type World, byType, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
+import { ACCESS_TOKEN, COMMAND, DRY_RUN_DIR, OK_INSERT, OPTIONS, type Row, SESSION_ID, USAGE, type World, byType, deadLetterFiles, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
 
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX16 = /^[0-9a-f]{16}$/
@@ -815,4 +815,24 @@ test('a short (< 5 s) headless session whose in-flight turn flush gets HTTP 401 
   ])
   expect(world.stderr[0]?.includes(bogusToken)).toBe(false)
   expect(deadLetterRows(world).length).toBe(4)
+})
+
+test('a short (< 5 s) session whose session.end batch hits table-not-found auto-creates the table and lands rows inside sendAtExit', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  const tableMissing = { status: 404, text: '{"error":{"code":404,"message":"Not found: Table my-gcp-project:agent_analytics.agent_events","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}' }
+  const tableCreated = { status: 200, text: '{"kind":"bigquery#table"}' }
+  world.replies = [tableMissing, tableCreated, OK_INSERT]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.turn.start({ turnId: 't-exit-autocreate', text: 'check' })
+  await $.turn.complete({ turnId: 't-exit-autocreate', answer: 'ok', durationMs: 25, isAborted: false, reason: 'answer' })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  expect(world.fetches.map(f => `${f.method} ${f.url.split('/').pop()?.split('?')[0]}`)).toEqual([
+    'POST insertAll',
+    'POST tables',
+    'POST insertAll',
+  ])
+  expect(world.acceptedRows().length).toBe(4)
+  expect(deadLetterFiles(world)).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+  expect(world.stderr).toEqual([])
 })

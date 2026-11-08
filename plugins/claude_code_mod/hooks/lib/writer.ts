@@ -260,6 +260,9 @@ const SETUP_COMMAND_CHARS = 4000
 // and its rows, spilled as well, would go twice (event_id dedups them).
 const EXIT_SEND_MIN_MS = 450
 const EXIT_SPILL_RESERVE_MS = 150
+// Session end creates a missing table only if at least this much time remains
+// before the post mark.
+const EXIT_CREATE_TABLE_MIN_MS = 250
 // Session end's replay starts only with at least EXIT_REPLAY_MIN_MS left,
 // and sends nothing in the last EXIT_REPLAY_RESERVE_MS, which the writes of
 // its outcome take.
@@ -1422,8 +1425,8 @@ export class Writer {
     return pending
   }
 
-  private async createTable(c: Config, token: string): Promise<boolean> {
-    const answer = await this.post(tablesUrl(c), createTableBody(c), token, c.requestTimeoutMs)
+  private async createTable(c: Config, token: string, timeoutMs = c.requestTimeoutMs): Promise<boolean> {
+    const answer = await this.post(tablesUrl(c), createTableBody(c), token, timeoutMs)
     if ('error' in answer) {
       this.recordError(`create table: ${answer.error}`)
       return false
@@ -1709,60 +1712,97 @@ export class Writer {
     // The rows carry the account of the token in use, where its lookup has
     // answered, else the user_id they were built with: no lookup starts now.
     if (c.userIdFromCredentials) for (const q of batch) this.stamp(q, this.currentIdentity())
-    const answer = await Promise.race([
-      this.post(insertAllUrl(c), insertAllBody(batch.map(q => q.row)), token, Math.max(50, until - this.io.now() - EXIT_SPILL_RESERVE_MS)),
-      marks.post.at.then(() => ({ error: 'no answer before the session ended' })),
-    ])
-    if ('error' in answer) {
-      this.recordError(`session end: ${answer.error}`)
-      park(batch)
-      return false
-    }
-    const outcome = classifyInsert(answer, batch.length)
-    switch (outcome.kind) {
-      case 'ok':
-        this.noteSessions(batch)
-        this.succeeded(batch.length, c)
-        return true
-      case 'partial': {
-        const landed: Queued[] = []
-        const again: Queued[] = []
-        const refused: Queued[] = []
-        let reason = ''
-        batch.forEach((q, i) => {
-          const why = outcome.rejected.get(i)
-          if (why !== undefined) {
-            refused.push(q)
-            reason ||= why
-          } else if (outcome.retry.has(i)) again.push(q)
-          else landed.push(q)
-        })
-        this.noteSessions(landed)
-        this.succeeded(landed.length, c)
-        // Its write is one of those under way, which the exit waits for.
-        if (refused.length > 0) writes.push(this.reject(refused, `BigQuery rejected ${refused.length} row(s): ${reason}`))
-        park(again)
-        return refused.length === 0 && again.length === 0
-      }
-      case 'rejected':
-        if (outcome.permission) this.noteProblem('permission', outcome.message, 'write')
-        else this.tableAnswered()
-        writes.push(this.reject(batch, outcome.message))
+    const body = insertAllBody(batch.map(q => q.row))
+    const postBatch = (): Promise<HttpAnswer | { error: string }> =>
+      Promise.race([
+        this.post(insertAllUrl(c), body, token, Math.max(50, until - this.io.now() - EXIT_SPILL_RESERVE_MS)),
+        marks.post.at.then(() => ({ error: 'no answer before the session ended' })),
+      ])
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const answer = await postBatch()
+      if ('error' in answer) {
+        this.recordError(`session end: ${answer.error}`)
+        park(batch)
         return false
-      case 'not-found':
-        // No table is made now: the next session's send makes it.
-        this.missingDestination(outcome.message)
-        break
-      case 'auth':
-        // No fresh token now: the next session's send gets one.
-        this.dropToken()
-        this.noteProblem('credentials', `authentication: ${outcome.message}`)
-        break
-      case 'retry':
-        break
+      }
+      const outcome = classifyInsert(answer, batch.length)
+      switch (outcome.kind) {
+        case 'ok':
+          this.noteSessions(batch)
+          this.succeeded(batch.length, c)
+          return true
+        case 'partial': {
+          const landed: Queued[] = []
+          const again: Queued[] = []
+          const refused: Queued[] = []
+          let reason = ''
+          batch.forEach((q, i) => {
+            const why = outcome.rejected.get(i)
+            if (why !== undefined) {
+              refused.push(q)
+              reason ||= why
+            } else if (outcome.retry.has(i)) again.push(q)
+            else landed.push(q)
+          })
+          this.noteSessions(landed)
+          this.succeeded(landed.length, c)
+          // Its write is one of those under way, which the exit waits for.
+          if (refused.length > 0) writes.push(this.reject(refused, `BigQuery rejected ${refused.length} row(s): ${reason}`))
+          park(again)
+          return refused.length === 0 && again.length === 0
+        }
+        case 'rejected':
+          if (outcome.permission) this.noteProblem('permission', outcome.message, 'write')
+          else this.tableAnswered()
+          writes.push(this.reject(batch, outcome.message))
+          return false
+        case 'not-found': {
+          const createBudget = until - this.io.now() - EXIT_SPILL_RESERVE_MS
+          if (
+            attempt === 0 &&
+            c.autoCreateTable &&
+            !this.createAttempted &&
+            !isDatasetMissing(outcome.message) &&
+            !marks.post.passed() &&
+            createBudget >= EXIT_CREATE_TABLE_MIN_MS
+          ) {
+            this.createAttempted = true
+            const created = await Promise.race([
+              this.createTable(c, token, Math.max(50, createBudget)),
+              marks.post.at.then(() => false),
+            ])
+            if (created) {
+              if (!marks.post.passed() && until - this.io.now() >= EXIT_SEND_MIN_MS) continue
+              this.recordError(`session end: table created (${tableRef(c)}); rows spilled`)
+              park(batch)
+              return false
+            }
+            if (marks.post.passed()) {
+              this.missingDestination(outcome.message)
+              this.recordError('session end: no answer before the session ended')
+              park(batch)
+              return false
+            }
+          }
+          this.missingDestination(outcome.message)
+          this.recordError(`session end: ${outcome.message}`)
+          park(batch)
+          return false
+        }
+        case 'auth':
+          // No fresh token now: the next session's send gets one.
+          this.dropToken()
+          this.noteProblem('credentials', `authentication: ${outcome.message}`)
+          this.recordError(`session end: ${outcome.message}`)
+          park(batch)
+          return false
+        case 'retry':
+          this.recordError(`session end: ${outcome.message}`)
+          park(batch)
+          return false
+      }
     }
-    this.recordError(`session end: ${outcome.message}`)
-    park(batch)
     return false
   }
 

@@ -1050,3 +1050,111 @@ test('/bqaa-status registers with the argument hint [check], as /bqaa-backfill d
   await startSession($)
   expect(Object.fromEntries(hints)).toEqual({ 'bqaa-status': '[check]', 'bqaa-flush': undefined, 'bqaa-backfill': '[force] [wait]', 'bqaa-mod-setup': undefined, 'bqaa-setup': undefined })
 })
+
+const EXIT_TABLE_MISSING = {
+  status: 404,
+  text: '{"error":{"code":404,"message":"Not found: Table my-gcp-project:agent_analytics.agent_events","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}',
+}
+const EXIT_TABLE_CREATED = { status: 200, text: '{"kind":"bigquery#table"}' }
+
+const fetchOps = (world: ReturnType<typeof setUp>): string[] =>
+  world.fetches.map(f => `${f.method} ${f.url.split('/').pop()?.split('?')[0]}`)
+
+const spillRowCount = (files: Map<string, string>): number =>
+  [...files.entries()]
+    .filter(([p, text]) => text.length > 0 && /\/spill-/.test(p))
+    .flatMap(([, text]) => text.trim().split('\n').map(l => (JSON.parse(l) as { row?: unknown }).row).filter(r => r !== undefined))
+    .length
+
+async function runShortHeadlessTurn($: Parameters<typeof startSession>[0], turnId: string): Promise<void> {
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.turn.start({ turnId, text: 'check' })
+  await $.turn.complete({ turnId, answer: 'ok', durationMs: 25, isAborted: false, reason: 'answer' })
+}
+
+test('sendAtExit cuts off hung createTable cleanly at marks.post and spills all rows', { options: OPTIONS }, async ($, on) => {
+  const token = ['ya29', 'exit-autocreate-hang-001'].join('.')
+  const sessionId = '5c4b1d2e-8f7a-4c3b-9d1e-2a6f0b7c8d9e'
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: token })
+  world.replies = [EXIT_TABLE_MISSING, { hang: true }]
+  await runShortHeadlessTurn($, 't-exit-hang-create')
+  const ending = $.session.end({ reason: 'other', sessionId, resume: { id: sessionId } })
+  await world.clock.advance(800)
+  await ending
+  expect(fetchOps(world)).toEqual(['POST insertAll', 'POST tables'])
+  expect(spillRowCount(world.files)).toBe(4)
+})
+
+test('sendAtExit skips createTable and spills immediately when remaining budget before marks.post is under 250 ms', { options: OPTIONS }, async () => {
+  const token = ['ya29', 'exit-autocreate-tight-002'].join('.')
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/exit-tight-budget' }, {})
+  const clock = probeClock()
+  const asked: string[] = []
+  const files = new Map<string, string>()
+  const baseIo = makeProbeIo(
+    clock,
+    async (reqUrl, init) => {
+      asked.push(`${init.method} ${reqUrl.split('/').pop()?.split('?')[0]}`)
+      if (asked.length === 1) {
+        return new Promise(resolve => { clock.after(420, () => resolve(EXIT_TABLE_MISSING)) })
+      }
+      return EXIT_TABLE_CREATED
+    },
+    async () => ({ exitCode: 0, stdout: `${token}\n`, stderr: '' }),
+  )
+  const io: Io = {
+    ...baseIo,
+    envToken: async () => token,
+    writeFile: async (p, text) => { files.set(p, text) },
+  }
+  const writer = new Writer(io, () => config, () => 'exit-tight-budget')
+  const row: Parameters<Writer['enqueue']>[0] = {
+    timestamp: '2026-11-08T00:00:00.000Z',
+    event_id: '0123456789abcdef0123456789abcdef',
+    event_type: 'SESSION_STARTED',
+    agent: 'coding-agent',
+    session_id: 'exit-tight-budget',
+    invocation_id: null,
+    user_id: 'dev',
+    trace_id: null,
+    span_id: null,
+    parent_span_id: null,
+    content: null,
+    content_parts: [],
+    attributes: '{}',
+    latency_ms: null,
+    status: 'OK',
+    error_message: null,
+    is_truncated: false,
+  }
+  writer.enqueue(row, 0)
+  let result: { spilled: number } | undefined
+  void writer.spillForExit(800, { sendQueued: true }).then(v => { result = v })
+  await clock.advance(800)
+  expect(result).toEqual({ spilled: 1 })
+  expect(asked).toEqual(['POST insertAll'])
+  expect(spillRowCount(files)).toBe(1)
+})
+
+test('sendAtExit never calls createTable when dataset is missing', { options: OPTIONS }, async ($, on) => {
+  const token = ['ya29', 'exit-autocreate-nods-003'].join('.')
+  const sessionId = '5c4b1d2e-8f7a-4c3b-9d1e-2a6f0b7c8d9e'
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: token })
+  world.replies = [DATASET_MISSING, EXIT_TABLE_CREATED, OK_INSERT]
+  await runShortHeadlessTurn($, 't-exit-dataset-missing')
+  await $.session.end({ reason: 'other', sessionId, resume: { id: sessionId } })
+  expect(fetchOps(world)).toEqual(['POST insertAll'])
+  expect(spillRowCount(world.files)).toBe(4)
+})
+
+test('sendAtExit spills without noisy missing-table stderr when retried insertAll hits streaming propagation 404 right after table creation', { options: OPTIONS }, async ($, on) => {
+  const token = ['ya29', 'exit-autocreate-prop-004'].join('.')
+  const sessionId = '5c4b1d2e-8f7a-4c3b-9d1e-2a6f0b7c8d9e'
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: token })
+  world.replies = [EXIT_TABLE_MISSING, EXIT_TABLE_CREATED, EXIT_TABLE_MISSING]
+  await runShortHeadlessTurn($, 't-exit-propagation')
+  await $.session.end({ reason: 'other', sessionId, resume: { id: sessionId } })
+  expect(fetchOps(world)).toEqual(['POST insertAll', 'POST tables', 'POST insertAll'])
+  expect(spillRowCount(world.files)).toBe(4)
+  expect(world.stderr).toEqual([])
+})
