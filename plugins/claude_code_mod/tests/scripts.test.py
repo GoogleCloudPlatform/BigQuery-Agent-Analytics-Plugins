@@ -379,6 +379,13 @@ def run_bq_checks():
           ) == {'start', 'end'})
     check('referenced_params detects @trace_id outside literals',
           run_bq.referenced_params('SELECT * FROM t WHERE trace_id = @trace_id') == {'trace_id'})
+    check('referenced_params ignores GoogleSQL @@ system variables while matching single-@ parameters',
+          run_bq.referenced_params('SELECT @@start, @@error.message, @@time_zone') == set()
+          and run_bq.referenced_params('SELECT @@trace_id, @start FROM t WHERE timestamp <= @end') == {'start', 'end'})
+    fake = FakeBigQuery(rows=[{'ok': 1}])
+    status, out, err = run_bq_with(fake, *base, 'SELECT @@trace_id, @@start, @@end')
+    check('SQL with @@ system variables needs no --trace-id and binds no @start/@end parameters',
+          status == 0 and parameters(fake.queries[0][1]) == {}, f'{status} {err!r}')
     fake = FakeBigQuery()
     status, out, err = run_bq_with(fake, *base, '--query', '6')
     check('--query 6 without --trace-id: exit 2 naming query 6, with no BigQuery client made',
@@ -1377,8 +1384,9 @@ def execute_stop_checks():
     # It stops before it calls anything when the credentials or the client it needs are missing.
     cloud = FakeCloud()
     status, out, err = execute(cloud, *DOCUMENTED, libraries=NO_CLIENT)
-    check('--execute, no BigQuery client to import: it stops before it calls anything, and says nothing was changed',
-          status == 1 and 'cannot import' in err and 'Nothing was changed' in err and cloud.calls == [], f'{status} {err!r}')
+    check('--execute, no BigQuery client to import: it stops before it calls anything, names ~/.bqaa-mod/venv (not .venv), and says nothing was changed',
+          status == 1 and 'cannot import' in err and '~/.bqaa-mod/venv' in err and '.venv' not in err
+          and 'Nothing was changed' in err and cloud.calls == [], f'{status} {err!r}')
     for what, preflight, fragment in (
         ('no gcloud', dataclasses.replace(READY, gcloud_available=False), 'gcloud is required for --execute'),
         ('no Application Default Credentials', dataclasses.replace(READY, adc_ok=False),
@@ -1637,7 +1645,8 @@ def setup_sh_checks():
         check(f'setup.sh --dry-run --team, {what}: it prints a command that runs the bootstrap of the scripts folder',
               result.returncode == 0 and len(words) > 2 and words[0] == 'python3'
               and pathlib.Path(words[1]).resolve() == (SCRIPTS / 'setup_gcp_prereqs.py').resolve()
-              and 'google-cloud-bigquery' in result.stdout,
+              and 'google-cloud-bigquery' in result.stdout and '~/.bqaa-mod/venv' in result.stdout
+              and '.venv' not in result.stdout,
               f'{result.returncode} {line!r} {result.stderr!r}')
         args = parsed(*words[2:])
         check('  ... naming the project, dataset, table, views dataset and location it was given',
@@ -1665,12 +1674,16 @@ def markdown_files():
 def cache_lookup_checks():
     lookups = [(path.relative_to(PLUGIN.parent.parent).as_posix(), line)
                for path in markdown_files() for line in LOOKUP.findall(path.read_text(encoding='utf-8'))]
-    check('the docs show the lookup of the installed copy at least five times', len(lookups) >= 5,
+    check('the docs show the lookup of the installed copy at least six times (including docs/service-account-auth.md)',
+          len(lookups) >= 6 and 'plugins/claude_code_mod/docs/service-account-auth.md' in {where for where, _ in lookups},
           [where for where, _ in lookups])
     stale = [where for where, line in lookups if CACHE not in line]
     check('every lookup reads the cache under CLAUDE_CONFIG_DIR when it is set, else under ~/.claude', stale == [], stale)
     shared = [path.name for path in markdown_files() if re.search(r'/tmp/\S*venv', path.read_text(encoding='utf-8'))]
     check('no doc makes a virtual environment in a shared /tmp path another user could make first', shared == [], shared)
+    sa_doc = (PLUGIN / 'docs' / 'service-account-auth.md').read_text(encoding='utf-8')
+    check('docs/service-account-auth.md puts the virtual environment in ~/.bqaa-mod/venv, not .venv in the plugin cache',
+          '~/.bqaa-mod/venv' in sa_doc and '.venv' not in sa_doc, sa_doc)
     sh = shutil.which('sh')
     if sh is None:
         check('each lookup picks the highest version installed (skipped: no sh)', True)
@@ -1965,6 +1978,42 @@ def clean_dead_letter_checks():
               and out_pos == '' and out_flag == ''
               and source.exists() and outcome.exists(),
               f'{status_pos} {err_pos!r} / {status_flag} {err_flag!r}')
+        sym_parent = tmp_path / 'symlink-parent'
+        sym_parent.symlink_to(tmp_path, target_is_directory=True)
+        via_sym_ancestor = sym_parent / 'dead-letter'
+        check('11g. plan_deletions refuses a dead-letter directory reached through a symlinked ancestor',
+              clean.plan_deletions(via_sym_ancestor) == [], str(clean.plan_deletions(via_sym_ancestor)))
+        status_anc, out_anc, err_anc = call(clean.main, '--dir', str(via_sym_ancestor), '--execute')
+        check('11h. main refuses a dead-letter directory reached through a symlinked ancestor with exit 1 and keeps target files',
+              status_anc == 1 and 'refusing symlinked dead-letter directory' in err_anc and out_anc == ''
+              and source.exists() and outcome.exists(),
+              f'{status_anc} {out_anc!r} {err_anc!r}')
+
+    # 12. An unreadable root dead-letter directory returns [] in plan_deletions and exits 1 with stderr error in main.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = pathlib.Path(tmp) / 'dead-letter'
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'spill-015.jsonl'
+        source.write_bytes(b'')
+        real_iterdir = pathlib.Path.iterdir
+
+        def fail_root_iterdir(path):
+            if path == base:
+                raise PermissionError(13, 'Permission denied', str(path))
+            return real_iterdir(path)
+
+        with patched(pathlib.Path, iterdir=fail_root_iterdir):
+            planned = clean.plan_deletions(base)
+            status_dry, out_dry, err_dry = call(clean.main, '--dir', str(base))
+            status_exec, out_exec, err_exec = call(clean.main, str(base), '--execute')
+        check('12a. plan_deletions returns [] when root directory iterdir() raises OSError',
+              planned == [], str(planned))
+        check('12b. main exits 1 on stderr when root directory cannot be listed (dry-run and --execute)',
+              status_dry == 1 and status_exec == 1
+              and 'cannot read dead-letter directory' in err_dry
+              and 'cannot read dead-letter directory' in err_exec
+              and out_dry == '' and out_exec == '' and source.exists(),
+              f'{status_dry} {err_dry!r} / {status_exec} {err_exec!r}')
 
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,

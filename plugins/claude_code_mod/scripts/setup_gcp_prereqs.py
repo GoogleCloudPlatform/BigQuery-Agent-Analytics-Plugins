@@ -1405,9 +1405,9 @@ def run(args: argparse.Namespace) -> int:
         if _steps_need_adc(steps) and not _bigquery_client_importable():
             raise SystemExit(
                 "This plan calls the Python BigQuery client (google-cloud-bigquery), which this Python "
-                "cannot import. Install it, for example python3 -m venv .venv && .venv/bin/pip install "
-                "google-cloud-bigquery, run the script with .venv/bin/python, and run again. Nothing "
-                "was changed."
+                "cannot import. Install it, for example python3 -m venv ~/.bqaa-mod/venv && "
+                "~/.bqaa-mod/venv/bin/pip install google-cloud-bigquery, run the script with "
+                "~/.bqaa-mod/venv/bin/python, and run again. Nothing was changed."
             )
         if _steps_need_cli_auth(steps) and not preflight.cli_auth_ok:
             raise SystemExit(

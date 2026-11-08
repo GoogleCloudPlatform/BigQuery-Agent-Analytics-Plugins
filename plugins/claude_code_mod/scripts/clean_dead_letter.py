@@ -29,8 +29,10 @@ This helper removes a ``(source, outcome-*)`` group **only** when:
   its completion record.
 
 It never deletes a non-empty source file, or an ``outcome-*`` file whose
-source is non-empty, unreadable, or missing. It deletes nothing in a
-partition directory whose entries cannot all be listed and read, or that
+source is non-empty, unreadable, or missing. It refuses a dead-letter path
+when the directory or any non-root ancestor is a symbolic link, exits 1 on
+stderr if the root dead-letter directory cannot be listed, and deletes nothing
+in a partition directory whose entries cannot all be listed and read, or that
 holds a non-empty source file whose completion record cannot be read (a file
 that cannot be opened, is not valid UTF-8, or does not end with a
 ``"complete": true`` record, as one still being written or cut short): such
@@ -166,6 +168,21 @@ def _plan_single_dir(directory: Path) -> list[Path]:
     return deletable
 
 
+def _has_symlink_component(path: Path) -> bool:
+    """Return True if ``path`` or any non-root ancestor is a symbolic link."""
+    root = Path("/")
+    for candidate in (path, *path.parents):
+        try:
+            if not candidate.is_symlink():
+                continue
+        except OSError:
+            return True
+        if sys.platform == "darwin" and candidate.parent == root and candidate.name in ("var", "tmp", "etc"):
+            continue
+        return True
+    return False
+
+
 def plan_deletions(directory: Path) -> list[Path]:
     """Return the list of files that may be deleted from ``directory``.
 
@@ -175,10 +192,15 @@ def plan_deletions(directory: Path) -> list[Path]:
     as ``parent``; nothing is in a partition directory that cannot be read
     whole (see ``_plan_single_dir``).
     """
-    if directory.is_symlink() or not directory.is_dir():
+    if _has_symlink_component(directory) or not directory.is_dir():
         return []
 
-    dirs = [directory, *[d for d in sorted(directory.iterdir()) if d.is_dir() and not d.is_symlink()]]
+    try:
+        subdirs = [d for d in sorted(directory.iterdir()) if not d.is_symlink() and d.is_dir()]
+    except OSError:
+        return []
+
+    dirs = [directory, *subdirs]
     deletable: list[Path] = []
     for d in dirs:
         deletable.extend(_plan_single_dir(d))
@@ -199,12 +221,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("pass either positional path or --dir, not both")
 
     base = (args.path if args.path is not None else args.dir if args.dir is not None else DEFAULT_DIR).expanduser()
-    if base.is_symlink():
+    if _has_symlink_component(base):
         print(f"ERROR: refusing symlinked dead-letter directory: {base}", file=sys.stderr)
         return 1
     if not base.is_dir():
         print(f"dead-letter directory not found: {base}")
         return 0
+    try:
+        list(base.iterdir())
+    except OSError as exc:
+        print(f"ERROR: cannot read dead-letter directory {base}: {exc}", file=sys.stderr)
+        return 1
 
     to_delete = plan_deletions(base)
     if not to_delete:

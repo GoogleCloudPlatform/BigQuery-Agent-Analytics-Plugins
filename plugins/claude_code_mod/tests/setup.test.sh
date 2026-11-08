@@ -79,6 +79,8 @@ check 'with --team, the next step names the project and dataset, and no table, v
 printf -v bootstrap '%q' "$plugin/scripts/setup_gcp_prereqs.py"
 check "with --team, the next step runs the bootstrap that sits beside setup.sh, by its full path" has "python3 $bootstrap" "$team_log.out"
 check 'with --team, the next step notes that --execute needs a virtual environment with google-cloud-bigquery' has 'google-cloud-bigquery' "$team_log.out"
+check 'with --team, the next step puts the virtual environment in ~/.bqaa-mod/venv, outside the plugin folder' has '~/.bqaa-mod/venv' "$team_log.out"
+check 'with --team, the next step never creates .venv inside the plugin folder' lacks '.venv' "$team_log.out"
 check 'the next step sends nobody to a checkout of another repository' bash -c "! grep -qE 'github\.com|git clone' '$team_log.out'"
 
 # 2. Run again with both datasets there: nothing is made but the views.

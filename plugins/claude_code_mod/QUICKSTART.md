@@ -58,7 +58,7 @@ BQAA_PROJECT_ID=YOUR_PROJECT BQAA_DATASET=agent_analytics bash "${PLUGIN_DIR:?mo
 
 ### 5. Verify and query your rows
 
-Start a session and send a short prompt (for example, `"list the files here"`). In the first session after installing a new mod version, a welcome card names your table and shows **✓ First rows landed in BigQuery** after a successful upload. The card may be absent in later sessions. In any session, wait a few seconds and run `/bqaa-status`: confirm the correct table (`BigQuery Agent Analytics mod: enabled, target YOUR_PROJECT.agent_analytics.agent_events (US)`), no `notice` line, and at least `1 ok` request. If the table was just created and you see `BigQuery cannot find the table`, wait a few minutes; queued rows retry automatically.
+Start a session and send a short prompt (for example, `"list the files here"`). In the first session after installing a new mod version, a welcome card names your table and shows **✓ First rows landed in BigQuery** after a successful upload. The card may be absent in later sessions. In any session, wait a few seconds and run `/bqaa-status`: confirm the correct table (`BigQuery Agent Analytics mod: enabled, target YOUR_PROJECT.agent_analytics.agent_events (US)`), no `notice` line, and at least `1 ok` request (or run `/bqaa-status check`—or `claude -p /bqaa-status < /dev/null` from a shell—to probe the destination table with a bounded `3 s` `tables.get` check before sending any prompt). If the table was just created and you see `BigQuery cannot find the table`, wait a few minutes; queued rows retry automatically.
 
 Then query your logged events in BigQuery (replace `YOUR_PROJECT` in both places):
 
@@ -102,11 +102,11 @@ Omit `--config "accessTokenCommand=..."` if your administrator did not give you 
 
 ### 4. Verify
 
-Start a session and send a prompt. If this is the first session for a newly installed mod version, a welcome card may confirm **✓ First rows landed in BigQuery**; later sessions need not show it. In any session, wait a few seconds after the prompt finishes, then run `/bqaa-status` and confirm your team's table, no `notice` line, and at least `1 ok` request. If it still shows `0 ok`, wait for the next flush and check again. If your admin created the table in the last few minutes and you see `BigQuery cannot find the table`, wait a few minutes; queued rows retry automatically. You won't be able to query the raw `agent_events` table yourself—that's by design, since it holds everyone's prompts and tool output.
+Start a session and send a prompt. If this is the first session for a newly installed mod version, a welcome card may confirm **✓ First rows landed in BigQuery**; later sessions need not show it. In any session, wait a few seconds after the prompt finishes, then run `/bqaa-status` (or `/bqaa-status check` / `claude -p /bqaa-status < /dev/null` to run a bounded `3 s` `tables.get` check immediately) and confirm your team's table, no `notice` line, and at least `1 ok` request. If it still shows `0 ok`, wait for the next flush and check again. If your admin created the table in the last few minutes and you see `BigQuery cannot find the table`, wait a few minutes; queued rows retry automatically. You won't be able to query the raw `agent_events` table yourself—that's by design, since it holds everyone's prompts and tool output.
 
 ## If rows are not written
 
-When rows cannot reach BigQuery, the mod buffers them on disk and shows the cause and fix in `/bqaa-status` and the banner above the prompt.
+When rows cannot reach BigQuery, the mod buffers them on disk and shows the cause and fix in `/bqaa-status` and the banner above the prompt (and in non-interactive `claude -p` runs, writes a single-line notice with the cause and fix—including the `setup.sh` command when the dataset is missing—to `stderr` at exit).
 
 | Symptom or message | How to fix it |
 | --- | --- |

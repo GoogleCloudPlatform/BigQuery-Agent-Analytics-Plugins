@@ -17,7 +17,11 @@
 -- Placeholders: {PROJECT}, {DATASET}, {TABLE}, and the query parameters
 -- @start, @end and @trace_id, which scripts/run_bq.py fills and binds (the
 -- project and dataset from --project and --dataset, or from BQAA_PROJECT_ID
--- and BQAA_DATASET). Pass one query at a time:
+-- and BQAA_DATASET; @start and @end default to the last 7 UTC days when
+-- omitted, and @trace_id is required for query 6). Pass --query 1..8 (or -q)
+-- to run a numbered query by ID, or pass one query string at a time:
+--
+--   python3 scripts/run_bq.py --dry-run --query 1
 --
 --   python3 scripts/run_bq.py --dry-run \
 --     --start 2026-10-01 --end 2026-10-13 "<one query below>"

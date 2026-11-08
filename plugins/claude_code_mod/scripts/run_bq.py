@@ -123,7 +123,7 @@ def referenced_params(sql: str) -> set[str]:
                 i += 2 if sql[i] == "\\" else 1
             i += 1
             continue
-        if sql[i] == "@" and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == "_")):
+        if sql[i] == "@" and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] in ("_", "@"))):
             match = PARAM_AT_RE.match(sql, i)
             if match:
                 found.add(match.group(1).lower())
