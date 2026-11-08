@@ -239,6 +239,14 @@ events dataset, where only the administrators hold project roles.
    Viewers or Editors access. Its caller needs Token Creator on both
    service accounts (here `READER_SA` stands in for a member of the readers'
    group). With `INSERT_PROBE=1` it also inserts one row as the writer.
+4. **Query as a reader or admin (`run_bq.py`)**: If your Application Default
+   Credentials carry a quota project from another workflow (for example Vertex
+   AI) that lacks `serviceusage.services.use` (`403 USER_PROJECT_DENIED`),
+   [`scripts/run_bq.py`](../scripts/run_bq.py) automatically retries once
+   without the ADC quota project. Pass `--quota-project PROJECT` (or set
+   `GOOGLE_CLOUD_QUOTA_PROJECT`) when your organization requires an explicit
+   billing quota project (only when needed—never assume `--project` grants
+   `serviceusage.services.use`).
 
 ## 1. Impersonation (workstations)
 

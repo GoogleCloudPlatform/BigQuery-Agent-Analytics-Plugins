@@ -45,6 +45,11 @@ time:
   --trace-id ID   Bind @trace_id (required when the query references @trace_id,
                   such as sample query 6, the span tree of one turn).
   --max-gb N      Refuse a query that would bill more than N GB (default 1).
+  --quota-project PROJECT
+                  Use PROJECT as the BigQuery billing/quota project (default:
+                  GOOGLE_CLOUD_QUOTA_PROJECT, else Application Default
+                  Credentials). On an ADC quota-project 403 denial without an
+                  explicit override, retries once without the ADC quota project.
   --dry-run       Run nothing: print, as one JSON object, the bytes the query
                   would scan (BigQuery estimates it; nothing is billed).
 
@@ -84,6 +89,10 @@ GB = 1 << 30
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 QUERY_HEADER = re.compile(r"^-- (V?\d+)\. ")
 PARAM_AT_RE = re.compile(r"@(start|end|trace_id)\b", re.IGNORECASE)
+QUOTA_403_RE = re.compile(
+    r"403.*(?:permission to use project|USER_PROJECT_DENIED|serviceusage\.services\.use)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _utc_now() -> datetime:
@@ -249,6 +258,14 @@ def load_bigquery():
     return bigquery
 
 
+def load_google_auth():
+    """google.auth, imported when first needed so --help and argument checks
+    work without the client dependencies installed."""
+    import google.auth
+
+    return google.auth
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run one query over the agent_events table, with a billing limit.",
@@ -286,6 +303,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--table",
         default=first_env("BQAA_TABLE", "BQ_TABLE", default="agent_events"),
         help="the events table (default: BQAA_TABLE, BQ_TABLE or agent_events)",
+    )
+    parser.add_argument(
+        "--quota-project",
+        default=first_env("GOOGLE_CLOUD_QUOTA_PROJECT") or None,
+        help=(
+            "the quota/billing project for BigQuery API calls "
+            "(default: GOOGLE_CLOUD_QUOTA_PROJECT, else Application Default Credentials)"
+        ),
     )
     parser.add_argument(
         "--start",
@@ -337,10 +362,35 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return args
 
 
+def _execute_query(bigquery, client, sql: str, parameters: list, limit: int, args: argparse.Namespace) -> None:
+    if args.dry_run:
+        config = bigquery.QueryJobConfig(
+            dry_run=True, use_query_cache=False, use_legacy_sql=False, query_parameters=parameters
+        )
+        scanned = client.query(sql, job_config=config).total_bytes_processed
+        print(
+            json.dumps(
+                {
+                    "dry_run": True,
+                    "total_bytes_processed": scanned,
+                    "human_readable": format_bytes(scanned),
+                    "exceeds_limit": scanned > limit,
+                    "limit_gb": int(args.max_gb) if args.max_gb.is_integer() else args.max_gb,
+                }
+            )
+        )
+        return
+    config = bigquery.QueryJobConfig(maximum_bytes_billed=limit, use_legacy_sql=False, query_parameters=parameters)
+    for row in client.query(sql, job_config=config).result():
+        print(json.dumps(dict(row), default=str))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         sql = inject_placeholders(args.query, args.project, args.dataset, args.table)
+        if args.quota_project is not None and not PROJECT_PATTERN.fullmatch(args.quota_project):
+            raise ValueError(f"{args.quota_project!r} is not a project id")
     except ValueError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
@@ -359,33 +409,60 @@ def main(argv: list[str] | None = None) -> int:
         message=r"Your application has authenticated using end user credentials from Google Cloud SDK without a quota project.*",
         category=UserWarning,
     )
+    dry_label = " (dry-run)" if args.dry_run else ""
+    parameters = build_query_parameters(bigquery, args)
+    client_kwargs: dict = {"project": args.project}
+    if args.quota_project:
+        client_kwargs["client_options"] = {"quota_project_id": args.quota_project}
     try:
-        client = bigquery.Client(project=args.project)
-        parameters = build_query_parameters(bigquery, args)
-        if args.dry_run:
-            config = bigquery.QueryJobConfig(
-                dry_run=True, use_query_cache=False, use_legacy_sql=False, query_parameters=parameters
-            )
-            scanned = client.query(sql, job_config=config).total_bytes_processed
-            print(
-                json.dumps(
-                    {
-                        "dry_run": True,
-                        "total_bytes_processed": scanned,
-                        "human_readable": format_bytes(scanned),
-                        "exceeds_limit": scanned > limit,
-                        "limit_gb": int(args.max_gb) if args.max_gb.is_integer() else args.max_gb,
-                    }
-                )
-            )
-            return 0
-        config = bigquery.QueryJobConfig(maximum_bytes_billed=limit, use_legacy_sql=False, query_parameters=parameters)
-        for row in client.query(sql, job_config=config).result():
-            print(json.dumps(dict(row), default=str))
+        client = bigquery.Client(**client_kwargs)
+        _execute_query(bigquery, client, sql, parameters, limit, args)
+        return 0
     except Exception as error:  # the client's errors: auth, access, a bad query, the limit
-        print(f"ERROR{' (dry-run)' if args.dry_run else ''}: {error}", file=sys.stderr)
+        if not QUOTA_403_RE.search(str(error)):
+            print(f"ERROR{dry_label}: {error}", file=sys.stderr)
+            return 1
+        if args.quota_project:
+            print(
+                f"ERROR{dry_label}: {error}\n"
+                f"HINT: explicit quota project {args.quota_project!r} requires "
+                f"serviceusage.services.use (roles/serviceusage.serviceUsageConsumer) on {args.quota_project}.",
+                file=sys.stderr,
+            )
+            return 1
+        had_adc_quota = None
+        stripped_creds = None
+        try:
+            google_auth = load_google_auth()
+            scopes = getattr(getattr(bigquery, "Client", None), "SCOPE", None)
+            creds, _ = google_auth.default(scopes=scopes)
+            had_adc_quota = getattr(creds, "quota_project_id", None)
+            if had_adc_quota and hasattr(creds, "with_quota_project"):
+                stripped_creds = creds.with_quota_project(None)
+        except Exception:
+            stripped_creds = None
+        if stripped_creds is not None:
+            try:
+                retry_client = bigquery.Client(project=args.project, credentials=stripped_creds)
+                _execute_query(bigquery, retry_client, sql, parameters, limit, args)
+                return 0
+            except Exception as retry_error:
+                if QUOTA_403_RE.search(str(retry_error)):
+                    print(
+                        f"ERROR{dry_label}: {retry_error}\n"
+                        f"HINT: ADC quota project {had_adc_quota!r} was denied and retrying without a quota project still failed; "
+                        f"pass --quota-project {args.project} or set GOOGLE_CLOUD_QUOTA_PROJECT={args.project} if your organization requires a billing quota project.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"ERROR{dry_label}: {retry_error}", file=sys.stderr)
+                return 1
+        print(
+            f"ERROR{dry_label}: {error}\n"
+            f"HINT: pass --quota-project {args.project} or set GOOGLE_CLOUD_QUOTA_PROJECT={args.project} if your organization requires a billing quota project.",
+            file=sys.stderr,
+        )
         return 1
-    return 0
 
 
 if __name__ == "__main__":

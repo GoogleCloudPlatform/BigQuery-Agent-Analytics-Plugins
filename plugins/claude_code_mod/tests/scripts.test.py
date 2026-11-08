@@ -178,7 +178,7 @@ run_bq = load('run_bq')
 class FakeBigQuery:
     """Stands in for the google.cloud.bigquery module, and keeps what run_bq asks of it."""
 
-    def __init__(self, rows=(), scanned=0, error=None):
+    def __init__(self, rows=(), scanned=0, error=None, on_query=None):
         self.clients, self.queries, self.fetched = [], [], 0
         outer = self
 
@@ -190,12 +190,16 @@ class FakeBigQuery:
                 return iter(list(rows))
 
         class Client:
-            def __init__(self, project=None):
+            def __init__(self, project=None, credentials=None, client_options=None):
                 self.project = project
+                self.credentials = credentials
+                self.client_options = client_options
                 outer.clients.append(self)
 
             def query(self, sql, job_config=None):
                 outer.queries.append((sql, job_config))
+                if on_query is not None:
+                    on_query(self, sql, job_config)
                 if error:
                     raise RuntimeError(error)
                 return Job()
@@ -442,7 +446,7 @@ def run_bq_checks():
             orig_client = self.Client
 
             class WarnClient(orig_client):
-                def __init__(self, project=None):
+                def __init__(self, project=None, credentials=None, client_options=None):
                     import warnings as _w
                     _w.warn(
                         'Your application has authenticated using end user credentials from Google Cloud SDK '
@@ -450,17 +454,149 @@ def run_bq_checks():
                         UserWarning,
                         stacklevel=2,
                     )
-                    super().__init__(project=project)
+                    super().__init__(project=project, credentials=credentials, client_options=client_options)
 
             self.Client = WarnClient
 
     status, out, err = run_bq_with(QuotaWarningBigQuery(), *base, '--query', '1')
     check('run_bq suppresses the Google Cloud SDK ADC quota-project UserWarning on stderr',
           status == 0 and 'without a quota project' not in err and err == '', f'{status} {err!r}')
+
+    # --quota-project, GOOGLE_CLOUD_QUOTA_PROJECT, and 403 ADC quota-project fallback.
+    class FakeCreds:
+        def __init__(self, quota_project_id):
+            self.quota_project_id = quota_project_id
+
+        def with_quota_project(self, quota_project_id):
+            return FakeCreds(quota_project_id)
+
+    def make_fake_google_auth(adc_quota_project):
+        calls = []
+        auth_mod = types.ModuleType('google.auth')
+
+        def default(scopes=None):
+            calls.append(scopes)
+            return FakeCreds(adc_quota_project), 'adc-default-proj'
+
+        auth_mod.default = default
+        google_pkg = types.ModuleType('google')
+        google_pkg.auth = auth_mod
+        return {'google': google_pkg, 'google.auth': auth_mod}, calls
+
+    # Default run never forces client_options.quota_project_id=args.project.
+    fake = FakeBigQuery(rows=[{'ok': 1}])
+    status, out, err = run_bq_with(fake, *base, 'SELECT 1')
+    check('default run leaves client_options and credentials unset (never forces --project as quota project)',
+          status == 0 and len(fake.clients) == 1
+          and fake.clients[0].client_options is None and fake.clients[0].credentials is None,
+          f'{status} {err!r}')
+
+    # Empty GOOGLE_CLOUD_QUOTA_PROJECT is treated as unset.
+    fake = FakeBigQuery(rows=[{'ok': 1}])
+    status, out, err = run_bq_with(fake, *base, 'SELECT 1', GOOGLE_CLOUD_QUOTA_PROJECT='')
+    check('empty GOOGLE_CLOUD_QUOTA_PROJECT is treated as unset',
+          status == 0 and fake.clients[0].client_options is None, f'{status} {err!r}')
+
+    # Non-empty GOOGLE_CLOUD_QUOTA_PROJECT sets client_options, and --quota-project overrides it.
+    fake = FakeBigQuery(rows=[{'ok': 1}])
+    status, out, err = run_bq_with(fake, *base, 'SELECT 1', GOOGLE_CLOUD_QUOTA_PROJECT='env-quota-proj')
+    check('GOOGLE_CLOUD_QUOTA_PROJECT sets client_options.quota_project_id',
+          status == 0 and fake.clients[0].client_options == {'quota_project_id': 'env-quota-proj'},
+          f'{status} {fake.clients[0].client_options!r} {err!r}')
+    fake = FakeBigQuery(rows=[{'ok': 1}])
+    status, out, err = run_bq_with(fake, *base, '--quota-project', 'flag-quota-proj', 'SELECT 1',
+                                   GOOGLE_CLOUD_QUOTA_PROJECT='env-quota-proj')
+    check('--quota-project overrides GOOGLE_CLOUD_QUOTA_PROJECT',
+          status == 0 and fake.clients[0].client_options == {'quota_project_id': 'flag-quota-proj'},
+          f'{status} {fake.clients[0].client_options!r} {err!r}')
+
+    # Invalid --quota-project / GOOGLE_CLOUD_QUOTA_PROJECT fails with exit 1 before creating a client.
+    for what, argv, env_vars in (
+        ('bad --quota-project', ['--quota-project', 'Bad_Quota', 'SELECT 1'], {}),
+        ('empty --quota-project', ['--quota-project', '', 'SELECT 1'], {}),
+        ('bad GOOGLE_CLOUD_QUOTA_PROJECT', ['SELECT 1'], {'GOOGLE_CLOUD_QUOTA_PROJECT': 'not valid'}),
+    ):
+        fake = FakeBigQuery()
+        status, out, err = run_bq_with(fake, *base, *argv, **env_vars)
+        check(f'{what}: exit 1 before any client is made',
+              status == 1 and 'not a project id' in err and fake.clients == [], f'{status} {err!r}')
+
+    # 403 USER_PROJECT_DENIED triggers single retry with credentials.with_quota_project(None).
+    def deny_adc_quota(client, sql, job_config):
+        if client.credentials is None:
+            raise RuntimeError(
+                '403 POST https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/jobs: '
+                'Caller does not have required permission to use project vertex-proj (USER_PROJECT_DENIED)'
+            )
+
+    fake = FakeBigQuery(rows=[{'n': 7}], on_query=deny_adc_quota)
+    fake_auth_mods, auth_calls = make_fake_google_auth('vertex-proj')
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, 'SELECT 1')
+    check('403 USER_PROJECT_DENIED with ADC quota project retries once with with_quota_project(None) and succeeds',
+          status == 0 and len(fake.clients) == 2
+          and fake.clients[0].credentials is None
+          and fake.clients[1].credentials is not None
+          and fake.clients[1].credentials.quota_project_id is None
+          and len(auth_calls) == 1
+          and json.loads(out) == {'n': 7} and err == '',
+          f'{status} clients={len(fake.clients)} out={out!r} err={err!r}')
+
+    # Same 403 retry also succeeds under --dry-run.
+    fake = FakeBigQuery(scanned=2048, on_query=deny_adc_quota)
+    fake_auth_mods, _ = make_fake_google_auth('vertex-proj')
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, '--dry-run', 'SELECT 1')
+    check('403 USER_PROJECT_DENIED retry also succeeds under --dry-run',
+          status == 0 and len(fake.clients) == 2 and json.loads(out)['total_bytes_processed'] == 2048 and err == '',
+          f'{status} {out!r} {err!r}')
+
+    # Explicit --quota-project or GOOGLE_CLOUD_QUOTA_PROJECT bypasses ADC fallback on 403.
+    fake = FakeBigQuery(
+        error='403 Caller does not have required permission to use project bad-qp (serviceusage.services.use)'
+    )
+    fake_auth_mods, auth_calls = make_fake_google_auth('vertex-proj')
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, '--quota-project', 'bad-qp', 'SELECT 1')
+    check('explicit --quota-project does not strip on 403 and hints serviceusage.services.use',
+          status == 1 and len(fake.clients) == 1 and auth_calls == []
+          and 'ERROR:' in err and 'serviceusage.services.use' in err,
+          f'{status} clients={len(fake.clients)} {err!r}')
+
+    # ADC without quota_project_id makes no duplicate retry on 403.
+    fake = FakeBigQuery(error='403 USER_PROJECT_DENIED: permission to use project missing')
+    fake_auth_mods, auth_calls = make_fake_google_auth(None)
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, 'SELECT 1')
+    check('403 when ADC has no quota_project_id makes no retry and hints --quota-project',
+          status == 1 and len(fake.clients) == 1 and len(auth_calls) == 1
+          and '--quota-project my-gcp-project' in err,
+          f'{status} clients={len(fake.clients)} {err!r}')
+
+    # Stripped retry also failing with 403 surfaces hint without retrying a second time.
+    fake = FakeBigQuery(error='403 USER_PROJECT_DENIED: caller lacks serviceusage.services.use')
+    fake_auth_mods, auth_calls = make_fake_google_auth('vertex-proj')
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, 'SELECT 1')
+    check('403 on stripped retry stops after 1 retry and names GOOGLE_CLOUD_QUOTA_PROJECT',
+          status == 1 and len(fake.clients) == 2 and len(auth_calls) == 1
+          and 'GOOGLE_CLOUD_QUOTA_PROJECT=my-gcp-project' in err,
+          f'{status} clients={len(fake.clients)} {err!r}')
+
+    # Non-quota errors fail immediately without calling google.auth or retrying.
+    fake = FakeBigQuery(error='404 Not found: Table my-gcp-project:agent_analytics.agent_events')
+    fake_auth_mods, auth_calls = make_fake_google_auth('vertex-proj')
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, 'SELECT 1')
+    check('non-quota 404 error fails immediately without google.auth lookup or retry',
+          status == 1 and len(fake.clients) == 1 and auth_calls == [] and 'ERROR: 404 Not found' in err,
+          f'{status} clients={len(fake.clients)} {err!r}')
+
     with environment(), modules(NO_CLIENT):
         status, out, err = call(run_bq.main, '--help')
-    check('--help needs no BigQuery client and documents --query and set-quota-project',
-          status == 0 and '--max-gb' in out and '--query' in out and 'set-quota-project' in out.replace('-\n', '-'),
+    check('--help needs no BigQuery client and documents --query, --quota-project and set-quota-project',
+          status == 0 and '--max-gb' in out and '--query' in out
+          and '--quota-project' in out and 'set-quota-project' in out.replace('-\n', '-'),
           f'{status} {out!r} {err!r}')
     with environment(), modules(NO_CLIENT):
         status, out, err = call(run_bq.main, *base, 'SELECT 1')

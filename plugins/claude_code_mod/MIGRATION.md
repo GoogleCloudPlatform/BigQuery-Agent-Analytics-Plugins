@@ -31,7 +31,11 @@ write the same events, so with both on, every event is written twice.
    Rows the earlier install left on disk (`~/.bqaa-mod/dead-letter`) are
    sent by this one: the folder and its format are the same.
 4. Check: `/bqaa-status` names your table, with no `notice` line, and
-   `/plugin` lists one mod.
+   `/plugin` lists one mod. When querying rows later with `scripts/run_bq.py`
+   across projects, if your ADC default quota project lacks
+   `serviceusage.services.use` (`403 USER_PROJECT_DENIED`), `run_bq.py` retries
+   once without the ADC quota project automatically, or you can pass
+   `--quota-project` / `GOOGLE_CLOUD_QUOTA_PROJECT`.
 
 ## From the SDK repository's marketplace
 

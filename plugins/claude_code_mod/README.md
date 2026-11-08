@@ -208,7 +208,7 @@ GROUP BY event_type
 ORDER BY row_count DESC;
 ```
 
-See [`sql/sample_queries.sql`](sql/sample_queries.sql) for query templates (fill in `{PROJECT}`, `{DATASET}`, and `{TABLE}`), and [`docs/value.md`](docs/value.md) (with [`sql/value_queries.sql`](sql/value_queries.sql)) for team adoption and cost estimates. [`scripts/run_bq.py`](scripts/run_bq.py) fills those placeholders in, binds `@start`, `@end` (defaulting to the last 7 UTC days when referenced and omitted), and `@trace_id` (required when referenced, such as query 6), and runs one query with a billing limit (`--dry-run` first estimates the bytes it would scan).
+See [`sql/sample_queries.sql`](sql/sample_queries.sql) for query templates (fill in `{PROJECT}`, `{DATASET}`, and `{TABLE}`), and [`docs/value.md`](docs/value.md) (with [`sql/value_queries.sql`](sql/value_queries.sql)) for team adoption and cost estimates. [`scripts/run_bq.py`](scripts/run_bq.py) fills those placeholders in, binds `@start`, `@end` (defaulting to the last 7 UTC days when referenced and omitted), and `@trace_id` (required when referenced, such as query 6), and runs one query with a billing limit (`--dry-run` first estimates the bytes it would scan). If your Application Default Credentials carry a quota project that lacks `serviceusage.services.use` on another project you are querying (`403 USER_PROJECT_DENIED`), `run_bq.py` automatically retries once without the ADC quota project; pass `--quota-project PROJECT` (or set `GOOGLE_CLOUD_QUOTA_PROJECT`) when an explicit billing quota project is required.
 
 ### Sample rows
 
