@@ -74,13 +74,15 @@ Set options with `--config key=value` at install time, `/plugin configure`, `/co
 | `location` | `BQAA_LOCATION` | `US` | Dataset location shown in `/bqaa-status` and its generated `setup.sh` command (manual `setup.sh` runs read `BQAA_LOCATION` from the environment). |
 | `enabled` | `BQAA_TRACE_ENABLED` (one-way disable: `false`/`0`/`no`/`off`) | `true` | Turn event capture on or off without uninstalling. |
 | `dryRun` | `BQAA_DRY_RUN` (one-way enable: `true`/`1`/`yes`/`on`) | `false` | Write JSONL batches locally to `<deadLetterDir>/../dry-run/` instead of BigQuery (a dry-run file can contain the same `event_id` twice if a session ends mid-write). |
-| `maxPayloadChars` | — | `16384` (`1024`–`500000`) | Max characters per JSON payload column (`content`, `attributes`); excess sets `is_truncated = true`. |
-| `flushIntervalMs` | — | `5000` (`1000`–`300000`) | How often (ms) the background writer flushes queued rows. |
+| `maxPayloadChars` | — | `16384` (`1024`–`500000`) | Max characters per JSON payload column (`content`, `attributes`); excess sets `is_truncated = true`. Out-of-range numbers clamp to `1024`–`500000` and non-numeric values fall back to `16384` with a `config notice:` in `/bqaa-status`. |
+| `flushIntervalMs` | — | `5000` (`1000`–`300000`) | How often (ms) the background writer flushes queued rows. Out-of-range numbers clamp to `1000`–`300000` and non-numeric values fall back to `5000` with a `config notice:` in `/bqaa-status`. |
 | `deadLetterDir` | `BQAA_DEAD_LETTER_DIR` | `~/.bqaa-mod/dead-letter` | Local directory for unsent JSONL batches, partitioned per `<project.dataset.table>`. |
 | `agentName` | `BQAA_AGENT_NAME` | `coding-agent` | Value written to the `agent` column on main-loop events. |
 | `accessTokenCommand` | `BQAA_ACCESS_TOKEN_COMMAND` | `gcloud auth application-default print-access-token` | Command (argv, no shell) that prints a Google OAuth access token. |
 | `userIdFromCredentials` | — | `false` | Opt-in: set `user_id` to the verified email of the access token's account. Leave off for team setups using service-account impersonation, or every row will record the service account's email. |
 | `recordHostname` | — | `false` | Opt-in: include this machine's hostname in `session_metadata.host_name`. |
+
+String-encoded boolean or numeric `userConfig` values (for example `"false"` or `"5000"`) coerce cleanly, while invalid values fall back to their defaults; clamped, coerced, or invalid options emit a `config notice:` line in `/bqaa-status` and the debug log.
 
 Advanced tuning (environment variables only):
 

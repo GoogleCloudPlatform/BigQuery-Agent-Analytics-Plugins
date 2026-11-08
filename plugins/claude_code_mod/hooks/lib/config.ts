@@ -99,12 +99,88 @@ export type Config = {
   recordHostname: boolean
   // Why rows will not reach BigQuery, if anything stops them.
   problems: string[]
+  // Non-fatal configuration notices (clamped numbers, coerced strings,
+  // or invalid values that fell back to defaults).
+  warnings: readonly string[]
 }
 
-const clampInt = (value: unknown, fallback: number, min: number, max: number): number => {
-  const n = typeof value === 'number' ? value : Number(value)
+const formatOptionValue = (value: unknown): string => {
+  if (typeof value === 'string') return JSON.stringify(value.slice(0, 64)).replace(/[\r\n]+/g, ' ')
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (value === null) return 'null'
+  try {
+    return (JSON.stringify(value) ?? String(value)).slice(0, 64).replace(/[\r\n]+/g, ' ')
+  } catch {
+    return String(value).slice(0, 64).replace(/[\r\n]+/g, ' ')
+  }
+}
+
+const clampEnvInt = (value: string | undefined, fallback: number, min: number, max: number): number => {
+  if (value === undefined) return fallback
+  const trimmed = value.trim()
+  if (trimmed === '') return fallback
+  const n = Number(trimmed)
   if (!Number.isFinite(n)) return fallback
   return Math.min(max, Math.max(min, Math.round(n)))
+}
+
+const readIntOption = (
+  name: string,
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+  warnings: string[],
+): number => {
+  if (value === undefined) return fallback
+  if (typeof value !== 'number' && typeof value !== 'string') {
+    warnings.push(`option ${name} (${formatOptionValue(value)}) is not a number; using default ${fallback}`)
+    return fallback
+  }
+  const fromString = typeof value === 'string'
+  const raw = fromString ? value.trim() : value
+  if (fromString && raw === '') {
+    warnings.push(`option ${name} ("") is not a valid number; using default ${fallback}`)
+    return fallback
+  }
+  const n = fromString ? Number(raw) : (raw as number)
+  if (!Number.isFinite(n)) {
+    warnings.push(`option ${name} (${formatOptionValue(value)}) is not a finite number; using default ${fallback}`)
+    return fallback
+  }
+  const rounded = Math.round(n)
+  const clamped = Math.min(max, Math.max(min, rounded))
+  if (clamped !== rounded) {
+    warnings.push(`option ${name} (${formatOptionValue(value)}) is outside ${min}-${max}; clamped to ${clamped}`)
+  } else if (fromString) {
+    warnings.push(`option ${name} (${formatOptionValue(value)}) coerced from string to number ${clamped}`)
+  } else if (rounded !== n) {
+    warnings.push(`option ${name} (${n}) rounded to integer ${clamped}`)
+  }
+  return clamped
+}
+
+const isFalse = (value: string | undefined): boolean =>
+  value !== undefined && ['false', '0', 'no', 'off'].includes(value.trim().toLowerCase())
+
+const isTrue = (value: string | undefined): boolean =>
+  value !== undefined && ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase())
+
+const readBoolOption = (name: string, value: unknown, fallback: boolean, warnings: string[]): boolean => {
+  if (value === undefined) return fallback
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') {
+    if (isTrue(value)) {
+      warnings.push(`option ${name} (${formatOptionValue(value)}) coerced from string to boolean true`)
+      return true
+    }
+    if (isFalse(value)) {
+      warnings.push(`option ${name} (${formatOptionValue(value)}) coerced from string to boolean false`)
+      return false
+    }
+  }
+  warnings.push(`option ${name} (${formatOptionValue(value)}) is not a valid boolean; using default ${fallback}`)
+  return fallback
 }
 
 const text = (value: unknown): string => (typeof value === 'string' ? value.trim() : '')
@@ -116,12 +192,6 @@ const firstSet = (...values: (string | undefined)[]): string => {
   }
   return ''
 }
-
-const isFalse = (value: string | undefined): boolean =>
-  value !== undefined && ['false', '0', 'no', 'off'].includes(value.trim().toLowerCase())
-
-const isTrue = (value: string | undefined): boolean =>
-  value !== undefined && ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase())
 
 // Splits a command line into argv: whitespace separated, with '...' and "..."
 // quoting. No shell: `$.process.run` takes argv and runs no shell.
@@ -165,6 +235,7 @@ const parentDir = (dir: string): string => {
 
 export function resolveConfig(options: Options, env: EnvSnapshot): Config {
   const problems: string[] = []
+  const warnings: string[] = []
   const project = firstSet(text(options.project), env.BQAA_PROJECT_ID, env.GCP_PROJECT_ID, env.GOOGLE_CLOUD_PROJECT)
   const dataset = firstSet(text(options.dataset), env.BQAA_DATASET, env.BQ_DATASET)
   const table = firstSet(text(options.table), env.BQAA_TABLE, env.BQ_TABLE, DEFAULT_TABLE)
@@ -176,8 +247,10 @@ export function resolveConfig(options: Options, env: EnvSnapshot): Config {
     home ? joinPath(home, '.bqaa-mod/dead-letter') : '',
   )
   // Kill switch and dry-run switch, as the tracing plugin spells them.
-  const enabled = options.enabled !== false && !isFalse(env.BQAA_TRACE_ENABLED)
-  const dryRun = options.dryRun === true || isTrue(env.BQAA_DRY_RUN)
+  const optEnabled = readBoolOption('enabled', options.enabled, true, warnings)
+  const optDryRun = readBoolOption('dryRun', options.dryRun, false, warnings)
+  const enabled = optEnabled && !isFalse(env.BQAA_TRACE_ENABLED)
+  const dryRun = optDryRun || isTrue(env.BQAA_DRY_RUN)
 
   if (!dryRun && (project === '' || dataset === '')) {
     problems.push('project and dataset are not set (userConfig project/dataset or BQAA_PROJECT_ID/BQAA_DATASET)')
@@ -196,17 +269,17 @@ export function resolveConfig(options: Options, env: EnvSnapshot): Config {
     location,
     agentName: firstSet(text(options.agentName), env.BQAA_AGENT_NAME, DEFAULT_AGENT_NAME),
     userId: firstSet(env.BQAA_USER_ID, env.USER, env.USERNAME, 'local-user'),
-    maxPayloadChars: clampInt(options.maxPayloadChars, 16384, 1024, 500_000),
-    flushIntervalMs: clampInt(options.flushIntervalMs, 5000, 1000, 300_000),
-    requestTimeoutMs: clampInt(env.BQAA_REQUEST_TIMEOUT_MS, 10_000, 1000, 30_000),
-    maxQueueRows: clampInt(env.BQAA_MAX_QUEUE_ROWS, 5000, 10, 100_000),
+    maxPayloadChars: readIntOption('maxPayloadChars', options.maxPayloadChars, 16384, 1024, 500_000, warnings),
+    flushIntervalMs: readIntOption('flushIntervalMs', options.flushIntervalMs, 5000, 1000, 300_000, warnings),
+    requestTimeoutMs: clampEnvInt(env.BQAA_REQUEST_TIMEOUT_MS, 10_000, 1000, 30_000),
+    maxQueueRows: clampEnvInt(env.BQAA_MAX_QUEUE_ROWS, 5000, 10, 100_000),
     maxQueueBytes: 8 * 1024 * 1024,
     maxBatchRows: 500,
     // `$.http.fetch` refuses a request body over 4 MiB, counted in
     // characters; UTF-8 bytes are never fewer, so this stays well under it.
     maxBatchBytes: 3 * 1024 * 1024,
     maxRetries: 3,
-    exitFlushMs: clampInt(env.BQAA_EXIT_FLUSH_MS, 800, 0, 1200),
+    exitFlushMs: clampEnvInt(env.BQAA_EXIT_FLUSH_MS, 800, 0, 1200),
     deadLetterDir,
     deadLetterDirIsDefault: text(options.deadLetterDir) === '' && (env.BQAA_DEAD_LETTER_DIR ?? '').trim() === '' && home !== '',
     dryRunDir: deadLetterDir ? joinPath(parentDir(deadLetterDir), 'dry-run') : '',
@@ -216,9 +289,10 @@ export function resolveConfig(options: Options, env: EnvSnapshot): Config {
     tokenTtlMs: 45 * 60 * 1000,
     autoCreateTable: !isFalse(env.BQAA_AUTO_CREATE_TABLE),
     autoBackfill: !isFalse(env.BQAA_AUTO_BACKFILL),
-    userIdFromCredentials: options.userIdFromCredentials === true,
-    recordHostname: options.recordHostname === true,
+    userIdFromCredentials: readBoolOption('userIdFromCredentials', options.userIdFromCredentials, false, warnings),
+    recordHostname: readBoolOption('recordHostname', options.recordHostname, false, warnings),
     problems,
+    warnings,
   }
 }
 

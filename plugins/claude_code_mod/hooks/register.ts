@@ -989,6 +989,7 @@ export const register: Register = (on, registered) => {
         }
       }
       for (const problem of config.problems) $.ui.log(clean(`bqaa: ${problem}`), { to: 'debug' })
+      for (const warning of config.warnings) $.ui.log(clean(`bqaa: config notice: ${warning}`), { to: 'debug' })
     } catch (err) {
       internalErrors += 1
       $.ui.log(clean(`bqaa: setup failed, rows are not sent: ${errorText(err)}`), { to: 'debug' })

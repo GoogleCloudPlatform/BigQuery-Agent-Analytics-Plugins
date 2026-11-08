@@ -56,18 +56,14 @@
     "maxPayloadChars": {
       "type": "number",
       "title": "Max payload size (characters)",
-      "description": "Cap for each JSON payload column (content, attributes); longer payloads are cut and the row marked is_truncated.",
-      "default": 16384,
-      "min": 1024,
-      "max": 500000
+      "description": "Cap for each JSON payload column (content, attributes) (1024-500000); longer payloads are cut and the row marked is_truncated.",
+      "default": 16384
     },
     "flushIntervalMs": {
       "type": "number",
       "title": "Flush interval (ms)",
-      "description": "How often the background writer sends queued rows.",
-      "default": 5000,
-      "min": 1000,
-      "max": 300000
+      "description": "How often the background writer sends queued rows, in ms (1000-300000).",
+      "default": 5000
     },
     "deadLetterDir": {
       "type": "string",

@@ -333,6 +333,125 @@ test('configuration: userConfig wins, then BQAA_* variables, then defaults', () 
   expect(resolveConfig({ project: '', dataset: 'agent_analytics' }, envWithNewProject).project).toBe('new-project')
 })
 
+test('configuration: out-of-range numbers clamp, string booleans/numbers coerce, invalid options fall back, and warnings are emitted', () => {
+  // Valid native options emit no warnings.
+  expect(
+    resolveConfig(
+      {
+        project: 'p1',
+        dataset: 'd1',
+        enabled: true,
+        dryRun: false,
+        maxPayloadChars: 16384,
+        flushIntervalMs: 5000,
+        userIdFromCredentials: false,
+        recordHostname: false,
+      },
+      { HOME: '/h' },
+    ).warnings,
+  ).toEqual([])
+
+  // Out-of-range numbers clamp with warnings.
+  const lowHigh = resolveConfig({ project: 'p1', dataset: 'd1', maxPayloadChars: 100, flushIntervalMs: 9e9 }, { HOME: '/h' })
+  expect(lowHigh.maxPayloadChars).toBe(1024)
+  expect(lowHigh.flushIntervalMs).toBe(300_000)
+  expect(lowHigh.warnings).toEqual([
+    'option maxPayloadChars (100) is outside 1024-500000; clamped to 1024',
+    'option flushIntervalMs (9000000000) is outside 1000-300000; clamped to 300000',
+  ])
+
+  // Non-numeric / empty / non-finite numbers fall back to defaults with warnings (never silently clamping '' to min).
+  const badNumbers = resolveConfig(
+    {
+      project: 'p1',
+      dataset: 'd1',
+      maxPayloadChars: '' as unknown as number,
+      flushIntervalMs: 'abc' as unknown as number,
+    },
+    { HOME: '/h' },
+  )
+  expect(badNumbers.maxPayloadChars).toBe(16384)
+  expect(badNumbers.flushIntervalMs).toBe(5000)
+  expect(badNumbers.warnings.length).toBe(2)
+  expect(badNumbers.warnings[0]).toContain('maxPayloadChars')
+  expect(badNumbers.warnings[1]).toContain('flushIntervalMs')
+
+  const nonFinite = resolveConfig(
+    {
+      project: 'p1',
+      dataset: 'd1',
+      maxPayloadChars: Number.NaN,
+      flushIntervalMs: true as unknown as number,
+    },
+    { HOME: '/h' },
+  )
+  expect(nonFinite.maxPayloadChars).toBe(16384)
+  expect(nonFinite.flushIntervalMs).toBe(5000)
+  expect(nonFinite.warnings.length).toBe(2)
+
+  // String numbers coerce (and clamp if out of bounds); fractional numbers round.
+  const strNums = resolveConfig(
+    {
+      project: 'p1',
+      dataset: 'd1',
+      maxPayloadChars: '8192' as unknown as number,
+      flushIntervalMs: 1500.6,
+    },
+    { HOME: '/h' },
+  )
+  expect(strNums.maxPayloadChars).toBe(8192)
+  expect(strNums.flushIntervalMs).toBe(1501)
+  expect(strNums.warnings).toEqual([
+    'option maxPayloadChars ("8192") coerced from string to number 8192',
+    'option flushIntervalMs (1500.6) rounded to integer 1501',
+  ])
+
+  // String booleans coerce ("false" disables enabled, "true" enables dryRun/flags) and invalid booleans fall back to default.
+  const strFalse = resolveConfig({ project: 'p1', dataset: 'd1', enabled: 'false' as unknown as boolean }, { HOME: '/h' })
+  expect(strFalse.enabled).toBe(false)
+  expect(strFalse.warnings).toEqual(['option enabled ("false") coerced from string to boolean false'])
+
+  const strBools = resolveConfig(
+    {
+      project: 'p1',
+      dataset: 'd1',
+      dryRun: 'true' as unknown as boolean,
+      userIdFromCredentials: 'YES' as unknown as boolean,
+      recordHostname: '0' as unknown as boolean,
+    },
+    { HOME: '/h' },
+  )
+  expect(strBools.dryRun).toBe(true)
+  expect(strBools.userIdFromCredentials).toBe(true)
+  expect(strBools.recordHostname).toBe(false)
+  expect(strBools.warnings.length).toBe(3)
+
+  const badBools = resolveConfig(
+    {
+      project: 'p1',
+      dataset: 'd1',
+      enabled: 'maybe' as unknown as boolean,
+      dryRun: 123 as unknown as boolean,
+      userIdFromCredentials: '' as unknown as boolean,
+    },
+    { HOME: '/h' },
+  )
+  expect(badBools.enabled).toBe(true)
+  expect(badBools.dryRun).toBe(false)
+  expect(badBools.userIdFromCredentials).toBe(false)
+  expect(badBools.warnings.length).toBe(3)
+
+  // Empty numeric env vars fall back to defaults instead of coercing "" -> 0.
+  const emptyEnv = resolveConfig(
+    { project: 'p1', dataset: 'd1' },
+    { HOME: '/h', BQAA_EXIT_FLUSH_MS: '', BQAA_REQUEST_TIMEOUT_MS: '', BQAA_MAX_QUEUE_ROWS: '' },
+  )
+  expect(emptyEnv.exitFlushMs).toBe(800)
+  expect(emptyEnv.requestTimeoutMs).toBe(10_000)
+  expect(emptyEnv.maxQueueRows).toBe(5000)
+  expect(emptyEnv.warnings).toEqual([])
+})
+
 test('the token command is split into argv without a shell', () => {
   expect(splitArgv('gcloud auth print-access-token --impersonate-service-account=bqaa@p.iam.gserviceaccount.com')).toEqual([
     'gcloud',

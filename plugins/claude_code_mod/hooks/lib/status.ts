@@ -148,5 +148,6 @@ export function formatStatus(args: {
   }
   lines.push(`redactions ${k.redactions}, truncated rows ${k.truncatedRows}; session ${args.sessionId ?? 'unknown'}`)
   for (const problem of c.problems) lines.push(`problem: ${problem}`)
+  for (const warning of c.warnings) lines.push(`config notice: ${warning}`)
   return redactDiagnostic(lines.join('\n'), 8000)
 }
