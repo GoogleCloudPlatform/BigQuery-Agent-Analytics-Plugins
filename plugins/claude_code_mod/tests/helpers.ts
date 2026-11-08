@@ -87,6 +87,8 @@ export type World = {
   store: Map<string, unknown>
   // The slash commands the mod registered.
   registered: string[]
+  // Lines the mod wrote to standard error (a `-p` run's notice).
+  stderr: string[]
 }
 
 export type Row = {
@@ -198,7 +200,10 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     },
     store: new Map(Object.entries(store).map(([key, value]) => [key, asJson(value)])),
     registered: [],
+    stderr: [],
   }
+  // Standard error, as the mod writes it, kept here rather than printed.
+  ;(globalThis as { __bqaaStderr?: (line: string) => void }).__bqaaStderr = line => world.stderr.push(line)
 
   on('store.get', ($, e) => ({ value: world.store.get(e.key) }))
   // As the host, a store of no more than 4 MiB of JSON in all.

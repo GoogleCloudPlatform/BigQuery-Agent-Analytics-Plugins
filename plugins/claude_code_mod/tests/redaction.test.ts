@@ -18,9 +18,9 @@
 // built at run time and has no known credential shape: only the key it sits
 // under, or the JSON it sits in, can give it away.
 
-import { expect, test } from 'claude-code/testing'
+import { type Engine, expect, test } from 'claude-code/testing'
 
-import { COMMAND, OPTIONS, type Row, type World, deadLetterFiles, deadLetterRows, setUp, startSession } from './helpers.ts'
+import { COMMAND, OPTIONS, type Row, type World, byType, deadLetterFiles, deadLetterRows, setUp, startSession } from './helpers.ts'
 
 const CANARY = ['canary', 'value', 'r'.repeat(12)].join('-')
 const REFUSED = { status: 403, text: '{"error":{"message":"permission denied","errors":[{"reason":"accessDenied"}]}}' }
@@ -180,4 +180,177 @@ test('/bqaa-status shows truncated rows when a row loses text past a credential 
   }
   const status = (await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })).text ?? ''
   expect(status).toMatch(/truncated rows [1-9]/)
+})
+
+test('single-line credential tail cuts mark row.is_truncated and record attributes.redaction { values, dropped_chars }, while pure value redactions keep is_truncated false', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  const tailCutCases: [string, string, number, number][] = [
+    ["It's done: --password=hunter2 and then line three", "It's done: --password=[REDACTED]", 1, ' and then line three'.length],
+    ['echo --password=hunter2 https://bob:s3cret@example.com && cat does-not-exist.txt', 'echo --password=[REDACTED]', 2, ' https://bob:s3cret@example.com && cat does-not-exist.txt'.length],
+    ['mysql -u root --password=hunter2 mydb -e "SELECT 1"', 'mysql -u root --password=[REDACTED]', 1, ' mydb -e "SELECT 1"'.length],
+    ['curl -H "Authorization: Bearer secret_token_123456" https://api.example.com/v1/health', 'curl -H "Authorization: [REDACTED]', 1, ' https://api.example.com/v1/health'.length],
+  ]
+  for (const [text] of tailCutCases) {
+    await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+  }
+  const pureValueCases = [
+    'mysql -u root --password=hunter2',
+    'curl -H "Authorization: Bearer secret_token_123456"',
+    'GET https://api.example.test/v1/items?access_token=hunter2&page=2',
+    'ordinary prompt with no secrets at all',
+  ]
+  for (const text of pureValueCases) {
+    await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+  }
+  await world.clock.advance(5000)
+  const sent = world.acceptedRows().filter(r => r.event_type === 'USER_MESSAGE_RECEIVED')
+  expect(sent.length).toBe(tailCutCases.length + pureValueCases.length)
+  for (let i = 0; i < tailCutCases.length; i += 1) {
+    const [, expectedText, expectedValues, expectedDropped] = tailCutCases[i] as [string, string, number, number]
+    const row = sent[i] as Row
+    expect(row.is_truncated).toBe(true)
+    const content = JSON.parse(row.content ?? '{}') as { text_summary: string }
+    expect(content.text_summary).toBe(expectedText)
+    expect(JSON.stringify(row)).not.toContain('hunter2')
+    expect(JSON.stringify(row)).not.toContain('s3cret')
+    expect(JSON.stringify(row)).not.toContain('secret_token_123456')
+    const attrs = JSON.parse(row.attributes ?? '{}') as { redaction?: { values: number; dropped_chars: number } }
+    expect(attrs.redaction).toEqual({ values: expectedValues, dropped_chars: expectedDropped })
+  }
+  const eolRow = sent[tailCutCases.length] as Row
+  expect(eolRow.is_truncated).toBe(false)
+  expect((JSON.parse(eolRow.attributes ?? '{}') as { redaction?: unknown }).redaction).toEqual({ values: 1, dropped_chars: 0 })
+
+  const bearerRow = sent[tailCutCases.length + 1] as Row
+  expect(bearerRow.is_truncated).toBe(false)
+  expect((JSON.parse(bearerRow.attributes ?? '{}') as { redaction?: unknown }).redaction).toEqual({ values: 1, dropped_chars: 0 })
+
+  const urlRow = sent[tailCutCases.length + 2] as Row
+  expect(urlRow.is_truncated).toBe(false)
+  expect((JSON.parse(urlRow.content ?? '{}') as { text_summary: string }).text_summary).toBe('GET https://api.example.test/v1/items?access_token=[REDACTED]&page=2')
+  expect((JSON.parse(urlRow.attributes ?? '{}') as { redaction?: unknown }).redaction).toEqual({ values: 1, dropped_chars: 0 })
+
+  const cleanRow = sent[tailCutCases.length + 3] as Row
+  expect(cleanRow.is_truncated).toBe(false)
+  expect((JSON.parse(cleanRow.attributes ?? '{}') as { redaction?: unknown }).redaction).toBeUndefined()
+})
+
+// A value under a quoted key (JSON, a dict, a here-document) starts outside
+// the key's quote, which closes before the separator: the value's own quote
+// is not a quote around it. Such a value ends at its closing quote, so a
+// pair alone loses nothing, the comma after it is one dropped character
+// (never the secret's length), and an Authorization header whose token a
+// pattern already redacted counts once.
+test('quoted-key JSON pairs: a pair alone is no cut, a dropped comma counts one character, and a JSON Authorization header counts one value', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  const cases: [string, string, boolean, { values: number; dropped_chars: number }][] = [
+    ['"password": "aHVudGVyMg=="', '"password": [REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    ['     3\t  "password": "hunter2-hunter2",', '     3\t  "password": [REDACTED]', true, { values: 1, dropped_chars: 1 }],
+    ['Sent {"Authorization": "Bearer abcdefghijklmnop"} to the API', 'Sent {"Authorization": [REDACTED]', true, { values: 1, dropped_chars: '} to the API'.length }],
+    // In a here-document every quote is unknown to the scan: the key's quote
+    // still closes before the value.
+    ['cat <<EOF > creds.json\n  "password": "hunter2-hunter2",\nEOF', 'cat <<EOF > creds.json\n  "password": [REDACTED]\nEOF', true, { values: 1, dropped_chars: 1 }],
+    ['cat <<EOF > creds.json\n  "password": "hunter2-hunter2"\nEOF', 'cat <<EOF > creds.json\n  "password": [REDACTED]\nEOF', false, { values: 1, dropped_chars: 0 }],
+    // The same header in a log line's escaped JSON.
+    ['log: {\\"Authorization\\": \\"Bearer abcdefghijklmnop\\"} done', 'log: {\\"Authorization\\": [REDACTED]', true, { values: 1, dropped_chars: '} done'.length }],
+    // Inside `$'…'` the quote before the name is still open: the value ends
+    // at the quote that closes it, and the command after it is dropped text.
+    ["printf $'password: hunter2\\n' && echo 'done'", "printf $'password: [REDACTED]", true, { values: 1, dropped_chars: " && echo 'done'".length }],
+  ]
+  for (const [text] of cases) await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+  await world.clock.advance(5000)
+  const sent = byType(world.acceptedRows(), 'USER_MESSAGE_RECEIVED')
+  expect(sent.length).toBe(cases.length)
+  cases.forEach(([text, expectedText, truncated, redaction], i) => {
+    const row = sent[i] as Row
+    const shown = { text, summary: (JSON.parse(row.content ?? '{}') as { text_summary: string }).text_summary, truncated: row.is_truncated, redaction: (JSON.parse(row.attributes ?? '{}') as { redaction?: unknown }).redaction }
+    expect(shown).toEqual({ text, summary: expectedText, truncated, redaction })
+    for (const secret of ['aHVudGVyMg', 'hunter2-hunter2', 'abcdefghijklmnop', 'hunter2']) expect(JSON.stringify(row)).not.toContain(secret)
+  })
+})
+
+// Each prompt as one row; what the row shows, cut and records, prompt by
+// prompt.
+async function promptRows($: Engine, world: World, texts: string[]): Promise<{ text: string; summary: string; truncated: boolean; redaction: unknown }[]> {
+  for (const text of texts) await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+  await world.clock.advance(5000)
+  const sent = byType(world.acceptedRows(), 'USER_MESSAGE_RECEIVED')
+  expect(sent.length).toBe(texts.length)
+  return sent.map((row, i) => ({
+    text: texts[i] as string,
+    summary: (JSON.parse(row.content ?? '{}') as { text_summary: string }).text_summary,
+    truncated: row.is_truncated,
+    redaction: (JSON.parse(row.attributes ?? '{}') as { redaction?: unknown }).redaction,
+  }))
+}
+
+// A value's own quoting, as the shell, YAML or SQL reads it: the quote the
+// value sits in closing right where the value starts (the value is glued on
+// after it), a doubled quote (which goes on with the value), a backslash in
+// single quotes (no escape there), a word glued on after a quoted string,
+// and a JSON comma after one. The text is redacted as it always was; only
+// what follows the value counts as dropped, and never the secret's length.
+test('quoted value edges: an outer quote closing at the value, doubled quotes, a backslash in single quotes and a glued word end the value as the shell or YAML does, and only the text after it counts as dropped', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  const cases: [string, string, boolean, { values: number; dropped_chars: number }][] = [
+    ['curl -H "password: "s3cr3t-v4lue-XYZ', 'curl -H "password: [REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    ["curl -H 'Authorization: Bearer 'abcdef123456SECRET", "curl -H 'Authorization: [REDACTED]", false, { values: 1, dropped_chars: 0 }],
+    ["curl -H 'Authorization: Bearer 'abcdef123456SECRET https://api.example.com", "curl -H 'Authorization: [REDACTED]", true, { values: 1, dropped_chars: ' https://api.example.com'.length }],
+    ["password: 'p@ss''word'", 'password: [REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    ["password: 'it''s' tail", 'password: [REDACTED]', true, { values: 1, dropped_chars: ' tail'.length }],
+    ['password: "abc"def', 'password: [REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    ['password: "abc",', 'password: [REDACTED]', true, { values: 1, dropped_chars: 1 }],
+    ["password: 'abc\\' --verbose", 'password: [REDACTED]', true, { values: 1, dropped_chars: ' --verbose'.length }],
+    // A quoted name and `=`, the value after the quote closes.
+    ['export "DB_PASSWORD="s3cr3tV4lue --verbose', 'export "DB_PASSWORD=[REDACTED]', true, { values: 1, dropped_chars: ' --verbose'.length }],
+    // An auth scheme after the quote the value sat in closes.
+    ['curl -H "Authorization: "Bearer abcdef123456SECRET', 'curl -H "Authorization: [REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    // After a closing quote, a colon ends the value, doubled quote or not.
+    ["password: 'it''s': tail", 'password: [REDACTED]', true, { values: 1, dropped_chars: ': tail'.length }],
+  ]
+  const shown = await promptRows($, world, cases.map(([text]) => text))
+  expect(shown).toEqual(cases.map(([text, summary, truncated, redaction]) => ({ text, summary, truncated, redaction })))
+  for (const secret of ['s3cr3t-v4lue-XYZ', 'abcdef123456SECRET', "p@ss''word", "it''s", 's3cr3tV4lue']) expect(JSON.stringify(world.acceptedRows())).not.toContain(secret)
+})
+
+// `NAME= value`, a blank after the `=`: the named-value rule redacts the
+// value (`NAME= [REDACTED]`) and the list-name rule then drops the blank
+// before the marker, as it always has. The value counts once, and the blank
+// is no dropped text; a real tail still is.
+test('NAME= value with a blank after the = reads NAME=[REDACTED] as before, counts one value, and drops no text but a real tail', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  const cases: [string, string, boolean, { values: number; dropped_chars: number }][] = [
+    ['Set DB_PASSWORD= hunter2', 'Set DB_PASSWORD=[REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    ["Set DB_PASSWORD= 'hunter2' --production", 'Set DB_PASSWORD=[REDACTED]', true, { values: 1, dropped_chars: ' --production'.length }],
+    // A marker with more of its word after it is a value of its own.
+    ['DB_PASSWORD= [REDACTED]:glued_secret', 'DB_PASSWORD=[REDACTED]', false, { values: 1, dropped_chars: 0 }],
+  ]
+  const shown = await promptRows($, world, cases.map(([text]) => text))
+  expect(shown).toEqual(cases.map(([text, summary, truncated, redaction]) => ({ text, summary, truncated, redaction })))
+  for (const secret of ['hunter2', 'glued_secret']) expect(JSON.stringify(world.acceptedRows())).not.toContain(secret)
+})
+
+// `attributes.redaction` is the mod's own record, added after a row is
+// redacted: a key of that name in a tool's payload is not on the allowlist,
+// and its value goes like any other unlisted key's.
+test('a tool payload key named redaction has its value redacted, while the row still records attributes.redaction', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const memo = ['privileged', 'memo', 'about', 'layoffs'].join(' ')
+  world.toolReply = () => ({ result: { redaction: { reason: memo }, text: 'password=hunter2' } })
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'memo.json' })
+  await world.clock.advance(5000)
+  const [row] = byType(world.acceptedRows(), 'TOOL_COMPLETED')
+  expect(row).toBeDefined()
+  const content = JSON.parse(row?.content ?? '{}') as { result?: { redaction?: unknown; text?: string } }
+  expect(content.result?.redaction).toBe('[REDACTED]')
+  expect(content.result?.text).toBe('password=[REDACTED]')
+  expect(JSON.stringify(row)).not.toContain(memo)
+  expect(JSON.stringify(row)).not.toContain('hunter2')
+  // The key's value and the credential: two values, nothing past them.
+  expect((JSON.parse(row?.attributes ?? '{}') as { redaction?: unknown }).redaction).toEqual({ values: 2, dropped_chars: 0 })
 })

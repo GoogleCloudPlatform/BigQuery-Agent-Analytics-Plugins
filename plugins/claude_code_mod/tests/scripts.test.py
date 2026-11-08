@@ -27,9 +27,12 @@ subprocess.run, and the plans and messages are the ones the scripts print.
     --execute run that stops before any change or applies only the narrow
     grants;
   - the repository: the docs, the SQL headers and setup.sh name scripts that
-    exist, the commands they show parse, and build_dist.sh ships the folder.
-Needs only the standard library (and bash, for the setup.sh check). Run from
-anywhere:
+    exist, the commands they show parse, and build_dist.sh ships the folder;
+    the docs' lookup of the installed copy picks the highest version under
+    CLAUDE_CONFIG_DIR (else ~/.claude), and no doc makes a virtual
+    environment in a shared /tmp path.
+Needs only the standard library (and bash, for the setup.sh check, and sh,
+for the lookup). Run from anywhere:
   python3 plugins/claude_code_mod/tests/scripts.test.py
 Exit 0: every check passed; 1: a check failed
 """
@@ -366,6 +369,72 @@ def run_bq_checks():
         expected_sql = run_bq.inject_placeholders(named_map[expected_id], 'my-gcp-project', 'agent_analytics', 'agent_events')
         check(f'{flag} {qid} resolves to query {expected_id} and runs it',
               status == 0 and len(fake.queries) == 1 and fake.queries[0][0] == expected_sql, f'{status} {err!r}')
+
+    # @trace_id pre-client validation and @start/@end 7-day UTC defaults when referenced.
+    check('referenced_params ignores comments, strings, backticks and mid-word @, while matching real @params',
+          run_bq.referenced_params(
+              "-- @trace_id @start\n# @end\n/* @trace_id */\n"
+              "SELECT '@start', \"a\\\" @trace_id b\", '''@end''', \"\"\"@start\"\"\", `@trace_id`, 'foo@end.com', "
+              "'trailing\\\\' WHERE timestamp BETWEEN @START AND @end"
+          ) == {'start', 'end'})
+    check('referenced_params detects @trace_id outside literals',
+          run_bq.referenced_params('SELECT * FROM t WHERE trace_id = @trace_id') == {'trace_id'})
+    check('referenced_params ignores GoogleSQL @@ system variables while matching single-@ parameters',
+          run_bq.referenced_params('SELECT @@start, @@error.message, @@time_zone') == set()
+          and run_bq.referenced_params('SELECT @@trace_id, @start FROM t WHERE timestamp <= @end') == {'start', 'end'})
+    fake = FakeBigQuery(rows=[{'ok': 1}])
+    status, out, err = run_bq_with(fake, *base, 'SELECT @@trace_id, @@start, @@end')
+    check('SQL with @@ system variables needs no --trace-id and binds no @start/@end parameters',
+          status == 0 and parameters(fake.queries[0][1]) == {}, f'{status} {err!r}')
+    fake = FakeBigQuery()
+    status, out, err = run_bq_with(fake, *base, '--query', '6')
+    check('--query 6 without --trace-id: exit 2 naming query 6, with no BigQuery client made',
+          status == 2 and 'usage:' in err and 'query 6 needs --trace-id' in err and fake.clients == [],
+          f'{status} {err!r}')
+    fake = FakeBigQuery()
+    status, out, err = run_bq_with(fake, *base, 'SELECT * FROM `{PROJECT}.{DATASET}.{TABLE}` WHERE trace_id = @trace_id')
+    check('custom SQL with @trace_id and no --trace-id: exit 2 before creating a BigQuery client',
+          status == 2 and 'usage:' in err and 'query needs --trace-id' in err and fake.clients == [],
+          f'{status} {err!r}')
+    fake = FakeBigQuery(rows=[{'ok': 1}])
+    status, out, err = run_bq_with(fake, *base, "SELECT '-- @trace_id', '@trace_id' -- @trace_id")
+    check('SQL mentioning @trace_id only in strings or comments needs no --trace-id and binds nothing',
+          status == 0 and parameters(fake.queries[0][1]) == {}, f'{status} {err!r}')
+    fixed_now = dt(2026, 11, 6, 12, 30)
+    with patched(run_bq, _utc_now=lambda: fixed_now):
+        fake = FakeBigQuery(rows=[{'ok': 1}])
+        status, out, err = run_bq_with(fake, *base, '--query', '4')
+        check('--query 4 with no --start/--end defaults @end to UTC now and @start to 7 days earlier',
+              status == 0 and parameters(fake.queries[0][1]) == {
+                  'start': ('TIMESTAMP', dt(2026, 10, 30, 12, 30)),
+                  'end': ('TIMESTAMP', fixed_now),
+              }, f'{status} {err!r} {fake.queries and parameters(fake.queries[0][1])}')
+        fake = FakeBigQuery(rows=[{'ok': 1}])
+        status, out, err = run_bq_with(fake, *base, '--query', '4', '--start', '2026-11-01')
+        check('--query 4 with --start only defaults @end to UTC now',
+              status == 0 and parameters(fake.queries[0][1]) == {
+                  'start': ('TIMESTAMP', dt(2026, 11, 1)),
+                  'end': ('TIMESTAMP', fixed_now),
+              }, f'{status} {err!r}')
+        fake = FakeBigQuery(rows=[{'ok': 1}])
+        status, out, err = run_bq_with(fake, *base, '--query', '4', '--end', '2026-11-06')
+        check('--query 4 with --end only defaults @start to 7 days before @end',
+              status == 0 and parameters(fake.queries[0][1]) == {
+                  'start': ('TIMESTAMP', dt(2026, 10, 30, 23, 59, 59, 999999)),
+                  'end': ('TIMESTAMP', dt(2026, 11, 6, 23, 59, 59, 999999)),
+              }, f'{status} {err!r}')
+        fake = FakeBigQuery()
+        status, out, err = run_bq_with(fake, *base, '--query', '4', '--start', '2026-11-10')
+        check('future --start without --end fails with exit 2 after @end defaults to UTC now',
+              status == 2 and 'is after --end' in err and fake.clients == [], f'{status} {err!r}')
+        fake = FakeBigQuery(rows=[{'span_id': 's1'}])
+        status, out, err = run_bq_with(fake, *base, '--query', '6', '--trace-id', 'trace-1')
+        check('--query 6 with --trace-id binds trace_id alongside defaulted @start and @end',
+              status == 0 and parameters(fake.queries[0][1]) == {
+                  'start': ('TIMESTAMP', dt(2026, 10, 30, 12, 30)),
+                  'end': ('TIMESTAMP', fixed_now),
+                  'trace_id': ('STRING', 'trace-1'),
+              }, f'{status} {err!r}')
 
     class QuotaWarningBigQuery(FakeBigQuery):
         def __init__(self):
@@ -1315,8 +1384,9 @@ def execute_stop_checks():
     # It stops before it calls anything when the credentials or the client it needs are missing.
     cloud = FakeCloud()
     status, out, err = execute(cloud, *DOCUMENTED, libraries=NO_CLIENT)
-    check('--execute, no BigQuery client to import: it stops before it calls anything, and says nothing was changed',
-          status == 1 and 'cannot import' in err and 'Nothing was changed' in err and cloud.calls == [], f'{status} {err!r}')
+    check('--execute, no BigQuery client to import: it stops before it calls anything, names ~/.bqaa-mod/venv (not .venv), and says nothing was changed',
+          status == 1 and 'cannot import' in err and '~/.bqaa-mod/venv' in err and '.venv' not in err
+          and 'Nothing was changed' in err and cloud.calls == [], f'{status} {err!r}')
     for what, preflight, fragment in (
         ('no gcloud', dataclasses.replace(READY, gcloud_available=False), 'gcloud is required for --execute'),
         ('no Application Default Credentials', dataclasses.replace(READY, adc_ok=False),
@@ -1520,6 +1590,12 @@ def repo_checks():
           made is not None and sorted(made.group(1).split()) == files == sorted(setup.VIEW_NAMES) and len(files) == 2,
           f'{made and made.group(1)} {files} {setup.VIEW_NAMES}')
 
+    markdown_files = sorted({*PLUGIN.glob('*.md'), *PLUGIN.glob('docs/*.md'), PLUGIN.parent.parent / 'README.md'})
+    non_portable_sort = [p.relative_to(PLUGIN.parent.parent).as_posix() for p in markdown_files
+                         if p.is_file() and 'sort -V' in p.read_text(encoding='utf-8')]
+    check('no Markdown file in the repository uses GNU-only sort -V',
+          non_portable_sort == [], str(non_portable_sort))
+
     # Every command the docs and the SQL headers show is one the scripts take.
     commands = documented_commands()
     check('the docs and the SQL headers show at least five commands, for both scripts',
@@ -1569,7 +1645,8 @@ def setup_sh_checks():
         check(f'setup.sh --dry-run --team, {what}: it prints a command that runs the bootstrap of the scripts folder',
               result.returncode == 0 and len(words) > 2 and words[0] == 'python3'
               and pathlib.Path(words[1]).resolve() == (SCRIPTS / 'setup_gcp_prereqs.py').resolve()
-              and 'google-cloud-bigquery' in result.stdout,
+              and 'google-cloud-bigquery' in result.stdout and '~/.bqaa-mod/venv' in result.stdout
+              and '.venv' not in result.stdout,
               f'{result.returncode} {line!r} {result.stderr!r}')
         args = parsed(*words[2:])
         check('  ... naming the project, dataset, table, views dataset and location it was given',
@@ -1577,6 +1654,68 @@ def setup_sh_checks():
               args and (args.project, args.dataset, args.table, args.views_dataset, args.location))
         status, out, err = attempt(*words[2:])
         check('  ... which the bootstrap takes: a dry run, exit 0', status == 0 and 'DRY RUN' in out, f'{status} {err!r}')
+
+
+# ---------------------------------------------------------------------------
+# The docs' lookup of the installed copy, and where they make a virtualenv
+# ---------------------------------------------------------------------------
+
+# `PLUGIN_DIR="$(ls -d .../*/ ...)"`, a line of a shell block in the docs.
+LOOKUP = re.compile(r'^[ \t]*(PLUGIN_DIR="\$\(ls -d .*\)")[ \t]*$', re.M)
+CACHE = '"${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/'
+MOD_CACHE = pathlib.PurePosixPath('plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod')
+
+
+def markdown_files():
+    return sorted(path for path in {*PLUGIN.glob('*.md'), *PLUGIN.glob('docs/*.md'), PLUGIN.parent.parent / 'README.md'}
+                  if path.is_file())
+
+
+def cache_lookup_checks():
+    lookups = [(path.relative_to(PLUGIN.parent.parent).as_posix(), line)
+               for path in markdown_files() for line in LOOKUP.findall(path.read_text(encoding='utf-8'))]
+    check('the docs show the lookup of the installed copy at least six times (including docs/service-account-auth.md)',
+          len(lookups) >= 6 and 'plugins/claude_code_mod/docs/service-account-auth.md' in {where for where, _ in lookups},
+          [where for where, _ in lookups])
+    stale = [where for where, line in lookups if CACHE not in line]
+    check('every lookup reads the cache under CLAUDE_CONFIG_DIR when it is set, else under ~/.claude', stale == [], stale)
+    shared = [path.name for path in markdown_files() if re.search(r'/tmp/\S*venv', path.read_text(encoding='utf-8'))]
+    check('no doc makes a virtual environment in a shared /tmp path another user could make first', shared == [], shared)
+    sa_doc = (PLUGIN / 'docs' / 'service-account-auth.md').read_text(encoding='utf-8')
+    check('docs/service-account-auth.md puts the virtual environment in ~/.bqaa-mod/venv, not .venv in the plugin cache',
+          '~/.bqaa-mod/venv' in sa_doc and '.venv' not in sa_doc, sa_doc)
+    sh = shutil.which('sh')
+    if sh is None:
+        check('each lookup picks the highest version installed (skipped: no sh)', True)
+        return
+    for line in sorted({line for _, line in lookups}):
+        # As a person runs it: then the guard every snippet uses before the path.
+        script = line + '\nprintf "%s" "${PLUGIN_DIR:?mod cache directory not found}"\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / 'claude config'  # a space, as in a macOS home
+            home = pathlib.Path(tmp) / 'home'
+            for root, versions in ((config, ('0.1.2', '0.1.10', '0.1.9')), (home / '.claude', ('0.1.3', '0.1.1'))):
+                for version in versions:
+                    (root / MOD_CACHE / version).mkdir(parents=True)
+            (pathlib.Path(tmp) / 'empty').mkdir()
+
+            def lookup(**env):
+                return subprocess.run([sh, '-c', script], capture_output=True, text=True, cwd=tmp,
+                                      env={'PATH': os.environ.get('PATH', ''), 'LC_ALL': 'C', 'HOME': str(home), **env})
+
+            found = lookup(CLAUDE_CONFIG_DIR=str(config))
+            check('a lookup with CLAUDE_CONFIG_DIR set picks the highest version under it (0.1.10 over 0.1.9 and 0.1.2)',
+                  found.returncode == 0 and found.stdout == f'{config / MOD_CACHE / "0.1.10"}/',
+                  f'{found.returncode} {found.stdout!r} {found.stderr!r}')
+            for what, env in (('unset', {}), ('empty', {'CLAUDE_CONFIG_DIR': ''})):
+                found = lookup(**env)
+                check(f'a lookup with CLAUDE_CONFIG_DIR {what} picks the highest version under ~/.claude',
+                      found.returncode == 0 and found.stdout == f'{home / ".claude" / MOD_CACHE / "0.1.3"}/',
+                      f'{found.returncode} {found.stdout!r} {found.stderr!r}')
+            found = lookup(CLAUDE_CONFIG_DIR=str(pathlib.Path(tmp) / 'empty'))
+            check('a lookup that finds no installed copy stops at the guard, with nothing printed',
+                  found.returncode != 0 and found.stdout == '' and 'mod cache directory not found' in found.stderr,
+                  f'{found.returncode} {found.stdout!r} {found.stderr!r}')
 
 
 # ---------------------------------------------------------------------------
@@ -1786,11 +1925,101 @@ def clean_dead_letter_checks():
               [p.relative_to(base).as_posix() for p in to_delete] == ['proj.ds.other/spill-011.jsonl'],
               str(to_delete))
 
+    # 11. Positional path, DEFAULT_DIR fallback, mutual exclusion with --dir, and symlinked root rejection.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        d = make_dir(tmp_path)
+        source = d / 'spill-012.jsonl'
+        source.write_bytes(b'')
+        outcome = d / 'outcome-spill-012.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        status, out, err = call(clean.main, str(d))
+        check('11a. positional path dry-run lists deletable files without deleting, exit 0',
+              status == 0 and '2 file(s) would delete' in out and source.exists() and outcome.exists(),
+              f'{status} {out!r} {err!r}')
+        status, out, err = call(clean.main, str(d), '--dir', str(d))
+        check('11b. passing both positional path and --dir exits 2 with usage error',
+              status == 2 and 'pass either positional path or --dir, not both' in err and source.exists(),
+              f'{status} {out!r} {err!r}')
+        status, out, err = call(clean.main, str(d), '--execute')
+        check('11c. positional path with --execute deletes empty source and outcome, exit 0',
+              status == 0 and not source.exists() and not outcome.exists(),
+              f'{status} {out!r} {err!r}')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        d = make_dir(tmp_path)
+        source = d / 'spill-013.jsonl'
+        source.write_bytes(b'')
+        with patched(clean, DEFAULT_DIR=tmp_path / 'dead-letter'):
+            status, out, err = call(clean.main, '--execute')
+        check('11d. omitting both positional path and --dir uses DEFAULT_DIR',
+              status == 0 and not source.exists() and '1 file(s) deleted' in out,
+              f'{status} {out!r} {err!r}')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        real_base = tmp_path / 'dead-letter'
+        d = make_dir(tmp_path)
+        source = d / 'spill-014.jsonl'
+        source.write_bytes(b'')
+        outcome = d / 'outcome-spill-014.jsonl'
+        outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        sym_root = tmp_path / 'symlink-dead-letter'
+        sym_root.symlink_to(real_base, target_is_directory=True)
+        check('11e. plan_deletions refuses a symlinked root directory',
+              clean.plan_deletions(sym_root) == [], str(clean.plan_deletions(sym_root)))
+        status_pos, out_pos, err_pos = call(clean.main, str(sym_root), '--execute')
+        status_flag, out_flag, err_flag = call(clean.main, '--dir', str(sym_root), '--execute')
+        check('11f. main refuses a symlinked root directory (positional and --dir) with exit 1 and keeps target files',
+              status_pos == 1 and status_flag == 1
+              and 'refusing symlinked dead-letter directory' in err_pos
+              and 'refusing symlinked dead-letter directory' in err_flag
+              and out_pos == '' and out_flag == ''
+              and source.exists() and outcome.exists(),
+              f'{status_pos} {err_pos!r} / {status_flag} {err_flag!r}')
+        sym_parent = tmp_path / 'symlink-parent'
+        sym_parent.symlink_to(tmp_path, target_is_directory=True)
+        via_sym_ancestor = sym_parent / 'dead-letter'
+        check('11g. plan_deletions refuses a dead-letter directory reached through a symlinked ancestor',
+              clean.plan_deletions(via_sym_ancestor) == [], str(clean.plan_deletions(via_sym_ancestor)))
+        status_anc, out_anc, err_anc = call(clean.main, '--dir', str(via_sym_ancestor), '--execute')
+        check('11h. main refuses a dead-letter directory reached through a symlinked ancestor with exit 1 and keeps target files',
+              status_anc == 1 and 'refusing symlinked dead-letter directory' in err_anc and out_anc == ''
+              and source.exists() and outcome.exists(),
+              f'{status_anc} {out_anc!r} {err_anc!r}')
+
+    # 12. An unreadable root dead-letter directory returns [] in plan_deletions and exits 1 with stderr error in main.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = pathlib.Path(tmp) / 'dead-letter'
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'spill-015.jsonl'
+        source.write_bytes(b'')
+        real_iterdir = pathlib.Path.iterdir
+
+        def fail_root_iterdir(path):
+            if path == base:
+                raise PermissionError(13, 'Permission denied', str(path))
+            return real_iterdir(path)
+
+        with patched(pathlib.Path, iterdir=fail_root_iterdir):
+            planned = clean.plan_deletions(base)
+            status_dry, out_dry, err_dry = call(clean.main, '--dir', str(base))
+            status_exec, out_exec, err_exec = call(clean.main, str(base), '--execute')
+        check('12a. plan_deletions returns [] when root directory iterdir() raises OSError',
+              planned == [], str(planned))
+        check('12b. main exits 1 on stderr when root directory cannot be listed (dry-run and --execute)',
+              status_dry == 1 and status_exec == 1
+              and 'cannot read dead-letter directory' in err_dry
+              and 'cannot read dead-letter directory' in err_exec
+              and out_dry == '' and out_exec == '' and source.exists(),
+              f'{status_dry} {err_dry!r} / {status_exec} {err_exec!r}')
+
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
           writer_grants_checks, row_writer_role_checks, resources_checks, readers_checks, api_checks,
           dataset_access_checks, execute_stop_checks, execute_apply_checks, repo_checks, setup_sh_checks,
-          clean_dead_letter_checks)
+          cache_lookup_checks, clean_dead_letter_checks)
 
 
 def main():

@@ -15,10 +15,16 @@
 -- The questions docs/value.md answers, one query each: a developer (V1, V2),
 -- a team lead or administrator (V3 to V6) and a platform team (V7).
 -- Placeholders as in sample_queries.sql: {PROJECT}, {DATASET}, {TABLE} and
--- the parameters @start and @end, which scripts/run_bq.py fills and binds.
+-- the parameters @start and @end, which scripts/run_bq.py fills and binds
+-- (@start and @end default to the last 7 UTC days when omitted).
 -- It runs with your Application Default Credentials, not the mod's
 -- settings, and stops a query that would bill more than --max-gb (1 GB by
--- default). Pass one query at a time:
+-- default). Pass --query V1..V7 (or -q) to run a query by ID, or pass one
+-- query string at a time:
+--
+--   python3 scripts/run_bq.py \
+--     --project my-gcp-project --dataset agent_analytics --table agent_events \
+--     --max-gb 1 --query V1
 --
 --   python3 scripts/run_bq.py \
 --     --project my-gcp-project --dataset agent_analytics --table agent_events \

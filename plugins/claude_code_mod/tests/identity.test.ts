@@ -175,9 +175,10 @@ test("rows parked on disk keep this process's account; rows an earlier session p
   expect(sent.filter(r => r.session_id !== 'earlier').every(r => r.user_id === ADDRESS)).toBe(true)
 })
 
-test("rows still queued at exit go to the spill file with this process's account", { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
+test("rows still queued at exit go to the spill file with this process's account when the exit request fails", { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
   const world = setUp(on)
   world.tokenInfo = VERIFIED
+  world.replies = [UNAVAILABLE]
   await startSession($)
   // The token and the account are looked up from a timer; no row is sent yet.
   await world.clock.settle()
@@ -187,6 +188,20 @@ test("rows still queued at exit go to the spill file with this process's account
   const spilled = deadLetterRows(world)
   expect(spilled.map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
   expect(spilled.every(r => r.user_id === ADDRESS)).toBe(true)
+})
+
+test("rows still queued at exit are sent in the exit request with this process's account", { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
+  const world = setUp(on)
+  world.tokenInfo = VERIFIED
+  await startSession($)
+  await world.clock.settle()
+  expect(world.insertCalls().length).toBe(0)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  expect(deadLetterRows(world)).toEqual([])
+  const sent = world.acceptedRows()
+  expect(sent.map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  expect(sent.every(r => r.user_id === ADDRESS)).toBe(true)
 })
 
 test('a token that comes after session end began has no account looked up: neither the send waiting for it nor the start-up fetch asks', { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {

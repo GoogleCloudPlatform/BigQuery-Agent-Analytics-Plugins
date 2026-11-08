@@ -507,11 +507,11 @@ test('session end is recorded with its reason, turn count and duration', { optio
   await $.turn.start({ turnId: 'turn-1', text: 'hi' })
   await $.turn.complete({ turnId: 'turn-1', answer: 'Hello.', durationMs: 800, isAborted: false, reason: 'answer' })
   await world.clock.advance(5000)
-  // Session end starts no request: its row goes to a spill file the next
-  // session sends.
+  // Session end sends its row in one request, with the token in hand.
   await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
-  const ends = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
+  const ends = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
   expect(ends.length).toBe(1)
+  expect(deadLetterRows(world)).toEqual([])
   expect(json(ends[0]?.attributes ?? null)).toMatchObject({ state_delta: { source: 'coding_agent_session_end', reason: 'prompt_input_exit', trace_count: 1 } })
 })
 
@@ -558,16 +558,17 @@ test('when classic.SessionStart is skipped, turns, tools and session end still r
   await $.turn.complete({ turnId: 'turn-s2', answer: 'Second answer.', durationMs: 400, isAborted: false, reason: 'answer', usage: USAGE })
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'second-session-id', resume: { id: 'second-session-id' } })
 
+  // The first end row went with the flush after /clear; the second, at the
+  // process's end, in session end's own request.
   const sentEnds = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
-  const spilledEnds = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
-  expect(sentEnds.length).toBe(1)
-  expect(spilledEnds.length).toBe(1)
+  expect(sentEnds.length).toBe(2)
+  expect(deadLetterRows(world)).toEqual([])
   expect(sentEnds[0]?.session_id).toBe(SESSION_ID)
   expect(json(sentEnds[0]?.attributes ?? null)).toMatchObject({
     state_delta: { source: 'coding_agent_session_end', reason: 'clear', trace_count: 1 },
   })
-  expect(spilledEnds[0]?.session_id).toBe('second-session-id')
-  expect(json(spilledEnds[0]?.attributes ?? null)).toMatchObject({
+  expect(sentEnds[1]?.session_id).toBe('second-session-id')
+  expect(json(sentEnds[1]?.attributes ?? null)).toMatchObject({
     state_delta: { source: 'coding_agent_session_end', reason: 'prompt_input_exit', trace_count: 1 },
   })
 })
@@ -587,7 +588,7 @@ test('when classic.SessionStart is skipped and the session id changes on /branch
   await world.clock.advance(5000)
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'branched-session-id', resume: { id: 'branched-session-id' } })
 
-  const ends = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
+  const ends = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
   expect(ends.length).toBe(1)
   expect(ends[0]?.session_id).toBe('branched-session-id')
   expect(json(ends[0]?.attributes ?? null)).toMatchObject({
@@ -723,9 +724,10 @@ test('a session_start the first writer had out lands after two takeovers: a late
   await $.classic.SessionStart({ source: 'compact', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
   await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
   await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
-  // The session sent a row: its end is written, and the later start with it.
-  const spilled = byType(deadLetterRows(world), 'STATE_DELTA').map(r => json(r.content))
-  expect(spilled).toEqual([{ session_start: true }, { session_end: true }])
+  // The session sent a row: its end is written, and the later start with it
+  // (sent at session end, after the first writer's row).
+  const written = byType([...world.sentRows(), ...deadLetterRows(world)], 'STATE_DELTA').map(r => json(r.content))
+  expect(written).toEqual([{ session_start: true }, { session_start: true }, { session_end: true }])
 })
 
 test('an in-flight subagent model step and tool call started before SubagentStart pick up agent_type and clear unidentified_loop on completion', { options: OPTIONS }, async ($, on) => {
@@ -778,4 +780,39 @@ test('the offline test shim rejects a session.end handler that returns no { sess
     caught = err as Error
   }
   expect(caught?.message ?? '').toContain('no implementation for session.end: returned no { sessionId }')
+})
+
+test('a short (< 5 s) headless session with BQAA_ACCESS_TOKEN=bogus-token getting HTTP 401 at session.end prints a credential notice to stderr and spills cleanly', { options: OPTIONS }, async ($, on) => {
+  const bogusToken = ['bogus', 'token', 'canary', '401'].join('-')
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: bogusToken })
+  world.replies = [{ status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  expect(world.stderr).toEqual([
+    'BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, set a fresh BQAA_ACCESS_TOKEN, or unset it to use the token command).',
+  ])
+  expect(world.stderr[0]?.includes(bogusToken)).toBe(false)
+  expect(deadLetterRows(world).length).toBe(2)
+})
+
+test('a short (< 5 s) headless session whose in-flight turn flush gets HTTP 401 after session.end began prints a credential notice to stderr and spills cleanly', { options: OPTIONS }, async ($, on) => {
+  const bogusToken = ['bogus', 'token', 'canary', '401'].join('-')
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: bogusToken })
+  const unauth = { status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }
+  world.replies = [{ hang: true }, unauth]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.turn.start({ turnId: 't-headless-401', text: 'check' })
+  await $.turn.complete({ turnId: 't-headless-401', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(1)
+  expect(world.insertCalls().length).toBe(1)
+  const ending = $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(50)
+  world.releaseHung(unauth.status, unauth.text)
+  await ending
+  expect(world.stderr).toEqual([
+    'BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, set a fresh BQAA_ACCESS_TOKEN, or unset it to use the token command).',
+  ])
+  expect(world.stderr[0]?.includes(bogusToken)).toBe(false)
+  expect(deadLetterRows(world).length).toBe(4)
 })

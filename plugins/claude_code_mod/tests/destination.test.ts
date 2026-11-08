@@ -23,11 +23,11 @@
 import { type Engine, expect, test } from 'claude-code/testing'
 
 import { PLUGIN_VERSION, resolveConfig } from '../hooks/lib/config.ts'
-import { parseFile } from '../hooks/lib/deadletter.ts'
+import { packFiles, parseFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
 
-import { ACCESS_TOKEN, COMMAND, OK_INSERT, OPTIONS, PARTITION_DIR, type World, deadLetterFiles, setUp, startSession, utf8Bytes } from './helpers.ts'
+import { ACCESS_TOKEN, COMMAND, OK_INSERT, OPTIONS, PARTITION_DIR, SESSION_ID, TABLE_REF, type World, deadLetterFiles, setUp, startSession, utf8Bytes } from './helpers.ts'
 
 const PLUGIN = 'bigquery-agent-analytics-mod'
 
@@ -502,30 +502,48 @@ test('the status line counts every row refused since rows last landed', { option
   expect(world.statusLines.at(-1)).toBe('BQAA: 2 row(s) refused (HTTP 400: Invalid value for the table schema); fix, then /bqaa-backfill')
 })
 
-test('/bqaa-setup prints the ready-to-run setup.sh command when configured, and a template when unconfigured', { options: OPTIONS }, async ($, on) => {
+test('/bqaa-mod-setup and /bqaa-setup print both setup.sh and the setup_gcp_prereqs.py bootstrap command when configured, and a template when unconfigured', { options: OPTIONS }, async ($, on) => {
   setUp(on)
   await startSession($)
-  const res = await $.command.run({ command: 'bqaa-setup', args: '', ...COMMAND })
-  expect(res.text ?? '').toMatch(/no repo clone needed/)
-  expect(res.text ?? '').toMatch(/setup: BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '\/[^']*\/setup\.sh'/)
+  for (const command of ['bqaa-mod-setup', 'bqaa-setup']) {
+    const res = await $.command.run({ command, args: '', ...COMMAND })
+    expect(res.text ?? '').toMatch(/no repo clone needed/)
+    expect(res.text ?? '').toMatch(/setup: BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '\/[^']*\/setup\.sh'/)
+    // The bootstrap's virtual environment is the administrator's own, in the
+    // home directory: never a shared /tmp path another user could make first.
+    expect(res.text ?? '').toMatch(/bootstrap \(for project administrators, dry-run by default\): python3 -m venv "\$HOME\/\.bqaa-mod\/venv" && "\$HOME\/\.bqaa-mod\/venv"\/bin\/pip install -q google-cloud-bigquery && "\$HOME\/\.bqaa-mod\/venv"\/bin\/python '\/[^']*\/scripts\/setup_gcp_prereqs\.py' --project my-gcp-project --dataset agent_analytics --table agent_events --location US/)
+  }
 })
 
-test('when project or dataset is unset, /bqaa-setup prints a template command, /bqaa-status omits ..agent_events, and subsequent sessions show a 1-line AbovePrompt warning', { options: {} }, async ($, on) => {
+test('when the host refuses /bqaa-setup registration, /bqaa-mod-setup still registers and prints both setup and bootstrap commands', { options: OPTIONS }, async ($, on) => {
+  on('command.register', { name: 'bqaa-setup' }, () => ({ deny: 'command already registered by another plugin' }))
+  const world = setUp(on)
+  await startSession($)
+  expect(world.registered).toEqual(['bqaa-status', 'bqaa-flush', 'bqaa-backfill', 'bqaa-mod-setup'])
+  const res = await $.command.run({ command: 'bqaa-mod-setup', args: '', ...COMMAND })
+  expect(res.text ?? '').toMatch(/setup: BQAA_PROJECT_ID=my-gcp-project /)
+  expect(res.text ?? '').toMatch(/bootstrap \(for project administrators, dry-run by default\): /)
+})
+
+test('when project or dataset is unset, /bqaa-mod-setup and /bqaa-setup print template setup and bootstrap commands, /bqaa-status omits ..agent_events, and subsequent sessions show a 1-line AbovePrompt warning', { options: {} }, async ($, on) => {
   const world = setUp(on)
   // Pretend the welcome card was already shown in an earlier session so this session is a subsequent session.
   world.store.set('welcome', { version: PLUGIN_VERSION, sessionId: 'earlier-session', previous: null })
   world.store.set(`welcome:${PLUGIN_VERSION}`, { sessionId: 'earlier-session', previous: null })
   await startSession($)
   await world.clock.settle()
-  const setupRes = await $.command.run({ command: 'bqaa-setup', args: '', ...COMMAND })
-  expect(setupRes.text ?? '').toContain('target not configured')
-  expect(setupRes.text ?? '').toMatch(/setup: BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics /)
+  for (const command of ['bqaa-mod-setup', 'bqaa-setup']) {
+    const setupRes = await $.command.run({ command, args: '', ...COMMAND })
+    expect(setupRes.text ?? '').toContain('target not configured')
+    expect(setupRes.text ?? '').toMatch(/setup: BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics /)
+    expect(setupRes.text ?? '').toMatch(/bootstrap \(for project administrators, dry-run by default\): .*--project my-gcp-project --dataset agent_analytics /)
+  }
   const status = await statusText($)
   expect(status).toContain('target not configured')
   expect(status).not.toContain('..agent_events')
   expect(status).not.toMatch(/^dead-letter:/m)
   const shown = await band($)
-  expect(shown.line).toBe('rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-setup.')
+  expect(shown.line).toBe('rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-mod-setup.')
 })
 
 test('dismissing the welcome card via Got it when project or dataset is unset immediately shows the target not set warning in AbovePrompt', { options: {} }, async ($, on) => {
@@ -538,5 +556,317 @@ test('dismissing the welcome card via Got it when project or dataset is unset im
   await ui.press({ key: 'bqaa-welcome-close' })
   const line = (await ui.find({ type: 'Text', text: /^rows are not being written/ }))?.text
   await ui.unmount()
-  expect(line).toBe('rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-setup.')
+  expect(line).toBe('rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-mod-setup.')
+})
+
+test('headless /bqaa-status and interactive /bqaa-status check probe tables.get and surface 200, 401, 403, and 404 before any batch has completed', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  // Interactive /bqaa-status without args stays zero-network.
+  const plain = await statusText($)
+  expect(world.fetches.length).toBe(0)
+  expect(plain).not.toContain('destination check:')
+
+  // Interactive /bqaa-status check probes tables.get -> 200 OK.
+  world.replies = [{ status: 200, text: '{"tableReference":{"projectId":"my-gcp-project","datasetId":"agent_analytics","tableId":"agent_events"}}' }]
+  const checkedOk = (await $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND })).text ?? ''
+  expect(world.fetches.at(-1)?.method).toBe('GET')
+  expect(world.fetches.at(-1)?.url).toBe('https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/datasets/agent_analytics/tables/agent_events?fields=tableReference')
+  expect(checkedOk).toContain('destination check: BigQuery found my-gcp-project.agent_analytics.agent_events')
+
+  // Headless session probes tables.get automatically on /bqaa-status: 401, 403, 404.
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  world.replies = [{ status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }]
+  const checked401 = await statusText($)
+  expect(checked401).toContain('destination check: HTTP 401')
+  expect(checked401).toContain('rows are not being written: no working Google credentials; to fix, run: gcloud auth application-default login')
+
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  world.replies = [{ status: 403, text: '{"error":{"code":403,"message":"Access Denied: Table my-gcp-project:agent_analytics.agent_events","errors":[{"reason":"accessDenied"}]}}' }]
+  const checked403 = await statusText($)
+  expect(checked403).toContain('BigQuery denied the identity access to the dataset')
+
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  world.replies = [DATASET_MISSING]
+  const checked404 = await statusText($)
+  expect(checked404).toContain('BigQuery cannot find the dataset my-gcp-project.agent_analytics')
+  expect(checked404).toMatch(/setup: BQAA_PROJECT_ID=my-gcp-project /)
+
+  // Explicit interactive `/bqaa-status check` still probes tables.get after an earlier 404 or 200 and clears a healed 404 when the table now exists:
+  await startSession($)
+  world.replies = [DATASET_MISSING]
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(await statusText($)).toContain('BigQuery cannot find the dataset my-gcp-project.agent_analytics')
+  world.replies = [{ status: 200, text: '{"tableReference":{"projectId":"my-gcp-project","datasetId":"agent_analytics","tableId":"agent_events"}}' }]
+  const healed = (await $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND })).text ?? ''
+  expect(healed).toContain('destination check: BigQuery found my-gcp-project.agent_analytics.agent_events')
+  expect(healed).not.toContain('BigQuery cannot find the dataset')
+})
+
+test('headless session.end writes a single redacted diagnostic line to stderr when rows could not be sent, and stays silent when healthy or interactive', { options: OPTIONS }, async ($, on) => {
+  const secret = ['canary', 'stderr', 'secret', '9876543210'].join('-')
+  const world = setUp(on, { BQAA_ACCESS_TOKEN_COMMAND: `my-token-helper --password=${secret}` })
+  world.processReply = { exitCode: 1, stdout: '', stderr: `auth failed: password=${secret}\n` }
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+  await $.session.end({ reason: 'other', sessionId: 'headless-err', resume: { id: 'headless-err' } })
+  expect(world.stderr.length).toBe(1)
+  expect(world.stderr[0]).toBe('BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, check the token command `my-token-helper`).')
+  expect(world.stderr[0]?.includes(secret)).toBe(false)
+
+  // Healthy headless session writes 0 stderr lines.
+  world.stderr.length = 0
+  world.processReply = { exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }
+  world.replies = [OK_INSERT]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await world.clock.settle()
+  await $.session.end({ reason: 'other', sessionId: 'headless-ok', resume: { id: 'headless-ok' } })
+  expect(world.stderr).toEqual([])
+
+  // Interactive session with a problem writes 0 stderr lines (uses AbovePrompt/statusLine instead).
+  world.replies = [{ status: 403, text: '{"error":{"code":403,"message":"Access Denied","errors":[{"reason":"accessDenied"}]}}' }]
+  await startSession($)
+  await world.clock.advance(5000)
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'interactive-err', resume: { id: 'interactive-err' } })
+  expect(world.stderr).toEqual([])
+})
+
+// tables.get, which /bqaa-status check asks, proves the dataset, the table
+// and the credentials, not that the identity may write rows
+// (bigquery.tables.updateData): what it finds clears only what it proves.
+const DENIED = {
+  status: 403,
+  text: '{"error":{"code":403,"message":"Access Denied: Table my-gcp-project:agent_analytics.agent_events: Permission bigquery.tables.updateData denied","errors":[{"reason":"accessDenied"}],"status":"PERMISSION_DENIED"}}',
+}
+const READ_DENIED = {
+  status: 403,
+  text: '{"error":{"code":403,"message":"Access Denied: Table my-gcp-project:agent_analytics.agent_events: Permission bigquery.tables.get denied","errors":[{"reason":"accessDenied"}],"status":"PERMISSION_DENIED"}}',
+}
+const UNAVAILABLE = { status: 503, text: '{"error":{"code":503,"message":"Service unavailable","status":"UNAVAILABLE"}}' }
+const TABLE_FOUND = { status: 200, text: '{"tableReference":{"projectId":"my-gcp-project","datasetId":"agent_analytics","tableId":"agent_events"}}' }
+const FOUND = 'destination check: BigQuery found my-gcp-project.agent_analytics.agent_events'
+const DENIED_NOTICE = 'rows are not being written: BigQuery denied the identity access to the dataset'
+
+const statusCheck = async ($: Engine): Promise<string> => (await $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND })).text ?? ''
+const writtenAgain = (world: World): string[] => world.transcript.filter(l => l.includes('rows are being written again'))
+
+test('/bqaa-status check finding the table keeps a denial BigQuery gave rows: the notice stays, and the transcript is told rows are written again only once a write lands', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DENIED]
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(await statusText($)).toContain(DENIED_NOTICE)
+  // tables.get refused too, then answered: neither says rows may be written.
+  for (const [reply, found] of [[READ_DENIED, false], [TABLE_FOUND, true]] as const) {
+    world.replies = [reply]
+    const checked = await statusCheck($)
+    expect(world.fetches.at(-1)?.method).toBe('GET')
+    expect(checked.includes(FOUND)).toBe(found)
+    expect(checked).toContain(DENIED_NOTICE)
+  }
+  expect((await band($)).line ?? '').toMatch(/^rows are not being written: BigQuery denied the identity access to the dataset/)
+  expect(writtenAgain(world)).toEqual([])
+  // A write BigQuery takes clears it, and the refused rows wait for
+  // /bqaa-backfill.
+  world.replies = [OK_INSERT]
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  await world.clock.advance(5000)
+  expect((await band($)).line).toBeUndefined()
+  expect(writtenAgain(world)).toEqual(['bqaa: rows are being written again; /bqaa-backfill sends the 3 row(s) parked while they could not be.'])
+})
+
+test('/bqaa-status check finding the table keeps a denial BigQuery gave rows when none of them could be parked', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DENIED]
+  // The refused rows' file cannot be written: nothing is counted as parked,
+  // so only the denial of the write itself keeps the notice.
+  world.failWrites = true
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(await statusText($)).toContain(DENIED_NOTICE)
+  expect(deadLetterFiles(world)).toEqual([])
+  world.replies = [READ_DENIED]
+  expect(await statusCheck($)).toContain(DENIED_NOTICE)
+  world.replies = [TABLE_FOUND]
+  const checked = await statusCheck($)
+  expect(checked).toContain(FOUND)
+  expect(checked).toContain(DENIED_NOTICE)
+  expect(writtenAgain(world)).toEqual([])
+})
+
+test('/bqaa-status check clears a denial of tables.get it raised once the table is found, but not while rows parked under that denial wait', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_MAX_QUEUE_ROWS: '10' })
+  await startSession($)
+  world.replies = [READ_DENIED]
+  expect(await statusCheck($)).toContain(DENIED_NOTICE)
+  // Nothing parked: the table found clears the notice, with no transcript line.
+  world.replies = [TABLE_FOUND]
+  const healed = await statusCheck($)
+  expect(healed).toContain(FOUND)
+  expect(healed).not.toContain('rows are not being written')
+  expect((await band($)).line).toBeUndefined()
+  expect(writtenAgain(world)).toEqual([])
+
+  // Denied again; BigQuery is unavailable while rows pile up, and past 80%
+  // of the queue they are parked under the notice: it stays.
+  world.replies = [READ_DENIED]
+  expect(await statusCheck($)).toContain(DENIED_NOTICE)
+  world.replies = [UNAVAILABLE]
+  for (let i = 0; i < 4; i += 1) await $.tool.call({ tool: 'Read', file_path: `f${i}` })
+  await world.clock.advance(5000)
+  expect(deadLetterFiles(world).length > 0).toBe(true)
+  world.replies = [TABLE_FOUND]
+  const checked = await statusCheck($)
+  expect(checked).toContain(FOUND)
+  expect(checked).toContain(DENIED_NOTICE)
+  expect(writtenAgain(world)).toEqual([])
+})
+
+test('/bqaa-status check that finds a dataset BigQuery could not find clears the status line and the backoff, and the rows waiting go at once', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+  // A surface that draws no band above the prompt: the notice is the
+  // status line.
+  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: BigQuery cannot find the dataset my-gcp-project\.agent_analytics\. /)
+  expect(await statusText($)).toMatch(/backing off: 1 failure\(s\) in a row/)
+  expect(world.acceptedRows()).toEqual([])
+  world.replies = [TABLE_FOUND, OK_INSERT]
+  const healed = await statusCheck($)
+  expect(healed).toContain(FOUND)
+  expect(healed).not.toContain('BigQuery cannot find')
+  expect(healed).not.toContain('backing off')
+  expect(world.statusLines.at(-1)).toBeUndefined()
+  // Well before the backoff would have ended or the next tick: the flush the
+  // check asked for sends the session-start row and the call's two rows.
+  await world.clock.advance(10)
+  expect(world.acceptedRows().length).toBe(3)
+  expect(writtenAgain(world)).toEqual([])
+})
+
+test('a headless run whose own rows all landed still writes the stderr line when the replay at its end finds the dataset gone', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const earlier = `${PARTITION_DIR}/spill-20261013T200102003Z-earlier-1.jsonl`
+  const row = {
+    timestamp: '2026-10-13T20:01:02.003Z', event_id: 'e'.repeat(32), event_type: 'STATE_DELTA', agent: 'coding-agent', session_id: 'earlier-session',
+    invocation_id: null, user_id: 'dev', trace_id: null, span_id: 'bbbbbbbbbbbbbbbb', parent_span_id: null, content: '{"session_end":true}',
+    content_parts: [], attributes: '{}', latency_ms: null, status: 'OK', error_message: null, is_truncated: false,
+  }
+  const file = packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: row.timestamp, table: TABLE_REF, row })])[0] as string
+  world.files.set(earlier, file)
+  world.replies = [{ hang: true }, OK_INSERT, DATASET_MISSING]
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  // The turn's batch is out when the session ends; it lands, then session_end
+  // goes, then the replay of the earlier spill finds no dataset.
+  await world.clock.advance(5000)
+  const ending = $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(100)
+  world.releaseHung(OK_INSERT.status, OK_INSERT.text)
+  await ending
+  expect(world.insertCalls().map(f => f.answered)).toEqual(['hang', 200, 404])
+  // Nothing of this run was spilled or refused: the run had activity, and
+  // that alone makes the line.
+  expect(deadLetterFiles(world)).toEqual([[earlier, file]])
+  // One line, ending in the setup.sh command that makes the dataset.
+  expect(world.stderr.length).toBe(1)
+  const line = world.stderr[0] ?? ''
+  const head = `BigQuery Agent Analytics: rows could not be sent (${HEADLINE}; to fix, ${FIX}). Run: `
+  expect(line.startsWith(head)).toBe(true)
+  expect(line.slice(head.length)).toMatch(SETUP)
+})
+
+test('/bqaa-status check that finds the table, with replays off and rows parked meanwhile, names /bqaa-backfill without saying rows are written again', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_MAX_QUEUE_ROWS: '10', BQAA_AUTO_BACKFILL: 'false' })
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  // Past 80% of the queue while the dataset is missing: rows are parked.
+  for (let i = 0; i < 4; i += 1) await $.tool.call({ tool: 'Read', file_path: `f${i}` })
+  await world.clock.advance(5000)
+  const parked = deadLetterFiles(world).length
+  expect(parked > 0).toBe(true)
+  world.replies = [TABLE_FOUND, OK_INSERT]
+  const healed = await statusCheck($)
+  expect(healed).toContain(FOUND)
+  expect(healed).not.toContain('BigQuery cannot find')
+  await world.clock.advance(10)
+  // The rows still queued went; the parked ones wait for /bqaa-backfill,
+  // and the transcript says so once, without claiming a write.
+  expect(world.acceptedRows().length > 0).toBe(true)
+  expect(deadLetterFiles(world).length).toBe(parked)
+  expect(writtenAgain(world)).toEqual([])
+  expect(world.transcript.filter(l => l.includes('/bqaa-backfill sends'))).toEqual([
+    'bqaa: BigQuery found the table; /bqaa-backfill sends the 5 row(s) parked while rows could not be written.',
+  ])
+})
+
+test('/bqaa-status check that finds the table replays the rows parked meanwhile a second later, as a send BigQuery takes after failures does', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_MAX_QUEUE_ROWS: '10' })
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  for (let i = 0; i < 4; i += 1) await $.tool.call({ tool: 'Read', file_path: `f${i}` })
+  await world.clock.advance(5000)
+  const parked = deadLetterFiles(world).map(([path]) => path)
+  expect(parked.length > 0).toBe(true)
+  world.replies = [TABLE_FOUND, OK_INSERT]
+  expect(await statusCheck($)).toContain(FOUND)
+  // The queued rows at once, then the parked ones a second later: long
+  // before the next flush tick would replay them.
+  await world.clock.advance(1100)
+  expect(parked.map(path => world.files.get(path))).toEqual(parked.map(() => ''))
+  const ids = world.acceptedRows().map(r => r.event_id)
+  expect(ids.length).toBe(9)
+  expect(new Set(ids).size).toBe(9)
+  expect(writtenAgain(world)).toEqual([])
+})
+
+test('/bqaa-status check asks tables.get once more with a fresh token after a 401, and finds the table with it', { options: OPTIONS }, async () => {
+  // Token pieces joined at run time (see helpers.ts).
+  const stale = ['ya29', 'stale-probe-token-0001'].join('.')
+  const fresh = ['ya29', 'fresh-probe-token-0002'].join('.')
+  const printed = [stale, fresh]
+  const asked: string[] = []
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/probe-retry' }, {})
+  const io: Io = {
+    now: () => 1000,
+    after: () => ({ cancel: () => undefined }),
+    // BigQuery refuses the first token and takes the fresh one.
+    fetch: async (url, init) => {
+      asked.push(`${init.method} ${url} ${init.headers.authorization ?? ''}`)
+      return init.headers.authorization === `Bearer ${fresh}` ? TABLE_FOUND : { status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }
+    },
+    runCommand: async () => ({ exitCode: 0, stdout: `${printed.shift() ?? fresh}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    readFile: async () => '',
+    writeFile: async () => undefined,
+    listDir: async () => [],
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const writer = new Writer(io, () => config, () => 'probe-session')
+  expect(await writer.probeDestination(3000, true)).toBe('BigQuery found my-gcp-project.agent_analytics.agent_events')
+  const url = 'https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/datasets/agent_analytics/tables/agent_events?fields=tableReference'
+  expect(asked).toEqual([`GET ${url} Bearer ${stale}`, `GET ${url} Bearer ${fresh}`])
+  expect(writer.problem).toBeNull()
+})
+
+test('/bqaa-status registers with the argument hint [check], as /bqaa-backfill does with its words', { options: OPTIONS }, async ($, on) => {
+  const hints = new Map<string, string | undefined>()
+  on('command.register', ($, e, next) => {
+    hints.set(e.name, e.argumentHint)
+    return next(e)
+  })
+  setUp(on)
+  await startSession($)
+  expect(Object.fromEntries(hints)).toEqual({ 'bqaa-status': '[check]', 'bqaa-flush': undefined, 'bqaa-backfill': '[force] [wait]', 'bqaa-mod-setup': undefined, 'bqaa-setup': undefined })
 })

@@ -612,6 +612,10 @@ tool output, so treat them as personal data on the machine:
 - With the policy gone they stay (checked).
 - With the mod back, `/bqaa-status` lists them (checked), and they are sent
   once tokens work, at session start or with `/bqaa-backfill`.
+- Once buffered rows have replayed and no `claude` session is running, run
+  `scripts/clean_dead_letter.py --execute` from the plugin folder (dry-run by
+  default without `--execute`) to remove retired `0`-byte source files and
+  their `outcome-*` records without deleting un-replayed files.
 - To discard them, delete the folder (checked: nothing waits after).
 - Include the folder when a machine is wiped or handed on.
 

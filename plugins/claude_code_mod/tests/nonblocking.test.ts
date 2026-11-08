@@ -39,14 +39,29 @@ test('hooks never call the network or a process themselves, session end included
   await world.clock.advance(5000)
   expect(world.sentRows().length).toBe(9)
   // A token is in hand, BigQuery answers and rows are queued: session end
-  // still starts no request and runs no process. The rows go to a spill file.
+  // runs no process and sends the queued batch in one bounded request, with
+  // no spill file needed.
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  const fetches = world.fetches.length
+  const commands = world.commands.length
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  expect(world.fetches.length).toBe(fetches + 1)
+  expect(world.commands.length).toBe(commands)
+  expect(world.acceptedRows().slice(-3).map(r => r.event_type)).toEqual(['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  expect(deadLetterRows(world)).toEqual([])
+})
+
+test('when BQAA_EXIT_FLUSH_MS is 0, session end starts no request and runs no process: queued rows go straight to a spill file', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_EXIT_FLUSH_MS: '0' })
+  await startSession($)
+  await world.clock.settle()
   await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
   const fetches = world.fetches.length
   const commands = world.commands.length
   await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
   expect(world.fetches.length).toBe(fetches)
   expect(world.commands.length).toBe(commands)
-  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
 })
 
 test('a request that hangs never holds up a hook, and times out on its own', { options: OPTIONS }, async ($, on) => {
