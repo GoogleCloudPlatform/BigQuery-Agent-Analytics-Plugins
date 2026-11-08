@@ -723,61 +723,72 @@ export class Writer {
   // Asks BigQuery for the table (tables.get, which the row writer's role
   // grants too) while nothing has told this writer yet whether rows can be
   // written: no request answered, no error, no notice; or whenever asked
-  // (`explicit`, /bqaa-status check). A refused token (again with a fresh
-  // one), denied access, or a missing dataset or table raises the notice a
-  // send would; any other answer is the last error, and so is no answer in
-  // `timeoutMs`. A missing table that the first send makes (autoCreateTable)
-  // is no notice. The table found clears only what finding it proves fixed
-  // (see foundTable). What it found, for /bqaa-status, or null where it did
-  // not ask. Never throws.
+  // (`explicit`, /bqaa-status check). Token acquisition is bounded by
+  // `Math.max(timeoutMs, c.tokenCommandTimeoutMs)` while each HTTP `tables.get`
+  // request stays bounded to `timeoutMs` (with one fresh-token retry on 401
+  // using fresh token and HTTP deadlines). A refused token, denied access, or
+  // a missing dataset or table raises the notice a send would; any other
+  // answer is the last error, and so is no answer in time. A missing table
+  // that the first send makes (autoCreateTable) is no notice. The table found
+  // clears only what finding it proves fixed (see foundTable). What it found,
+  // for /bqaa-status, or null where it did not ask. Never throws.
   async probeDestination(timeoutMs = 3000, explicit = false): Promise<string | null> {
     const c = this.config()
     if (!canDeliver(c) || c.dryRun || this.closing || (!explicit && (this.problem !== null || this.lastSuccessAt !== null || this.lastError !== null))) return null
-    const timers: Timer[] = []
-    const deadline = this.moment(timeoutMs, timers)
+    const tokenTimeoutMs = Math.max(timeoutMs, c.tokenCommandTimeoutMs)
     const url = `${tablesUrl(c)}/${encodeURIComponent(c.table)}?fields=tableReference`
-    try {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        const token = await Promise.race([this.getToken().catch(() => null), deadline.at.then(() => TIMED_OUT)])
-        // Null: getToken raised the credentials notice.
-        if (token === null) return 'no working credentials'
-        if (typeof token !== 'string') {
-          this.recordError(`destination check: no token within ${timeoutMs} ms`)
-          return `no token within ${timeoutMs} ms`
-        }
-        const answer = await Promise.race([
-          this.request(url, { method: 'GET', headers: { authorization: `Bearer ${token}` } }, timeoutMs),
-          deadline.at.then(() => ({ error: `request timed out after ${timeoutMs} ms` })),
-        ])
-        if ('error' in answer) {
-          this.recordError(`destination check: ${answer.error}`)
-          return `no answer (${diagnostic(answer.error, 200)})`
-        }
-        if (answer.status >= 200 && answer.status < 300) {
-          this.foundTable(c)
-          return `BigQuery found ${tableRef(c)}`
-        }
-        const outcome = classifyInsert(answer, 0)
-        if (outcome.kind === 'auth' && attempt === 0) {
-          // The token may have run out early: once more with a fresh one.
-          this.dropToken()
-          continue
-        }
-        if (outcome.kind === 'auth') this.noteProblem('credentials', `BigQuery refused a fresh token too: ${outcome.message}`)
-        else if (outcome.kind === 'not-found') {
-          if (!isDatasetMissing(outcome.message) && c.autoCreateTable && !this.createAttempted) return `${tableRef(c)} is not there yet; the first send makes it`
-          this.missingDestination(outcome.message)
-        } else if (outcome.kind === 'rejected' && outcome.permission) {
-          // Rows BigQuery refused already stay the reason: reading the table
-          // denied too does not make writing allowed.
-          this.noteProblem('permission', outcome.message, this.problem?.kind === 'permission' && this.problem.missing === 'write' ? 'write' : undefined)
-        } else this.recordError(`destination check: ${'message' in outcome ? outcome.message : `HTTP ${answer.status}`}`)
-        return diagnostic(`HTTP ${answer.status}`, 200)
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const tokenTimers: Timer[] = []
+      let token: string | symbol | null
+      try {
+        const tokenDeadline = this.moment(tokenTimeoutMs, tokenTimers)
+        token = await Promise.race([this.getToken().catch(() => null), tokenDeadline.at.then(() => TIMED_OUT)])
+      } finally {
+        for (const timer of tokenTimers) timer.cancel()
       }
-      return null
-    } finally {
-      for (const timer of timers) timer.cancel()
+      // Null: getToken raised the credentials notice.
+      if (token === null) return 'no working credentials'
+      if (typeof token !== 'string') {
+        this.recordError(`destination check: no token within ${tokenTimeoutMs} ms`)
+        return `no token within ${tokenTimeoutMs} ms`
+      }
+      const httpTimers: Timer[] = []
+      let answer: HttpAnswer | { error: string }
+      try {
+        const httpDeadline = this.moment(timeoutMs, httpTimers)
+        answer = await Promise.race([
+          this.request(url, { method: 'GET', headers: { authorization: `Bearer ${token}` } }, timeoutMs),
+          httpDeadline.at.then(() => ({ error: `request timed out after ${timeoutMs} ms` })),
+        ])
+      } finally {
+        for (const timer of httpTimers) timer.cancel()
+      }
+      if ('error' in answer) {
+        this.recordError(`destination check: ${answer.error}`)
+        return `no answer (${diagnostic(answer.error, 200)})`
+      }
+      if (answer.status >= 200 && answer.status < 300) {
+        this.foundTable(c)
+        return `BigQuery found ${tableRef(c)}`
+      }
+      const outcome = classifyInsert(answer, 0)
+      if (outcome.kind === 'auth' && attempt === 0) {
+        // The token may have run out early: once more with a fresh one.
+        this.dropToken(token)
+        continue
+      }
+      if (outcome.kind === 'auth') this.noteProblem('credentials', `BigQuery refused a fresh token too: ${outcome.message}`)
+      else if (outcome.kind === 'not-found') {
+        if (!isDatasetMissing(outcome.message) && c.autoCreateTable && !this.createAttempted) return `${tableRef(c)} is not there yet; the first send makes it`
+        this.missingDestination(outcome.message)
+      } else if (outcome.kind === 'rejected' && outcome.permission) {
+        // Rows BigQuery refused already stay the reason: reading the table
+        // denied too does not make writing allowed.
+        this.noteProblem('permission', outcome.message, this.problem?.kind === 'permission' && this.problem.missing === 'write' ? 'write' : undefined)
+      } else this.recordError(`destination check: ${'message' in outcome ? outcome.message : `HTTP ${answer.status}`}`)
+      return diagnostic(`HTTP ${answer.status}`, 200)
     }
+    return null
   }
 
   private async flushLoop(): Promise<void> {
@@ -1294,8 +1305,9 @@ export class Writer {
   // A token that expired or that BigQuery refused is let go, and so is the
   // account looked up for it: while no fresh token comes, rows parked meanwhile
   // carry the user_id they were built with, never that account.
-  private dropToken(): void {
+  private dropToken(stale?: string): void {
     const dropped = this.token
+    if (stale !== undefined && dropped !== null && dropped.value !== stale) return
     this.token = null
     if (dropped !== null && this.identity !== null && this.identity.token === dropped.value) this.identity = null
   }

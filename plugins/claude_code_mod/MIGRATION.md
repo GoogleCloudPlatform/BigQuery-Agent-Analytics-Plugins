@@ -69,11 +69,12 @@ move to this repository's marketplace:
      --config dataset=agent_analytics
    ```
 
-4. Verify with `claude -p /bqaa-status < /dev/null` (or `/bqaa-status check`
-   inside an interactive session; when no request has succeeded yet, both run
-   a bounded `3 s` `tables.get` check to verify credentials and table
-   existence immediately, and non-interactive `-p` runs also write a one-line
-   notice to `stderr` if rows could not be sent). Rows the earlier copy left on disk
+4. Verify with `claude -p "/bqaa-status check" < /dev/null` (or `/bqaa-status check`
+   inside an interactive session; acquires credentials under the token timeout
+   and runs a `3 s` `tables.get` HTTP check immediately; in `-p` runs, pass
+   `--debug-file /tmp/bqaa.log` to inspect exit diagnostics, since recent host
+   CLIs hide `process.stderr` from plugin hooks and capture `console.error`
+   only in `--debug-file`). Rows the earlier copy left on disk
    (`~/.bqaa-mod/dead-letter`) are sent by this one. Once all buffered rows
    have replayed and **no `claude` session is running**, you can clean up
    retired `0`-byte source files and their `outcome-*` records from `0.1.0` /

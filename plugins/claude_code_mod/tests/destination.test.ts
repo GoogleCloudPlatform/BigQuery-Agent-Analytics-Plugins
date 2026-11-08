@@ -860,6 +860,186 @@ test('/bqaa-status check asks tables.get once more with a fresh token after a 40
   expect(writer.problem).toBeNull()
 })
 
+function probeClock(): {
+  now: () => number
+  after: (ms: number, fn: () => void) => { cancel: () => void }
+  advance: (ms: number) => Promise<void>
+} {
+  let now = 1000
+  const timers: Array<{ at: number; fn: () => void; cancelled: boolean }> = []
+  const flushMicrotasks = async (): Promise<void> => {
+    for (let i = 0; i < 8; i += 1) await Promise.resolve()
+  }
+  return {
+    now: () => now,
+    after: (ms, fn) => {
+      const entry = { at: now + Math.max(0, ms), fn, cancelled: false }
+      timers.push(entry)
+      return { cancel: () => { entry.cancelled = true } }
+    },
+    advance: async ms => {
+      const target = now + ms
+      await flushMicrotasks()
+      while (true) {
+        let next: { at: number; fn: () => void; cancelled: boolean } | undefined
+        for (const t of timers) {
+          if (!t.cancelled && t.at <= target && (!next || t.at < next.at)) next = t
+        }
+        if (!next) break
+        next.cancelled = true
+        now = Math.max(now, next.at)
+        next.fn()
+        await flushMicrotasks()
+      }
+      now = target
+    },
+  }
+}
+
+function makeProbeIo(
+  clock: ReturnType<typeof probeClock>,
+  fetchImpl: Io['fetch'],
+  runCommandImpl: Io['runCommand'],
+): Io {
+  return {
+    now: clock.now,
+    after: clock.after,
+    fetch: fetchImpl,
+    runCommand: runCommandImpl,
+    envToken: async () => undefined,
+    readFile: async () => '',
+    writeFile: async () => undefined,
+    listDir: async () => [],
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+}
+
+test('probeDestination decouples token acquisition (15 s) from the 3 s HTTP timeout and refreshes deadlines on 401 retry', { options: OPTIONS }, async () => {
+  const stale = ['ya29', 'slow-stale-token-0001'].join('.')
+  const fresh = ['ya29', 'slow-fresh-token-0002'].join('.')
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/probe-decoupled' }, {})
+  const url = 'https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/datasets/agent_analytics/tables/agent_events?fields=tableReference'
+
+  // Case 1: token command takes 4000 ms (> 3000 ms HTTP budget, < 15000 ms token budget) and succeeds.
+  {
+    const clock = probeClock()
+    const asked: string[] = []
+    const writer = new Writer(
+      makeProbeIo(
+        clock,
+        async (reqUrl, init) => {
+          asked.push(`${init.method} ${reqUrl} ${init.headers.authorization ?? ''}`)
+          return new Promise(resolve => { clock.after(100, () => resolve(TABLE_FOUND)) })
+        },
+        async () => new Promise(resolve => {
+          clock.after(4000, () => resolve({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' }))
+        }),
+      ),
+      () => config,
+      () => 'probe-slow-token',
+    )
+    let result: string | null | undefined
+    void writer.probeDestination(3000, true).then(v => { result = v })
+    await clock.advance(3500)
+    expect(result).toBeUndefined()
+    expect(asked).toEqual([])
+    await clock.advance(700)
+    expect(result).toBe('BigQuery found my-gcp-project.agent_analytics.agent_events')
+    expect(asked).toEqual([`GET ${url} Bearer ${fresh}`])
+    expect(writer.problem).toBeNull()
+  }
+
+  // Case 2: hung/slow token command > 15000 ms reports tokenCommandTimeoutMs rather than 3000 ms.
+  {
+    const clock = probeClock()
+    const asked: string[] = []
+    const writer = new Writer(
+      makeProbeIo(
+        clock,
+        async (reqUrl, init) => {
+          asked.push(`${init.method} ${reqUrl}`)
+          return TABLE_FOUND
+        },
+        async () => new Promise(resolve => {
+          clock.after(20_000, () => resolve({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' }))
+        }),
+      ),
+      () => config,
+      () => 'probe-token-timeout',
+    )
+    let result: string | null | undefined
+    void writer.probeDestination(3000, true).then(v => { result = v })
+    await clock.advance(14_999)
+    expect(result).toBeUndefined()
+    await clock.advance(1)
+    expect(result).toBe('no token within 15000 ms')
+    expect(writer.snapshot().lastError?.message).toBe('destination check: no token within 15000 ms')
+    expect(asked).toEqual([])
+  }
+
+  // Case 3: slow attempt 0 (2500 ms token + 1000 ms HTTP 401 = 3500 ms) drops token and gets fresh deadlines on retry.
+  {
+    const clock = probeClock()
+    const printed = [stale, fresh]
+    const delays = [2500, 2000]
+    const asked: string[] = []
+    const writer = new Writer(
+      makeProbeIo(
+        clock,
+        async (reqUrl, init) => {
+          asked.push(`${init.method} ${reqUrl} ${init.headers.authorization ?? ''}`)
+          const ok = init.headers.authorization === `Bearer ${fresh}`
+          return new Promise(resolve => {
+            clock.after(1000, () => resolve(
+              ok ? TABLE_FOUND : { status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' },
+            ))
+          })
+        },
+        async () => {
+          const val = printed.shift() ?? fresh
+          const delay = delays.shift() ?? 100
+          return new Promise(resolve => {
+            clock.after(delay, () => resolve({ exitCode: 0, stdout: `${val}\n`, stderr: '' }))
+          })
+        },
+      ),
+      () => config,
+      () => 'probe-401-refresh',
+    )
+    let result: string | null | undefined
+    void writer.probeDestination(3000, true).then(v => { result = v })
+    await clock.advance(6600)
+    expect(result).toBe('BigQuery found my-gcp-project.agent_analytics.agent_events')
+    expect(asked).toEqual([`GET ${url} Bearer ${stale}`, `GET ${url} Bearer ${fresh}`])
+    expect(writer.problem).toBeNull()
+  }
+
+  // Case 4: HTTP tables.get still times out at 3000 ms once token is acquired.
+  {
+    const clock = probeClock()
+    const writer = new Writer(
+      makeProbeIo(
+        clock,
+        async () => new Promise(resolve => { clock.after(5000, () => resolve(TABLE_FOUND)) }),
+        async () => ({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' }),
+      ),
+      () => config,
+      () => 'probe-http-timeout',
+    )
+    let result: string | null | undefined
+    void writer.probeDestination(3000, true).then(v => { result = v })
+    await clock.advance(2999)
+    expect(result).toBeUndefined()
+    await clock.advance(1)
+    expect(result).toBe('no answer (request timed out after 3000 ms)')
+    expect(writer.snapshot().lastError?.message).toBe('destination check: request timed out after 3000 ms')
+  }
+})
+
 test('/bqaa-status registers with the argument hint [check], as /bqaa-backfill does with its words', { options: OPTIONS }, async ($, on) => {
   const hints = new Map<string, string | undefined>()
   on('command.register', ($, e, next) => {

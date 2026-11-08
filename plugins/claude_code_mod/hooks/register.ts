@@ -57,7 +57,7 @@ let ranModCommand = false
 // Whether a person is at the prompt (session.start says): a `-p` run has no
 // band, toast or later moment, so its session end replays parked files,
 // /bqaa-backfill waits for its result, /bqaa-status asks BigQuery for the
-// table, and a problem that kept rows out goes to standard error.
+// table, and a problem that kept rows out writes a diagnostic via `writeStderr`.
 let isInteractiveSession = true
 // How long /bqaa-backfill waits for its result in a `-p` run (or with `wait`).
 const BACKFILL_WAIT_MS = 15_000
@@ -189,9 +189,11 @@ const none = (): undefined => undefined
 const clean = (text: string, maxChars = 2000): string => redactDiagnostic(text, maxChars)
 const say = (text: string): { text: string } => ({ text: clean(text, 8000) })
 
-// One line on the process's standard error, where the caller of a `-p` run
-// (a script, a CI job) sees it: such a run draws no band and shows no toast.
-// A test takes the line instead, through `globalThis.__bqaaStderr`.
+// One line on `process.stderr` when the host runtime exposes it, or into the
+// host `--debug-file` via `console.error` when the plugin sandbox hides
+// `process.stderr` (such as Claude Code CLI 2.1.319+): a `-p` run draws no
+// band and shows no toast. A test captures the line instead through
+// `globalThis.__bqaaStderr`.
 function writeStderr(line: string): void {
   const host = globalThis as {
     __bqaaStderr?: (line: string) => void
@@ -211,10 +213,10 @@ function writeStderr(line: string): void {
 // At the end of a `-p` run that recorded something (`hadActivity`, read
 // before session end resets it, or rows spilled or parked), while a problem
 // keeps rows from BigQuery: what is wrong and the fix, redacted, on one line
-// of standard error, with the setup command where the fix is one (a dataset
-// or table BigQuery cannot find). The command goes whole, after the rest is
-// cut; where redaction would change it, the line names /bqaa-mod-setup,
-// which prints it.
+// via `writeStderr` (`stderr` when exposed by the host, else `--debug-file`),
+// with the setup command where the fix is one (a dataset or table BigQuery
+// cannot find). The command goes whole, after the rest is cut; where redaction
+// would change it, the line names /bqaa-mod-setup, which prints it.
 function headlessNotice(current: Writer, hadActivity: boolean): void {
   const { counters } = current.snapshot()
   if (current.problem === null || !(hadActivity || counters.spilled > 0 || counters.failed > 0)) return
@@ -1299,7 +1301,8 @@ export const register: Register = (on, registered) => {
     if (!writer) return say('BigQuery Agent Analytics mod: not started (session.start has not run).')
     const current = writer
     // A `-p` run sends nothing before it prints this (and `check` asks
-    // anywhere): BigQuery is asked for the table, up to 3 seconds, so a
+    // anywhere): BigQuery is asked for the table, up to 3 seconds for the
+    // HTTP request (with token acquisition using `tokenCommandTimeoutMs`), so a
     // refused token, denied access or a missing table shows now.
     const explicitCheck = (e.args ?? '').trim() === 'check'
     const destinationCheck = !isInteractiveSession || explicitCheck ? await current.probeDestination(3000, explicitCheck) : null
