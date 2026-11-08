@@ -39,6 +39,8 @@ claude plugin install bigquery-agent-analytics-mod@bqaa-tracing \
 
 The installer may print `11 userConfig options not yet set — ...`; that's fine because every other option has a default. If you already have a `claude` session open, run `/reload-plugins` or start a new session.
 
+> **Served copy vs. `main` & `-p` command check:** Marketplace installs track the released snapshot in the [served marketplace copy](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/blob/main/plugins/claude_code_dist/bigquery-agent-analytics-mod/README.md), while `plugins/claude_code_mod/` on `main` may be ahead between releases. Version `0.1.1` uses `/bqaa-setup`, whereas `0.1.2+` uses `/bqaa-mod-setup` (with `/bqaa-setup` kept as a `0.1.x` alias). Verify your installed version first with `claude plugin list` or `/bqaa-status`: passing an unknown slash command to `claude -p "/..."` does **not** fail fast and instead runs as a normal billed model prompt.
+
 ### 4. Create the BigQuery dataset and table
 
 The installed mod includes `setup.sh` and `scripts/`, so you do not need to clone the repository. Print the ready-to-run `setup.sh` command for your installed copy with `/bqaa-mod-setup` (`/bqaa-setup` remains a compatibility alias in `0.1.x`, and `/bqaa-status` prints the same command when the dataset is missing), then run the printed `BQAA_PROJECT_ID=... setup.sh` command in your shell:

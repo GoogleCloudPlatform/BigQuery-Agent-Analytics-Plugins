@@ -22,6 +22,8 @@ claude plugin install bigquery-agent-analytics-mod@bqaa-tracing \
 
 Inside an open `claude` session, run `/reload-plugins` (or start a new session) after installing.
 
+> **Served marketplace copy vs. `main`:** Marketplace installs run the currently released snapshot documented in the [served marketplace copy](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/blob/main/plugins/claude_code_dist/bigquery-agent-analytics-mod/README.md), whereas `plugins/claude_code_mod/` on `main` holds development HEAD (which can be ahead between releases). Version `0.1.1` provides `/bqaa-setup`, while `0.1.2+` adds `/bqaa-mod-setup` (keeping `/bqaa-setup` as a `0.1.x` alias). Before passing any slash command to `claude -p "/..."`, verify your installed version with `claude plugin list` or `/bqaa-status`—Claude Code does **not** fail fast on an unknown slash command in `-p`, and instead executes it as a normal billed model prompt.
+
 To run directly from a local repository checkout for a single session:
 
 ```bash

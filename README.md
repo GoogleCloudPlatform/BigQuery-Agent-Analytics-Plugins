@@ -46,6 +46,8 @@ the BigQuery destination and runtime dependencies.
 
 Notes:
 
+- **Served marketplace copy vs. `main` docs**: Marketplace installs (`bqaa-tracing`) serve the committed release snapshot in [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json) and [`plugins/claude_code_dist/bigquery-agent-analytics-mod/README.md`](plugins/claude_code_dist/bigquery-agent-analytics-mod/README.md), whereas `plugins/claude_code_mod/` on `main` holds development HEAD and can be ahead of the marketplace between releases. In particular, `0.1.1` exposes `/bqaa-setup`, while `0.1.2+` introduces `/bqaa-mod-setup` (keeping `/bqaa-setup` as an alias in `0.1.x`).
+- **Verify commands before `claude -p`**: Passing an unknown slash command to `claude -p "/..."` does **not** fail fast—Claude Code treats it as a normal billed model prompt. Check your installed version and registered commands first with `claude plugin list` or `/bqaa-status`.
 - Add the marketplace with the `<owner>/<repo>` form, not with a URL to
   `marketplace.json`: the catalog's plugin `source` paths are relative, so they
   resolve only in a Git checkout.
