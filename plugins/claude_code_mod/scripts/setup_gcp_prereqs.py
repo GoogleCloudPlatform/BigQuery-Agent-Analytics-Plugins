@@ -53,10 +53,30 @@ import shlex
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Callable
 
 BIGQUERY_API_SERVICES = ("bigquery.googleapis.com", "bigquerystorage.googleapis.com")
+QUOTA_403_RE = re.compile(
+    r"403\b.*(?:"
+    r"permission to use project"
+    r"|USER_PROJECT_DENIED"
+    r"|serviceusage\.services\.use"
+    r"|Consumer\s+['\"]?project"
+    r"|quota[ _-]?project"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+SERVICE_DISABLED_403_RE = re.compile(
+    r"403\b.*(?:"
+    r"SERVICE_DISABLED"
+    r"|accessNotConfigured"
+    r"|has not been used in project"
+    r"|it is disabled"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
 # The custom role --writer-role row-writer grants: streaming inserts check
 # bigquery.tables.get as well as bigquery.tables.updateData ("Permission
 # bigquery.tables.get denied on table" without it).
@@ -201,6 +221,99 @@ def _default_table() -> str:
     return os.environ.get("BQAA_TABLE") or os.environ.get("BQ_TABLE") or "agent_events"
 
 
+def _default_quota_project() -> str | None:
+    return os.environ.get("GOOGLE_CLOUD_QUOTA_PROJECT") or None
+
+
+def _load_google_auth():
+    import google.auth
+
+    return google.auth
+
+
+def _suppress_adc_quota_warning() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Your application has authenticated using end user credentials from Google Cloud SDK without a quota project.*",
+        category=UserWarning,
+    )
+
+
+def _bigquery_client(project: str, quota_project: str | None = None, credentials=None):
+    from google.cloud import bigquery
+
+    _suppress_adc_quota_warning()
+    kwargs: dict = {"project": project}
+    if credentials is not None:
+        kwargs["credentials"] = credentials
+    if quota_project:
+        kwargs["client_options"] = {"quota_project_id": quota_project}
+    return bigquery.Client(**kwargs)
+
+
+def _call_with_adc_quota_retry(project: str, quota_project: str | None, fn):
+    from google.cloud import bigquery
+
+    try:
+        return fn(_bigquery_client(project, quota_project=quota_project))
+    except Exception as error:
+        err_str = str(error)
+        is_quota_403 = bool(QUOTA_403_RE.search(err_str))
+        is_service_disabled_403 = bool(SERVICE_DISABLED_403_RE.search(err_str))
+        if not (is_quota_403 or is_service_disabled_403):
+            raise
+        foreign_service_disabled = is_service_disabled_403 and bool(
+            re.search(
+                rf"(?:in project\s+|project=)(?!{re.escape(project)}(?:[^A-Za-z0-9_.-]|$))[A-Za-z0-9.:-]+",
+                err_str,
+                re.IGNORECASE,
+            )
+        )
+        if quota_project:
+            if is_quota_403 or (
+                is_service_disabled_403
+                and quota_project != project
+                and (quota_project in err_str or foreign_service_disabled)
+            ):
+                raise SystemExit(
+                    f"{error}\n"
+                    f"HINT: explicit quota project {quota_project!r} requires "
+                    f"serviceusage.services.use (roles/serviceusage.serviceUsageConsumer) and the BigQuery API enabled on {quota_project}."
+                ) from error
+            raise
+        had_adc_quota = None
+        stripped_creds = None
+        try:
+            google_auth = _load_google_auth()
+            scopes = getattr(getattr(bigquery, "Client", None), "SCOPE", None)
+            creds, _ = google_auth.default(scopes=scopes)
+            had_adc_quota = getattr(creds, "quota_project_id", None)
+            if (
+                had_adc_quota
+                and had_adc_quota != project
+                and hasattr(creds, "with_quota_project")
+                and (is_quota_403 or had_adc_quota in err_str or foreign_service_disabled)
+            ):
+                stripped_creds = creds.with_quota_project(None)
+        except Exception:
+            stripped_creds = None
+        if stripped_creds is not None:
+            try:
+                return fn(_bigquery_client(project, credentials=stripped_creds))
+            except Exception as retry_error:
+                raise SystemExit(
+                    f"{retry_error}\n"
+                    f"HINT: ADC quota project {had_adc_quota!r} was denied and retrying without a quota project still failed; "
+                    f"pass --quota-project {project} or set GOOGLE_CLOUD_QUOTA_PROJECT={project} if your organization requires a billing quota project."
+                ) from retry_error
+        if is_quota_403:
+            raise SystemExit(
+                f"{error}\n"
+                f"HINT: pass --quota-project {project} or set GOOGLE_CLOUD_QUOTA_PROJECT={project} if your organization requires a billing quota project."
+            ) from error
+        raise
+
+
 def _quote_command(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
@@ -285,6 +398,9 @@ def _require_project_dataset(args: argparse.Namespace) -> None:
         raise SystemExit("--dataset is required, or set BQAA_DATASET")
     if not PROJECT_ID_PATTERN.fullmatch(args.project):
         raise SystemExit(f"--project {args.project!r} is not a project id")
+    quota_project = getattr(args, "quota_project", None)
+    if quota_project is not None and not PROJECT_ID_PATTERN.fullmatch(quota_project):
+        raise SystemExit(f"--quota-project {quota_project!r} is not a project id")
     for flag, name in (("--dataset", args.dataset), ("--table", args.table), ("--views-dataset", _views_dataset(args))):
         if not (PLAIN_NAME_PATTERN.fullmatch(name) and len(name) <= MAX_NAME_LENGTH):
             raise SystemExit(f"{flag} {name!r} is not a plain dataset or table name (letters, digits and underscores)")
@@ -840,14 +956,26 @@ def _run_with_retry(command: list[str], what: str) -> None:
     raise subprocess.CalledProcessError(result.returncode, command)
 
 
-def _authorize_views(project: str, dataset: str, views_dataset: str, client=None) -> None:
+def _authorize_views(
+    project: str,
+    dataset: str,
+    views_dataset: str,
+    client=None,
+    quota_project: str | None = None,
+) -> None:
     """Authorize the mod's views (VIEW_NAMES) of the views dataset on the
     events dataset, so readers of the views need no access to the table.
     Other views there are left out: one could select raw columns."""
     from google.cloud import bigquery
     from google.cloud.exceptions import NotFound
 
-    client = client or bigquery.Client(project=project)
+    if client is None:
+        _call_with_adc_quota_retry(
+            project,
+            quota_project,
+            lambda c: _authorize_views(project, dataset, views_dataset, client=c),
+        )
+        return
     source = client.get_dataset(f"{project}.{dataset}")
     views, missing = [], []
     for name in VIEW_NAMES:
@@ -894,14 +1022,25 @@ _EVENTS_DATASET_GROUPS = ("projectReaders", "projectWriters", "allAuthenticatedU
 _VIEWS_DATASET_GROUPS = ("projectWriters", "allAuthenticatedUsers")
 
 
-def _restrict_dataset_access(project: str, dataset: str, views_dataset: str, client=None) -> None:
+def _restrict_dataset_access(
+    project: str,
+    dataset: str,
+    views_dataset: str,
+    client=None,
+    quota_project: str | None = None,
+) -> None:
     """Take the project's Viewer and Editor groups off the events dataset, and
     Editors off the views dataset, so project roles read and change nothing
     there. Owners, named members and authorized views stay."""
-    from google.cloud import bigquery
     from google.cloud.exceptions import NotFound
 
-    client = client or bigquery.Client(project=project)
+    if client is None:
+        _call_with_adc_quota_retry(
+            project,
+            quota_project,
+            lambda c: _restrict_dataset_access(project, dataset, views_dataset, client=c),
+        )
+        return
     for name, groups in ((dataset, _EVENTS_DATASET_GROUPS), (views_dataset, _VIEWS_DATASET_GROUPS)):
         try:
             target = client.get_dataset(f"{project}.{name}")
@@ -1103,7 +1242,12 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                 Step(
                     f"Take the project's Viewer and Editor groups off {args.project}.{args.dataset}, "
                     f"and Editors off {args.project}.{views_dataset}",
-                    action=lambda: _restrict_dataset_access(args.project, args.dataset, views_dataset),
+                    action=lambda: _restrict_dataset_access(
+                        args.project,
+                        args.dataset,
+                        views_dataset,
+                        quota_project=getattr(args, "quota_project", None),
+                    ),
                     detail=(
                         "bigquery.Client: remove projectReaders and projectWriters (and allUsers, "
                         "allAuthenticatedUsers) from the events dataset's access, and projectWriters "
@@ -1161,7 +1305,12 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
         steps.append(
             Step(
                 f"Authorize {', '.join(VIEW_NAMES)} of {args.project}.{views_dataset} on {args.project}.{args.dataset}",
-                action=lambda: _authorize_views(args.project, args.dataset, views_dataset),
+                action=lambda: _authorize_views(
+                    args.project,
+                    args.dataset,
+                    views_dataset,
+                    quota_project=getattr(args, "quota_project", None),
+                ),
                 detail=(
                     "bigquery.Client: add those two views to the events dataset's access "
                     "entries, so readers need no access to the table; no other view"
@@ -1380,6 +1529,28 @@ def _print_plan(args: argparse.Namespace, steps: list[Step]) -> None:
     print()
 
 
+def _verify_adc_bigquery_access(args: argparse.Namespace) -> None:
+    """Verify ADC BigQuery reachability (and quota-project fallback) before any
+    gcloud or bq IAM mutation runs under --execute."""
+    from google.cloud.exceptions import NotFound
+
+    def _probe(client) -> None:
+        try:
+            list(client.list_datasets(project=args.project, max_results=1))
+        except NotFound:
+            pass
+
+    try:
+        _call_with_adc_quota_retry(args.project, getattr(args, "quota_project", None), _probe)
+    except SystemExit as stop:
+        msg = str(stop)
+        if "Nothing was changed" not in msg:
+            msg = f"ERROR: {msg}\nNothing was changed."
+        raise SystemExit(msg) from stop
+    except Exception as error:
+        raise SystemExit(f"ERROR: {error}\nNothing was changed.") from error
+
+
 def run(args: argparse.Namespace) -> int:
     if args.service_account and not args.principal:
         email = _service_account_email(args.project, args.service_account)
@@ -1418,6 +1589,8 @@ def run(args: argparse.Namespace) -> int:
                 "ADC alone is not enough: gcloud subcommands ignore ADC "
                 "and use the active CLI account."
             )
+        if _steps_need_adc(steps):
+            _verify_adc_bigquery_access(args)
     _print_plan(args, steps)
     if not args.execute:
         print("No changes made, and nothing called: the plan came from the arguments alone.")
@@ -1460,6 +1633,14 @@ def main(argv: list[str] | None = None) -> int:
         "--location",
         default=os.environ.get("BQAA_LOCATION") or "US",
         help="BigQuery dataset location (default: BQAA_LOCATION or US).",
+    )
+    parser.add_argument(
+        "--quota-project",
+        default=_default_quota_project(),
+        help=(
+            "Google Cloud billing/quota project for Python BigQuery API calls "
+            "(default: GOOGLE_CLOUD_QUOTA_PROJECT, else Application Default Credentials)."
+        ),
     )
     parser.add_argument(
         "--principal",

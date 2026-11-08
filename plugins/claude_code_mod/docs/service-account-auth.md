@@ -153,7 +153,7 @@ events dataset, where only the administrators hold project roles.
    `--execute`:
 
    ```bash
-   PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{s=$(NF-1); sub(/\+.*/,"",s); p=index(s,"-"); pre=p?substr(s,p+1):""; core=p?substr(s,1,p-1):s; split(core,v,"."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (pre==""), pre, $0}' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
+   PLUGIN_DIR="$(printf '%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ | awk '{ s=$0; sub(/\/$/, "", s); sub(/.*\//, "", s); if (s !~ /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/) next; sub(/\+.*/, "", s); pk=""; i=index(s, "-"); if (i) { n=split(substr(s, i+1), p, "."); s=substr(s, 1, i-1); for (k=1; k<=n; k++) pk=(k>1 ? pk "." : "") (p[k] ~ /^[0-9]+$/ ? sprintf("0%08d", p[k]+0) : "1" p[k]) } split(s, v, "."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (i==0), pk, $0 }' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
    cd "${PLUGIN_DIR:?mod cache directory not found}"
    python3 scripts/setup_gcp_prereqs.py \
      --project my-gcp-project --dataset agent_analytics \
@@ -239,10 +239,10 @@ events dataset, where only the administrators hold project roles.
    Viewers or Editors access. Its caller needs Token Creator on both
    service accounts (here `READER_SA` stands in for a member of the readers'
    group). With `INSERT_PROBE=1` it also inserts one row as the writer.
-4. **Query as a reader or admin (`run_bq.py`)**: If your Application Default
-   Credentials carry a quota project from another workflow (for example Vertex
-   AI) that lacks `serviceusage.services.use` (`403 USER_PROJECT_DENIED`),
-   [`scripts/run_bq.py`](../scripts/run_bq.py) automatically retries once
+4. **Query or bootstrap across projects (`run_bq.py` and `setup_gcp_prereqs.py`)**: If your Application Default
+   Credentials carry a foreign quota project from another workflow (for example Vertex
+   AI) that lacks `serviceusage.services.use` or has the BigQuery API disabled on that quota project (`403 USER_PROJECT_DENIED` or `SERVICE_DISABLED` naming the ADC quota project),
+   both [`scripts/run_bq.py`](../scripts/run_bq.py) and [`scripts/setup_gcp_prereqs.py`](../scripts/setup_gcp_prereqs.py) automatically retry once
    without the ADC quota project. Pass `--quota-project PROJECT` (or set
    `GOOGLE_CLOUD_QUOTA_PROJECT`) when your organization requires an explicit
    billing quota project (only when needed—never assume `--project` grants

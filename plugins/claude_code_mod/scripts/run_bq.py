@@ -61,10 +61,10 @@ names are taken.
 
 Needs the Python BigQuery client (python3 -m pip install google-cloud-bigquery,
 or run it with uv) and Application Default Credentials (gcloud auth
-application-default login; optionally gcloud auth application-default
-set-quota-project PROJECT) that may run queries and read the table. Exit
-status: 0 on success; 1 when the query or the setup fails, with an ERROR line
-on stderr; 2 for a bad argument.
+application-default login; pass --quota-project PROJECT or set
+GOOGLE_CLOUD_QUOTA_PROJECT=PROJECT when a billing quota project is needed) that
+may run queries and read the table. Exit status: 0 on success; 1 when the query
+or the setup fails, with an ERROR line on stderr; 2 for a bad argument.
 """
 
 from __future__ import annotations
@@ -90,7 +90,22 @@ SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 QUERY_HEADER = re.compile(r"^-- (V?\d+)\. ")
 PARAM_AT_RE = re.compile(r"@(start|end|trace_id)\b", re.IGNORECASE)
 QUOTA_403_RE = re.compile(
-    r"403.*(?:permission to use project|USER_PROJECT_DENIED|serviceusage\.services\.use)",
+    r"403\b.*(?:"
+    r"permission to use project"
+    r"|USER_PROJECT_DENIED"
+    r"|serviceusage\.services\.use"
+    r"|Consumer\s+['\"]?project"
+    r"|quota[ _-]?project"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+SERVICE_DISABLED_403_RE = re.compile(
+    r"403\b.*(?:"
+    r"SERVICE_DISABLED"
+    r"|accessNotConfigured"
+    r"|has not been used in project"
+    r"|it is disabled"
+    r")",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -272,7 +287,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         epilog=(
             "Placeholders in the query: {PROJECT}, {DATASET}, {TABLE}; parameters: @start, @end, @trace_id. "
             "Uses Application Default Credentials (gcloud auth application-default login; "
-            "gcloud auth application-default set-quota-project PROJECT)."
+            "pass --quota-project PROJECT or set GOOGLE_CLOUD_QUOTA_PROJECT=PROJECT when a quota project is needed)."
         ),
     )
     parser.add_argument(
@@ -419,16 +434,33 @@ def main(argv: list[str] | None = None) -> int:
         _execute_query(bigquery, client, sql, parameters, limit, args)
         return 0
     except Exception as error:  # the client's errors: auth, access, a bad query, the limit
-        if not QUOTA_403_RE.search(str(error)):
+        err_str = str(error)
+        is_quota_403 = bool(QUOTA_403_RE.search(err_str))
+        is_service_disabled_403 = bool(SERVICE_DISABLED_403_RE.search(err_str))
+        if not (is_quota_403 or is_service_disabled_403):
             print(f"ERROR{dry_label}: {error}", file=sys.stderr)
             return 1
-        if args.quota_project:
-            print(
-                f"ERROR{dry_label}: {error}\n"
-                f"HINT: explicit quota project {args.quota_project!r} requires "
-                f"serviceusage.services.use (roles/serviceusage.serviceUsageConsumer) on {args.quota_project}.",
-                file=sys.stderr,
+        foreign_service_disabled = is_service_disabled_403 and bool(
+            re.search(
+                rf"(?:in project\s+|project=)(?!{re.escape(args.project)}(?:[^A-Za-z0-9_.-]|$))[A-Za-z0-9.:-]+",
+                err_str,
+                re.IGNORECASE,
             )
+        )
+        if args.quota_project:
+            if is_quota_403 or (
+                is_service_disabled_403
+                and args.quota_project != args.project
+                and (args.quota_project in err_str or foreign_service_disabled)
+            ):
+                print(
+                    f"ERROR{dry_label}: {error}\n"
+                    f"HINT: explicit quota project {args.quota_project!r} requires "
+                    f"serviceusage.services.use (roles/serviceusage.serviceUsageConsumer) and the BigQuery API enabled on {args.quota_project}.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"ERROR{dry_label}: {error}", file=sys.stderr)
             return 1
         had_adc_quota = None
         stripped_creds = None
@@ -437,7 +469,12 @@ def main(argv: list[str] | None = None) -> int:
             scopes = getattr(getattr(bigquery, "Client", None), "SCOPE", None)
             creds, _ = google_auth.default(scopes=scopes)
             had_adc_quota = getattr(creds, "quota_project_id", None)
-            if had_adc_quota and hasattr(creds, "with_quota_project"):
+            if (
+                had_adc_quota
+                and had_adc_quota != args.project
+                and hasattr(creds, "with_quota_project")
+                and (is_quota_403 or had_adc_quota in err_str or foreign_service_disabled)
+            ):
                 stripped_creds = creds.with_quota_project(None)
         except Exception:
             stripped_creds = None
@@ -447,21 +484,21 @@ def main(argv: list[str] | None = None) -> int:
                 _execute_query(bigquery, retry_client, sql, parameters, limit, args)
                 return 0
             except Exception as retry_error:
-                if QUOTA_403_RE.search(str(retry_error)):
-                    print(
-                        f"ERROR{dry_label}: {retry_error}\n"
-                        f"HINT: ADC quota project {had_adc_quota!r} was denied and retrying without a quota project still failed; "
-                        f"pass --quota-project {args.project} or set GOOGLE_CLOUD_QUOTA_PROJECT={args.project} if your organization requires a billing quota project.",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(f"ERROR{dry_label}: {retry_error}", file=sys.stderr)
+                print(
+                    f"ERROR{dry_label}: {retry_error}\n"
+                    f"HINT: ADC quota project {had_adc_quota!r} was denied and retrying without a quota project still failed; "
+                    f"pass --quota-project {args.project} or set GOOGLE_CLOUD_QUOTA_PROJECT={args.project} if your organization requires a billing quota project.",
+                    file=sys.stderr,
+                )
                 return 1
-        print(
-            f"ERROR{dry_label}: {error}\n"
-            f"HINT: pass --quota-project {args.project} or set GOOGLE_CLOUD_QUOTA_PROJECT={args.project} if your organization requires a billing quota project.",
-            file=sys.stderr,
-        )
+        if is_quota_403:
+            print(
+                f"ERROR{dry_label}: {error}\n"
+                f"HINT: pass --quota-project {args.project} or set GOOGLE_CLOUD_QUOTA_PROJECT={args.project} if your organization requires a billing quota project.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"ERROR{dry_label}: {error}", file=sys.stderr)
         return 1
 
 

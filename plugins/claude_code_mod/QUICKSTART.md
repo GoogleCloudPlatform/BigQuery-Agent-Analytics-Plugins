@@ -39,20 +39,21 @@ claude plugin install bigquery-agent-analytics-mod@bqaa-tracing \
 
 The installer may print `11 userConfig options not yet set — ...`; that's fine because every other option has a default. If you already have a `claude` session open, run `/reload-plugins` or start a new session.
 
-> **Served copy vs. `main` & `-p` command check:** Marketplace installs track the released snapshot in the [served marketplace copy](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/blob/main/plugins/claude_code_dist/bigquery-agent-analytics-mod/README.md), while `plugins/claude_code_mod/` on `main` may be ahead between releases. Version `0.1.1` uses `/bqaa-setup`, whereas `0.1.2+` uses `/bqaa-mod-setup` (with `/bqaa-setup` kept as a `0.1.x` alias). Verify your installed version first with `claude plugin list` or `/bqaa-status`: passing an unknown slash command to `claude -p "/..."` does **not** fail fast and instead runs as a normal billed model prompt.
+> **Served copy vs. `main` & `-p` command check:** Marketplace installs track the released snapshot in the [served marketplace copy](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins/blob/main/plugins/claude_code_dist/bigquery-agent-analytics-mod/README.md), while `plugins/claude_code_mod/` on `main` may be ahead between releases. Version `0.1.1` uses `/bqaa-setup` and `clean_dead_letter.py --dir DIR`; `0.1.2+` adds `/bqaa-mod-setup` (with `/bqaa-setup` kept as a `0.1.x` alias), `/bqaa-status check`, `/bqaa-backfill wait`, and positional `clean_dead_letter.py [DIR]`; and `0.1.3+` adds a decoupled `15 s` token timeout on `/bqaa-status check`, `-p` exit table auto-create, `--quota-project` and automatic ADC quota-project `403` retry in `run_bq.py` and `setup_gcp_prereqs.py`, `dry-run/` inside `deadLetterDir`, and source-before-tombstone `clean_dead_letter.py` deletion. Verify your installed version first with `claude plugin list`: passing an unknown slash command to `claude -p "/..."` does **not** fail fast and instead runs as a normal billed model prompt.
 
 ### 4. Create the BigQuery dataset and table
 
 The installed mod includes `setup.sh` and `scripts/`, so you do not need to clone the repository. Print the ready-to-run `setup.sh` command for your installed copy with `/bqaa-mod-setup` (`/bqaa-setup` remains a compatibility alias in `0.1.x`, and `/bqaa-status` prints the same command when the dataset is missing), then run the printed `BQAA_PROJECT_ID=... setup.sh` command in your shell:
 
 ```bash
+# On marketplace 0.1.1, run /bqaa-setup instead of /bqaa-mod-setup
 claude -p /bqaa-mod-setup < /dev/null
 ```
 
 If you prefer to invoke `setup.sh` directly from the installed mod cache without opening `claude` (selecting the highest installed version when multiple versions are cached; the cache is under `$CLAUDE_CONFIG_DIR` when you set it, else `~/.claude`):
 
 ```bash
-PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{s=$(NF-1); sub(/\+.*/,"",s); p=index(s,"-"); pre=p?substr(s,p+1):""; core=p?substr(s,1,p-1):s; split(core,v,"."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (pre==""), pre, $0}' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
+PLUGIN_DIR="$(printf '%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ | awk '{ s=$0; sub(/\/$/, "", s); sub(/.*\//, "", s); if (s !~ /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/) next; sub(/\+.*/, "", s); pk=""; i=index(s, "-"); if (i) { n=split(substr(s, i+1), p, "."); s=substr(s, 1, i-1); for (k=1; k<=n; k++) pk=(k>1 ? pk "." : "") (p[k] ~ /^[0-9]+$/ ? sprintf("0%08d", p[k]+0) : "1" p[k]) } split(s, v, "."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (i==0), pk, $0 }' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
 BQAA_PROJECT_ID=YOUR_PROJECT BQAA_DATASET=agent_analytics bash "${PLUGIN_DIR:?mod cache directory not found}setup.sh"
 ```
 
@@ -127,7 +128,7 @@ Because `--config project=...` (or `/config`) saves `"project"` in `~/.claude/se
 
 1. **Provision the dataset, table, and views in the new project** (run `/bqaa-mod-setup` after updating `project`, or run `setup.sh` from your installed mod cache):
    ```bash
-   PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{s=$(NF-1); sub(/\+.*/,"",s); p=index(s,"-"); pre=p?substr(s,p+1):""; core=p?substr(s,1,p-1):s; split(core,v,"."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (pre==""), pre, $0}' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
+   PLUGIN_DIR="$(printf '%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ | awk '{ s=$0; sub(/\/$/, "", s); sub(/.*\//, "", s); if (s !~ /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/) next; sub(/\+.*/, "", s); pk=""; i=index(s, "-"); if (i) { n=split(substr(s, i+1), p, "."); s=substr(s, 1, i-1); for (k=1; k<=n; k++) pk=(k>1 ? pk "." : "") (p[k] ~ /^[0-9]+$/ ? sprintf("0%08d", p[k]+0) : "1" p[k]) } split(s, v, "."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (i==0), pk, $0 }' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
    BQAA_PROJECT_ID=NEW_PROJECT BQAA_DATASET=agent_analytics bash "${PLUGIN_DIR:?mod cache directory not found}setup.sh"
    ```
 2. **Update the saved `project` option**:
@@ -145,7 +146,7 @@ Because `--config project=...` (or `/config`) saves `"project"` in `~/.claude/se
 1. **Create the dataset, table, and views**: Run `setup.sh` (see [Step A.4](#4-create-the-bigquery-dataset-and-table)) in a dedicated GCP project where regular users do not hold project-wide BigQuery read roles. This creates `<dataset>.agent_events` and two aggregate views (`daily_usage_by_user`, `daily_usage_by_model`) in `<dataset>_reporting`.
 2. **Create the writer service account and grant your two groups**: The bootstrap script (`scripts/setup_gcp_prereqs.py`) is included inside the installed mod directory (shown by `/bqaa-mod-setup`, or resolved from the cache below) as well as in a repository checkout. Applying its plan needs `google-cloud-bigquery`, so create a virtual environment outside the read-only plugin cache, in your home directory rather than a shared directory such as `/tmp` that another user could create first (for example `~/.bqaa-mod/venv`):
    ```bash
-   PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{s=$(NF-1); sub(/\+.*/,"",s); p=index(s,"-"); pre=p?substr(s,p+1):""; core=p?substr(s,1,p-1):s; split(core,v,"."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (pre==""), pre, $0}' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
+   PLUGIN_DIR="$(printf '%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ | awk '{ s=$0; sub(/\/$/, "", s); sub(/.*\//, "", s); if (s !~ /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/) next; sub(/\+.*/, "", s); pk=""; i=index(s, "-"); if (i) { n=split(substr(s, i+1), p, "."); s=substr(s, 1, i-1); for (k=1; k<=n; k++) pk=(k>1 ? pk "." : "") (p[k] ~ /^[0-9]+$/ ? sprintf("0%08d", p[k]+0) : "1" p[k]) } split(s, v, "."); printf "%06d%06d%06d.%d.%s %s\n", v[1], v[2], v[3], (i==0), pk, $0 }' | LC_ALL=C sort | tail -n 1 | cut -d' ' -f2-)"
    cd "${PLUGIN_DIR:?mod cache directory not found}"
    python3 -m venv ~/.bqaa-mod/venv && ~/.bqaa-mod/venv/bin/pip install google-cloud-bigquery
    ~/.bqaa-mod/venv/bin/python scripts/setup_gcp_prereqs.py \

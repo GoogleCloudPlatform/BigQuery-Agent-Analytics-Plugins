@@ -583,6 +583,95 @@ def run_bq_checks():
           and 'GOOGLE_CLOUD_QUOTA_PROJECT=my-gcp-project' in err,
           f'{status} clients={len(fake.clients)} {err!r}')
 
+    # Stripped retry failing with a non-403 error (e.g. 400 USER_PROJECT_MISSING) still surfaces --quota-project hint.
+    def deny_then_missing_user_project(client, sql, job_config):
+        if client.credentials is None:
+            raise RuntimeError(
+                '403 POST https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/jobs: '
+                'Caller does not have required permission to use project vertex-proj (USER_PROJECT_DENIED)'
+            )
+        raise RuntimeError(
+            '400 POST https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/jobs: '
+            'User project is missing for this credential (USER_PROJECT_MISSING)'
+        )
+
+    fake = FakeBigQuery(on_query=deny_then_missing_user_project)
+    fake_auth_mods, auth_calls = make_fake_google_auth('vertex-proj')
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, 'SELECT 1')
+    check('non-403 failure on stripped retry (400 USER_PROJECT_MISSING) still prints --quota-project and GOOGLE_CLOUD_QUOTA_PROJECT hint',
+          status == 1 and len(fake.clients) == 2 and len(auth_calls) == 1
+          and 'USER_PROJECT_MISSING' in err
+          and '--quota-project my-gcp-project' in err
+          and 'GOOGLE_CLOUD_QUOTA_PROJECT=my-gcp-project' in err,
+          f'{status} clients={len(fake.clients)} {err!r}')
+
+    # Foreign 403 SERVICE_DISABLED naming ADC quota_project_id (!= --project) retries once without ADC quota project.
+    def disable_foreign_adc_quota(client, sql, job_config):
+        if client.credentials is None:
+            raise RuntimeError(
+                '403 POST https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/jobs: '
+                'BigQuery API has not been used in project vertex-proj before or it is disabled. '
+                'Enable it by visiting https://console.developers.google.com/apis/api/bigquery.googleapis.com/overview?project=vertex-proj '
+                '(SERVICE_DISABLED)'
+            )
+
+    fake = FakeBigQuery(rows=[{'n': 11}], on_query=disable_foreign_adc_quota)
+    fake_auth_mods, auth_calls = make_fake_google_auth('vertex-proj')
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, 'SELECT 1')
+    check('foreign 403 SERVICE_DISABLED naming ADC quota project retries once with with_quota_project(None) and succeeds',
+          status == 0 and len(fake.clients) == 2 and len(auth_calls) == 1
+          and fake.clients[1].credentials is not None
+          and fake.clients[1].credentials.quota_project_id is None
+          and json.loads(out) == {'n': 11} and err == '',
+          f'{status} clients={len(fake.clients)} out={out!r} err={err!r}')
+
+    # Foreign 403 SERVICE_DISABLED citing numeric project number (e.g. 725213578853) when had_adc_quota="vertex-proj" also retries.
+    def disable_foreign_adc_quota_by_number(client, sql, job_config):
+        if client.credentials is None:
+            raise RuntimeError(
+                '403 POST https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/jobs: '
+                'BigQuery API has not been used in project 725213578853 before or it is disabled. '
+                'Enable it by visiting https://console.developers.google.com/apis/api/bigquery.googleapis.com/overview?project=725213578853 '
+                '(SERVICE_DISABLED)'
+            )
+
+    fake = FakeBigQuery(rows=[{'n': 12}], on_query=disable_foreign_adc_quota_by_number)
+    fake_auth_mods, auth_calls = make_fake_google_auth('vertex-proj')
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, 'SELECT 1')
+    check('foreign 403 SERVICE_DISABLED naming numeric quota project number retries once with with_quota_project(None) and succeeds',
+          status == 0 and len(fake.clients) == 2 and len(auth_calls) == 1
+          and fake.clients[1].credentials is not None
+          and fake.clients[1].credentials.quota_project_id is None
+          and json.loads(out) == {'n': 12} and err == '',
+          f'{status} clients={len(fake.clients)} out={out!r} err={err!r}')
+
+    # Target-project 403 SERVICE_DISABLED naming --project does NOT retry and does NOT emit a quota-project hint.
+    target_disabled_err = (
+        '403 POST https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/jobs: '
+        'BigQuery API has not been used in project my-gcp-project before or it is disabled (SERVICE_DISABLED)'
+    )
+    fake = FakeBigQuery(error=target_disabled_err)
+    fake_auth_mods, auth_calls = make_fake_google_auth('vertex-proj')
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, 'SELECT 1')
+    check('target-project 403 SERVICE_DISABLED makes 1 call, 0 retries, and emits no quota-project hint',
+          status == 1 and len(fake.clients) == 1 and len(auth_calls) == 1
+          and 'SERVICE_DISABLED' in err and 'HINT:' not in err and '--quota-project' not in err,
+          f'{status} clients={len(fake.clients)} {err!r}')
+
+    # Same-project 403 SERVICE_DISABLED when ADC quota_project_id == --project does NOT retry.
+    fake = FakeBigQuery(error=target_disabled_err)
+    fake_auth_mods, auth_calls = make_fake_google_auth('my-gcp-project')
+    with modules(fake_auth_mods):
+        status, out, err = run_bq_with(fake, *base, 'SELECT 1')
+    check('403 SERVICE_DISABLED when ADC quota_project_id equals --project makes 1 call and 0 retries',
+          status == 1 and len(fake.clients) == 1 and len(auth_calls) == 1
+          and 'SERVICE_DISABLED' in err and 'HINT:' not in err,
+          f'{status} clients={len(fake.clients)} {err!r}')
+
     # Non-quota errors fail immediately without calling google.auth or retrying.
     fake = FakeBigQuery(error='404 Not found: Table my-gcp-project:agent_analytics.agent_events')
     fake_auth_mods, auth_calls = make_fake_google_auth('vertex-proj')
@@ -594,10 +683,14 @@ def run_bq_checks():
 
     with environment(), modules(NO_CLIENT):
         status, out, err = call(run_bq.main, '--help')
-    check('--help needs no BigQuery client and documents --query, --quota-project and set-quota-project',
+    check('--help needs no BigQuery client, documents --query and --quota-project, and never suggests global set-quota-project',
           status == 0 and '--max-gb' in out and '--query' in out
-          and '--quota-project' in out and 'set-quota-project' in out.replace('-\n', '-'),
+          and '--quota-project' in out and 'GOOGLE_CLOUD_QUOTA_PROJECT' in out
+          and 'set-quota-project' not in out.replace('-\n', '-'),
           f'{status} {out!r} {err!r}')
+    check('run_bq.py module docstring does not recommend global gcloud auth application-default set-quota-project',
+          'set-quota-project' not in (run_bq.__doc__ or ''),
+          run_bq.__doc__ or '')
     with environment(), modules(NO_CLIENT):
         status, out, err = call(run_bq.main, *base, 'SELECT 1')
     check('without the BigQuery client: exit 1, and how to install it',
@@ -723,9 +816,10 @@ def setup_dry_run_checks():
     status, out, err = attempt(*DOCUMENTED, '--dry-run', '--execute')
     check('--dry-run with --execute: exit 2', status == 2 and 'not allowed with argument' in err, f'{status} {err!r}')
     status, out, err = attempt('--help')
-    check('--help: exit 0, needs no program and no client, and describes --project, --dataset, --table and --location defaults',
+    check('--help: exit 0, needs no program and no client, and describes --project, --dataset, --table, --location and --quota-project defaults',
           status == 0 and '--writer-role' in out and 'BQAA_PROJECT_ID' in out and 'BQAA_DATASET' in out
-          and 'BQAA_TABLE' in out and 'BQAA_LOCATION' in out,
+          and 'BQAA_TABLE' in out and 'BQAA_LOCATION' in out and '--quota-project' in out
+          and 'GOOGLE_CLOUD_QUOTA_PROJECT' in out and 'set-quota-project' not in out.replace('-\n', '-'),
           f'{status} {out!r} {err!r}')
     status, out, err = attempt(*BASE, '--no-create-dataset', '--no-create-table')
     check('--no-create-dataset and --no-create-table are accepted, and change nothing',
@@ -747,10 +841,19 @@ def setup_dry_run_checks():
           args is not None and (args.project, args.dataset, args.table) == ('gcp-two-aaaa', 'bq_dataset', 'bq_table'))
     args = parsed(GOOGLE_CLOUD_PROJECT='gcp-three-aa')
     check('GOOGLE_CLOUD_PROJECT is the last project; the dataset, table and location have defaults',
-          args is not None and (args.project, args.dataset, args.table, args.location, args.views_dataset)
-          == ('gcp-three-aa', 'agent_analytics', 'agent_events', 'US', ''))
+          args is not None and (args.project, args.dataset, args.table, args.location, args.views_dataset, args.quota_project)
+          == ('gcp-three-aa', 'agent_analytics', 'agent_events', 'US', '', None))
     args = parsed('--project', 'flag-project-a', BQAA_PROJECT_ID='bqaa-one-aaa')
     check('a flag comes before any variable', args is not None and args.project == 'flag-project-a')
+    args = parsed(*BASE, GOOGLE_CLOUD_QUOTA_PROJECT='')
+    check('empty GOOGLE_CLOUD_QUOTA_PROJECT in setup_gcp_prereqs is treated as unset',
+          args is not None and args.quota_project is None)
+    args = parsed(*BASE, GOOGLE_CLOUD_QUOTA_PROJECT='env-quota-proj')
+    check('GOOGLE_CLOUD_QUOTA_PROJECT sets setup_gcp_prereqs quota_project',
+          args is not None and args.quota_project == 'env-quota-proj')
+    args = parsed(*BASE, '--quota-project', 'flag-quota-proj', GOOGLE_CLOUD_QUOTA_PROJECT='env-quota-proj')
+    check('--quota-project overrides GOOGLE_CLOUD_QUOTA_PROJECT in setup_gcp_prereqs',
+          args is not None and args.quota_project == 'flag-quota-proj')
 
 
 def setup_refusal_checks():
@@ -788,6 +891,10 @@ def setup_refusal_checks():
         ('a views dataset with a hyphen', [*BASE, '--views-dataset', 'v-w'],
          'is not a plain dataset or table name'),
         ('a location with a space', [*BASE, '--location', 'us east'], 'is not a location'),
+        ('a quota project that is no project id', [*BASE, '--quota-project', 'Bad_Quota'],
+         'is not a project id'),
+        ('an empty --quota-project flag', [*BASE, '--quota-project', ''],
+         'is not a project id'),
     )
     for what, argv, fragment in cases:
         for mode in ([], ['--execute']):
@@ -1062,6 +1169,9 @@ class FakeClient:
     def __init__(self, datasets, tables):
         self.datasets, self.tables, self.updates = datasets, tables, []
 
+    def list_datasets(self, project=None, max_results=None):
+        return iter(list(self.datasets.values())[:max_results])
+
     def get_dataset(self, reference):
         try:
             return self.datasets[reference.split('.')[1]]
@@ -1090,19 +1200,34 @@ def fake_client(events=DEFAULT_ENTRIES, views=DEFAULT_ENTRIES, tables=None):
                        VIEWS: Dataset([AccessEntry(*entry) for entry in views])}, tables)
 
 
-def google_modules(client):
+def google_modules(client, adc_quota_project=None, on_client=None):
     """The sys.modules entries that make `from google.cloud import bigquery` give this client."""
+    class SetupFakeCreds:
+        def __init__(self, qp):
+            self.quota_project_id = qp
+
+        def with_quota_project(self, qp):
+            return SetupFakeCreds(qp)
+
+    def make_client(project=None, credentials=None, client_options=None):
+        if on_client is not None:
+            on_client(project=project, credentials=credentials, client_options=client_options)
+        return client
+
     bigquery = types.ModuleType('google.cloud.bigquery')
-    bigquery.Client = lambda project=None: client
+    bigquery.Client = make_client
     bigquery.AccessEntry = AccessEntry
     exceptions = types.ModuleType('google.cloud.exceptions')
     exceptions.NotFound = NotFound
     cloud = types.ModuleType('google.cloud')
     cloud.bigquery, cloud.exceptions = bigquery, exceptions
+    auth = types.ModuleType('google.auth')
+    auth.default = lambda scopes=None: (SetupFakeCreds(adc_quota_project), 'adc-default-proj')
     google = types.ModuleType('google')
     google.cloud = cloud
+    google.auth = auth
     return {'google': google, 'google.cloud': cloud, 'google.cloud.bigquery': bigquery,
-            'google.cloud.exceptions': exceptions}
+            'google.cloud.exceptions': exceptions, 'google.auth': auth}
 
 
 def held(dataset):
@@ -1534,6 +1659,93 @@ def execute_stop_checks():
         check(f'--execute, {what}: it stops before it calls anything',
               status == 1 and fragment in err and cloud.calls == [], f'{status} {err!r}')
 
+    # Pre-mutation ADC BigQuery check: if ADC BigQuery access fails (including stripped-quota retry),
+    # --execute stops BEFORE running any gcloud or bq IAM mutation steps.
+    client_calls = []
+
+    class QuotaFailingClient:
+        def __init__(self, mode):
+            self.mode = mode
+
+        def list_datasets(self, project=None, max_results=None):
+            if self.mode == 'first_403_then_400':
+                if len(client_calls) == 1:
+                    raise RuntimeError(
+                        '403 Caller does not have required permission to use project vertex-proj (USER_PROJECT_DENIED)'
+                    )
+                raise RuntimeError('400 User project is missing for this credential (USER_PROJECT_MISSING)')
+            raise RuntimeError(
+                '403 BigQuery API has not been used in project my-gcp-project before or it is disabled (SERVICE_DISABLED)'
+            )
+
+        def get_dataset(self, reference):
+            return self.list_datasets()
+
+    def record_failing_client(**kwargs):
+        client_calls.append(kwargs)
+
+    cloud = FakeCloud()
+    fail_client = QuotaFailingClient('first_403_then_400')
+    status, out, err = execute(
+        cloud, *DOCUMENTED,
+        libraries=google_modules(fail_client, adc_quota_project='vertex-proj', on_client=record_failing_client),
+    )
+    check('--execute, ADC quota project 403 + stripped retry failure: stops in preflight before any gcloud/bq call and prints --quota-project hint',
+          status == 1 and len(client_calls) == 2
+          and client_calls[0]['credentials'] is None
+          and client_calls[1]['credentials'] is not None and client_calls[1]['credentials'].quota_project_id is None
+          and 'Nothing was changed' in err and '--quota-project my-gcp-project' in err
+          and 'GOOGLE_CLOUD_QUOTA_PROJECT=my-gcp-project' in err
+          and cloud.calls == [] and cloud.mutations == [],
+          f'{status} calls={len(client_calls)} cloud={cloud.calls} {err!r}')
+
+    client_calls.clear()
+    cloud = FakeCloud()
+    target_disabled_client = QuotaFailingClient('target_service_disabled')
+    status, out, err = execute(
+        cloud, *DOCUMENTED,
+        libraries=google_modules(target_disabled_client, adc_quota_project='vertex-proj', on_client=record_failing_client),
+    )
+    check('--execute, target-project SERVICE_DISABLED in ADC preflight: stops with 1 call, 0 retries, no quota hint, and no gcloud/bq calls',
+          status == 1 and len(client_calls) == 1
+          and 'SERVICE_DISABLED' in err and '--quota-project' not in err
+          and cloud.calls == [] and cloud.mutations == [],
+          f'{status} calls={len(client_calls)} cloud={cloud.calls} {err!r}')
+
+    # Foreign 403 SERVICE_DISABLED (including numeric project number in preflight) retries once without ADC quota project and succeeds.
+    retry_calls = []
+    good_client = fake_client()
+    real_list_datasets = good_client.list_datasets
+    real_get_dataset = good_client.get_dataset
+
+    def list_datasets_with_foreign_number_disabled(project=None, max_results=None):
+        if retry_calls and retry_calls[-1]['credentials'] is None:
+            raise RuntimeError(
+                '403 BigQuery API has not been used in project 725213578853 before or it is disabled (SERVICE_DISABLED)'
+            )
+        return real_list_datasets(project=project, max_results=max_results)
+
+    def get_dataset_with_foreign_disabled(reference):
+        if retry_calls and retry_calls[-1]['credentials'] is None:
+            raise RuntimeError(
+                '403 BigQuery API has not been used in project vertex-proj before or it is disabled (SERVICE_DISABLED)'
+            )
+        return real_get_dataset(reference)
+
+    good_client.list_datasets = list_datasets_with_foreign_number_disabled
+    good_client.get_dataset = get_dataset_with_foreign_disabled
+    cloud = FakeCloud()
+    status, out, err = execute(
+        cloud, *DOCUMENTED,
+        libraries=google_modules(good_client, adc_quota_project='vertex-proj', on_client=lambda **kw: retry_calls.append(kw)),
+    )
+    check('--execute, foreign SERVICE_DISABLED on ADC quota project: retries with with_quota_project(None) and completes all 12 steps',
+          status == 0 and err == '' and out.rstrip().endswith('Access setup completed.')
+          and len(retry_calls) == 6
+          and all(retry_calls[i]['credentials'] is None and retry_calls[i + 1]['credentials'].quota_project_id is None
+                  for i in range(0, 6, 2)),
+          f'{status} retries={len(retry_calls)} {err!r}')
+
     # A writer that already holds more is refused before any grant (the APIs are the one thing enabled before the check).
     cloud, client = FakeCloud(), fake_client()
     cloud.service_account = True
@@ -1732,6 +1944,14 @@ def repo_checks():
     check('no Markdown file in the repository uses GNU-only sort -V',
           non_portable_sort == [], str(non_portable_sort))
 
+    manifest = json.loads((PLUGIN / '.claude-plugin' / 'plugin.json').read_text(encoding='utf-8'))
+    user_cfg = manifest.get('userConfig') or {}
+    number_opts = {k: v for k, v in user_cfg.items() if isinstance(v, dict) and v.get('type') == 'number'}
+    bounded_opts = [k for k, v in number_opts.items() if 'min' in v or 'max' in v]
+    check('plugin.json numeric userConfig options (maxPayloadChars, flushIntervalMs) carry no min/max so runtime clamping handles out-of-range numbers',
+          {'maxPayloadChars', 'flushIntervalMs'} <= set(number_opts) and bounded_opts == [],
+          f'number_opts={list(number_opts)} bounded={bounded_opts}')
+
     # Every command the docs and the SQL headers show is one the scripts take.
     commands = documented_commands()
     check('the docs and the SQL headers show at least five commands, for both scripts',
@@ -1796,8 +2016,8 @@ def setup_sh_checks():
 # The docs' lookup of the installed copy, and where they make a virtualenv
 # ---------------------------------------------------------------------------
 
-# `PLUGIN_DIR="$(ls -d .../*/ ...)"`, a line of a shell block in the docs.
-LOOKUP = re.compile(r'^[ \t]*(PLUGIN_DIR="\$\(ls -d .*\)")[ \t]*$', re.M)
+# `PLUGIN_DIR="$(printf '%s\n' .../*/ | awk ...)"`, a line of a shell block in the docs.
+LOOKUP = re.compile(r'^[ \t]*(PLUGIN_DIR="\$\((?:printf|ls -d) .*\)")[ \t]*$', re.M)
 CACHE = '"${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/'
 MOD_CACHE = pathlib.PurePosixPath('plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod')
 
@@ -1815,6 +2035,8 @@ def cache_lookup_checks():
           [where for where, _ in lookups])
     stale = [where for where, line in lookups if CACHE not in line]
     check('every lookup reads the cache under CLAUDE_CONFIG_DIR when it is set, else under ~/.claude', stale == [], stale)
+    check('all six documented PLUGIN_DIR lookup lines are identical',
+          len({line for _, line in lookups}) == 1, [where for where, _ in lookups])
     shared = [path.name for path in markdown_files() if re.search(r'/tmp/\S*venv', path.read_text(encoding='utf-8'))]
     check('no doc makes a virtual environment in a shared /tmp path another user could make first', shared == [], shared)
     sa_doc = (PLUGIN / 'docs' / 'service-account-auth.md').read_text(encoding='utf-8')
@@ -1859,6 +2081,38 @@ def cache_lookup_checks():
             check('a lookup that finds no installed copy stops at the guard, with nothing printed',
                   found.returncode != 0 and found.stdout == '' and 'mod cache directory not found' in found.stderr,
                   f'{found.returncode} {found.stdout!r} {found.stderr!r}')
+
+            # SemVer 2.0.0 §11.4 pre-release ordering, +build metadata stripping, and non-SemVer noise filtering.
+            semver_cases = (
+                ('multi-digit numeric pre-release (0.2.0-alpha.10 > 0.2.0-alpha.2)',
+                 ('0.2.0-alpha.2', '0.2.0-alpha.10', '0.2.0-alpha.9'), '0.2.0-alpha.10'),
+                ('multi-digit rc pre-release (0.2.0-rc.10 > 0.2.0-rc.2)',
+                 ('0.2.0-rc.2', '0.2.0-rc.10', '0.2.0-beta.11'), '0.2.0-rc.10'),
+                ('numeric pre-release has lower precedence than non-numeric (0.2.0-alpha > 0.2.0-10 > 0.2.0-2)',
+                 ('0.2.0-2', '0.2.0-10', '0.2.0-alpha'), '0.2.0-alpha'),
+                ('build metadata stripped before pre-release split (0.2.0-rc.10+build.20261108 > 0.2.0-rc.9)',
+                 ('0.2.0-rc.9', '0.2.0-rc.10+build.20261108'), '0.2.0-rc.10+build.20261108'),
+                ('release outranks pre-release with build metadata (0.2.0 > 0.2.0-rc.10+build.20261108)',
+                 ('0.2.0-rc.10+build.20261108', '0.2.0'), '0.2.0'),
+                ('non-SemVer noise dirs are ignored so valid 0.0.0-alpha.1 wins',
+                 ('0.0.0-alpha.1', 'dev', 'latest', 'deadbeef', 'v9.9.9', '.DS_Store'), '0.0.0-alpha.1'),
+            )
+            awk_bins = [cmd for cmd in ('awk', 'gawk --posix', 'mawk', 'nawk')
+                        if shutil.which(cmd.split()[0]) is not None]
+            for label, dirs, expected_winner in semver_cases:
+                for awk_cmd in awk_bins:
+                    case_cfg = pathlib.Path(tmp) / f'semver-{awk_cmd.replace(" ", "_")}-{expected_winner}'
+                    for dname in dirs:
+                        (case_cfg / MOD_CACHE / dname).mkdir(parents=True, exist_ok=True)
+                    awk_script = script.replace('| awk ', f'| {awk_cmd} ', 1)
+                    res = subprocess.run(
+                        [sh, '-c', awk_script], capture_output=True, text=True, cwd=tmp,
+                        env={'PATH': os.environ.get('PATH', ''), 'LC_ALL': 'C', 'HOME': str(home),
+                             'CLAUDE_CONFIG_DIR': str(case_cfg)},
+                    )
+                    check(f'SemVer 2.0.0 lookup ({awk_cmd}): {label}',
+                          res.returncode == 0 and res.stdout == f'{case_cfg / MOD_CACHE / expected_winner}/',
+                          f'{res.returncode} {res.stdout!r} {res.stderr!r}')
 
 
 # ---------------------------------------------------------------------------
@@ -1994,9 +2248,9 @@ def clean_dead_letter_checks():
         outcome = d / 'outcome-spill-006.jsonl'
         outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
         status, out, err = call(clean.main, '--dir', str(d))
-        check('dry-run: each planned file, then the count, exit 0',
+        check('dry-run: each planned file (source before outcome), then the count, exit 0',
               status == 0 and err == '' and out.splitlines() == [
-                  'would delete: outcome-spill-006.jsonl', 'would delete: spill-006.jsonl', '2 file(s) would delete'],
+                  'would delete: spill-006.jsonl', 'would delete: outcome-spill-006.jsonl', '2 file(s) would delete'],
               f'{status} {out!r} {err!r}')
         real_unlink = pathlib.Path.unlink
 
@@ -2011,8 +2265,68 @@ def clean_dead_letter_checks():
               status == 1 and 'ERROR: outcome-spill-006.jsonl: ' in err and 'deleted: outcome-spill-006.jsonl' not in out
               and out.splitlines() == ['deleted: spill-006.jsonl', '1 file(s) deleted'],
               f'{status} {out!r} {err!r}')
-        check('under --execute: the file that could not be removed stays and the one after it is deleted',
+        check('under --execute: the file that could not be removed stays and the one before it is deleted',
               outcome.exists() and not source.exists(), f'{outcome.exists()} {source.exists()}')
+
+    # 6b. Source-first ordering & lstat() re-verification: if source.unlink() fails, becomes non-empty,
+    #     or is replaced by a symlink before unlink, all outcome-* tombstones in that group remain intact on disk.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        source = d / 'spill-006b.jsonl'
+        source.write_bytes(b'')
+        outcome1 = d / 'outcome-spill-006b.jsonl'
+        outcome1.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        outcome2 = d / 'outcome-done-w1-spill-006b.jsonl'
+        outcome2.write_text(seal('{"journal":true,"done":true}\n'), encoding='utf-8')
+        real_unlink = pathlib.Path.unlink
+
+        def fail_source_unlink(path, *args, **kwargs):
+            if path.name == source.name:
+                raise PermissionError(13, 'Permission denied', str(path))
+            return real_unlink(path, *args, **kwargs)
+
+        with patched(pathlib.Path, unlink=fail_source_unlink):
+            status, out, err = call(clean.main, '--dir', str(d), '--execute')
+        check('6b. when source.unlink() fails, no outcome-* file in that group is deleted',
+              status == 1 and 'ERROR: spill-006b.jsonl:' in err
+              and out.splitlines() == ['0 file(s) deleted']
+              and source.exists() and outcome1.exists() and outcome2.exists(),
+              f'{status} {out!r} {err!r}')
+
+        # Mutate source to non-empty between plan_deletion_groups() and main()'s lstat() check.
+        real_plan_groups = clean.plan_deletion_groups
+
+        def plan_then_grow(directory):
+            groups = real_plan_groups(directory)
+            source.write_text(seal('{"row":1}\n'), encoding='utf-8')
+            return groups
+
+        with patched(clean, plan_deletion_groups=plan_then_grow):
+            status, out, err = call(clean.main, '--dir', str(d), '--execute')
+        check('6c. when source becomes non-empty before unlink, lstat() guard aborts group and keeps source + outcome-* files',
+              status == 1 and 'no longer an empty regular file' in err
+              and out.splitlines() == ['0 file(s) deleted']
+              and source.exists() and outcome1.exists() and outcome2.exists(),
+              f'{status} {out!r} {err!r}')
+
+        # Replace source with a symlink to a 0-byte file between plan_deletion_groups() and main()'s lstat() check.
+        source.write_bytes(b'')
+        outside_empty = pathlib.Path(tmp) / 'outside-empty.jsonl'
+        outside_empty.write_bytes(b'')
+
+        def plan_then_symlink(directory):
+            groups = real_plan_groups(directory)
+            source.unlink()
+            source.symlink_to(outside_empty)
+            return groups
+
+        with patched(clean, plan_deletion_groups=plan_then_symlink):
+            status, out, err = call(clean.main, '--dir', str(d), '--execute')
+        check('6d. when source is replaced by a symlink before unlink, lstat() guard aborts group and keeps outcome-* files',
+              status == 1 and 'no longer an empty regular file' in err
+              and out.splitlines() == ['0 file(s) deleted']
+              and source.is_symlink() and outside_empty.exists() and outcome1.exists() and outcome2.exists(),
+              f'{status} {out!r} {err!r}')
 
     # 7-9. A non-empty source file whose completion record cannot be read may
     #    name any source as parent: nothing in its partition directory is

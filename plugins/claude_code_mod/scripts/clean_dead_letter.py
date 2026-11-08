@@ -53,6 +53,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -119,31 +120,30 @@ def _is_source(name: str) -> bool:
     return any(name.startswith(p) for p in SOURCE_PREFIXES)
 
 
-def _plan_single_dir(directory: Path) -> list[Path]:
-    """Plan one partition directory: nothing in it (``[]``) where an entry
-    cannot be listed or stat'ed, or a non-empty source file's completion
-    record cannot be read (see ``_read_completion_parent``)."""
+def _plan_single_dir_groups(directory: Path) -> list[tuple[Path, list[Path]]]:
+    """Plan one partition directory as ``(source, sorted_outcomes)`` groups:
+    nothing in it (``[]``) where an entry cannot be listed or lstat'ed, or a
+    non-empty source file's completion record cannot be read (see
+    ``_read_completion_parent``)."""
     try:
         entries = sorted(directory.iterdir())
     except OSError:
         return []
-    sources: dict[str, Path] = {}
+    sources: dict[str, tuple[Path, int]] = {}
     outcomes_by_source: dict[str, list[Path]] = {}
     non_empty_parents: set[str] = set()
 
     for entry in entries:
         try:
-            if entry.is_symlink() or not entry.is_file():
-                continue
+            st = entry.lstat()
         except OSError:
             return []
+        if not stat.S_ISREG(st.st_mode):
+            continue
         name = entry.name
         if _is_source(name):
-            sources[name] = entry
-            try:
-                size = entry.stat().st_size
-            except OSError:
-                return []
+            size = st.st_size
+            sources[name] = (entry, size)
             if size > 0:
                 ok, parent = _read_completion_parent(entry)
                 if not ok:
@@ -155,17 +155,13 @@ def _plan_single_dir(directory: Path) -> list[Path]:
         if of is not None:
             outcomes_by_source.setdefault(of, []).append(entry)
 
-    deletable: list[Path] = []
-    for name, path in sources.items():
-        try:
-            is_empty = path.stat().st_size == 0
-        except OSError:
-            return []
-        if is_empty and name not in non_empty_parents:
-            deletable.append(path)
-            deletable.extend(outcomes_by_source.get(name, []))
+    groups: list[tuple[Path, list[Path]]] = []
+    for name in sorted(sources):
+        path, size = sources[name]
+        if size == 0 and name not in non_empty_parents:
+            groups.append((path, sorted(outcomes_by_source.get(name, []))))
 
-    return deletable
+    return groups
 
 
 def _has_symlink_component(path: Path) -> bool:
@@ -183,14 +179,14 @@ def _has_symlink_component(path: Path) -> bool:
     return False
 
 
-def plan_deletions(directory: Path) -> list[Path]:
-    """Return the list of files that may be deleted from ``directory``.
+def plan_deletion_groups(directory: Path) -> list[tuple[Path, list[Path]]]:
+    """Return ``[(source_path, sorted_outcome_paths), ...]`` for ``directory``.
 
     Scans ``directory`` and its immediate ``<project.dataset.table>``
     subdirectories. A source file and all its ``outcome-*`` files are deletable
     when the source is empty (0 bytes) and no non-empty leftover file names it
     as ``parent``; nothing is in a partition directory that cannot be read
-    whole (see ``_plan_single_dir``).
+    whole (see ``_plan_single_dir_groups``).
     """
     if _has_symlink_component(directory) or not directory.is_dir():
         return []
@@ -202,10 +198,20 @@ def plan_deletions(directory: Path) -> list[Path]:
         return []
 
     dirs = [directory, *subdirs]
-    deletable: list[Path] = []
+    groups: list[tuple[Path, list[Path]]] = []
     for d in dirs:
-        deletable.extend(_plan_single_dir(d))
-    return sorted(set(deletable))
+        groups.extend(_plan_single_dir_groups(d))
+    return groups
+
+
+def plan_deletions(directory: Path) -> list[Path]:
+    """Return the list of files that may be deleted from ``directory``.
+
+    Scans ``directory`` and its immediate ``<project.dataset.table>``
+    subdirectories. For each deletable group, ``<source>.jsonl`` precedes its
+    ``outcome-*`` files.
+    """
+    return [path for source, outcomes in plan_deletion_groups(directory) for path in (source, *outcomes)]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -234,7 +240,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: cannot read dead-letter directory {base}: {exc}", file=sys.stderr)
         return 1
 
-    to_delete = plan_deletions(base)
+    groups = plan_deletion_groups(base)
+    to_delete = [path for source, outcomes in groups for path in (source, *outcomes)]
     if not to_delete:
         print("nothing to clean")
         return 0
@@ -245,20 +252,52 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{len(to_delete)} file(s) would delete")
         return 0
 
-    # A file is reported deleted only once unlink() has removed it; one that
-    # cannot be removed is reported on stderr and makes the exit status 1.
+    # Each group unlinks its 0-byte regular source file first (re-verifying
+    # lstat() right before unlink()), and unlinks its outcome-* files only
+    # after the source is gone so outcome records are never orphaned beside a
+    # source file that became non-empty or could not be removed.
     deleted_count = 0
     error_count = 0
-    for path in to_delete:
-        rel = path.relative_to(base)
+    for source, outcomes in groups:
+        rel_source = source.relative_to(base)
         try:
-            path.unlink()
+            st = source.lstat()
         except OSError as exc:
             error_count += 1
-            print(f"  ERROR: {rel}: {exc}", file=sys.stderr)
+            print(f"  ERROR: {rel_source}: {exc}", file=sys.stderr)
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_size != 0:
+            error_count += 1
+            print(f"  ERROR: {rel_source}: no longer an empty regular file", file=sys.stderr)
+            continue
+        try:
+            source.unlink()
+        except OSError as exc:
+            error_count += 1
+            print(f"  ERROR: {rel_source}: {exc}", file=sys.stderr)
             continue
         deleted_count += 1
-        print(f"deleted: {rel}")
+        print(f"deleted: {rel_source}")
+        for outcome in outcomes:
+            rel_outcome = outcome.relative_to(base)
+            try:
+                ost = outcome.lstat()
+            except OSError as exc:
+                error_count += 1
+                print(f"  ERROR: {rel_outcome}: {exc}", file=sys.stderr)
+                continue
+            if not stat.S_ISREG(ost.st_mode):
+                error_count += 1
+                print(f"  ERROR: {rel_outcome}: not a regular file", file=sys.stderr)
+                continue
+            try:
+                outcome.unlink()
+            except OSError as exc:
+                error_count += 1
+                print(f"  ERROR: {rel_outcome}: {exc}", file=sys.stderr)
+                continue
+            deleted_count += 1
+            print(f"deleted: {rel_outcome}")
 
     print(f"{deleted_count} file(s) deleted")
     return 1 if error_count else 0
