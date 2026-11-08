@@ -17,7 +17,11 @@
 -- Placeholders: {PROJECT}, {DATASET}, {TABLE}, and the query parameters
 -- @start, @end and @trace_id, which scripts/run_bq.py fills and binds (the
 -- project and dataset from --project and --dataset, or from BQAA_PROJECT_ID
--- and BQAA_DATASET). Pass one query at a time:
+-- and BQAA_DATASET; @start and @end default to the last 7 UTC days when
+-- omitted, and @trace_id is required for query 6). Pass --query 1..8 (or -q)
+-- to run a numbered query by ID, or pass one query string at a time:
+--
+--   python3 scripts/run_bq.py --dry-run --query 1
 --
 --   python3 scripts/run_bq.py --dry-run \
 --     --start 2026-10-01 --end 2026-10-13 "<one query below>"
@@ -132,13 +136,13 @@ FROM tools
 GROUP BY tool_name, tool_origin
 ORDER BY failures DESC, calls DESC;
 
--- 5. One line per turn: the prompt (excluding host-injected
---    task-notification messages), how long it took, how many model
---    requests and tool calls it made, its tokens (including subagents' and
---    responses_without_usage) and how it ended. Rows of a loop the mod saw
---    no start for (unidentified_loop, such as the host's own fork that
---    proposes the next prompt) are left out; an engine fork inside a turn
---    would add to both model_requests and tool_calls.
+-- 5. One line per turn: its trace_id (pass to query 6 for the full span tree),
+--    the prompt (excluding host-injected task-notification messages), how long
+--    it took, how many model requests and tool calls it made, its tokens
+--    (including subagents' and responses_without_usage) and how it ended. Rows
+--    of a loop the mod saw no start for (unidentified_loop, such as the host's
+--    own fork that proposes the next prompt) are left out; an engine fork
+--    inside a turn would add to both model_requests and tool_calls.
 WITH events AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
@@ -150,6 +154,7 @@ WITH events AS (
 SELECT
   session_id,
   invocation_id,
+  ANY_VALUE(trace_id) AS trace_id,
   MIN(timestamp) AS started_at,
   STRING_AGG(
     IF(

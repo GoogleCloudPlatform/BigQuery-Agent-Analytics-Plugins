@@ -76,7 +76,9 @@ const ERROR_MESSAGE_CHARS = 4096
 // a key that is not on the allowlist redacted (allowlist.ts, sanitize.ts),
 // `is_truncated` set when anything was cut. `content` holds what the agent,
 // the model and the tools produced under the row's own field names;
-// `attributes` is the mod's own metadata.
+// `attributes` is the mod's own metadata, and, when anything in the row was
+// redacted, `redaction`: how many values were replaced and how many
+// characters past them a redaction removed with them.
 export function buildRow(input: RowInput): BuiltRow {
   const stats: SanitizeStats = newStats()
   const limits: Limits = limitsFor(input.maxPayloadChars)
@@ -94,6 +96,11 @@ export function buildRow(input: RowInput): BuiltRow {
   if (input.errorMessage) {
     const errLimits: Limits = { ...limits, budgetChars: ERROR_MESSAGE_CHARS, maxStringChars: ERROR_MESSAGE_CHARS }
     errorMessage = sanitize(input.errorMessage, errLimits, stats) as string
+  }
+  // Every column is redacted by now, so the record counts all of them; it is
+  // added before `attributes` is held to its cap, which counts it too.
+  if (stats.redactions > 0 && attributes !== null && typeof attributes === 'object' && !Array.isArray(attributes)) {
+    attributes.redaction = { values: stats.redactions, dropped_chars: stats.droppedChars }
   }
   const row: BqaaRow = {
     timestamp: new Date(input.timestampMs).toISOString(),
