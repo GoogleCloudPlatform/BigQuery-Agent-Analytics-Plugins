@@ -18,7 +18,7 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
-import { deadLetterPartition, resolveConfig } from '../hooks/lib/config.ts'
+import { type Config, deadLetterPartition, resolveConfig } from '../hooks/lib/config.ts'
 import { type DeadLetterLine, encodeLines, packFiles, parseFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
@@ -28,6 +28,7 @@ import {
   DEAD_LETTER_DIR,
   DRY_RUN_DIR,
   GREETED,
+  HOME,
   HOST_FILE_BYTES,
   OK_INSERT,
   OPTIONS,
@@ -446,7 +447,7 @@ test('session end waits, inside half its budget, for a request already out: once
 test('a spill write that hangs holds session end no longer than its budget', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   // The token command started at session start does not answer: the exit
-  // waits for it until 200 ms before its budget ends, then spills.
+  // waits for it until 450 ms before its budget ends, then spills.
   world.processDelayMs = 100_000
   await startSession($)
   await world.clock.settle()
@@ -1432,4 +1433,293 @@ test('a short non-interactive session where autoBackfill is already running at s
       .filter(r => r.session_id === SESSION_ID)
       .map(r => JSON.parse(r.content ?? '{}')),
   ).toEqual([{ session_start: true }, { session_end: true }])
+})
+
+// ---- session end's own request, takeovers and the commands around them ----
+
+const TABLE_FOUND = { status: 200, text: '{"tableReference":{"projectId":"my-gcp-project","datasetId":"agent_analytics","tableId":"agent_events"}}' }
+const DENIED_NOTICE = 'rows are not being written: BigQuery denied the identity access to the dataset'
+const DENIED_LINE = /^BQAA: BigQuery denied the identity access to the dataset\. To fix, /
+
+// session.start again with no reload (the plugin turned off and on): a new
+// writer takes over from the one before (`adopt`).
+const restart = ($: Engine, surface: 'terminal' | 'ide' = 'terminal'): Promise<unknown> => $.session.start({ surface, isInteractive: true, cwd: '/work/my-repo' })
+
+// A writer of its own, as session.start makes one, on this test's clock,
+// files, store and scripted BigQuery answers, with a configuration no option
+// sets (`overrides`).
+function ownWriter($: Engine, world: World, overrides: Partial<Config> = {}): Writer {
+  const config: Config = { ...resolveConfig(OPTIONS, { HOME, USER: 'dev' }), ...overrides }
+  const io: Io = {
+    now: () => world.clock.now(),
+    after: (ms, fn) => $.clock.after(ms, fn),
+    fetch: async (url, init) => {
+      const answer = await $.http.fetch(url, init)
+      return { status: answer.status, text: answer.text }
+    },
+    runCommand: async (argv, timeoutMs) => {
+      const run = await $.process.run(argv, { timeoutMs })
+      return { exitCode: run.exitCode, stdout: run.stdout, stderr: run.stderr }
+    },
+    envToken: async () => undefined,
+    writeFile: (path, text) => $.fs.write(path, text),
+    readFile: path => $.fs.read(path),
+    exists: path => $.fs.exists(path),
+    listDir: path => $.fs.list(path),
+    storeGet: key => $.store.get(key),
+    storeSet: (key, value) => $.store.set(key, value),
+    storeDelete: key => $.store.delete(key),
+    status: text => $.ui.status(text),
+    debug: text => $.ui.log(text, { to: 'debug' }),
+  }
+  return new Writer(io, () => config, () => SESSION_ID)
+}
+
+// A row of this session's, for a writer of its own.
+const ownRow = (eventId: string) =>
+  buildRow({
+    eventType: 'STATE_DELTA',
+    timestampMs: 1000,
+    eventId,
+    agent: 'coding-agent',
+    sessionId: SESSION_ID,
+    invocationId: null,
+    userId: 'dev',
+    traceId: null,
+    spanId: null,
+    parentSpanId: null,
+    content: { session_end: true },
+    attributes: {},
+    maxPayloadChars: 16384,
+  }).row
+
+test('with BQAA_EXIT_FLUSH_MS=300, under the 450 ms its own request needs, session end sends nothing: its rows go to a spill file', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_EXIT_FLUSH_MS: '300' })
+  await startSession($)
+  // A token is at hand.
+  await world.clock.settle()
+  expect(world.commands.length).toBe(1)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await $.session.end(END)
+  expect(world.insertCalls()).toEqual([])
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+})
+
+// Its 800 ms budget: the request starts by 350 ms in, when 450 ms are left,
+// or not at all.
+for (const [answerMs, sends] of [
+  [340, true],
+  [360, false],
+] as const) {
+  test(`session end's own request starts only while 450 ms of its budget are left: a batch out answered ${answerMs} ms in ${sends ? 'lets the rows queued after it go in one request' : 'leaves them to a spill file'}`, { options: OPTIONS }, async ($, on) => {
+    const world = setUp(on)
+    world.replies = [{ hang: true }, OK_INSERT]
+    await startSession($)
+    await world.clock.advance(5000)
+    expect(world.insertCalls().length).toBe(1)
+    await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+    const ending = $.session.end({ ...END, reason: 'other' })
+    await world.clock.advance(answerMs)
+    world.releaseHung(OK_INSERT.status, OK_INSERT.text)
+    await ending
+    expect(world.insertCalls().length).toBe(sends ? 2 : 1)
+    expect(deadLetterRows(world).map(r => r.event_type)).toEqual(sends ? [] : ['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  })
+}
+
+test('rows parked on disk this session keep session end from sending, though a later send landed and no failure, backoff or replay is left', { options: OPTIONS }, async ($, on) => {
+  // Replays off: nothing replays the parked rows, or clears their mark.
+  const world = setUp(on, { BQAA_MAX_QUEUE_ROWS: '10', BQAA_AUTO_BACKFILL: 'false' })
+  world.replies = [UNAVAILABLE, OK_INSERT]
+  await startSession($)
+  for (let i = 0; i < 4; i += 1) await $.tool.call({ tool: 'Read', file_path: `f${i}` })
+  // The send fails with the queue past 80%: half of it goes to disk.
+  await world.clock.advance(5000)
+  const parked = deadLetterRows(world).length
+  expect(parked > 0).toBe(true)
+  // BigQuery takes the rest after the backoff.
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(2)
+  expect(await statusText($)).not.toMatch(/backing off/)
+  await $.tool.call({ tool: 'Read', file_path: 'last.ts' })
+  await $.session.end(END)
+  // Its own rows go behind the parked ones, to a spill file.
+  expect(world.insertCalls().length).toBe(2)
+  expect(deadLetterRows(world).length).toBe(parked + 3)
+})
+
+test('in a -p run, session end that spills rows past one batch replays no earlier spill file at its end', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const earlier = `${PARTITION_DIR}/spill-20261013T200102003Z-earlier-1.jsonl`
+  const file = parkedFile(parkedLine(TABLE_REF, 'e'.repeat(32), 'earlier-session'))
+  world.files.set(earlier, file)
+  const writer = ownWriter($, world, { maxBatchRows: 2 })
+  writer.prefetchToken()
+  await world.clock.settle()
+  for (const id of ['1', '2', '3']) writer.enqueue(ownRow(id.repeat(32)), 0)
+  const exiting = writer.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await world.clock.advance(800)
+  // One batch goes; the row past it is spilled, so the replay does not run.
+  expect(await exiting).toEqual({ spilled: 1 })
+  expect(world.insertCalls().map(call => (JSON.parse(call.body) as { rows: { json: { event_id: string } }[] }).rows.map(r => r.json.event_id))).toEqual([['1'.repeat(32), '2'.repeat(32)]])
+  expect(world.files.get(earlier)).toBe(file)
+  expect(deadLetterRows(world).map(r => r.event_id).sort()).toEqual(['3'.repeat(32), 'e'.repeat(32)])
+})
+
+test('a headless /bqaa-backfill still replaying after 15 s says the files left wait for a later session, never that /bqaa-status shows progress', { options: OPTIONS }, async ($, on) => {
+  // The replay's request is not given up before the command stops waiting.
+  const world = setUp(on, { BQAA_REQUEST_TIMEOUT_MS: '30000' })
+  world.files.set(`${PARTITION_DIR}/spill-20261013T200102003Z-slow-1.jsonl`, parkedFile(parkedLine(TABLE_REF, '9'.repeat(32), 'earlier-session')))
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await world.clock.settle()
+  // BigQuery does not answer the replay.
+  world.replies = [{ hang: true }]
+  const running = $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.advance(15_000)
+  expect((await running).text ?? '').toBe(
+    `BigQuery Agent Analytics mod: backfill of 1 file(s) in ${PARTITION_DIR} did not finish within 15 s before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
+  )
+  world.releaseHung(OK_INSERT.status, OK_INSERT.text)
+})
+
+test('a refused /bqaa-setup, which the tracing plugin may hold, is no internal error; a refused name of the mod still is', { options: OPTIONS }, async ($, on) => {
+  on('command.register', { name: 'bqaa-setup' }, () => ({ deny: 'command already registered by another plugin' }))
+  on('command.register', { name: 'bqaa-flush' }, () => ({ deny: 'command refused' }))
+  const world = setUp(on)
+  await startSession($)
+  expect(world.registered).toEqual(['bqaa-status', 'bqaa-backfill', 'bqaa-mod-setup'])
+  expect(await statusText($)).toMatch(/^internal errors \(skipped bookkeeping\): 1$/m)
+})
+
+// After a takeover, the writer before holds what it last saw: a failure or a
+// notice from before the new writer's own sends.
+for (const [failure, replies] of [
+  ['a 503', [UNAVAILABLE]],
+  ['a 401, with a fresh token refused too', [UNAUTHENTICATED, UNAUTHENTICATED]],
+] as const) {
+  test(`after ${failure} on the writer before a takeover, session end still sends once the new writer's own send landed`, { options: OPTIONS }, async ($, on) => {
+    const world = setUp(on)
+    world.replies = [...replies, OK_INSERT]
+    await startSession($)
+    await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+    await world.clock.advance(5000)
+    expect(world.acceptedRows()).toEqual([])
+    await restart($)
+    await world.clock.advance(5000)
+    const landed = world.acceptedRows().length
+    expect(landed).toBe(3)
+    await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+    await $.session.end(END)
+    // Its own request: the call's two rows and session_end, none spilled.
+    expect(world.acceptedRows().length).toBe(landed + 3)
+    expect(deadLetterRows(world)).toEqual([])
+  })
+}
+
+test('a batch the writer before a takeover still has out, answered with a failure while session end waits, keeps session end from sending: every row is spilled', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [{ hang: true }, OK_INSERT]
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+  await restart($)
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  const ending = $.session.end({ ...END, reason: 'other' })
+  await world.clock.advance(100)
+  world.releaseHung(UNAVAILABLE.status, UNAVAILABLE.text)
+  await ending
+  expect(world.insertCalls().length).toBe(1)
+  expect(deadLetterRows(world).map(r => r.event_type).sort()).toEqual(['STATE_DELTA', 'STATE_DELTA', 'TOOL_COMPLETED', 'TOOL_COMPLETED', 'TOOL_STARTING', 'TOOL_STARTING'])
+})
+
+test('a batch the writer before a takeover has out after a failure keeps session end from sending, though it lands while session end waits', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [UNAVAILABLE, { hang: true }, OK_INSERT]
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  // After the backoff the batch goes again, and is out when the takeover
+  // comes.
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(2)
+  await restart($)
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  const ending = $.session.end({ ...END, reason: 'other' })
+  await world.clock.advance(100)
+  world.releaseHung(OK_INSERT.status, OK_INSERT.text)
+  await ending
+  // No request after the batch, which landed: the rows queued behind it
+  // were spilled.
+  expect(world.insertCalls().length).toBe(2)
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+})
+
+test('a replay that a send after failures set going on the writer before a takeover keeps session end from sending while it is due', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_MAX_QUEUE_ROWS: '10' })
+  world.replies = [UNAVAILABLE, OK_INSERT]
+  await startSession($)
+  for (let i = 0; i < 4; i += 1) await $.tool.call({ tool: 'Read', file_path: `f${i}` })
+  await world.clock.advance(5000)
+  const parked = deadLetterRows(world).length
+  expect(parked > 0).toBe(true)
+  // BigQuery takes the rest after the backoff: the replay of the parked rows
+  // is due a second later, and the takeover and session end come first.
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(2)
+  await restart($)
+  // The new writer has its token at hand (nothing else keeps it from
+  // sending); the replay is still due.
+  const commands = world.commands.length
+  await world.clock.settle()
+  expect(world.commands.length).toBe(commands + 1)
+  await $.tool.call({ tool: 'Read', file_path: 'last.ts' })
+  await $.session.end({ ...END, reason: 'other' })
+  await world.clock.advance(2000)
+  expect(world.insertCalls().length).toBe(2)
+  expect(deadLetterRows(world).length).toBe(parked + 3)
+})
+
+test('a takeover keeps a denial of writes BigQuery gave rows: the status line shows it again, a /bqaa-status check that finds the table keeps it, it is told once, and a write BigQuery takes clears it', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DENIED]
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+  // A surface that draws no band above the prompt: the notice is the status
+  // line.
+  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(world.statusLines.at(-1) ?? '').toMatch(DENIED_LINE)
+  expect(world.toasts.length).toBe(1)
+  await restart($, 'ide')
+  expect(world.statusLines.at(-1) ?? '').toMatch(DENIED_LINE)
+  // Refused again under the new writer: no second toast or transcript line.
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  await world.clock.advance(5000)
+  expect(world.toasts.length).toBe(1)
+  expect(world.transcript.filter(l => l.startsWith('bqaa: rows are not being written')).length).toBe(1)
+  world.replies = [TABLE_FOUND]
+  const checked = (await $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND })).text ?? ''
+  expect(checked).toContain('destination check: BigQuery found my-gcp-project.agent_analytics.agent_events')
+  expect(checked).toContain(DENIED_NOTICE)
+  world.replies = [OK_INSERT]
+  await $.tool.call({ tool: 'Read', file_path: 'c.ts' })
+  await world.clock.advance(5000)
+  expect(world.statusLines.at(-1)).toBeUndefined()
+  expect(world.transcript.filter(l => l.includes('/bqaa-backfill sends'))).toEqual(['bqaa: rows are being written again; /bqaa-backfill sends the 5 row(s) parked while they could not be.'])
+})
+
+test('a takeover under another dataset starts clean: a denial of writes to the table before does not carry over', { options: { project: 'my-gcp-project' } }, async ($, on) => {
+  let dataset = 'agent_analytics'
+  on('env.get', ($, e, next) => (e.name === 'BQAA_DATASET' ? { value: dataset } : next(e)))
+  const world = setUp(on)
+  world.replies = [DENIED]
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(await statusText($)).toContain(DENIED_NOTICE)
+  dataset = 'other_dataset'
+  await restart($, 'ide')
+  expect(world.statusLines.at(-1)).toBeUndefined()
+  expect(await statusText($)).not.toContain('rows are not being written')
 })

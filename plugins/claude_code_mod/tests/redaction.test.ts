@@ -18,7 +18,7 @@
 // built at run time and has no known credential shape: only the key it sits
 // under, or the JSON it sits in, can give it away.
 
-import { expect, test } from 'claude-code/testing'
+import { type Engine, expect, test } from 'claude-code/testing'
 
 import { COMMAND, OPTIONS, type Row, type World, byType, deadLetterFiles, deadLetterRows, setUp, startSession } from './helpers.ts'
 
@@ -269,6 +269,69 @@ test('quoted-key JSON pairs: a pair alone is no cut, a dropped comma counts one 
     expect(shown).toEqual({ text, summary: expectedText, truncated, redaction })
     for (const secret of ['aHVudGVyMg', 'hunter2-hunter2', 'abcdefghijklmnop', 'hunter2']) expect(JSON.stringify(row)).not.toContain(secret)
   })
+})
+
+// Each prompt as one row; what the row shows, cut and records, prompt by
+// prompt.
+async function promptRows($: Engine, world: World, texts: string[]): Promise<{ text: string; summary: string; truncated: boolean; redaction: unknown }[]> {
+  for (const text of texts) await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+  await world.clock.advance(5000)
+  const sent = byType(world.acceptedRows(), 'USER_MESSAGE_RECEIVED')
+  expect(sent.length).toBe(texts.length)
+  return sent.map((row, i) => ({
+    text: texts[i] as string,
+    summary: (JSON.parse(row.content ?? '{}') as { text_summary: string }).text_summary,
+    truncated: row.is_truncated,
+    redaction: (JSON.parse(row.attributes ?? '{}') as { redaction?: unknown }).redaction,
+  }))
+}
+
+// A value's own quoting, as the shell, YAML or SQL reads it: the quote the
+// value sits in closing right where the value starts (the value is glued on
+// after it), a doubled quote (which goes on with the value), a backslash in
+// single quotes (no escape there), a word glued on after a quoted string,
+// and a JSON comma after one. The text is redacted as it always was; only
+// what follows the value counts as dropped, and never the secret's length.
+test('quoted value edges: an outer quote closing at the value, doubled quotes, a backslash in single quotes and a glued word end the value as the shell or YAML does, and only the text after it counts as dropped', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  const cases: [string, string, boolean, { values: number; dropped_chars: number }][] = [
+    ['curl -H "password: "s3cr3t-v4lue-XYZ', 'curl -H "password: [REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    ["curl -H 'Authorization: Bearer 'abcdef123456SECRET", "curl -H 'Authorization: [REDACTED]", false, { values: 1, dropped_chars: 0 }],
+    ["curl -H 'Authorization: Bearer 'abcdef123456SECRET https://api.example.com", "curl -H 'Authorization: [REDACTED]", true, { values: 1, dropped_chars: ' https://api.example.com'.length }],
+    ["password: 'p@ss''word'", 'password: [REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    ["password: 'it''s' tail", 'password: [REDACTED]', true, { values: 1, dropped_chars: ' tail'.length }],
+    ['password: "abc"def', 'password: [REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    ['password: "abc",', 'password: [REDACTED]', true, { values: 1, dropped_chars: 1 }],
+    ["password: 'abc\\' --verbose", 'password: [REDACTED]', true, { values: 1, dropped_chars: ' --verbose'.length }],
+    // A quoted name and `=`, the value after the quote closes.
+    ['export "DB_PASSWORD="s3cr3tV4lue --verbose', 'export "DB_PASSWORD=[REDACTED]', true, { values: 1, dropped_chars: ' --verbose'.length }],
+    // An auth scheme after the quote the value sat in closes.
+    ['curl -H "Authorization: "Bearer abcdef123456SECRET', 'curl -H "Authorization: [REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    // After a closing quote, a colon ends the value, doubled quote or not.
+    ["password: 'it''s': tail", 'password: [REDACTED]', true, { values: 1, dropped_chars: ': tail'.length }],
+  ]
+  const shown = await promptRows($, world, cases.map(([text]) => text))
+  expect(shown).toEqual(cases.map(([text, summary, truncated, redaction]) => ({ text, summary, truncated, redaction })))
+  for (const secret of ['s3cr3t-v4lue-XYZ', 'abcdef123456SECRET', "p@ss''word", "it''s", 's3cr3tV4lue']) expect(JSON.stringify(world.acceptedRows())).not.toContain(secret)
+})
+
+// `NAME= value`, a blank after the `=`: the named-value rule redacts the
+// value (`NAME= [REDACTED]`) and the list-name rule then drops the blank
+// before the marker, as it always has. The value counts once, and the blank
+// is no dropped text; a real tail still is.
+test('NAME= value with a blank after the = reads NAME=[REDACTED] as before, counts one value, and drops no text but a real tail', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  const cases: [string, string, boolean, { values: number; dropped_chars: number }][] = [
+    ['Set DB_PASSWORD= hunter2', 'Set DB_PASSWORD=[REDACTED]', false, { values: 1, dropped_chars: 0 }],
+    ["Set DB_PASSWORD= 'hunter2' --production", 'Set DB_PASSWORD=[REDACTED]', true, { values: 1, dropped_chars: ' --production'.length }],
+    // A marker with more of its word after it is a value of its own.
+    ['DB_PASSWORD= [REDACTED]:glued_secret', 'DB_PASSWORD=[REDACTED]', false, { values: 1, dropped_chars: 0 }],
+  ]
+  const shown = await promptRows($, world, cases.map(([text]) => text))
+  expect(shown).toEqual(cases.map(([text, summary, truncated, redaction]) => ({ text, summary, truncated, redaction })))
+  for (const secret of ['hunter2', 'glued_secret']) expect(JSON.stringify(world.acceptedRows())).not.toContain(secret)
 })
 
 // `attributes.redaction` is the mod's own record, added after a row is

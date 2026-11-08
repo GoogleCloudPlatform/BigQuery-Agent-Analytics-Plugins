@@ -775,7 +775,12 @@ test('a headless run whose own rows all landed still writes the stderr line when
   // Nothing of this run was spilled or refused: the run had activity, and
   // that alone makes the line.
   expect(deadLetterFiles(world)).toEqual([[earlier, file]])
-  expect(world.stderr).toEqual([`BigQuery Agent Analytics: rows could not be sent (${HEADLINE}; to fix, ${FIX}).`])
+  // One line, ending in the setup.sh command that makes the dataset.
+  expect(world.stderr.length).toBe(1)
+  const line = world.stderr[0] ?? ''
+  const head = `BigQuery Agent Analytics: rows could not be sent (${HEADLINE}; to fix, ${FIX}). Run: `
+  expect(line.startsWith(head)).toBe(true)
+  expect(line.slice(head.length)).toMatch(SETUP)
 })
 
 test('/bqaa-status check that finds the table, with replays off and rows parked meanwhile, names /bqaa-backfill without saying rows are written again', { options: OPTIONS }, async ($, on) => {
@@ -820,4 +825,48 @@ test('/bqaa-status check that finds the table replays the rows parked meanwhile 
   expect(ids.length).toBe(9)
   expect(new Set(ids).size).toBe(9)
   expect(writtenAgain(world)).toEqual([])
+})
+
+test('/bqaa-status check asks tables.get once more with a fresh token after a 401, and finds the table with it', { options: OPTIONS }, async () => {
+  // Token pieces joined at run time (see helpers.ts).
+  const stale = ['ya29', 'stale-probe-token-0001'].join('.')
+  const fresh = ['ya29', 'fresh-probe-token-0002'].join('.')
+  const printed = [stale, fresh]
+  const asked: string[] = []
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/probe-retry' }, {})
+  const io: Io = {
+    now: () => 1000,
+    after: () => ({ cancel: () => undefined }),
+    // BigQuery refuses the first token and takes the fresh one.
+    fetch: async (url, init) => {
+      asked.push(`${init.method} ${url} ${init.headers.authorization ?? ''}`)
+      return init.headers.authorization === `Bearer ${fresh}` ? TABLE_FOUND : { status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }
+    },
+    runCommand: async () => ({ exitCode: 0, stdout: `${printed.shift() ?? fresh}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    readFile: async () => '',
+    writeFile: async () => undefined,
+    listDir: async () => [],
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const writer = new Writer(io, () => config, () => 'probe-session')
+  expect(await writer.probeDestination(3000, true)).toBe('BigQuery found my-gcp-project.agent_analytics.agent_events')
+  const url = 'https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/datasets/agent_analytics/tables/agent_events?fields=tableReference'
+  expect(asked).toEqual([`GET ${url} Bearer ${stale}`, `GET ${url} Bearer ${fresh}`])
+  expect(writer.problem).toBeNull()
+})
+
+test('/bqaa-status registers with the argument hint [check], as /bqaa-backfill does with its words', { options: OPTIONS }, async ($, on) => {
+  const hints = new Map<string, string | undefined>()
+  on('command.register', ($, e, next) => {
+    hints.set(e.name, e.argumentHint)
+    return next(e)
+  })
+  setUp(on)
+  await startSession($)
+  expect(Object.fromEntries(hints)).toEqual({ 'bqaa-status': '[check]', 'bqaa-flush': undefined, 'bqaa-backfill': '[force] [wait]', 'bqaa-mod-setup': undefined, 'bqaa-setup': undefined })
 })

@@ -255,8 +255,10 @@ export const COMMAND_LINE_CHARS = 1000
 const SETUP_COMMAND_CHARS = 4000
 // Session end's own request starts only with at least EXIT_SEND_MIN_MS of
 // its budget left, and is given up EXIT_SPILL_RESERVE_MS before the budget
-// ends, so the rows it did not land are spilled within it.
-const EXIT_SEND_MIN_MS = 200
+// ends, so the rows it did not land are spilled within it. The request so
+// has at least 300 ms to be answered: one given up sooner may still land,
+// and its rows, spilled as well, would go twice (event_id dedups them).
+const EXIT_SEND_MIN_MS = 450
 const EXIT_SPILL_RESERVE_MS = 150
 // Session end's replay starts only with at least EXIT_REPLAY_MIN_MS left,
 // and sends nothing in the last EXIT_REPLAY_RESERVE_MS, which the writes of
@@ -594,6 +596,11 @@ export class Writer {
   private identity: { token: string; email: string | null; seq: number } | null = null
   private identityPending: { token: string; answer: Promise<string | null> } | null = null
   private identitySeq = 0
+  // The dead-letter partition (the table) of the configuration this writer
+  // began with. The configuration is read again through the same function
+  // after a reload, which may have changed it: a takeover compares this
+  // (`adopt`).
+  private readonly partition: string
 
   constructor(io: Io, config: () => Config, sessionId: () => string | null) {
     this.io = io
@@ -601,6 +608,7 @@ export class Writer {
     this.sessionId = sessionId
     const c = config()
     this.queue = new BoundedQueue(c.maxQueueRows, c.maxQueueBytes)
+    this.partition = deadLetterPartition(c)
   }
 
   // ---- hot path ----------------------------------------------------------
@@ -659,6 +667,19 @@ export class Writer {
     // comes to is held here too. Its marks stay its own: one with no
     // outcome held keeps this writer from sending the file, as another's.
     this.rewrites = previous.rewrites
+    // A denial of writes BigQuery gave rows (insertAll, not tables.get)
+    // stands across the takeover, with the rows parked under it, while the
+    // table and dead-letter directory stay the same: a /bqaa-status check
+    // that finds the table does not clear it (foundTable), only a request
+    // BigQuery takes does. Another table starts clean.
+    const denied = previous.problem
+    if (this.problem === null && denied?.kind === 'permission' && denied.missing === 'write' && previous.partition === deadLetterPartition(c)) {
+      this.problem = { ...denied }
+      this.parkedDuringProblem = previous.parkedDuringProblem
+      for (const id of previous.parkedIds) this.parkedIds.add(id)
+      this.parkedRough = previous.parkedRough
+      if (previous.announced.has('permission')) this.announced.add('permission')
+    }
   }
 
   // Asks for a flush shortly, outside the caller's dispatch.
@@ -1060,10 +1081,15 @@ export class Writer {
 
   // At session.start, after any takeover: the host keeps the plugin's status
   // line until it is replaced, a reload included, and this writer holds no
-  // notice yet. A clear that does not land leaves the line not known, so the
-  // next status the writers set is written whatever it is.
+  // notice yet, unless it took over a denial of writes (`adopt`), which it
+  // shows again. A clear that does not land leaves the line not known, so
+  // the next status the writers set is written whatever it is.
   clearStatus(): void {
     this.status.text = null
+    if (this.problem !== null) {
+      this.showProblem()
+      return
+    }
     this.setStatus(undefined)
   }
 
@@ -1556,7 +1582,7 @@ export class Writer {
     // batch one still has out goes with the rest once its wait is over.
     const writers = [...this.before, this]
     // Read before the exit changes anything.
-    const sending = opts.sendQueued === true && budgetMs >= EXIT_SEND_MIN_MS && this.canSendAtExit(c, writers, opts.replaySpills === true)
+    const sending = opts.sendQueued === true && budgetMs >= EXIT_SEND_MIN_MS && this.canSendAtExit(c, opts.replaySpills === true)
     this.closing = true
     this.soon?.cancel()
     this.soon = null
@@ -1586,7 +1612,10 @@ export class Writer {
         }
       : null
     if (marks === null) park(this.queue.takeAll())
-    const flights = writers.flatMap(writer => (writer.inFlightRows.length > 0 && writer.inFlight !== null ? [writer.inFlight] : []))
+    // The writers with a batch out now: an answer that comes for one during
+    // the wait below can leave BigQuery's state in doubt.
+    const flightWriters = writers.filter(writer => writer.inFlightRows.length > 0 && writer.inFlight !== null)
+    const flights = flightWriters.flatMap(writer => (writer.inFlight !== null ? [writer.inFlight] : []))
     if (flights.length > 0 && budgetMs > 0) await this.raceUntil(Promise.all(flights), start + Math.floor(budgetMs / 2))
     // What no answer took: the rows still out, and those an answer asked
     // for again. Rows an answer refused, or parks after their retries, are
@@ -1594,9 +1623,13 @@ export class Writer {
     // so the exit waits for that write instead, within the same bound.
     const out: Queued[] = []
     for (const writer of writers) out.push(...writer.inFlightRows)
-    // Every batch out answered and landed whole: the exit sends. Any other
-    // answer (or none) leaves BigQuery's state in doubt, and the rows wait.
-    if (marks !== null && out.length === 0 && this.persisting.size === 0 && writers.every(w => w.problem === null && w.consecutiveFailures === 0 && !w.heldAtExit)) {
+    // Every batch out answered and landed whole, and this writer has no
+    // notice or failure: the exit sends. Any other answer (or none) leaves
+    // BigQuery's state in doubt, and the rows wait. A writer taken over from
+    // (`adopt`) with no batch out counts only for a batch it held at the
+    // exit: a notice or failures it saw came before this writer's sends.
+    const settled = (w: Writer): boolean => w.problem === null && w.consecutiveFailures === 0 && !w.heldAtExit
+    if (marks !== null && out.length === 0 && this.persisting.size === 0 && settled(this) && this.before.every(w => !w.heldAtExit) && flightWriters.every(settled)) {
       if ((await this.sendAtExit(c, marks, park, writes, until)) && opts.replaySpills === true && spilled === 0) await this.replayAtExit(c, marks, until)
     } else park([...out, ...this.queue.takeAll()])
     const pending = [...writes, ...this.persisting]
@@ -1614,18 +1647,22 @@ export class Writer {
   }
 
   // Whether session end may send (spillForExit): BigQuery is to be written
-  // to, and no writer has anything that leaves its answer in doubt.
-  private canSendAtExit(c: Config, writers: readonly Writer[], replaySpills = false): boolean {
+  // to, and nothing leaves its answer in doubt: on this writer, no notice,
+  // backoff, failure, replay or recovery due, dead-letter write or rows
+  // parked to replay first. A writer this one took over from (`adopt`)
+  // stops it only with a recovery or replay of its own due, a batch held at
+  // the exit, or a batch out after a failure or under a notice: what it saw
+  // before the takeover, with no batch out, is stale once this writer sends.
+  private canSendAtExit(c: Config, replaySpills = false): boolean {
     if (!canDeliver(c) || c.dryRun || this.persisting.size > 0 || this.parked.recoverable) return false
-    return writers.every(
-      w =>
-        !w.closing &&
-        w.problem === null &&
-        w.pauseTimer === null &&
-        w.consecutiveFailures === 0 &&
-        w.recoveryTimer === null &&
-        (w.backfilling === null || (replaySpills && w.lastSuccessAt !== null)) &&
-        !w.heldAtExit,
+    const quiet = (w: Writer): boolean =>
+      !w.closing && !w.heldAtExit && w.recoveryTimer === null && (w.backfilling === null || (replaySpills && this.lastSuccessAt !== null))
+    return (
+      quiet(this) &&
+      this.problem === null &&
+      this.pauseTimer === null &&
+      this.consecutiveFailures === 0 &&
+      this.before.every(w => quiet(w) && (!w.batchOpen || (w.problem === null && w.consecutiveFailures === 0)))
     )
   }
 

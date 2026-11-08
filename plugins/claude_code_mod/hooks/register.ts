@@ -211,12 +211,19 @@ function writeStderr(line: string): void {
 // At the end of a `-p` run that recorded something (`hadActivity`, read
 // before session end resets it, or rows spilled or parked), while a problem
 // keeps rows from BigQuery: what is wrong and the fix, redacted, on one line
-// of standard error.
+// of standard error, with the setup command where the fix is one (a dataset
+// or table BigQuery cannot find). The command goes whole, after the rest is
+// cut; where redaction would change it, the line names /bqaa-mod-setup,
+// which prints it.
 function headlessNotice(current: Writer, hadActivity: boolean): void {
   const { counters } = current.snapshot()
   if (current.problem === null || !(hadActivity || counters.spilled > 0 || counters.failed > 0)) return
   const { headline, fix } = current.problemText()
-  writeStderr(clean(`BigQuery Agent Analytics: rows could not be sent (${headline}; to fix, ${fix}).`, 1000).replace(/[\r\n]+/g, ' '))
+  const base = clean(`BigQuery Agent Analytics: rows could not be sent (${headline}; to fix, ${fix}).`, 1000)
+  const run = current.commandLine()
+  const withCommand = run === null ? base : clean(`${base} ${run}`, 2100)
+  const line = run === null || withCommand.includes(run) ? withCommand : `${base} Run /bqaa-mod-setup for the setup.sh command.`
+  writeStderr(line.replace(/[\r\n]+/g, ' '))
 }
 
 async function readEnv($: EngineInterface): Promise<EnvSnapshot> {
@@ -952,7 +959,8 @@ export const register: Register = (on, registered) => {
       // off and on): keep what the previous writer still held.
       if (previous) writer.adopt(previous)
       // The host keeps one status line per plugin until it is replaced, a
-      // reload included: this writer starts with none, as it holds no notice.
+      // reload included: this writer starts with none, unless it kept a
+      // denial of writes from the writer before (see adopt), which it shows.
       writer.clearStatus()
       for (const held of early.splice(0)) writer.enqueue(held.row, held.redactions)
       const [sessionId, version] = await Promise.all([$.session.id().catch(() => null), $.session.version().catch(() => null)])
@@ -987,7 +995,7 @@ export const register: Register = (on, registered) => {
     configurationLoaded()
     // Each in its own try: a refused name must not keep the others out.
     try {
-      await $.command.register({ name: 'bqaa-status', description: 'BigQuery Agent Analytics: queue, sent, failed and dead-letter counts', immediate: true })
+      await $.command.register({ name: 'bqaa-status', description: 'BigQuery Agent Analytics: queue, sent, failed and dead-letter counts', argumentHint: '[check]', immediate: true })
     } catch {
       internalErrors += 1
     }
@@ -1007,11 +1015,12 @@ export const register: Register = (on, registered) => {
       internalErrors += 1
     }
     // The earlier name, kept through 0.1.x; in its own try, as the tracing
-    // plugin may hold it already.
+    // plugin may hold it already. That is expected while both are enabled,
+    // so a refusal here is no internal error: /bqaa-mod-setup still works.
     try {
       await $.command.register({ name: 'bqaa-setup', description: 'BigQuery Agent Analytics: same as /bqaa-mod-setup (earlier name)', immediate: true })
     } catch {
-      internalErrors += 1
+      // Held by the tracing plugin.
     }
     // In the background: neither the first prompt nor anything above waits
     // on the store for the welcome card.
@@ -1360,6 +1369,13 @@ export const register: Register = (on, registered) => {
     const report = await Promise.race([running, waited])
     timer.cancel()
     if (report !== null) return say(formatBackfillReport(report))
+    if (!isInteractiveSession) {
+      // The run ends once this returns: no /bqaa-status comes after it, and
+      // the replay stops with the process.
+      return say(
+        `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} did not finish within ${BACKFILL_WAIT_MS / 1000} s before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
+      )
+    }
     logWhenDone()
     return say(`BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} still running after ${BACKFILL_WAIT_MS / 1000} s; /bqaa-status shows progress.`)
   })
