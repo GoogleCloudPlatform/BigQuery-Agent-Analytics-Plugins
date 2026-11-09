@@ -491,10 +491,10 @@ const tests = {
     holding = false
     const c = await load(h, B)
     await c.start()
-    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dry-run')
+    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dead-letter/dry-run')
     reads.answer()
     await settle()
-    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dry-run')
+    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dead-letter/dry-run')
     assert.equal(await b.shown(), false)
     await b.land()
     assert.equal(h.card()?.sent, 0)
@@ -549,11 +549,11 @@ const tests = {
     h.stateRead = undefined
     const b = await load(h, B)
     await b.start()
-    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dry-run')
+    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dead-letter/dry-run')
     for (const go of waiting.splice(0)) go()
     await starting
     await settle()
-    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dry-run')
+    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dead-letter/dry-run')
     assert.equal(await a.shown(), false)
     assert.equal(await b.shown(), true)
   },
@@ -642,7 +642,7 @@ const tests = {
         await c.start()
         reads.answer()
         await settle()
-        assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dry-run')
+        assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dead-letter/dry-run')
         assert.equal(await c.shown(), true)
         assert.equal(await b.shown(), false)
       }
@@ -678,11 +678,11 @@ const tests = {
           else reads[0]()
           await settle()
           assert.equal(h.state.get('loads').value.count, 3)
-          assert.equal(h.card().destination, 'dry run: /home/dev/b/dry-run')
+          assert.equal(h.card().destination, 'dry run: /home/dev/b/dead-letter/dry-run')
           assert.equal(await b.shown(), false)
           await c.land()
           assert.equal(h.card().sent, 1)
-          assert.equal(h.card().landedTo, 'dry run: /home/dev/b/dry-run')
+          assert.equal(h.card().landedTo, 'dry run: /home/dev/b/dead-letter/dry-run')
           assert.ok((await c.texts()).some(text => text.startsWith('✓ First rows written · 1 so far')))
           await c.prompt()
           assert.equal(await c.shown(), false)
@@ -1179,11 +1179,11 @@ const tests = {
     const b = await load(h, B)
     await b.start()
     await b.land()
-    assert.deepEqual([h.card().destination, h.card().sent], ['dry run: /home/dev/a/dry-run', 1])
+    assert.deepEqual([h.card().destination, h.card().sent], ['dry run: /home/dev/a/dead-letter/dry-run', 1])
     holding = false
     reads.answer()
     await settle()
-    assert.deepEqual([h.card().destination, h.card().sent], ['dry run: /home/dev/b/dry-run', 1])
+    assert.deepEqual([h.card().destination, h.card().sent], ['dry run: /home/dev/b/dead-letter/dry-run', 1])
     assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
   },
   async 'rows a load lands before and after the session\'s state is reset (/clear, /resume or /branch, which fire no session start) never count on the card an update opens after it: the count\'s new lifetime starts over'() {
@@ -1309,7 +1309,7 @@ const tests = {
       async () => {
         let holding = false
         const h = host({ holdState: (value, key) => holding && key === 'welcome' && value?.version === '0.3.0' })
-        const stale = { version: NEXT, previous: PLUGIN_VERSION, sessionId: 'before-clear', landedAt: null, landedTo: null, closed: false, sent: 0, destination: 'dry run: /home/dev/.bqaa-mod/dry-run', owner: 'gone:1', rank: 5, since: 5, lifetime: 'before' }
+        const stale = { version: NEXT, previous: PLUGIN_VERSION, sessionId: 'before-clear', landedAt: null, landedTo: null, closed: false, sent: 0, destination: 'dry run: /home/dev/.bqaa-mod/dead-letter/dry-run', owner: 'gone:1', rank: 5, since: 5, lifetime: 'before' }
         if (when === 'first read') h.state.set('welcome', { value: stale, version: 1 })
         else holding = true
         const c = await load(h, {}, '0.3.0')
@@ -1328,7 +1328,7 @@ const tests = {
   async 'this session\'s card of the lifetime before a reset, of a higher rank, is taken over by the next run, which counts from itself'() {
     const h = host()
     h.store.set(`welcome:${PLUGIN_VERSION}`, { version: PLUGIN_VERSION, sessionId: SESSION, previous: null })
-    h.state.set('welcome', { value: { version: PLUGIN_VERSION, previous: null, sessionId: SESSION, landedAt: null, landedTo: null, closed: false, sent: 0, destination: 'dry run: /home/dev/.bqaa-mod/dry-run', owner: 'gone:1', rank: 5, since: 5, lifetime: 'before' }, version: 1 })
+    h.state.set('welcome', { value: { version: PLUGIN_VERSION, previous: null, sessionId: SESSION, landedAt: null, landedTo: null, closed: false, sent: 0, destination: 'dry run: /home/dev/.bqaa-mod/dead-letter/dry-run', owner: 'gone:1', rank: 5, since: 5, lifetime: 'before' }, version: 1 })
     const a = await load(h)
     await a.start()
     assert.equal(await a.shown(), true)
@@ -1435,7 +1435,7 @@ const tests = {
   async 'this session\'s card of the lifetime before a reset, landed, is taken over with no count and no landing: the next prompt leaves it until this lifetime lands'() {
     const h = host()
     h.store.set(`welcome:${PLUGIN_VERSION}`, { version: PLUGIN_VERSION, sessionId: SESSION, previous: null })
-    h.state.set('welcome', { value: { version: PLUGIN_VERSION, previous: null, sessionId: SESSION, landedAt: 1, landedTo: 'dry run: /home/dev/.bqaa-mod/dry-run', closed: false, sent: 7, destination: 'dry run: /home/dev/.bqaa-mod/dry-run', owner: 'gone:1', rank: 1, since: 1, lifetime: 'before' }, version: 1 })
+    h.state.set('welcome', { value: { version: PLUGIN_VERSION, previous: null, sessionId: SESSION, landedAt: 1, landedTo: 'dry run: /home/dev/.bqaa-mod/dead-letter/dry-run', closed: false, sent: 7, destination: 'dry run: /home/dev/.bqaa-mod/dead-letter/dry-run', owner: 'gone:1', rank: 1, since: 1, lifetime: 'before' }, version: 1 })
     const a = await load(h)
     await a.start()
     assert.equal(await a.shown(), true)

@@ -86,15 +86,20 @@ export function formatStatus(args: {
   isBackfilling: boolean
   cleanupCommand?: string | null
   destinationCheck?: string | null
+  maskTransientSessionStart?: boolean
 }): string {
   const { config: c, writer, now } = args
   const s = writer.snapshot()
   const k = s.counters
+  const transient = args.maskTransientSessionStart === true
+  const queued = transient ? 0 : s.queued
+  const queuedBytes = transient ? 0 : s.queuedBytes
+  const captured = transient ? Math.max(0, k.captured - s.queued) : k.captured
   const target = c.dryRun ? `dry run -> ${c.dryRunDir}` : c.project && c.dataset ? `${tableRef(c)} (${c.location})` : 'not configured'
   const lines = [
     short(`BigQuery Agent Analytics mod: ${c.enabled ? 'enabled' : 'disabled'}, target ${target}`),
-    `queue: ${s.queued} rows (${kb(s.queuedBytes)}), ${s.inFlight} in flight; flush every ${c.flushIntervalMs} ms`,
-    `rows: captured ${k.captured}, sent ${k.sent}${k.replayed > 0 ? ` (${k.replayed} replayed)` : ''}, dead-lettered ${k.failed} (${k.rejected} refused), spilled ${k.spilled}, dropped ${s.dropped}, not captured ${k.skipped}`,
+    `queue: ${queued} rows (${kb(queuedBytes)}), ${s.inFlight} in flight; flush every ${c.flushIntervalMs} ms`,
+    `rows: captured ${captured}, sent ${k.sent}${k.replayed > 0 ? ` (${k.replayed} replayed)` : ''}, dead-lettered ${k.failed} (${k.rejected} refused), spilled ${k.spilled}, dropped ${s.dropped}, not captured ${k.skipped}`,
     `requests: ${k.batches} ok, ${k.retries} retried; last success ${ago(now, s.lastSuccessAt)}`,
   ]
   if (args.destinationCheck) lines.push(short(`destination check: ${args.destinationCheck}`))
@@ -134,7 +139,7 @@ export function formatStatus(args: {
       lines.push(`dead-letter: ${d.elsewhere} waiting file(s)${elsewhereRetired > 0 ? ` (${elsewhereRetired} leftover(s))` : ''} in ${c.deadLetterDir} for other tables or an older layout, not replayed under this configuration`)
     }
     // No credential word before a colon here either.
-    if (retired + elsewhereRetired >= CLEANUP_HINT_FILES && args.cleanupCommand) lines.push(`cleanup (run while no session is running): ${args.cleanupCommand}`)
+    if (retired + elsewhereRetired >= CLEANUP_HINT_FILES && args.cleanupCommand) lines.push(`cleanup (run while no session is running; dry run by default, pass --execute to delete): ${args.cleanupCommand}`)
   }
   if (args.isBackfilling) lines.push('backfill: running')
   else if (args.backfill) {
@@ -148,5 +153,6 @@ export function formatStatus(args: {
   }
   lines.push(`redactions ${k.redactions}, truncated rows ${k.truncatedRows}; session ${args.sessionId ?? 'unknown'}`)
   for (const problem of c.problems) lines.push(`problem: ${problem}`)
+  for (const warning of c.warnings) lines.push(`config notice: ${warning}`)
   return redactDiagnostic(lines.join('\n'), 8000)
 }

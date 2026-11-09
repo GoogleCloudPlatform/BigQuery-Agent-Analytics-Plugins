@@ -31,7 +31,12 @@ write the same events, so with both on, every event is written twice.
    Rows the earlier install left on disk (`~/.bqaa-mod/dead-letter`) are
    sent by this one: the folder and its format are the same.
 4. Check: `/bqaa-status` names your table, with no `notice` line, and
-   `/plugin` lists one mod.
+   `/plugin` lists one mod. When running `scripts/run_bq.py` or
+   `scripts/setup_gcp_prereqs.py` across projects in `0.1.3+`, if your ADC
+   default quota project lacks `serviceusage.services.use` or has the BigQuery
+   API disabled (`403 USER_PROJECT_DENIED` or foreign `SERVICE_DISABLED`), both
+   scripts retry once without the ADC quota project automatically, or you can
+   pass `--quota-project` / `GOOGLE_CLOUD_QUOTA_PROJECT`.
 
 ## From the SDK repository's marketplace
 
@@ -69,17 +74,23 @@ move to this repository's marketplace:
      --config dataset=agent_analytics
    ```
 
-4. Verify with `claude -p /bqaa-status < /dev/null` (or `/bqaa-status check`
-   inside an interactive session; when no request has succeeded yet, both run
-   a bounded `3 s` `tables.get` check to verify credentials and table
-   existence immediately, and non-interactive `-p` runs also write a one-line
-   notice to `stderr` if rows could not be sent). Rows the earlier copy left on disk
+4. Verify with `claude -p "/bqaa-status check" < /dev/null` on `0.1.2+` (or
+   `claude -p /bqaa-status < /dev/null` on `0.1.1`; version `0.1.1` uses
+   `/bqaa-setup` and `clean_dead_letter.py --dir DIR`, `0.1.2+` adds
+   `/bqaa-mod-setup`, `/bqaa-status check`, `/bqaa-backfill wait`, and
+   positional `clean_dead_letter.py [DIR]`, and `0.1.3+` decouples `/bqaa-status check`'s
+   `15 s` token timeout from the `3 s` `tables.get` HTTP check — verify your
+   installed version with `claude plugin list` before passing a slash command
+   to `-p`, since unknown commands run as normal model prompts; in `-p` runs,
+   pass `--debug-file /tmp/bqaa.log` to inspect exit diagnostics, since recent
+   host CLIs hide `process.stderr` from plugin hooks and capture `console.error`
+   only in `--debug-file`). Rows the earlier copy left on disk
    (`~/.bqaa-mod/dead-letter`) are sent by this one. Once all buffered rows
    have replayed and **no `claude` session is running**, you can clean up
    retired `0`-byte source files and their `outcome-*` records from `0.1.0` /
    `0.1.1` with `scripts/clean_dead_letter.py` inside the installed mod
-   directory (dry-run by default; pass `--execute` to delete, and pass an
-   optional `[DIR]` or `--dir DIR` if `deadLetterDir` was customized).
+   directory (dry-run by default; pass `--execute` to delete, and pass `--dir DIR`
+   on `0.1.1+` or positional `[DIR]` on `0.1.2+` if `deadLetterDir` was customized).
 
 If your organization's managed settings list `bqaa-tracing` under
 `extraKnownMarketplaces` with `"repo": "GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK"`,

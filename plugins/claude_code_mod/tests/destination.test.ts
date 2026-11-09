@@ -860,6 +860,329 @@ test('/bqaa-status check asks tables.get once more with a fresh token after a 40
   expect(writer.problem).toBeNull()
 })
 
+function probeClock(): {
+  now: () => number
+  after: (ms: number, fn: () => void) => { cancel: () => void }
+  advance: (ms: number) => Promise<void>
+  // Timers set and neither cancelled nor gone off yet.
+  pending: () => number
+} {
+  let now = 1000
+  const timers: Array<{ at: number; fn: () => void; cancelled: boolean }> = []
+  const flushMicrotasks = async (): Promise<void> => {
+    for (let i = 0; i < 8; i += 1) await Promise.resolve()
+  }
+  return {
+    now: () => now,
+    after: (ms, fn) => {
+      const entry = { at: now + Math.max(0, ms), fn, cancelled: false }
+      timers.push(entry)
+      return { cancel: () => { entry.cancelled = true } }
+    },
+    pending: () => timers.filter(t => !t.cancelled).length,
+    advance: async ms => {
+      const target = now + ms
+      await flushMicrotasks()
+      while (true) {
+        let next: { at: number; fn: () => void; cancelled: boolean } | undefined
+        for (const t of timers) {
+          if (!t.cancelled && t.at <= target && (!next || t.at < next.at)) next = t
+        }
+        if (!next) break
+        next.cancelled = true
+        now = Math.max(now, next.at)
+        next.fn()
+        await flushMicrotasks()
+      }
+      now = target
+    },
+  }
+}
+
+function makeProbeIo(
+  clock: ReturnType<typeof probeClock>,
+  fetchImpl: Io['fetch'],
+  runCommandImpl: Io['runCommand'],
+): Io {
+  return {
+    now: clock.now,
+    after: clock.after,
+    fetch: fetchImpl,
+    runCommand: runCommandImpl,
+    envToken: async () => undefined,
+    readFile: async () => '',
+    writeFile: async () => undefined,
+    listDir: async () => [],
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+}
+
+test('probeDestination decouples token acquisition (15 s) from the 3 s HTTP timeout and refreshes deadlines on 401 retry', { options: OPTIONS }, async () => {
+  const stale = ['ya29', 'slow-stale-token-0001'].join('.')
+  const fresh = ['ya29', 'slow-fresh-token-0002'].join('.')
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/probe-decoupled' }, {})
+  const url = 'https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/datasets/agent_analytics/tables/agent_events?fields=tableReference'
+
+  // Case 1: token command takes 4000 ms (> 3000 ms HTTP budget, < 15000 ms token budget) and succeeds.
+  {
+    const clock = probeClock()
+    const asked: string[] = []
+    const writer = new Writer(
+      makeProbeIo(
+        clock,
+        async (reqUrl, init) => {
+          asked.push(`${init.method} ${reqUrl} ${init.headers.authorization ?? ''}`)
+          return new Promise(resolve => { clock.after(100, () => resolve(TABLE_FOUND)) })
+        },
+        async () => new Promise(resolve => {
+          clock.after(4000, () => resolve({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' }))
+        }),
+      ),
+      () => config,
+      () => 'probe-slow-token',
+    )
+    let result: string | null | undefined
+    void writer.probeDestination(3000, true).then(v => { result = v })
+    await clock.advance(3500)
+    expect(result).toBeUndefined()
+    expect(asked).toEqual([])
+    await clock.advance(700)
+    expect(result).toBe('BigQuery found my-gcp-project.agent_analytics.agent_events')
+    expect(asked).toEqual([`GET ${url} Bearer ${fresh}`])
+    expect(writer.problem).toBeNull()
+  }
+
+  // Case 2: hung/slow token command > 15000 ms reports tokenCommandTimeoutMs rather than 3000 ms.
+  {
+    const clock = probeClock()
+    const asked: string[] = []
+    const writer = new Writer(
+      makeProbeIo(
+        clock,
+        async (reqUrl, init) => {
+          asked.push(`${init.method} ${reqUrl}`)
+          return TABLE_FOUND
+        },
+        async () => new Promise(resolve => {
+          clock.after(20_000, () => resolve({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' }))
+        }),
+      ),
+      () => config,
+      () => 'probe-token-timeout',
+    )
+    let result: string | null | undefined
+    void writer.probeDestination(3000, true).then(v => { result = v })
+    await clock.advance(14_999)
+    expect(result).toBeUndefined()
+    await clock.advance(1)
+    expect(result).toBe('no token within 15000 ms')
+    expect(writer.snapshot().lastError?.message).toBe('destination check: no token within 15000 ms')
+    expect(asked).toEqual([])
+  }
+
+  // Case 3: slow attempt 0 (2500 ms token + 1000 ms HTTP 401 = 3500 ms) drops token and gets fresh deadlines on retry.
+  {
+    const clock = probeClock()
+    const printed = [stale, fresh]
+    const delays = [2500, 2000]
+    const asked: string[] = []
+    const writer = new Writer(
+      makeProbeIo(
+        clock,
+        async (reqUrl, init) => {
+          asked.push(`${init.method} ${reqUrl} ${init.headers.authorization ?? ''}`)
+          const ok = init.headers.authorization === `Bearer ${fresh}`
+          return new Promise(resolve => {
+            clock.after(1000, () => resolve(
+              ok ? TABLE_FOUND : { status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' },
+            ))
+          })
+        },
+        async () => {
+          const val = printed.shift() ?? fresh
+          const delay = delays.shift() ?? 100
+          return new Promise(resolve => {
+            clock.after(delay, () => resolve({ exitCode: 0, stdout: `${val}\n`, stderr: '' }))
+          })
+        },
+      ),
+      () => config,
+      () => 'probe-401-refresh',
+    )
+    let result: string | null | undefined
+    void writer.probeDestination(3000, true).then(v => { result = v })
+    await clock.advance(6600)
+    expect(result).toBe('BigQuery found my-gcp-project.agent_analytics.agent_events')
+    expect(asked).toEqual([`GET ${url} Bearer ${stale}`, `GET ${url} Bearer ${fresh}`])
+    expect(writer.problem).toBeNull()
+  }
+
+  // Case 4: HTTP tables.get still times out at 3000 ms once token is acquired.
+  {
+    const clock = probeClock()
+    const writer = new Writer(
+      makeProbeIo(
+        clock,
+        async () => new Promise(resolve => { clock.after(5000, () => resolve(TABLE_FOUND)) }),
+        async () => ({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' }),
+      ),
+      () => config,
+      () => 'probe-http-timeout',
+    )
+    let result: string | null | undefined
+    void writer.probeDestination(3000, true).then(v => { result = v })
+    await clock.advance(2999)
+    expect(result).toBeUndefined()
+    await clock.advance(1)
+    expect(result).toBe('no answer (request timed out after 3000 ms)')
+    expect(writer.snapshot().lastError?.message).toBe('destination check: request timed out after 3000 ms')
+  }
+})
+
+const UNAUTHENTICATED = { status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }
+const PROBE_CONFIG = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/probe-bounds' }, {})
+const PROBE_FOUND = 'BigQuery found my-gcp-project.agent_analytics.agent_events'
+
+test('the destination check ends within the token time and two requests\' time in all: after a slow token and a 401, the fresh token gets only what is left; after a quick 401, the whole token time', { options: OPTIONS }, async () => {
+  const stale = ['ya29', 'bounded-stale-token-0005'].join('.')
+  const fresh = ['ya29', 'bounded-fresh-token-0006'].join('.')
+  // The token command takes 14 s, BigQuery refuses its token after 0.5 s,
+  // and the token command run again never answers.
+  {
+    const clock = probeClock()
+    const ran: number[] = []
+    const writer = new Writer(
+      makeProbeIo(
+        clock,
+        async () => new Promise(resolve => { clock.after(500, () => resolve(UNAUTHENTICATED)) }),
+        async () => {
+          ran.push(clock.now())
+          if (ran.length > 1) return new Promise(() => undefined)
+          return new Promise(resolve => { clock.after(14_000, () => resolve({ exitCode: 0, stdout: `${stale}\n`, stderr: '' })) })
+        },
+      ),
+      () => PROBE_CONFIG,
+      () => 'probe-slow-401',
+    )
+    const started = clock.now()
+    let result: string | null | undefined
+    let endedAt = 0
+    void writer.probeDestination(3000, true).then(v => {
+      result = v
+      endedAt = clock.now()
+    })
+    await clock.advance(17_999)
+    expect(result).toBeUndefined()
+    await clock.advance(1)
+    // 15 s for a token and 2 x 3 s for requests: 21 s in all. 14.5 s went,
+    // and a request's 3 s is kept, so the fresh token gets 3.5 s.
+    expect([result, endedAt - started, ran.map(at => at - started)]).toEqual(['no token within 3500 ms', 18_000, [0, 14_500]])
+    expect(writer.snapshot().lastError?.message).toBe('destination check: no token within 3500 ms')
+    expect(clock.pending()).toBe(0)
+  }
+  // A token at hand that BigQuery refuses at once: the fresh one gets the
+  // whole 15 s, and comes in 14 s.
+  {
+    const clock = probeClock()
+    const printed = [stale, fresh]
+    const writer = new Writer(
+      makeProbeIo(
+        clock,
+        async (url, init) => new Promise(resolve => { clock.after(100, () => resolve(init.headers.authorization === `Bearer ${fresh}` ? TABLE_FOUND : UNAUTHENTICATED)) }),
+        async () => {
+          const value = printed.shift() ?? fresh
+          if (value === stale) return { exitCode: 0, stdout: `${stale}\n`, stderr: '' }
+          return new Promise(resolve => { clock.after(14_000, () => resolve({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' })) })
+        },
+      ),
+      () => PROBE_CONFIG,
+      () => 'probe-quick-401',
+    )
+    let result: string | null | undefined
+    void writer.probeDestination(3000, true).then(v => { result = v })
+    await clock.advance(14_199)
+    expect(result).toBeUndefined()
+    await clock.advance(1)
+    expect(result).toBe(PROBE_FOUND)
+    expect(clock.pending()).toBe(0)
+  }
+})
+
+test('a destination check answered at once, after a 401 and a fresh token too, leaves none of its timers set', { options: OPTIONS }, async () => {
+  const stale = ['ya29', 'quick-stale-token-0007'].join('.')
+  const fresh = ['ya29', 'quick-fresh-token-0008'].join('.')
+  const clock = probeClock()
+  const printed = [fresh, stale, fresh]
+  const writer = new Writer(
+    makeProbeIo(
+      clock,
+      async (url, init) => (init.headers.authorization === `Bearer ${fresh}` ? TABLE_FOUND : UNAUTHENTICATED),
+      async () => ({ exitCode: 0, stdout: `${printed.shift() ?? fresh}\n`, stderr: '' }),
+    ),
+    () => PROBE_CONFIG,
+    () => 'probe-quick',
+  )
+  // Found at once: neither the token's deadline (15 s) nor the request's
+  // (3 s) is left set on the clock.
+  expect(await writer.probeDestination(3000, true)).toBe(PROBE_FOUND)
+  expect(clock.pending()).toBe(0)
+  // Refused at once, then found with a fresh token at once.
+  const again = new Writer(
+    makeProbeIo(
+      clock,
+      async (url, init) => (init.headers.authorization === `Bearer ${fresh}` ? TABLE_FOUND : UNAUTHENTICATED),
+      async () => ({ exitCode: 0, stdout: `${printed.shift() ?? fresh}\n`, stderr: '' }),
+    ),
+    () => PROBE_CONFIG,
+    () => 'probe-quick-401',
+  )
+  expect(await again.probeDestination(3000, true)).toBe(PROBE_FOUND)
+  expect([printed, clock.pending()]).toEqual([[], 0])
+})
+
+test('a destination check refused for a token another send has since replaced keeps the newer token: its retry goes with it, and no token command runs for it', { options: OPTIONS }, async () => {
+  const stale = ['ya29', 'probe-stale-token-0009'].join('.')
+  const fresh = ['ya29', 'send-fresh-token-0010'].join('.')
+  const spare = ['ya29', 'spare-token-0011'].join('.')
+  const printed = [stale, fresh, spare]
+  const clock = probeClock()
+  const asked: string[] = []
+  let answerProbe = (): void => undefined
+  const writer = new Writer(
+    makeProbeIo(
+      clock,
+      async (url, init) => {
+        const auth = init.headers.authorization ?? ''
+        asked.push(`${init.method} ${url.split('/').pop()?.split('?')[0]} ${auth}`)
+        // The check's request with the first token is answered last.
+        if (init.method === 'GET' && auth === `Bearer ${stale}`) {
+          await new Promise<void>(resolve => (answerProbe = resolve))
+          return UNAUTHENTICATED
+        }
+        if (auth === `Bearer ${stale}`) return UNAUTHENTICATED
+        return init.method === 'GET' ? TABLE_FOUND : OK_INSERT
+      },
+      async () => ({ exitCode: 0, stdout: `${printed.shift() ?? spare}\n`, stderr: '' }),
+    ),
+    () => PROBE_CONFIG,
+    () => 'probe-stale-401',
+  )
+  const checking = writer.probeDestination(3000, true)
+  for (let i = 0; i < 100 && asked.length === 0; i += 1) await Promise.resolve()
+  expect(asked).toEqual([`GET agent_events Bearer ${stale}`])
+  // Meanwhile a send gets a 401 for the same token, and lands with a fresh one.
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'f'.repeat(32), agent: 'coding-agent', sessionId: 'probe-stale-401', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+  await writer.flush()
+  answerProbe()
+  expect(await checking).toBe(PROBE_FOUND)
+  expect(asked).toEqual([`GET agent_events Bearer ${stale}`, `POST insertAll Bearer ${stale}`, `POST insertAll Bearer ${fresh}`, `GET agent_events Bearer ${fresh}`])
+  expect(printed).toEqual([spare])
+})
+
 test('/bqaa-status registers with the argument hint [check], as /bqaa-backfill does with its words', { options: OPTIONS }, async ($, on) => {
   const hints = new Map<string, string | undefined>()
   on('command.register', ($, e, next) => {
@@ -869,4 +1192,145 @@ test('/bqaa-status registers with the argument hint [check], as /bqaa-backfill d
   setUp(on)
   await startSession($)
   expect(Object.fromEntries(hints)).toEqual({ 'bqaa-status': '[check]', 'bqaa-flush': undefined, 'bqaa-backfill': '[force] [wait]', 'bqaa-mod-setup': undefined, 'bqaa-setup': undefined })
+})
+
+const EXIT_TABLE_MISSING = {
+  status: 404,
+  text: '{"error":{"code":404,"message":"Not found: Table my-gcp-project:agent_analytics.agent_events","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}',
+}
+const EXIT_TABLE_CREATED = { status: 200, text: '{"kind":"bigquery#table"}' }
+
+const fetchOps = (world: ReturnType<typeof setUp>): string[] =>
+  world.fetches.map(f => `${f.method} ${f.url.split('/').pop()?.split('?')[0]}`)
+
+const spillRowCount = (files: Map<string, string>): number =>
+  [...files.entries()]
+    .filter(([p, text]) => text.length > 0 && /\/spill-/.test(p))
+    .flatMap(([, text]) => text.trim().split('\n').map(l => (JSON.parse(l) as { row?: unknown }).row).filter(r => r !== undefined))
+    .length
+
+async function runShortHeadlessTurn($: Parameters<typeof startSession>[0], turnId: string): Promise<void> {
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.turn.start({ turnId, text: 'check' })
+  await $.turn.complete({ turnId, answer: 'ok', durationMs: 25, isAborted: false, reason: 'answer' })
+}
+
+test('sendAtExit cuts off hung createTable cleanly at marks.post and spills all rows', { options: OPTIONS }, async ($, on) => {
+  const token = ['ya29', 'exit-autocreate-hang-001'].join('.')
+  const sessionId = '5c4b1d2e-8f7a-4c3b-9d1e-2a6f0b7c8d9e'
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: token })
+  world.replies = [EXIT_TABLE_MISSING, { hang: true }]
+  await runShortHeadlessTurn($, 't-exit-hang-create')
+  const ending = $.session.end({ reason: 'other', sessionId, resume: { id: sessionId } })
+  await world.clock.advance(800)
+  await ending
+  expect(fetchOps(world)).toEqual(['POST insertAll', 'POST tables'])
+  expect(spillRowCount(world.files)).toBe(4)
+})
+
+test('sendAtExit skips createTable and spills immediately when remaining budget before marks.post is under 250 ms', { options: OPTIONS }, async () => {
+  const token = ['ya29', 'exit-autocreate-tight-002'].join('.')
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/exit-tight-budget' }, {})
+  const clock = probeClock()
+  const asked: string[] = []
+  const files = new Map<string, string>()
+  const baseIo = makeProbeIo(
+    clock,
+    async (reqUrl, init) => {
+      asked.push(`${init.method} ${reqUrl.split('/').pop()?.split('?')[0]}`)
+      if (asked.length === 1) {
+        return new Promise(resolve => { clock.after(420, () => resolve(EXIT_TABLE_MISSING)) })
+      }
+      return EXIT_TABLE_CREATED
+    },
+    async () => ({ exitCode: 0, stdout: `${token}\n`, stderr: '' }),
+  )
+  const io: Io = {
+    ...baseIo,
+    envToken: async () => token,
+    writeFile: async (p, text) => { files.set(p, text) },
+  }
+  const writer = new Writer(io, () => config, () => 'exit-tight-budget')
+  const row: Parameters<Writer['enqueue']>[0] = {
+    timestamp: '2026-11-08T00:00:00.000Z',
+    event_id: '0123456789abcdef0123456789abcdef',
+    event_type: 'SESSION_STARTED',
+    agent: 'coding-agent',
+    session_id: 'exit-tight-budget',
+    invocation_id: null,
+    user_id: 'dev',
+    trace_id: null,
+    span_id: null,
+    parent_span_id: null,
+    content: null,
+    content_parts: [],
+    attributes: '{}',
+    latency_ms: null,
+    status: 'OK',
+    error_message: null,
+    is_truncated: false,
+  }
+  writer.enqueue(row, 0)
+  let result: { spilled: number } | undefined
+  void writer.spillForExit(800, { sendQueued: true }).then(v => { result = v })
+  await clock.advance(800)
+  expect(result).toEqual({ spilled: 1 })
+  expect(asked).toEqual(['POST insertAll'])
+  expect(spillRowCount(files)).toBe(1)
+})
+
+test('sendAtExit spills the rows, with no second insertAll, when the table it made leaves less than 450 ms of the exit budget', { options: OPTIONS }, async () => {
+  const token = ['ya29', 'exit-autocreate-late-005'].join('.')
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/exit-late-create' }, {})
+  const clock = probeClock()
+  const asked: string[] = []
+  const files = new Map<string, string>()
+  const io: Io = {
+    ...makeProbeIo(
+      clock,
+      async (reqUrl, init) => {
+        asked.push(`${init.method} ${reqUrl.split('/').pop()?.split('?')[0]}`)
+        // The insertAll's 404 after 100 ms, the table made 300 ms later: 400 ms
+        // of the 800 ms budget are left, under the 450 ms a request needs.
+        if (asked.length === 1) return new Promise(resolve => { clock.after(100, () => resolve(EXIT_TABLE_MISSING)) })
+        if (asked.length === 2) return new Promise(resolve => { clock.after(300, () => resolve(EXIT_TABLE_CREATED)) })
+        return OK_INSERT
+      },
+      async () => ({ exitCode: 0, stdout: `${token}\n`, stderr: '' }),
+    ),
+    envToken: async () => token,
+    writeFile: async (p, text) => { files.set(p, text) },
+  }
+  const writer = new Writer(io, () => config, () => 'exit-late-create')
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'e'.repeat(32), agent: 'coding-agent', sessionId: 'exit-late-create', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+  let result: { spilled: number } | undefined
+  void writer.spillForExit(800, { sendQueued: true }).then(v => { result = v })
+  await clock.advance(800)
+  expect(result).toEqual({ spilled: 1 })
+  expect(asked).toEqual(['POST insertAll', 'POST tables'])
+  expect(spillRowCount(files)).toBe(1)
+  expect(writer.snapshot().lastError?.message).toBe('session end: table created (my-gcp-project.agent_analytics.agent_events); rows spilled')
+})
+
+test('sendAtExit never calls createTable when dataset is missing', { options: OPTIONS }, async ($, on) => {
+  const token = ['ya29', 'exit-autocreate-nods-003'].join('.')
+  const sessionId = '5c4b1d2e-8f7a-4c3b-9d1e-2a6f0b7c8d9e'
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: token })
+  world.replies = [DATASET_MISSING, EXIT_TABLE_CREATED, OK_INSERT]
+  await runShortHeadlessTurn($, 't-exit-dataset-missing')
+  await $.session.end({ reason: 'other', sessionId, resume: { id: sessionId } })
+  expect(fetchOps(world)).toEqual(['POST insertAll'])
+  expect(spillRowCount(world.files)).toBe(4)
+})
+
+test('sendAtExit spills without noisy missing-table stderr when retried insertAll hits streaming propagation 404 right after table creation', { options: OPTIONS }, async ($, on) => {
+  const token = ['ya29', 'exit-autocreate-prop-004'].join('.')
+  const sessionId = '5c4b1d2e-8f7a-4c3b-9d1e-2a6f0b7c8d9e'
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: token })
+  world.replies = [EXIT_TABLE_MISSING, EXIT_TABLE_CREATED, EXIT_TABLE_MISSING]
+  await runShortHeadlessTurn($, 't-exit-propagation')
+  await $.session.end({ reason: 'other', sessionId, resume: { id: sessionId } })
+  expect(fetchOps(world)).toEqual(['POST insertAll', 'POST tables', 'POST insertAll'])
+  expect(spillRowCount(world.files)).toBe(4)
+  expect(world.stderr).toEqual([])
 })

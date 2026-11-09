@@ -45,7 +45,7 @@ import { redactDiagnostic } from './lib/sanitize.ts'
 import { type DeadLetterSummary, formatBackfillReport, formatStatus } from './lib/status.ts'
 import { type StepCtx, type StepResult, type ToolCtx, type ToolOutcome, Tracer, errorText } from './lib/tracer.ts'
 import { CardRecords, WELCOME_KEY, type Welcome, cardKey, closedKey, destinationKey, greetedBy, greetedKey, greetedVersions, landedToast, openWelcome, reopenWelcome, welcomeCard, welcomeNotice } from './lib/welcome.ts'
-import { COMMAND_LINE_CHARS, type Io, Writer, buildCleanupCommand, buildPrereqsCommand, buildSetupCommand } from './lib/writer.ts'
+import { COMMAND_LINE_CHARS, type Io, Writer, buildCleanupCommand, buildPrereqsCommand, buildSetupCommand, recordOf } from './lib/writer.ts'
 
 let options: Options = {}
 let config: Config = resolveConfig({}, {})
@@ -57,7 +57,7 @@ let ranModCommand = false
 // Whether a person is at the prompt (session.start says): a `-p` run has no
 // band, toast or later moment, so its session end replays parked files,
 // /bqaa-backfill waits for its result, /bqaa-status asks BigQuery for the
-// table, and a problem that kept rows out goes to standard error.
+// table, and a problem that kept rows out writes a diagnostic via `writeStderr`.
 let isInteractiveSession = true
 // How long /bqaa-backfill waits for its result in a `-p` run (or with `wait`).
 const BACKFILL_WAIT_MS = 15_000
@@ -189,9 +189,11 @@ const none = (): undefined => undefined
 const clean = (text: string, maxChars = 2000): string => redactDiagnostic(text, maxChars)
 const say = (text: string): { text: string } => ({ text: clean(text, 8000) })
 
-// One line on the process's standard error, where the caller of a `-p` run
-// (a script, a CI job) sees it: such a run draws no band and shows no toast.
-// A test takes the line instead, through `globalThis.__bqaaStderr`.
+// One line on `process.stderr` when the host runtime exposes it, or into the
+// host `--debug-file` via `console.error` when the plugin sandbox hides
+// `process.stderr` (such as Claude Code CLI 2.1.319+): a `-p` run draws no
+// band and shows no toast. A test captures the line instead through
+// `globalThis.__bqaaStderr`.
 function writeStderr(line: string): void {
   const host = globalThis as {
     __bqaaStderr?: (line: string) => void
@@ -211,10 +213,10 @@ function writeStderr(line: string): void {
 // At the end of a `-p` run that recorded something (`hadActivity`, read
 // before session end resets it, or rows spilled or parked), while a problem
 // keeps rows from BigQuery: what is wrong and the fix, redacted, on one line
-// of standard error, with the setup command where the fix is one (a dataset
-// or table BigQuery cannot find). The command goes whole, after the rest is
-// cut; where redaction would change it, the line names /bqaa-mod-setup,
-// which prints it.
+// via `writeStderr` (`stderr` when exposed by the host, else `--debug-file`),
+// with the setup command where the fix is one (a dataset or table BigQuery
+// cannot find). The command goes whole, after the rest is cut; where redaction
+// would change it, the line names /bqaa-mod-setup, which prints it.
 function headlessNotice(current: Writer, hadActivity: boolean): void {
   const { counters } = current.snapshot()
   if (current.problem === null || !(hadActivity || counters.spilled > 0 || counters.failed > 0)) return
@@ -827,8 +829,12 @@ function closeWelcome($: EngineInterface, landedOnly = false): void {
 // This table's dead-letter files, those elsewhere in the dead-letter
 // directory (other tables' subdirectories, at most 50 of them, and files from
 // the older flat layout), and files too large to read back. Elsewhere, files
-// that hold rows wait (`elsewhere`), and replays' leftovers (emptied files,
-// `outcome-*` records) are counted apart (`elsewhereRetired`).
+// that hold rows wait (`elsewhere`), and replays' leftovers are counted apart
+// (`elsewhereRetired`). Leftovers, here and elsewhere, are what
+// scripts/clean_dead_letter.py deletes: emptied files, and the `outcome-*`
+// records beside an emptied file in the same directory. A record beside a
+// file that still holds rows (a replay's mark while it sends, say), or beside
+// no file at all, is no leftover.
 async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary> {
   if (config.deadLetterDir === '') return { error: 'no dead-letter directory configured' }
   const dir = deadLetterPartition(config)
@@ -844,41 +850,57 @@ async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary>
     recordFiles: 0,
     retiredFiles: 0,
   }
-  const countElsewhere = (entry: { name: string; kind: string; size: number }): void => {
-    if (entry.kind !== 'file') return
-    if (kindOf(entry.name) !== null && entry.size > 0) summary.elsewhere += 1
-    else if (kindOf(entry.name) !== null || entry.name.startsWith('outcome-')) summary.elsewhereRetired += 1
+  type Entry = { name: string; kind: string; size: number }
+  // Of one directory's entries, the records beside an emptied file there.
+  const recordsOfEmptied = (entries: readonly Entry[]): number => {
+    const emptied = new Set<string>()
+    for (const entry of entries) if (entry.kind === 'file' && entry.size === 0 && kindOf(entry.name) !== null) emptied.add(entry.name)
+    let records = 0
+    for (const entry of entries) {
+      const of = entry.kind === 'file' ? recordOf(entry.name) : null
+      if (of !== null && emptied.has(of)) records += 1
+    }
+    return records
+  }
+  // Another directory's entries (another table's, or the older flat layout's).
+  const countElsewhere = (entries: readonly Entry[]): void => {
+    for (const entry of entries) {
+      if (entry.kind !== 'file' || kindOf(entry.name) === null) continue
+      if (entry.size > 0) summary.elsewhere += 1
+      else summary.elsewhereRetired += 1
+    }
+    summary.elsewhereRetired += recordsOfEmptied(entries)
   }
   try {
     if (!(await $.fs.exists(config.deadLetterDir))) return summary
     if (await $.fs.exists(dir)) {
-      for (const entry of await $.fs.list(dir)) {
+      const entries = await $.fs.list(dir)
+      for (const entry of entries) {
         const kind = kindOf(entry.name)
-        if (entry.kind === 'file' && entry.name.startsWith('outcome-')) {
-          summary.recordFiles += 1
-          summary.retiredFiles += 1
-          continue
-        }
-        if (entry.kind === 'file' && kind !== null && entry.size === 0) {
+        if (entry.kind !== 'file' || kind === null) continue
+        if (entry.size === 0) {
           summary.emptyFiles += 1
-          summary.retiredFiles += 1
           continue
         }
-        if (entry.kind !== 'file' || kind === null || entry.size === 0) continue
         summary.files += 1
         summary.bytes += entry.size
         summary.byKind[kind] = (summary.byKind[kind] ?? 0) + 1
         if (entry.size > HOST_FILE_BYTES) summary.oversized.push(entry.name)
       }
+      summary.recordFiles = recordsOfEmptied(entries)
+      summary.retiredFiles = summary.emptyFiles + summary.recordFiles
     }
     const mine = destinationDir(tableRef(config))
     let dirs = 0
+    const loose: Entry[] = []
     for (const entry of await $.fs.list(config.deadLetterDir)) {
-      if (entry.kind === 'dir' && entry.name !== mine && dirs < 50) {
+      if (entry.kind !== 'dir') loose.push(entry)
+      else if (entry.name !== mine && entry.name !== 'dry-run' && dirs < 50) {
         dirs += 1
-        for (const inner of await $.fs.list(joinPath(config.deadLetterDir, entry.name))) countElsewhere(inner)
-      } else countElsewhere(entry)
+        countElsewhere(await $.fs.list(joinPath(config.deadLetterDir, entry.name)))
+      }
     }
+    countElsewhere(loose)
     return summary
   } catch (err) {
     return { error: clean(`could not list ${config.deadLetterDir}: ${errorText(err)}`, 300) }
@@ -987,6 +1009,7 @@ export const register: Register = (on, registered) => {
         }
       }
       for (const problem of config.problems) $.ui.log(clean(`bqaa: ${problem}`), { to: 'debug' })
+      for (const warning of config.warnings) $.ui.log(clean(`bqaa: config notice: ${warning}`), { to: 'debug' })
     } catch (err) {
       internalErrors += 1
       $.ui.log(clean(`bqaa: setup failed, rows are not sent: ${errorText(err)}`), { to: 'debug' })
@@ -1299,11 +1322,17 @@ export const register: Register = (on, registered) => {
     if (!writer) return say('BigQuery Agent Analytics mod: not started (session.start has not run).')
     const current = writer
     // A `-p` run sends nothing before it prints this (and `check` asks
-    // anywhere): BigQuery is asked for the table, up to 3 seconds, so a
-    // refused token, denied access or a missing table shows now.
+    // anywhere): BigQuery is asked for the table, up to 3 seconds for each
+    // HTTP request and the token command's timeout for a token, a retry with
+    // a fresh token after a 401 included within that token time and two
+    // requests' time in all, so a refused token, denied access or a missing
+    // table shows now.
     const explicitCheck = (e.args ?? '').trim() === 'check'
     const destinationCheck = !isInteractiveSession || explicitCheck ? await current.probeDestination(3000, explicitCheck) : null
     const summary = await deadLetterSummary($)
+    const snap = current.snapshot()
+    const maskTransientSessionStart =
+      !tracer.hasActivity && snap.consecutiveFailures === 0 && snap.inFlight === 0 && current.hasOnlyUnsentSessionStart(tracer.sessionId)
     const text = formatStatus({
       config,
       writer: current,
@@ -1314,6 +1343,7 @@ export const register: Register = (on, registered) => {
       isBackfilling: current.isBackfilling,
       cleanupCommand: buildCleanupCommand(config, $.plugin.root),
       destinationCheck,
+      maskTransientSessionStart,
     })
     return say(internalErrors > 0 ? `${text}\ninternal errors (skipped bookkeeping): ${internalErrors}` : text)
   })
@@ -1371,7 +1401,11 @@ export const register: Register = (on, registered) => {
     if (report !== null) return say(formatBackfillReport(report))
     if (!isInteractiveSession) {
       // The run ends once this returns: no /bqaa-status comes after it, and
-      // the replay stops with the process.
+      // the replay stops with the process. Whatever it comes to is no
+      // unhandled rejection.
+      void running.catch(() => {
+        internalErrors += 1
+      })
       return say(
         `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} did not finish within ${BACKFILL_WAIT_MS / 1000} s before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
       )

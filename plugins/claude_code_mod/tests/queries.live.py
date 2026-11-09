@@ -68,6 +68,7 @@ client and Application Default Credentials that may create a dataset:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -75,14 +76,34 @@ import secrets
 import subprocess
 import sys
 import textwrap
+import warnings
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 MOD = HERE.parent
 RUNNER = Path(os.environ.get("RUNNER") or MOD / "scripts" / "run_bq.py")
 START, END = "2026-10-19", "2026-10-20"
+QUOTA_403_RE = re.compile(
+    r"403\b.*(?:"
+    r"permission to use project"
+    r"|USER_PROJECT_DENIED"
+    r"|serviceusage\.services\.use"
+    r"|Consumer\s+['\"]?project"
+    r"|quota[ _-]?project"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+SERVICE_DISABLED_403_RE = re.compile(
+    r"403\b.*(?:"
+    r"SERVICE_DISABLED"
+    r"|accessNotConfigured"
+    r"|has not been used in project"
+    r"|it is disabled"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
 
-MOD_WRITER = {"plugin": "bigquery-agent-analytics-mod", "version": "0.1.0", "label": "bigquery-agent-analytics-mod/0.1.0"}
+MOD_WRITER = {"plugin": "bigquery-agent-analytics-mod", "version": "0.1.3", "label": "bigquery-agent-analytics-mod/0.1.3"}
 TRACER_WRITER = {"plugin": "bqaa-coding-agent-plugin", "version": "0.1.0", "label": "bqaa-coding-agent-plugin/0.1.0"}
 # This repository's settings-hook tracer stamps another name.
 SDK_TRACER_WRITER = {"plugin": "bigquery-agent-analytics-tracing", "version": "0.1.0",
@@ -645,19 +666,83 @@ def literal(value) -> str:
     return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Live BigQuery check for sample_queries.sql and value_queries.sql.")
+    parser.add_argument(
+        "--project",
+        default=(
+            os.environ.get("PROJECT")
+            or os.environ.get("BQAA_PROJECT_ID")
+            or os.environ.get("GCP_PROJECT_ID")
+            or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        ),
+        help="Google Cloud project ID (default: PROJECT, BQAA_PROJECT_ID, GCP_PROJECT_ID, or GOOGLE_CLOUD_PROJECT).",
+    )
+    parser.add_argument(
+        "--quota-project",
+        default=os.environ.get("QUOTA_PROJECT") or os.environ.get("GOOGLE_CLOUD_QUOTA_PROJECT") or None,
+        help="BigQuery billing/quota project (default: QUOTA_PROJECT, GOOGLE_CLOUD_QUOTA_PROJECT, else ADC).",
+    )
+    return parser.parse_args(argv)
+
+
+def _create_dataset_with_adc_quota_retry(bigquery, project: str, quota_project: str | None, made):
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Your application has authenticated using end user credentials from Google Cloud SDK without a quota project.*",
+        category=UserWarning,
+    )
+    kwargs: dict = {"project": project}
+    if quota_project:
+        kwargs["client_options"] = {"quota_project_id": quota_project}
+    client = bigquery.Client(**kwargs)
+    try:
+        client.create_dataset(made)
+        return client
+    except Exception as error:
+        err_str = str(error)
+        is_quota_403 = bool(QUOTA_403_RE.search(err_str))
+        is_service_disabled_403 = bool(SERVICE_DISABLED_403_RE.search(err_str))
+        if quota_project or not (is_quota_403 or is_service_disabled_403):
+            raise
+        import google.auth
+
+        scopes = getattr(getattr(bigquery, "Client", None), "SCOPE", None)
+        creds, _ = google.auth.default(scopes=scopes)
+        had_adc_quota = getattr(creds, "quota_project_id", None)
+        foreign_service_disabled = is_service_disabled_403 and bool(
+            re.search(
+                rf"(?:in project\s+|project=)(?!{re.escape(project)}(?:[^A-Za-z0-9_.-]|$))[A-Za-z0-9.:-]+",
+                err_str,
+                re.IGNORECASE,
+            )
+        )
+        if not (
+            had_adc_quota
+            and had_adc_quota != project
+            and hasattr(creds, "with_quota_project")
+            and (is_quota_403 or had_adc_quota in err_str or foreign_service_disabled)
+        ):
+            raise
+        retry_client = bigquery.Client(project=project, credentials=creds.with_quota_project(None))
+        retry_client.create_dataset(made)
+        return retry_client
+
+
+def main(argv: list[str] | None = None) -> int:
     from google.cloud import bigquery
 
-    project = os.environ.get("PROJECT")
+    args = parse_args(argv)
+    project = args.project
+    quota_project = args.quota_project
     if not project:
-        sys.exit("set PROJECT")
+        sys.exit("set PROJECT (or pass --project)")
     if not RUNNER.is_file():
         sys.exit(f"RUNNER is not a file: {RUNNER} (the default is the mod's scripts/run_bq.py)")
     dataset = f"bqaa_query_check_{secrets.token_hex(4)}"
-    client = bigquery.Client(project=project)
     made = bigquery.Dataset(f"{project}.{dataset}")
     made.location = "US"
-    client.create_dataset(made)
+    client = _create_dataset_with_adc_quota_retry(bigquery, project, quota_project, made)
     passed = failed = 0
     try:
         # The CREATE statement alone (its descriptions hold semicolons).
@@ -710,6 +795,8 @@ def main() -> int:
         for label, name, sql, start, end in runs:
             base = [sys.executable, str(RUNNER), "--project", project, "--dataset", dataset,
                     "--table", "agent_events", "--start", start, "--end", end]
+            if quota_project:
+                base += ["--quota-project", quota_project]
             if name == "6":
                 base += ["--trace-id", "trace-1"]
             dry = subprocess.run(base + ["--dry-run", sql], capture_output=True, text=True)
