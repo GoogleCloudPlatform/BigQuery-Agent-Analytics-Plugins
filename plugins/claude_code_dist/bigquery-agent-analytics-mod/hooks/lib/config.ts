@@ -17,7 +17,7 @@
 // already uses. Pure: no `$` calls here, so it can be unit tested directly.
 
 export const PLUGIN_NAME = 'bigquery-agent-analytics-mod'
-export const PLUGIN_VERSION = '0.1.1'
+export const PLUGIN_VERSION = '0.1.2'
 export const WRITER_LABEL = `${PLUGIN_NAME}/${PLUGIN_VERSION}`
 
 export const DEFAULT_TABLE = 'agent_events'
@@ -82,6 +82,10 @@ export type Config = {
   // How long session.end may wait for its spill file to be written.
   exitFlushMs: number
   deadLetterDir: string
+  // Whether `deadLetterDir` is the default one, under the home directory
+  // (~/.bqaa-mod/dead-letter): the one scripts/clean_dead_letter.py cleans
+  // when given no directory.
+  deadLetterDirIsDefault: boolean
   dryRunDir: string
   accessTokenCommand: string[]
   tokenCommandTimeoutMs: number
@@ -204,6 +208,7 @@ export function resolveConfig(options: Options, env: EnvSnapshot): Config {
     maxRetries: 3,
     exitFlushMs: clampInt(env.BQAA_EXIT_FLUSH_MS, 800, 0, 1200),
     deadLetterDir,
+    deadLetterDirIsDefault: text(options.deadLetterDir) === '' && (env.BQAA_DEAD_LETTER_DIR ?? '').trim() === '' && home !== '',
     dryRunDir: deadLetterDir ? joinPath(parentDir(deadLetterDir), 'dry-run') : '',
     accessTokenCommand: splitArgv(tokenLine),
     tokenCommandTimeoutMs: 15_000,

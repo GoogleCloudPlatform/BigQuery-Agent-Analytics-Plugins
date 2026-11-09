@@ -34,9 +34,11 @@ export type SanitizeStats = {
   // Something was cut (BQAA `is_truncated`).
   truncated: boolean
   // How many replacements were made; redaction alone does not set `truncated`,
-  // as in the BQAA plugin, unless it removes text past the credential's own
-  // line (see noteCut).
+  // as in the BQAA plugin, unless it removes text past the credential itself
+  // (see noteCut).
   redactions: number
+  // Characters such redactions removed past the credentials themselves.
+  droppedChars: number
 }
 
 export type Limits = {
@@ -49,7 +51,7 @@ export type Limits = {
   maxItems: number
 }
 
-export const newStats = (): SanitizeStats => ({ truncated: false, redactions: 0 })
+export const newStats = (): SanitizeStats => ({ truncated: false, redactions: 0, droppedChars: 0 })
 
 // Room left under a column's cap for the truncation markers the walk adds
 // (at most one per nesting level once the budget is spent), so a cut copy
@@ -405,11 +407,226 @@ function namedValueEnd(text: string, start: number): number {
 const valueStop = (text: string, start: number, end: number, flag: boolean, spanEnd = 0): number =>
   flag && /[;&|<>)]/.test(text[end] ?? '') ? end : spanEnd > 0 ? spanEnd : lineEnd(text, start, end)
 
-// Text a redaction removes past the end of the credential's own line (an end
-// these rules cannot tell runs to the end of the text) is lost, not hidden:
-// the row is marked cut (`is_truncated`), as a cut for size is.
-function noteCut(text: string, start: number, end: number, stats: SanitizeStats): void {
-  if (end >= text.length && !stats.truncated && lineEnd(text, start, start) < text.length) stats.truncated = true
+// Whether a value read by the rules below is over at `at`: at `limit`, or at
+// a blank, an operator, or a `,`, `}` or `]`, which end a value in JSON,
+// YAML or a dict.
+const valueOverAt = (text: string, at: number, limit: number): boolean =>
+  at >= limit || /\s/.test(text[at] as string) || /[;&|<>(),}\]]/.test(text[at] as string)
+
+// Where a credential's value itself, starting at `start`, ends within
+// `[start, limit)`, as best these rules can tell: a quoted string at the
+// quote that closes it (a doubled quote, `''` or `""`, does not), `$'…'`,
+// `$(…)` and `${…}` whole, else at the first blank, operator or line break,
+// or just past the quote the value sits in (`outerQuote`, as the `"` that
+// closes `-H "Authorization: Bearer …"`). A `,`, `}` or `]` right after a
+// quoted string ends the value, as in JSON, YAML or a dict.
+// Used only to tell whether a redaction removed more than the value (see
+// noteCut): it never narrows what is removed.
+function fallbackValueEnd(text: string, start: number, limit: number, outerQuote = ''): number {
+  let i = start
+  if (i >= limit) return limit
+  // A value that starts with the quote it sits in closes that quote
+  // (`"PASSWORD="s3cret`): the value is what is glued on after it, read
+  // outside quotes; none, where a blank or a delimiter follows.
+  if (outerQuote !== '' && text[i] === outerQuote) {
+    i += 1
+    if (valueOverAt(text, i, limit)) return i
+    outerQuote = ''
+  }
+  // A quote a command string's quoting escapes (`\"value\"`).
+  if (text[i] === '\\' && (text[i + 1] === '"' || text[i + 1] === "'")) {
+    const q = text[i + 1]
+    i += 2
+    while (i < limit) {
+      if (text[i] === '\\' && text[i + 1] === q) return i + 2
+      if (text[i] === '\n') break
+      i += 1
+    }
+    return limit
+  }
+  const q = text[i]
+  if ((q === '"' || q === "'") && q !== outerQuote) {
+    i += 1
+    while (i < limit) {
+      if (q === '"' && text[i] === '\\' && i + 1 < limit) {
+        i += 2
+        continue
+      }
+      if (text[i] === q) {
+        if (i + 1 < limit && text[i + 1] === q) {
+          i += 2
+          continue
+        }
+        i += 1
+        // The quote the value sits in, closed right after its own.
+        if (outerQuote !== '' && i < limit && text[i] === outerQuote) {
+          i += 1
+          outerQuote = ''
+        }
+        // More of the word glued after the quote is read on below, unless a
+        // delimiter (`,`, `}`, `]`, an operator) ends the value.
+        if (!valueOverAt(text, i, limit)) break
+        return i
+      }
+      i += 1
+    }
+    if (i >= limit) return limit
+  } else if (q === '$' && text[i + 1] === "'") {
+    i += 2
+    while (i < limit) {
+      if (text[i] === '\\' && i + 1 < limit) {
+        i += 2
+        continue
+      }
+      if (text[i] === "'") return i + 1
+      i += 1
+    }
+    return limit
+  }
+  while (i < limit) {
+    const c = text[i] as string
+    if (outerQuote !== '' && c === outerQuote) return i + 1
+    if (c === '\\') {
+      if (text[i + 1] === '\n') {
+        i += 2
+        continue
+      }
+      if (text[i + 1] === '\r' && text[i + 2] === '\n') {
+        i += 3
+        continue
+      }
+      if (i + 1 < limit) {
+        i += 2
+        continue
+      }
+    }
+    if (c === '$' && (text[i + 1] === '(' || text[i + 1] === '{')) {
+      const open = text[i + 1] as string
+      const close = open === '(' ? ')' : '}'
+      let depth = 1
+      i += 2
+      while (i < limit && depth > 0) {
+        if (text[i] === '\\' && i + 1 < limit) {
+          i += 2
+          continue
+        }
+        if (text[i] === open) depth += 1
+        else if (text[i] === close) depth -= 1
+        i += 1
+      }
+      continue
+    }
+    if (c === '"' || c === "'") {
+      // A quoted piece of the word only where a quote like it closes it
+      // before `limit`; otherwise it closes a quote around the value.
+      let k = i + 1
+      let found = -1
+      while (k < limit) {
+        if (c === '"' && text[k] === '\\' && k + 1 < limit) {
+          k += 2
+          continue
+        }
+        if (text[k] === c) {
+          if (k + 1 < limit && text[k + 1] === c) {
+            k += 2
+            continue
+          }
+          found = k
+          break
+        }
+        k += 1
+      }
+      if (found === -1) return i + 1
+      i = found + 1
+      continue
+    }
+    if (c === '`') {
+      const closeTick = text.indexOf('`', i + 1)
+      if (closeTick !== -1 && closeTick < limit) {
+        i = closeTick + 1
+        continue
+      }
+      break
+    }
+    if (/\s/.test(c) || /[;&|<>()]/.test(c)) break
+    i += 1
+  }
+  return i
+}
+
+// Just past the quote that closes the quoted value that starts at `start`,
+// else `limit`. A backslash escapes the character after it inside double
+// quotes, as in JSON, a dict or a log line, but not inside single quotes, as
+// in the shell and YAML (`'abc\'` closes at its last quote); a doubled quote
+// (`''`, `""`) goes on with the value. The quote the value sits in
+// (`outerQuote`), closed right after, is the value's too, and so is a word
+// glued on after the quotes (`"abc"def`), up to a blank, an operator or a
+// `,`, `}`, `]` or `:` (fallbackValueEnd).
+function closingQuoteEnd(text: string, start: number, limit: number, outerQuote = ''): number {
+  const quote = text[start]
+  for (let i = start + 1; i < limit; i += 1) {
+    if (quote === '"' && text[i] === '\\') {
+      i += 1
+      continue
+    }
+    if (text[i] === quote) {
+      if (i + 1 < limit && text[i + 1] === quote) {
+        i += 1
+        continue
+      }
+      let end = i + 1
+      if (outerQuote !== '' && end < limit && text[end] === outerQuote) {
+        end += 1
+        outerQuote = ''
+      }
+      return valueOverAt(text, end, limit) || text[end] === ':' ? end : fallbackValueEnd(text, end, limit, outerQuote)
+    }
+  }
+  return limit
+}
+
+// Where one value after a `name:` or `name = ` ends (see namedTokenEnd): a
+// quoted value as closingQuoteEnd reads it, else its word (fallbackValueEnd).
+// Where the quote the value sits in closes right at `start`
+// (`'Authorization: Bearer 'token`), the value is what is glued on after it.
+function namedSingleValueEnd(text: string, start: number, limit: number, outerQuote = ''): number {
+  if (start >= limit) return limit
+  if (outerQuote !== '' && text[start] === outerQuote) return valueOverAt(text, start + 1, limit) ? start + 1 : namedSingleValueEnd(text, start + 1, limit, '')
+  if (text[start] === '"' || text[start] === "'") return closingQuoteEnd(text, start, limit, outerQuote)
+  return fallbackValueEnd(text, start, limit, outerQuote)
+}
+
+// The same for a `name:` or `name = ` value (namedValueEnd), which may be an
+// auth scheme and its token (`Bearer …`, `Basic …`). A quoted value ends at
+// the quote that closes it: what follows (the `,` or `}` after a JSON or
+// dict value) is not the credential's, unless it is glued on (`"abc"def`).
+// A scheme can follow the quote the value sits in, where that quote closes
+// right at `start` (`-H "Authorization: "Bearer …`).
+function namedTokenEnd(text: string, start: number, limit: number, outerQuote = ''): number {
+  if (start >= limit) return limit
+  if (outerQuote !== '' && text[start] === outerQuote) return valueOverAt(text, start + 1, limit) ? start + 1 : namedTokenEnd(text, start + 1, limit, '')
+  // A quoted value, or `$'…'`, is no scheme: it starts with a quote or `$`.
+  const first = namedSingleValueEnd(text, start, limit, outerQuote)
+  if (/^(?:Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|Bot)$/i.test(text.slice(start, first))) {
+    let j = first
+    while (j < limit && (text[j] === ' ' || text[j] === '\t')) j += 1
+    if (j < limit && text[j] !== '\n' && text[j] !== '\r') return namedSingleValueEnd(text, j, limit, outerQuote)
+  }
+  return first
+}
+
+// Text a redaction removes past the credential's value (`valueEnd`) up to
+// where it stops (`end`) is lost, not hidden: when any of it is more than
+// blanks, the row is marked cut (`is_truncated`), as a cut for size is, and
+// its length is counted (`droppedChars`). A cut that runs on past the line
+// the value starts on (`start`) to the end of the text (an end these rules
+// cannot tell) marks the row cut too.
+function noteCut(text: string, start: number, valueEnd: number, end: number, stats: SanitizeStats): void {
+  const dropped = text.slice(Math.min(Math.max(start, valueEnd), end), end)
+  if (dropped.trim() !== '') {
+    stats.truncated = true
+    stats.droppedChars += dropped.length
+  } else if (end >= text.length && !stats.truncated && lineEnd(text, start, start) < text.length) stats.truncated = true
 }
 
 // ---- credential values in shell text ----------------------------------------
@@ -427,6 +644,15 @@ const DOUBLE = 1
 const SINGLE = 2
 const ANSI = 3
 const UNKNOWN = 4
+
+// The quote a credential value sits in, for fallbackValueEnd: the one its
+// first character is in (`state`, as quoteStates reads it). Where that scan
+// cannot tell (`$'…'`, past a here-document's `<<`), a quote just before
+// its name (`boundary`), while that quote is still open where the value
+// starts (`open`): the key's own quote in `"password": "…"` closes before
+// the value, so it is no quote around it. Outside quotes (NONE), none.
+const outerQuoteOf = (state: number | undefined, boundary = '', open = true): string =>
+  state === DOUBLE ? '"' : state === SINGLE ? "'" : state !== NONE && open && (boundary === '"' || boundary === "'") ? boundary : ''
 
 // The quote open at `to`, reading `text` from `from` by the shell's quoting
 // rules alone: single quotes, double quotes, `$'…'` and backslashes (a line
@@ -801,6 +1027,8 @@ function redactNamedValues(text: string, stats: SanitizeStats): string {
     const from = wordStart(text, m.index + m.boundary.length)
     const equals = text[m.separator] === '='
     let end: number
+    // Where the value itself ends (see noteCut).
+    let valueEnd: number
     // A quote open where the value starts and closed in it is put back after
     // the marker.
     let close = ''
@@ -819,6 +1047,7 @@ function redactNamedValues(text: string, stats: SanitizeStats): string {
           break
         }
       }
+      valueEnd = end
       // After `;` or `&` it may be a shell assignment, after `?` or `#` in a
       // list gcloud's delimiter holding it sets apart (`^#^`), a list's entry,
       // whose value a quoted or escaped `&` does not end, and a quote
@@ -830,27 +1059,36 @@ function redactNamedValues(text: string, stats: SanitizeStats): string {
         const read = readValue(text, start, from, (states ??= quoteStates(text)))
         if (read === null) {
           end = text.length
+          valueEnd = fallbackValueEnd(text, start, end, outerQuoteOf((states ??= quoteStates(text))[start]))
         } else if (read.end >= end) {
           // Also where both end at once: the quote the value starts in is
           // put back.
           end = read.end
+          valueEnd = read.end
           close = read.close
         }
       }
     } else if (equals && start === m.separator + 1 && !/[ \t]/.test(text[m.separator - 1] as string)) {
       const read = readValue(text, start, from, (states ??= quoteStates(text)))
       end = read === null ? text.length : valueStop(text, start, read.end, /^\$?["']*-/.test(text.slice(from, start)), read.spanEnd)
+      valueEnd = read === null ? fallbackValueEnd(text, start, end, outerQuoteOf((states ??= quoteStates(text))[start])) : read.end
       close = read?.close ?? ''
     } else {
       end = namedValueEnd(text, start)
+      const open = !text.slice(m.index + 1, start).includes(m.boundary)
+      valueEnd = namedTokenEnd(text, start, end, outerQuoteOf((states ??= quoteStates(text))[start], m.boundary, open))
     }
     const value = text.slice(start, end)
     if (value.trim() === '') continue
-    noteCut(text, start, end, stats)
+    // An auth scheme whose token a pattern already redacted (and counted),
+    // quoted or not (`"Bearer [REDACTED]"` in JSON, escaped in a log line).
+    const alreadyRedactedScheme =
+      /^\\?['"]?(?:Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|Bot)\s+\[REDACTED(?::[a-z-]+)?\]\\?['"]?$/i.test(text.slice(start, valueEnd).trim())
+    noteCut(text, start, valueEnd, end, stats)
     out += text.slice(copied, start) + MARKER + close
     copied = end
     next = end
-    if (value !== MARKER + close) stats.redactions += 1
+    if (value !== MARKER + close && !alreadyRedactedScheme) stats.redactions += 1
   }
   return copied === 0 ? text : out + text.slice(copied)
 }
@@ -898,6 +1136,8 @@ function redactFlagValues(text: string, stats: SanitizeStats): string {
     const dashes = m.index + (m[1] as string).length
     let start = m.index + m[0].length
     let end = text.length
+    // Where the value itself ends (see noteCut); -1 until it is read.
+    let valueEnd = -1
     let close = ''
     if (!/[ \t]/.test(m[4] as string)) {
       // Line continuations alone after the name glue what follows to its
@@ -915,6 +1155,7 @@ function redactFlagValues(text: string, stats: SanitizeStats): string {
         // No value before an operator (`--password ;`).
         if (read.end === start) continue
         end = read.end
+        valueEnd = read.end
         close = read.close
       }
     } else {
@@ -938,7 +1179,8 @@ function redactFlagValues(text: string, stats: SanitizeStats): string {
       start = m.index + m[0].indexOf(raw, (m[1] as string).length) + cut
     }
     if (wholeMarker(text.slice(start, end), close)) continue
-    noteCut(text, start, end, stats)
+    if (valueEnd === -1) valueEnd = fallbackValueEnd(text, start, end, outerQuoteOf((states ??= quoteStates(text))[start]))
+    noteCut(text, start, valueEnd, end, stats)
     out += text.slice(copied, start) + MARKER + close
     copied = end
     stats.redactions += 1
@@ -1457,14 +1699,17 @@ function redactOptionWords(text: string, stats: SanitizeStats): string {
     if (!nested && word.value !== -1 && !word.name.startsWith('--') && /^\$?["']?-?[A-Za-z_][A-Za-z0-9_.-]*["']?$/.test(text.slice(from, word.value - 1))) continue
     let start: number
     let end = text.length
+    // Where the value itself ends (see noteCut).
+    let valueEnd: number
     let close = ''
     if (word.value !== -1) {
       start = word.value
       const read = nested ? null : readValue(text, start, at, scan.states(), option.alone)
       if (read !== null) {
         end = valueStop(text, start, read.end, /^\$?["']*-/.test(text.slice(at, start)), read.spanEnd)
+        valueEnd = read.end
         close = read.close
-      }
+      } else valueEnd = fallbackValueEnd(text, start, end, outerQuoteOf(scan.states()[start]))
     } else {
       if (!credentialOption(name)) continue
       start = word.end
@@ -1478,12 +1723,13 @@ function redactOptionWords(text: string, stats: SanitizeStats): string {
       if (read !== null) {
         if (read.end === start) continue
         end = read.end
+        valueEnd = read.end
         close = read.close
-      }
+      } else valueEnd = fallbackValueEnd(text, start, end, outerQuoteOf(scan.states()[start]))
     }
     const value = text.slice(start, end)
     if (value.trim() === '' || wholeMarker(value, close)) continue
-    noteCut(text, start, end, stats)
+    noteCut(text, start, valueEnd, end, stats)
     out += text.slice(copied, start) + MARKER + close
     copied = end
     OPTION_WORD.lastIndex = end
@@ -1973,10 +2219,15 @@ function redactListNames(text: string, stats: SanitizeStats): string {
     const close = read?.close ?? ''
     const value = text.slice(start, end)
     if (value.trim() === '' || wholeMarker(value, close)) continue
-    noteCut(text, start, end, stats)
+    // A marker an earlier rule left after a blank (`NAME= [REDACTED]`) is a
+    // value redacted and counted already: the blank goes, as it always has,
+    // with nothing counted again.
+    if (!wholeMarker(value.trimStart(), close)) {
+      noteCut(text, start, read === null ? fallbackValueEnd(text, start, end, outerQuoteOf(scanned()[start])) : read.end, end, stats)
+      stats.redactions += 1
+    }
     out += text.slice(copied, start) + MARKER + close
     copied = end
-    stats.redactions += 1
     if (end >= text.length) break
     e = end - 1
   }

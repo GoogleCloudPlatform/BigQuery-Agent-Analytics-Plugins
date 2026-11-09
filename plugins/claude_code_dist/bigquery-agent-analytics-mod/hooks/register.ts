@@ -22,10 +22,11 @@
 // returns. No hook waits on the network or a process; the writer does that
 // from timers. Two lifecycle hooks do bounded work before passing their event
 // on: session.start sets the writer up and registers the commands, and
-// session.end writes what is still queued to a spill file, waiting at most
-// the exit budget. If the mod's own code throws, the event goes on as if the
-// mod were not there (fail open): the observers through their `.catch`, the
-// other hooks because their bookkeeping runs inside `safely` or a `try`.
+// session.end sends what is still queued, with a token already at hand, or
+// writes it to a spill file, waiting at most the exit budget. If the mod's
+// own code throws, the event goes on as if the mod were not there (fail
+// open): the observers through their `.catch`, the other hooks because their
+// bookkeeping runs inside `safely` or a `try`.
 // While rows cannot be written for lack of credentials or permission, the
 // band above the prompt says what is wrong; no prompt ever waits on that.
 // With nothing wrong, in the first session after an install or an update,
@@ -41,10 +42,10 @@ import { HOST_FILE_BYTES, kindOf } from './lib/deadletter.ts'
 import { randomIds } from './lib/ids.ts'
 import type { BqaaRow } from './lib/rows.ts'
 import { redactDiagnostic } from './lib/sanitize.ts'
-import { type DeadLetterSummary, formatStatus } from './lib/status.ts'
+import { type DeadLetterSummary, formatBackfillReport, formatStatus } from './lib/status.ts'
 import { type StepCtx, type StepResult, type ToolCtx, type ToolOutcome, Tracer, errorText } from './lib/tracer.ts'
 import { CardRecords, WELCOME_KEY, type Welcome, cardKey, closedKey, destinationKey, greetedBy, greetedKey, greetedVersions, landedToast, openWelcome, reopenWelcome, welcomeCard, welcomeNotice } from './lib/welcome.ts'
-import { COMMAND_LINE_CHARS, type Io, Writer, buildSetupCommand } from './lib/writer.ts'
+import { COMMAND_LINE_CHARS, type Io, Writer, buildCleanupCommand, buildPrereqsCommand, buildSetupCommand } from './lib/writer.ts'
 
 let options: Options = {}
 let config: Config = resolveConfig({}, {})
@@ -53,6 +54,13 @@ let flushTimer: { cancel: () => void } | null = null
 let internalErrors = 0
 let canShowBand = false
 let ranModCommand = false
+// Whether a person is at the prompt (session.start says): a `-p` run has no
+// band, toast or later moment, so its session end replays parked files,
+// /bqaa-backfill waits for its result, /bqaa-status asks BigQuery for the
+// table, and a problem that kept rows out goes to standard error.
+let isInteractiveSession = true
+// How long /bqaa-backfill waits for its result in a `-p` run (or with `wait`).
+const BACKFILL_WAIT_MS = 15_000
 // The host's timer, from session.start's `$`, for work that waits briefly
 // outside any hook (a finished tool call waiting for its decision).
 let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null = null
@@ -180,6 +188,43 @@ const none = (): undefined => undefined
 // Every line the mod logs or a command prints is redacted on its way out.
 const clean = (text: string, maxChars = 2000): string => redactDiagnostic(text, maxChars)
 const say = (text: string): { text: string } => ({ text: clean(text, 8000) })
+
+// One line on the process's standard error, where the caller of a `-p` run
+// (a script, a CI job) sees it: such a run draws no band and shows no toast.
+// A test takes the line instead, through `globalThis.__bqaaStderr`.
+function writeStderr(line: string): void {
+  const host = globalThis as {
+    __bqaaStderr?: (line: string) => void
+    process?: { stderr?: { write?: (text: string) => unknown } }
+    console?: { error?: (text: string) => void }
+  }
+  try {
+    const stderr = host.process?.stderr
+    if (typeof host.__bqaaStderr === 'function') host.__bqaaStderr(line)
+    else if (typeof stderr?.write === 'function') stderr.write(`${line}\n`)
+    else host.console?.error?.(line)
+  } catch {
+    internalErrors += 1
+  }
+}
+
+// At the end of a `-p` run that recorded something (`hadActivity`, read
+// before session end resets it, or rows spilled or parked), while a problem
+// keeps rows from BigQuery: what is wrong and the fix, redacted, on one line
+// of standard error, with the setup command where the fix is one (a dataset
+// or table BigQuery cannot find). The command goes whole, after the rest is
+// cut; where redaction would change it, the line names /bqaa-mod-setup,
+// which prints it.
+function headlessNotice(current: Writer, hadActivity: boolean): void {
+  const { counters } = current.snapshot()
+  if (current.problem === null || !(hadActivity || counters.spilled > 0 || counters.failed > 0)) return
+  const { headline, fix } = current.problemText()
+  const base = clean(`BigQuery Agent Analytics: rows could not be sent (${headline}; to fix, ${fix}).`, 1000)
+  const run = current.commandLine()
+  const withCommand = run === null ? base : clean(`${base} ${run}`, 2100)
+  const line = run === null || withCommand.includes(run) ? withCommand : `${base} Run /bqaa-mod-setup for the setup.sh command.`
+  writeStderr(line.replace(/[\r\n]+/g, ' '))
+}
 
 async function readEnv($: EngineInterface): Promise<EnvSnapshot> {
   const [
@@ -781,7 +826,9 @@ function closeWelcome($: EngineInterface, landedOnly = false): void {
 
 // This table's dead-letter files, those elsewhere in the dead-letter
 // directory (other tables' subdirectories, at most 50 of them, and files from
-// the older flat layout), and files too large to read back.
+// the older flat layout), and files too large to read back. Elsewhere, files
+// that hold rows wait (`elsewhere`), and replays' leftovers (emptied files,
+// `outcome-*` records) are counted apart (`elsewhereRetired`).
 async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary> {
   if (config.deadLetterDir === '') return { error: 'no dead-letter directory configured' }
   const dir = deadLetterPartition(config)
@@ -792,9 +839,15 @@ async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary>
     byKind: {} as Record<string, number>,
     oversized: [] as string[],
     elsewhere: 0,
+    elsewhereRetired: 0,
     emptyFiles: 0,
     recordFiles: 0,
     retiredFiles: 0,
+  }
+  const countElsewhere = (entry: { name: string; kind: string; size: number }): void => {
+    if (entry.kind !== 'file') return
+    if (kindOf(entry.name) !== null && entry.size > 0) summary.elsewhere += 1
+    else if (kindOf(entry.name) !== null || entry.name.startsWith('outcome-')) summary.elsewhereRetired += 1
   }
   try {
     if (!(await $.fs.exists(config.deadLetterDir))) return summary
@@ -821,13 +874,10 @@ async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary>
     const mine = destinationDir(tableRef(config))
     let dirs = 0
     for (const entry of await $.fs.list(config.deadLetterDir)) {
-      if (entry.kind === 'file' && kindOf(entry.name) !== null && entry.size > 0) summary.elsewhere += 1
-      else if (entry.kind === 'dir' && entry.name !== mine && dirs < 50) {
+      if (entry.kind === 'dir' && entry.name !== mine && dirs < 50) {
         dirs += 1
-        for (const inner of await $.fs.list(joinPath(config.deadLetterDir, entry.name))) {
-          if (inner.kind === 'file' && kindOf(inner.name) !== null && inner.size > 0) summary.elsewhere += 1
-        }
-      }
+        for (const inner of await $.fs.list(joinPath(config.deadLetterDir, entry.name))) countElsewhere(inner)
+      } else countElsewhere(entry)
     }
     return summary
   } catch (err) {
@@ -849,6 +899,7 @@ export const register: Register = (on, registered) => {
     // Its rank, in a session a person sees (a `-p` run draws no card).
     cardSession = e.isInteractive && e.surface !== null
     canShowBand = Boolean(e.isInteractive && e.surface === 'terminal')
+    isInteractiveSession = Boolean(e.isInteractive)
     ranModCommand = false
     const ranked = cardSession ? nextLoad($).catch(() => null) : Promise.resolve(null)
     const admitted = admit($, ranked).catch(() => null)
@@ -888,7 +939,8 @@ export const register: Register = (on, registered) => {
         // Where setup.sh is, for the fix when BigQuery cannot find the dataset.
         pluginRoot: $.plugin.root,
         sent: (rows, to) => {
-          if (rows > 0 && !e.isInteractive && !autoBackfillStarted && config.autoBackfill && canDeliver(config) && !config.dryRun) {
+          // Once the exit began, its own replay (a `-p` run's) is the one.
+          if (rows > 0 && !e.isInteractive && !autoBackfillStarted && config.autoBackfill && canDeliver(config) && !config.dryRun && !own.isClosing) {
             autoBackfillStarted = true
             void own.backfill(['spill', 'retry'], 'auto')
           }
@@ -907,7 +959,8 @@ export const register: Register = (on, registered) => {
       // off and on): keep what the previous writer still held.
       if (previous) writer.adopt(previous)
       // The host keeps one status line per plugin until it is replaced, a
-      // reload included: this writer starts with none, as it holds no notice.
+      // reload included: this writer starts with none, unless it kept a
+      // denial of writes from the writer before (see adopt), which it shows.
       writer.clearStatus()
       for (const held of early.splice(0)) writer.enqueue(held.row, held.redactions)
       const [sessionId, version] = await Promise.all([$.session.id().catch(() => null), $.session.version().catch(() => null)])
@@ -942,7 +995,7 @@ export const register: Register = (on, registered) => {
     configurationLoaded()
     // Each in its own try: a refused name must not keep the others out.
     try {
-      await $.command.register({ name: 'bqaa-status', description: 'BigQuery Agent Analytics: queue, sent, failed and dead-letter counts', immediate: true })
+      await $.command.register({ name: 'bqaa-status', description: 'BigQuery Agent Analytics: queue, sent, failed and dead-letter counts', argumentHint: '[check]', immediate: true })
     } catch {
       internalErrors += 1
     }
@@ -952,14 +1005,22 @@ export const register: Register = (on, registered) => {
       internalErrors += 1
     }
     try {
-      await $.command.register({ name: 'bqaa-backfill', description: 'BigQuery Agent Analytics: resend rows parked in the dead-letter directory', argumentHint: '[force]', immediate: true })
+      await $.command.register({ name: 'bqaa-backfill', description: 'BigQuery Agent Analytics: resend rows parked in the dead-letter directory', argumentHint: '[force] [wait]', immediate: true })
     } catch {
       internalErrors += 1
     }
     try {
-      await $.command.register({ name: 'bqaa-setup', description: 'BigQuery Agent Analytics: print the setup.sh command to create the dataset, table and views', immediate: true })
+      await $.command.register({ name: 'bqaa-mod-setup', description: 'BigQuery Agent Analytics: print the setup.sh command to create the dataset, table and views', immediate: true })
     } catch {
       internalErrors += 1
+    }
+    // The earlier name, kept through 0.1.x; in its own try, as the tracing
+    // plugin may hold it already. That is expected while both are enabled,
+    // so a refusal here is no internal error: /bqaa-mod-setup still works.
+    try {
+      await $.command.register({ name: 'bqaa-setup', description: 'BigQuery Agent Analytics: same as /bqaa-mod-setup (earlier name)', immediate: true })
+    } catch {
+      // Held by the tracing plugin.
     }
     // In the background: neither the first prompt nor anything above waits
     // on the store for the welcome card.
@@ -1048,7 +1109,7 @@ export const register: Register = (on, registered) => {
             flexWrap: 'wrap',
             children: [
               Text({ color: 'warning', bold: true, children: '⚠ BQAA: ' }),
-              Text({ children: 'rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-setup.' }),
+              Text({ children: 'rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-mod-setup.' }),
             ],
           })
           return Box({ flexDirection: 'column', children: [line, theirs] })
@@ -1201,9 +1262,11 @@ export const register: Register = (on, registered) => {
 
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' || e.reason === 'resume') resets += 1
+    // Read before sessionEnded, which resets it.
+    const hadActivity = tracer.hasActivity
     const suppressEmpty =
       ranModCommand &&
-      !tracer.hasActivity &&
+      !hadActivity &&
       (writer === null || writer.dropUnsentSessionStart(e.sessionId ?? tracer.sessionId, tracer.hasSessionStart))
     ranModCommand = false
     safely(() => tracer.sessionEnded(e, { suppressRow: suppressEmpty }))
@@ -1212,16 +1275,20 @@ export const register: Register = (on, registered) => {
         // The process goes on under another session: send as usual.
         safely(() => writer?.requestFlush(0))
       } else {
-        // The process is ending. No request starts here: what is still
-        // queued goes to a spill file the next session sends, and the write
-        // may take at most the exit budget, inside the engine's
-        // end-of-session bound.
+        // The process is ending, inside the engine's end-of-session bound:
+        // the exit budget. While BigQuery takes this session's rows, what is
+        // still queued goes in one request with a token at hand (no process
+        // runs), and in a `-p` run, which has no later moment, parked files
+        // are replayed after it; what is not sent goes to a spill file the
+        // next session sends.
         const budget = Math.max(0, Math.min(config.exitFlushMs, next.budget.remainingMs - 300))
+        const ending = writer
         try {
-          await writer.spillForExit(budget)
+          await ending.spillForExit(budget, { sendQueued: true, replaySpills: !isInteractiveSession && config.autoBackfill })
         } catch {
           internalErrors += 1
         }
+        if (!isInteractiveSession) safely(() => headlessNotice(ending, hadActivity))
       }
     }
     return next(e)
@@ -1230,15 +1297,23 @@ export const register: Register = (on, registered) => {
   on('command.run', { command: 'bqaa-status' }, async ($, e) => {
     ranModCommand = true
     if (!writer) return say('BigQuery Agent Analytics mod: not started (session.start has not run).')
+    const current = writer
+    // A `-p` run sends nothing before it prints this (and `check` asks
+    // anywhere): BigQuery is asked for the table, up to 3 seconds, so a
+    // refused token, denied access or a missing table shows now.
+    const explicitCheck = (e.args ?? '').trim() === 'check'
+    const destinationCheck = !isInteractiveSession || explicitCheck ? await current.probeDestination(3000, explicitCheck) : null
     const summary = await deadLetterSummary($)
     const text = formatStatus({
       config,
-      writer,
+      writer: current,
       now: Date.now(),
       sessionId: tracer.sessionId,
       deadLetter: summary,
-      backfill: writer.backfillReport,
-      isBackfilling: writer.isBackfilling,
+      backfill: current.backfillReport,
+      isBackfilling: current.isBackfilling,
+      cleanupCommand: buildCleanupCommand(config, $.plugin.root),
+      destinationCheck,
     })
     return say(internalErrors > 0 ? `${text}\ninternal errors (skipped bookkeeping): ${internalErrors}` : text)
   })
@@ -1271,36 +1346,54 @@ export const register: Register = (on, registered) => {
     }
     // `force` replays afresh, too, a file another session's replay holds (its
     // mark, or its record cut off part-way): for a session that stopped
-    // mid-replay. Runs in the background: the command returns now. Its
-    // result is a transcript line.
-    const force = (e.args ?? '').trim() === 'force'
-    void current
-      .backfill(['spill', 'retry', 'rejected'], force ? 'force' : 'command')
-      .then(report => {
-        const refused = report.rowsRefused ? `, ${report.rowsRefused} of them refused` : ''
-        const other = report.otherTableRows ? ` (${report.otherTableRows} for another table)` : ''
-        const oversized = report.oversizedFiles.length ? `, ${report.oversizedFiles.length} file(s) too large to read` : ''
-        const incomplete = report.incompleteFiles.length ? `, ${report.incompleteFiles.length} file(s) without a completion record kept` : ''
-        $.ui.log(clean(`bqaa backfill: ${report.files} file(s), ${report.rowsSent} row(s) sent, ${report.rowsLeft} left${refused}${other}${oversized}${incomplete}${report.held ? `; left waiting: ${report.held}` : ''}${report.error ? `; stopped: ${report.error}` : ''}`, 500))
-      })
-      .catch(() => {
-        internalErrors += 1
-      })
-    return say(`BigQuery Agent Analytics mod: backfill started for ${summary.files} file(s) in ${summary.dir}; /bqaa-status shows progress.`)
+    // mid-replay. Runs in the background: the command returns now, and its
+    // result is a transcript line. A `-p` run ends once the command returns,
+    // so there (and with `wait`) it waits for the result instead, up to
+    // BACKFILL_WAIT_MS.
+    const words = (e.args ?? '').trim().split(/\s+/)
+    const running = current.backfill(['spill', 'retry', 'rejected'], words.includes('force') ? 'force' : 'command')
+    const logWhenDone = (): void => {
+      void running
+        .then(report => $.ui.log(clean(formatBackfillReport(report), 500)))
+        .catch(() => {
+          internalErrors += 1
+        })
+    }
+    if (isInteractiveSession && !words.includes('wait')) {
+      logWhenDone()
+      return say(`BigQuery Agent Analytics mod: backfill started for ${summary.files} file(s) in ${summary.dir}; /bqaa-status shows progress.`)
+    }
+    let stopWaiting = (): void => undefined
+    const waited = new Promise<null>(resolve => (stopWaiting = () => resolve(null)))
+    const timer = $.clock.after(BACKFILL_WAIT_MS, () => stopWaiting())
+    const report = await Promise.race([running, waited])
+    timer.cancel()
+    if (report !== null) return say(formatBackfillReport(report))
+    if (!isInteractiveSession) {
+      // The run ends once this returns: no /bqaa-status comes after it, and
+      // the replay stops with the process.
+      return say(
+        `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} did not finish within ${BACKFILL_WAIT_MS / 1000} s before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
+      )
+    }
+    logWhenDone()
+    return say(`BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} still running after ${BACKFILL_WAIT_MS / 1000} s; /bqaa-status shows progress.`)
   })
 
-  on('command.run', { command: 'bqaa-setup' }, async ($) => {
+  // /bqaa-mod-setup, and /bqaa-setup, its earlier name: the setup.sh command
+  // for the configured table (a template while the target is not set), and
+  // the command a project administrator runs once to set up who writes and
+  // reads it.
+  const setupText = (root: string | undefined): { text: string } => {
     ranModCommand = true
-    const root = $.plugin.root
     const configuredTarget = Boolean(config.project && config.dataset)
-    const command = buildSetupCommand(
-      configuredTarget ? config : { ...config, project: config.project || 'my-gcp-project', dataset: config.dataset || 'agent_analytics' },
-      root,
-    )
+    const target = configuredTarget ? config : { ...config, project: config.project || 'my-gcp-project', dataset: config.dataset || 'agent_analytics' }
+    const command = buildSetupCommand(target, root)
+    const prereqs = buildPrereqsCommand(target, root)
+    // No credential word before a colon: the free-text rules would cut it.
+    const bootstrap = prereqs ? `\nbootstrap (for project administrators, dry-run by default): ${prereqs}` : ''
     if (!configuredTarget) {
-      const hint = command
-        ? `\nTemplate command (replace my-gcp-project / agent_analytics as needed):\nsetup: ${command}`
-        : ''
+      const hint = command ? `\nTemplate command (replace my-gcp-project / agent_analytics as needed):\nsetup: ${command}${bootstrap}` : ''
       return say(
         `BigQuery Agent Analytics mod: target not configured. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), then run the setup.sh command below to create the dataset, table, and views (no repo clone needed).${hint}`,
       )
@@ -1311,7 +1404,9 @@ export const register: Register = (on, registered) => {
       )
     }
     return say(
-      `BigQuery Agent Analytics mod: run this command in a shell to create the dataset, ${config.table} table, and ${config.dataset}_reporting views (no repo clone needed):\nsetup: ${command}`,
+      `BigQuery Agent Analytics mod: run this command in a shell to create the dataset, ${config.table} table, and ${config.dataset}_reporting views (no repo clone needed):\nsetup: ${command}${bootstrap}`,
     )
-  })
+  }
+  on('command.run', { command: 'bqaa-mod-setup' }, async $ => setupText($.plugin.root))
+  on('command.run', { command: 'bqaa-setup' }, async $ => setupText($.plugin.root))
 }

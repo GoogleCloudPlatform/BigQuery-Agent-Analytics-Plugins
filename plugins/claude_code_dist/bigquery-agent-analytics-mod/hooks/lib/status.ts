@@ -22,7 +22,10 @@ import type { BackfillReport, Writer } from './writer.ts'
 
 // This table's dead-letter files (`dir`), the files elsewhere in the
 // dead-letter directory (other tables' subdirectories, an older flat
-// layout), and files too large to read back.
+// layout), and files too large to read back. `retiredFiles` and
+// `elsewhereRetired` count the leftovers of replays, here and elsewhere:
+// emptied files and `outcome-*` records, which no replay needs once no
+// session is running (scripts/clean_dead_letter.py deletes them).
 export type DeadLetterSummary =
   | {
       dir: string
@@ -31,11 +34,15 @@ export type DeadLetterSummary =
       byKind: Record<string, number>
       oversized: string[]
       elsewhere: number
+      elsewhereRetired?: number
       emptyFiles?: number
       recordFiles?: number
       retiredFiles?: number
     }
   | { error: string }
+
+// Leftovers past which /bqaa-status offers the command that deletes them.
+export const CLEANUP_HINT_FILES = 100
 
 const ago = (now: number, at: number | null): string => {
   if (at === null) return 'never'
@@ -54,6 +61,21 @@ const names = (list: readonly string[]): string => `${list.slice(0, 5).join(', '
 // the command's output keeps.
 const short = (line: string): string => redactDiagnostic(line, 1000)
 
+// The line /bqaa-backfill gives for a replay it ran: never `0 left` without
+// the waiting files it did not read.
+export function formatBackfillReport(r: BackfillReport): string {
+  const refused = r.rowsRefused ? `, ${r.rowsRefused} of them refused` : ''
+  const other = r.otherTableRows ? ` (${r.otherTableRows} for another table)` : ''
+  const skipped = r.skippedFiles ? `, ${r.skippedFiles} waiting file(s) not replayed` : ''
+  const oversized = r.oversizedFiles.length ? `, ${r.oversizedFiles.length} file(s) too large to read` : ''
+  const incomplete = r.incompleteFiles.length ? `, ${r.incompleteFiles.length} file(s) without a completion record kept` : ''
+  return `bqaa backfill: ${r.files} file(s), ${r.rowsSent} row(s) sent, ${r.rowsLeft} left${refused}${other}${skipped}${oversized}${incomplete}${r.held ? `; left waiting: ${r.held}` : ''}${r.error ? `; stopped: ${r.error}` : ''}`
+}
+
+// `cleanupCommand`: the command that deletes the replays' leftovers
+// (buildCleanupCommand), shown once there are CLEANUP_HINT_FILES of them.
+// `destinationCheck`: what asking BigQuery for the table found, when this
+// command asked (Writer.probeDestination).
 export function formatStatus(args: {
   config: Config
   writer: Writer
@@ -62,6 +84,8 @@ export function formatStatus(args: {
   deadLetter: DeadLetterSummary
   backfill: BackfillReport | null
   isBackfilling: boolean
+  cleanupCommand?: string | null
+  destinationCheck?: string | null
 }): string {
   const { config: c, writer, now } = args
   const s = writer.snapshot()
@@ -73,6 +97,7 @@ export function formatStatus(args: {
     `rows: captured ${k.captured}, sent ${k.sent}${k.replayed > 0 ? ` (${k.replayed} replayed)` : ''}, dead-lettered ${k.failed} (${k.rejected} refused), spilled ${k.spilled}, dropped ${s.dropped}, not captured ${k.skipped}`,
     `requests: ${k.batches} ok, ${k.retries} retried; last success ${ago(now, s.lastSuccessAt)}`,
   ]
+  if (args.destinationCheck) lines.push(short(`destination check: ${args.destinationCheck}`))
   if (s.consecutiveFailures > 0) lines.push(`backing off: ${s.consecutiveFailures} failure(s) in a row, next try in about ${Math.max(0, Math.round((s.pausedUntil - now) / 1000))}s`)
   if (s.problem) {
     const { headline, fix } = writer.problemText()
@@ -104,7 +129,12 @@ export function formatStatus(args: {
       lines.push(`dead-letter: ${d.files} file(s), ${kb(d.bytes)}${kinds ? ` (${kinds})` : ''} in ${d.dir}${retiredNote}`)
     }
     if (d.oversized.length > 0) lines.push(`dead-letter: ${d.oversized.length} file(s) over the 4 MiB read limit, not replayed: ${names(d.oversized)}`)
-    if (d.elsewhere > 0) lines.push(`dead-letter: ${d.elsewhere} more file(s) in ${c.deadLetterDir} for other tables or an older layout, not replayed under this configuration`)
+    const elsewhereRetired = d.elsewhereRetired ?? 0
+    if (d.elsewhere > 0 || elsewhereRetired > 0) {
+      lines.push(`dead-letter: ${d.elsewhere} waiting file(s)${elsewhereRetired > 0 ? ` (${elsewhereRetired} leftover(s))` : ''} in ${c.deadLetterDir} for other tables or an older layout, not replayed under this configuration`)
+    }
+    // No credential word before a colon here either.
+    if (retired + elsewhereRetired >= CLEANUP_HINT_FILES && args.cleanupCommand) lines.push(`cleanup (run while no session is running): ${args.cleanupCommand}`)
   }
   if (args.isBackfilling) lines.push('backfill: running')
   else if (args.backfill) {
