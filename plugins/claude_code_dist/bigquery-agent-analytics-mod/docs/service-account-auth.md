@@ -146,10 +146,15 @@ events dataset, where only the administrators hold project roles.
    (the README's [The dataset](../README.md#the-dataset)).
 2. **The writer and the readers**: the bootstrap,
    [`setup_gcp_prereqs.py`](../scripts/setup_gcp_prereqs.py), which comes
-   with this plugin: run it from the plugin folder. It prints its plan and
-   changes nothing; read it, then run it again with `--execute`:
+   with this plugin: run it from the installed plugin folder (shown by
+   `/bqaa-mod-setup` or `setup.sh --team`, or resolved from the cache below;
+   in a repository checkout, run it from `plugins/claude_code_mod`). It
+   prints its plan and changes nothing; read it, then run it again with
+   `--execute`:
 
    ```bash
+   PLUGIN_DIR="$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/bqaa-tracing/bigquery-agent-analytics-mod/*/ 2>/dev/null | awk -F/ '{split($(NF-1),v,"."); printf "%06d%06d%06d %s\n", v[1], v[2], v[3], $0}' | sort | tail -n 1 | cut -d' ' -f2-)"
+   cd "${PLUGIN_DIR:?mod cache directory not found}"
    python3 scripts/setup_gcp_prereqs.py \
      --project my-gcp-project --dataset agent_analytics \
      --no-create-dataset --no-create-table \
@@ -206,8 +211,8 @@ events dataset, where only the administrators hold project roles.
 
    Printing the plan needs none of the following; applying it (`--execute`)
    needs `gcloud`, `bq` and the Python BigQuery client
-   (`python3 -m venv .venv && .venv/bin/pip install google-cloud-bigquery`,
-   then run the script with `.venv/bin/python`; it checks the client before
+   (`python3 -m venv ~/.bqaa-mod/venv && ~/.bqaa-mod/venv/bin/pip install google-cloud-bigquery`,
+   then run the script with `~/.bqaa-mod/venv/bin/python`; it checks the client before
    it changes anything), signed in (with `gcloud auth login`, and
    `gcloud auth application-default login` for the steps that change the
    datasets' access) as someone who may enable services,

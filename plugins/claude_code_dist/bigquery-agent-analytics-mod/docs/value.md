@@ -91,10 +91,17 @@ from the plugin folder. The runner needs the Python BigQuery client
 reads it from the script's header), uses your Application Default
 Credentials (`gcloud auth application-default login`), not the mod's
 settings, fills `{PROJECT}`, `{DATASET}` and `{TABLE}`, binds `@start` and
-`@end` (a bare `--end` date counts that whole day), and refuses a query that
-would bill more than `--max-gb`:
+`@end` (defaulting to the last 7 UTC days when omitted; a bare `--end` date
+counts that whole day), accepts `--query <1..8 | V1..V7>` (or `-q`) to run a
+numbered query directly from [`sql/sample_queries.sql`](../sql/sample_queries.sql)
+or [`sql/value_queries.sql`](../sql/value_queries.sql) without copying its
+SQL text, and refuses a query that would bill more than `--max-gb`:
 
 ```bash
+python3 scripts/run_bq.py \
+  --project my-gcp-project --dataset agent_analytics --table agent_events \
+  --max-gb 1 --dry-run --query V1
+
 python3 scripts/run_bq.py \
   --project my-gcp-project --dataset agent_analytics --table agent_events \
   --start 2026-10-01 --end 2026-10-31 --max-gb 1 --dry-run "<one query>"
@@ -131,7 +138,7 @@ For docs, posts and partner write-ups, once the mod has a tagged release
 (`mod-vX.Y.Z`); its link goes where the bracket is:
 
 > BigQuery Agent Analytics for coding agents is an early-access mod
-> (version 0.1.0) that writes each coding-agent session to a BigQuery table
+> (version 0.1.2) that writes each coding-agent session to a BigQuery table
 > in the `agent_events` schema of ADK's BigQuery Agent Analytics: prompts,
 > the model's answers, tool calls with their arguments and results, token
 > counts and timings. Teams can see adoption against who was enrolled,

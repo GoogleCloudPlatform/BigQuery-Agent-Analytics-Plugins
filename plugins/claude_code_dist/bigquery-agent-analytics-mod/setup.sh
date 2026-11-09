@@ -151,7 +151,8 @@ if ((team)); then
   echo "readers of the views in $project:$views_dataset who need no access to the table."
   echo "Previewing the plan above uses only the Python standard library; applying it"
   echo "(--execute) requires a virtual environment with google-cloud-bigquery installed"
-  echo "(python3 -m venv .venv && .venv/bin/pip install google-cloud-bigquery)."
+  echo "(python3 -m venv ~/.bqaa-mod/venv && ~/.bqaa-mod/venv/bin/pip install google-cloud-bigquery,"
+  echo "then run the command above with ~/.bqaa-mod/venv/bin/python)."
 else
   echo "For a shared team table (write-only service account + view readers), run setup.sh --team or see docs/service-account-auth.md."
 fi
