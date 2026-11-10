@@ -771,9 +771,15 @@ export class Writer {
     const tokenTimeoutMs = Math.min(Math.max(timeoutMs, c.tokenCommandTimeoutMs), Math.max(1, totalBudgetMs - reqBudgetMs))
     const url = `${tablesUrl(c)}/${encodeURIComponent(c.table)}?fields=tableReference`
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      // A token's time, out of what is left: a request's time is kept for
-      // the request it is for.
-      const tokenMs = Math.min(tokenTimeoutMs, Math.max(0, deadline - this.io.now() - reqBudgetMs))
+      // A token's time, out of what is left: keep a full request budget on
+      // attempt 0 (and on unbounded checks when > reqBudgetMs remains), and at
+      // least 500 ms on bounded post-401 retries so a fresh-token retry still
+      // proceeds when 500 ms .. reqBudgetMs of the deadline remains.
+      const remainingBeforeToken = deadline - this.io.now()
+      const reserveMs = attempt === 0 || (budgetMs === undefined && remainingBeforeToken > reqBudgetMs)
+        ? reqBudgetMs
+        : Math.min(reqBudgetMs, 500)
+      const tokenMs = Math.min(tokenTimeoutMs, Math.max(0, remainingBeforeToken - reserveMs))
       if (tokenMs <= 0) {
         this.recordError(`destination check: no token within ${tokenTimeoutMs} ms`)
         return `no token within ${tokenTimeoutMs} ms`

@@ -1403,3 +1403,41 @@ test('/bqaa-status check stays within the 10 s command.run budget when the token
   expect(answer2).not.toBeNull()
   expect(asked2).toEqual([])
 })
+
+test('probeDestination retries once with a fresh token after 401 when 500 ms .. 3000 ms of a tight budget remains', { options: OPTIONS }, async () => {
+  const stale = ['ya29', 'tight-stale-token-0013'].join('.')
+  const fresh = ['ya29', 'tight-fresh-token-0014'].join('.')
+  const clock = probeClock()
+  const printed = [stale, fresh]
+  const asked: string[] = []
+  const writer = new Writer(
+    makeProbeIo(
+      clock,
+      async (_reqUrl, init) => {
+        const auth = init.headers.authorization ?? ''
+        asked.push(auth)
+        const delay = auth === `Bearer ${stale}` ? 2700 : 200
+        return new Promise(resolve => {
+          clock.after(delay, () => resolve(auth === `Bearer ${fresh}` ? TABLE_FOUND : UNAUTHENTICATED))
+        })
+      },
+      async () => {
+        const val = printed.shift() ?? fresh
+        const delay = val === stale ? 2800 : 300
+        return new Promise(resolve => {
+          clock.after(delay, () => resolve({ exitCode: 0, stdout: `${val}\n`, stderr: '' }))
+        })
+      },
+    ),
+    () => PROBE_CONFIG,
+    () => 'probe-tight-401-retry',
+  )
+  // attempt 0 consumes 2800 ms (token) + 2700 ms (401) = 5500 ms of an 8000 ms budget,
+  // leaving 2500 ms (within 500 ms .. 3000 ms) for attempt 1's 300 ms token + 200 ms tables.get.
+  let answer: string | null | undefined
+  void writer.probeDestination(3000, true, 8000).then(v => { answer = v })
+  await clock.advance(6100)
+  expect(answer).toBe(PROBE_FOUND)
+  expect(asked).toEqual([`Bearer ${stale}`, `Bearer ${fresh}`])
+  expect(clock.pending()).toBe(0)
+})

@@ -70,6 +70,13 @@ SOURCE_RE = re.compile(r"^(spill|retry|rejected)-[A-Za-z0-9._-]+\.jsonl$")
 MARKED_RE = re.compile(r"^outcome-(?:sending|done)-[0-9a-z]+-(.+)$")
 ORPHAN_RETENTION_SECS = 24 * 60 * 60
 _ORIG_PATH_UNLINK = Path.unlink
+_ORIG_PATH_ITERDIR = Path.iterdir
+
+
+def _list_pinned_dir(directory: Path, dfd: int | None) -> list[Path]:
+    if Path.iterdir is not _ORIG_PATH_ITERDIR or dfd is None:
+        return sorted(directory.iterdir())
+    return sorted(directory / name for name in os.listdir(dfd))
 
 
 def record_of(name: str) -> str | None:
@@ -261,6 +268,7 @@ def _scan_single_dir(
     base: Path | None = None,
     now: float | None = None,
     root_dfd: int | None = None,
+    entries: list[Path] | None = None,
 ) -> tuple[list[tuple[Path, list[Path]]], list[Path], list[str]]:
     """Inspect one partition directory using descriptor-pinned syscalls.
 
@@ -287,10 +295,11 @@ def _scan_single_dir(
         owns_dfd = True
 
     try:
-        try:
-            entries = sorted(directory.iterdir())
-        except OSError as exc:
-            return [], [], [f"cannot read partition directory {_rel_label(directory, base)}: {exc}"]
+        if entries is None:
+            try:
+                entries = _list_pinned_dir(directory, dfd)
+            except OSError as exc:
+                return [], [], [f"cannot read partition directory {_rel_label(directory, base)}: {exc}"]
 
         sources: dict[str, tuple[Path, int]] = {}
         outcomes_by_source: dict[str, list[tuple[Path, float]]] = {}
@@ -398,12 +407,17 @@ def _validate_base_safety(directory: Path) -> str | None:
     return _dir_safety_error(directory, euid, is_ancestor=False)
 
 
-def _discover_dirs(directory: Path, root_dfd: int | None = None) -> tuple[list[Path], list[str]]:
+def _discover_dirs(
+    directory: Path,
+    root_dfd: int | None = None,
+    entries: list[Path] | None = None,
+) -> tuple[list[Path], list[str]]:
     errors: list[str] = []
-    try:
-        entries = sorted(directory.iterdir())
-    except OSError as exc:
-        return [], [f"cannot read dead-letter directory {directory}: {exc}"]
+    if entries is None:
+        try:
+            entries = _list_pinned_dir(directory, root_dfd)
+        except OSError as exc:
+            return [], [f"cannot read dead-letter directory {directory}: {exc}"]
     subdirs: list[Path] = []
     for d in entries:
         try:
@@ -417,6 +431,36 @@ def _discover_dirs(directory: Path, root_dfd: int | None = None) -> tuple[list[P
         if stat.S_ISDIR(st.st_mode) and d.name != "dry-run":
             subdirs.append(d)
     return [directory, *subdirs], errors
+
+
+def _scan_tree(
+    directory: Path,
+    root_dfd: int,
+    now: float | None = None,
+    root_entries: list[Path] | None = None,
+) -> tuple[list[tuple[Path, list[Path]]], list[Path], list[str]]:
+    now_ts = time.time() if now is None else now
+    if root_entries is None:
+        try:
+            root_entries = _list_pinned_dir(directory, root_dfd)
+        except OSError as exc:
+            return [], [], [f"cannot read dead-letter directory {directory}: {exc}"]
+    dirs, scan_errors = _discover_dirs(directory, root_dfd=root_dfd, entries=root_entries)
+    all_groups: list[tuple[Path, list[Path]]] = []
+    all_orphans: list[Path] = []
+    for d in dirs:
+        d_entries = root_entries if d == directory else None
+        groups, orphans, errs = _scan_single_dir(
+            d,
+            base=directory,
+            now=now_ts,
+            root_dfd=root_dfd,
+            entries=d_entries,
+        )
+        all_groups.extend(groups)
+        all_orphans.extend(orphans)
+        scan_errors.extend(errs)
+    return all_groups, all_orphans, scan_errors
 
 
 def plan_deletion_groups(directory: Path) -> list[tuple[Path, list[Path]]]:
@@ -437,17 +481,16 @@ def plan_deletion_groups(directory: Path) -> list[tuple[Path, list[Path]]]:
     if open_err is not None or root_dfd is None:
         return []
     try:
-        dirs, _errors = _discover_dirs(directory, root_dfd=root_dfd)
-        groups: list[tuple[Path, list[Path]]] = []
-        for d in dirs:
-            d_groups, _orphans, _errs = _scan_single_dir(d, base=directory, root_dfd=root_dfd)
-            groups.extend(d_groups)
+        groups, _orphans, _errs = _scan_tree(directory, root_dfd=root_dfd)
         return groups
     finally:
         try:
             os.close(root_dfd)
         except OSError:
             pass
+
+
+_ORIG_PLAN_DELETION_GROUPS = plan_deletion_groups
 
 
 def plan_deletions(directory: Path) -> list[Path]:
@@ -464,14 +507,7 @@ def plan_deletions(directory: Path) -> list[Path]:
     if open_err is not None or root_dfd is None:
         return []
     try:
-        dirs, _errors = _discover_dirs(directory, root_dfd=root_dfd)
-        now_ts = time.time()
-        all_groups: list[tuple[Path, list[Path]]] = []
-        all_orphans: list[Path] = []
-        for d in dirs:
-            groups, orphans, _errs = _scan_single_dir(d, base=directory, now=now_ts, root_dfd=root_dfd)
-            all_groups.extend(groups)
-            all_orphans.extend(orphans)
+        all_groups, all_orphans, _errs = _scan_tree(directory, root_dfd=root_dfd)
         planned = [path for source, outcomes in all_groups for path in (*outcomes, source)]
         planned.extend(all_orphans)
         return planned
@@ -544,12 +580,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {safety_err}", file=sys.stderr)
         return 1
 
-    try:
-        list(base.iterdir())
-    except OSError as exc:
-        print(f"ERROR: cannot read dead-letter directory {base}: {exc}", file=sys.stderr)
-        return 1
-
     euid = os.geteuid()
     root_dfd, root_open_err = _open_pinned_dir(base, euid)
     if root_open_err is not None or root_dfd is None:
@@ -558,17 +588,29 @@ def main(argv: list[str] | None = None) -> int:
 
     part_fds: dict[Path, int] = {base: root_dfd}
     try:
-        dirs, dir_errors = _discover_dirs(base, root_dfd=root_dfd)
+        try:
+            root_entries = _list_pinned_dir(base, root_dfd)
+        except OSError as exc:
+            print(f"ERROR: cannot read dead-letter directory {base}: {exc}", file=sys.stderr)
+            return 1
+
         now_ts = time.time()
-        # Keep plan_deletion_groups(base) callable/interceptable while collecting
-        # partition diagnostics and 24-hour stale orphans using pinned descriptors.
-        groups = plan_deletion_groups(base)
-        stale_orphans: list[Path] = []
-        scan_errors = list(dir_errors)
-        for d in dirs:
-            _g, d_orphans, d_errs = _scan_single_dir(d, base=base, now=now_ts, root_dfd=root_dfd)
-            scan_errors.extend(d_errs)
-            stale_orphans.extend(d_orphans)
+        if plan_deletion_groups is not _ORIG_PLAN_DELETION_GROUPS:
+            # Keep plan_deletion_groups(base) interceptable when monkeypatched in tests.
+            groups = plan_deletion_groups(base)
+            _g, stale_orphans, scan_errors = _scan_tree(
+                base,
+                root_dfd=root_dfd,
+                now=now_ts,
+                root_entries=root_entries,
+            )
+        else:
+            groups, stale_orphans, scan_errors = _scan_tree(
+                base,
+                root_dfd=root_dfd,
+                now=now_ts,
+                root_entries=root_entries,
+            )
 
         for err in scan_errors:
             print(f"ERROR: {err}", file=sys.stderr)

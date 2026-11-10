@@ -118,69 +118,67 @@ def _read_transcript_delta(
   if not transcript.exists():
     return "", model, usage, False, last_consumed_line, next_seen
 
-  raw_text = transcript.read_text(encoding="utf-8", errors="replace")
-  raw_lines = raw_text.splitlines(keepends=True)
-
   pass_max: dict[str, dict[str, int]] = {}
-  for line_no, raw_line in enumerate(raw_lines, start=1):
-    if line_no <= last_consumed_line:
-      continue
-    if not raw_line.strip():
+  with transcript.open("r", encoding="utf-8", errors="replace") as fh:
+    for line_no, raw_line in enumerate(fh, start=1):
+      if line_no <= last_consumed_line:
+        continue
+      if not raw_line.strip():
+        last_consumed_line = line_no
+        continue
+      try:
+        item = json.loads(raw_line)
+      except json.JSONDecodeError:
+        if not raw_line.endswith(("\n", "\r")):
+          # Incomplete line at EOF still being written by the host CLI.
+          break
+        last_consumed_line = line_no
+        continue
       last_consumed_line = line_no
-      continue
-    try:
-      item = json.loads(raw_line)
-    except json.JSONDecodeError:
-      if not raw_line.endswith(("\n", "\r")):
-        # Incomplete line at EOF still being written by the host CLI.
-        break
-      last_consumed_line = line_no
-      continue
-    last_consumed_line = line_no
-    if not isinstance(item, dict) or item.get("type") != "assistant":
-      continue
-    message = item.get("message") or {}
-    if not isinstance(message, dict):
-      continue
-    model = message.get("model") or model
-    text = _text_from_content(message.get("content"))
-    if text:
-      if max_bytes > 0:
-        encoded = text.encode("utf-8", "replace")
-        remaining = max_bytes - bytes_collected
-        if remaining <= 0:
-          was_truncated = True
-        elif len(encoded) > remaining:
-          output_parts.append(
-              encoded[:remaining].decode("utf-8", "replace") + "...[TRUNCATED]"
-          )
-          bytes_collected = max_bytes
-          was_truncated = True
+      if not isinstance(item, dict) or item.get("type") != "assistant":
+        continue
+      message = item.get("message") or {}
+      if not isinstance(message, dict):
+        continue
+      model = message.get("model") or model
+      text = _text_from_content(message.get("content"))
+      if text:
+        if max_bytes > 0:
+          encoded = text.encode("utf-8", "replace")
+          remaining = max_bytes - bytes_collected
+          if remaining <= 0:
+            was_truncated = True
+          elif len(encoded) > remaining:
+            output_parts.append(
+                encoded[:remaining].decode("utf-8", "replace") + "...[TRUNCATED]"
+            )
+            bytes_collected = max_bytes
+            was_truncated = True
+          else:
+            output_parts.append(text)
+            bytes_collected += len(encoded)
         else:
           output_parts.append(text)
-          bytes_collected += len(encoded)
-      else:
-        output_parts.append(text)
 
-    raw_usage = message.get("usage")
-    if isinstance(raw_usage, dict) and any(
-        raw_usage.get(f) is not None for f in _USAGE_FIELDS
-    ):
-      msg_id = message.get("id")
-      dedup_key = (
-          str(msg_id)
-          if isinstance(msg_id, str) and msg_id.strip()
-          else f"line-{line_no}"
-      )
-      cur = pass_max.get(dedup_key, {f: 0 for f in _USAGE_FIELDS})
-      for field in _USAGE_FIELDS:
-        try:
-          val = int(raw_usage.get(field) or 0)
-        except (TypeError, ValueError):
-          val = 0
-        if val > cur[field]:
-          cur[field] = val
-      pass_max[dedup_key] = cur
+      raw_usage = message.get("usage")
+      if isinstance(raw_usage, dict) and any(
+          raw_usage.get(f) is not None for f in _USAGE_FIELDS
+      ):
+        msg_id = message.get("id")
+        dedup_key = (
+            str(msg_id)
+            if isinstance(msg_id, str) and msg_id.strip()
+            else f"line-{line_no}"
+        )
+        cur = pass_max.get(dedup_key, {f: 0 for f in _USAGE_FIELDS})
+        for field in _USAGE_FIELDS:
+          try:
+            val = int(raw_usage.get(field) or 0)
+          except (TypeError, ValueError):
+            val = 0
+          if val > cur[field]:
+            cur[field] = val
+        pass_max[dedup_key] = cur
 
   for key, cur_fields in pass_max.items():
     prev = next_seen.get(key, {f: 0 for f in _USAGE_FIELDS})
@@ -246,16 +244,15 @@ def _line_count(path: str) -> int:
   transcript = Path(path).expanduser()
   if not transcript.exists():
     return 0
-  raw_text = transcript.read_text(encoding="utf-8", errors="replace")
-  raw_lines = raw_text.splitlines(keepends=True)
   count = 0
-  for raw_line in raw_lines:
-    if not raw_line.endswith(("\n", "\r")) and raw_line.strip():
-      try:
-        json.loads(raw_line)
-      except json.JSONDecodeError:
-        break
-    count += 1
+  with transcript.open("r", encoding="utf-8", errors="replace") as fh:
+    for raw_line in fh:
+      if not raw_line.endswith(("\n", "\r")) and raw_line.strip():
+        try:
+          json.loads(raw_line)
+        except json.JSONDecodeError:
+          break
+      count += 1
   return count
 
 

@@ -2625,6 +2625,40 @@ def clean_dead_letter_checks():
               status_after == 0 and err_after == '' and list(d.iterdir()) == [],
               f'{status_after} {out_after!r} {err_after!r} {sorted(p.name for p in d.iterdir())}')
 
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        base = pathlib.Path(tmp) / 'dead-letter'
+        source = d / 'spill-p2b.jsonl'
+        source.write_bytes(b'')
+        scan_calls = []
+        real_scan_single = clean._scan_single_dir
+
+        def counting_scan(directory, *args, **kwargs):
+            scan_calls.append(directory)
+            return real_scan_single(directory, *args, **kwargs)
+
+        with patched(clean, _scan_single_dir=counting_scan):
+            status_p2b, _out_p2b, err_p2b = call(clean.main, '--dir', str(base), '--execute')
+        check('13l. main() scans each directory (root + partition) once without double-scanning partitions',
+              status_p2b == 0 and err_p2b == '' and not source.exists()
+              and scan_calls == [base, d],
+              f'{status_p2b} {scan_calls!r} {err_p2b!r}')
+
+        (d / 'spill-listdir.jsonl').write_bytes(b'')
+        listdir_fds = []
+        real_listdir = os.listdir
+
+        def spy_listdir(arg='.'):
+            listdir_fds.append(arg)
+            return real_listdir(arg)
+
+        with patched(os, listdir=spy_listdir):
+            status_ld, _out_ld, err_ld = call(clean.main, '--dir', str(base), '--execute')
+        check('13m. main() lists pinned directory descriptors via os.listdir(dfd) once per directory',
+              status_ld == 0 and err_ld == '' and not (d / 'spill-listdir.jsonl').exists()
+              and len(listdir_fds) == 2 and all(isinstance(fd, int) for fd in listdir_fds),
+              f'{status_ld} listdir_fds={listdir_fds!r} {err_ld!r}')
+
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
           writer_grants_checks, row_writer_role_checks, resources_checks, readers_checks, api_checks,
