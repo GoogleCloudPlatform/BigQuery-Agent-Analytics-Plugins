@@ -39,8 +39,11 @@ from typing import Any, Iterator
 from ._utils import deterministic_span
 from ._utils import ensure_private_dir
 from ._utils import hex_id
+from ._utils import inspect_legacy_backlog
 from ._utils import inspect_spool_status
 from ._utils import log_to_file
+from ._utils import migrate_legacy_session_state
+from ._utils import migrate_legacy_spool
 from ._utils import PrivateDir
 from ._utils import safe_json_loads
 from ._utils import timestamp_ms
@@ -130,11 +133,10 @@ def _read_transcript_delta(
   - Non-regular files (symlinks, FIFOs, directories) are safely ignored.
   - If the transcript shrank/compacted below ``start_line``, scans from line 0
     so post-compaction responses and cursor position are preserved.
-  - Token usage is deduplicated per ``message.id`` (taking per-field ``max``
-    within the pass across content-block lines, then subtracting tokens
-    already emitted in prior hooks via ``seen_usage``). Anonymous lines lacking
-    ``message.id`` are keyed by ``f"line-{line_no}"``.
-  - ``seen_usage`` is FIFO-capped at ``_MAX_SEEN_USAGE`` (256) entries.
+  - Token usage is deduplicated per ``message.id`` directly inside a bounded
+    sliding ``working_seen`` map (capped at ``_MAX_SEEN_USAGE = 256`` entries),
+    keeping memory ``O(1)``. Anonymous lines lacking ``message.id`` add
+    directly to ``pass_usage`` without polluting ``seen_usage``.
   """
   output_parts: list[str] = []
   bytes_collected = 0
@@ -151,7 +153,9 @@ def _read_transcript_delta(
   if fh is None:
     return "", model, usage, False, last_consumed_line, next_seen
 
-  def _scan(effective_start: int) -> tuple[int, dict[str, dict[str, int]]]:
+  def _scan(
+      effective_start: int,
+  ) -> tuple[int, dict[str, int], dict[str, dict[str, int]]]:
     nonlocal output_parts, bytes_collected, was_truncated, model
     nonlocal last_consumed_line
     output_parts = []
@@ -159,7 +163,12 @@ def _read_transcript_delta(
     was_truncated = False
     model = ""
     last_consumed_line = effective_start
-    local_max: dict[str, dict[str, int]] = {}
+    working_seen = {k: dict(v) for k, v in next_seen.items()}
+    pass_usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
     complete_line_no = 0
     for line_no, raw_line in enumerate(fh, start=1):
       parsed_item: Any = _UNSET
@@ -215,52 +224,66 @@ def _read_transcript_delta(
       if isinstance(raw_usage, dict) and any(
           raw_usage.get(f) is not None for f in _USAGE_FIELDS
       ):
-        msg_id = message.get("id")
-        dedup_key = (
-            str(msg_id)
-            if isinstance(msg_id, str) and msg_id.strip()
-            else f"line-{line_no}"
-        )
-        cur = local_max.get(dedup_key, {f: 0 for f in _USAGE_FIELDS})
+        parsed_vals: dict[str, int] = {}
         for field in _USAGE_FIELDS:
           try:
             val = int(raw_usage.get(field) or 0)
           except (TypeError, ValueError):
             val = 0
-          if val > cur[field]:
-            cur[field] = val
-        local_max[dedup_key] = cur
-    return complete_line_no, local_max
+          parsed_vals[field] = max(0, val)
+
+        msg_id = message.get("id")
+        if isinstance(msg_id, str) and msg_id.strip():
+          dedup_key = str(msg_id)
+          prev = working_seen.pop(dedup_key, None)
+          if prev is None:
+            pass_usage["prompt_tokens"] += (
+                parsed_vals["input_tokens"]
+                + parsed_vals["cache_read_input_tokens"]
+                + parsed_vals["cache_creation_input_tokens"]
+            )
+            pass_usage["completion_tokens"] += parsed_vals["output_tokens"]
+            working_seen[dedup_key] = parsed_vals
+            while len(working_seen) > _MAX_SEEN_USAGE:
+              del working_seen[next(iter(working_seen))]
+          else:
+            pass_usage["prompt_tokens"] += (
+                max(0, parsed_vals["input_tokens"] - prev["input_tokens"])
+                + max(
+                    0,
+                    parsed_vals["cache_read_input_tokens"]
+                    - prev["cache_read_input_tokens"],
+                )
+                + max(
+                    0,
+                    parsed_vals["cache_creation_input_tokens"]
+                    - prev["cache_creation_input_tokens"],
+                )
+            )
+            pass_usage["completion_tokens"] += max(
+                0, parsed_vals["output_tokens"] - prev["output_tokens"]
+            )
+            working_seen[dedup_key] = {
+                f: max(prev[f], parsed_vals[f]) for f in _USAGE_FIELDS
+            }
+        else:
+          pass_usage["prompt_tokens"] += (
+              parsed_vals["input_tokens"]
+              + parsed_vals["cache_read_input_tokens"]
+              + parsed_vals["cache_creation_input_tokens"]
+          )
+          pass_usage["completion_tokens"] += parsed_vals["output_tokens"]
+    pass_usage["total_tokens"] = (
+        pass_usage["prompt_tokens"] + pass_usage["completion_tokens"]
+    )
+    return complete_line_no, pass_usage, working_seen
 
   with fh:
-    complete_line_no, pass_max = _scan(requested_start)
+    complete_line_no, usage, next_seen = _scan(requested_start)
     if requested_start > 0 and complete_line_no < requested_start:
       fh.seek(0)
-      _, pass_max = _scan(0)
+      _, usage, next_seen = _scan(0)
 
-  for key, cur_fields in pass_max.items():
-    prev = next_seen.get(key, {f: 0 for f in _USAGE_FIELDS})
-    delta_in = max(0, cur_fields["input_tokens"] - prev["input_tokens"])
-    delta_cr = max(
-        0,
-        cur_fields["cache_read_input_tokens"]
-        - prev["cache_read_input_tokens"],
-    )
-    delta_cc = max(
-        0,
-        cur_fields["cache_creation_input_tokens"]
-        - prev["cache_creation_input_tokens"],
-    )
-    delta_out = max(0, cur_fields["output_tokens"] - prev["output_tokens"])
-    usage["prompt_tokens"] += delta_in + delta_cr + delta_cc
-    usage["completion_tokens"] += delta_out
-    merged = {f: max(prev[f], cur_fields[f]) for f in _USAGE_FIELDS}
-    next_seen.pop(key, None)
-    next_seen[key] = merged
-  while len(next_seen) > _MAX_SEEN_USAGE:
-    del next_seen[next(iter(next_seen))]
-
-  usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
   return (
       "\n".join(output_parts),
       model,
@@ -374,6 +397,7 @@ class StateStore:
     self.key = safe_key
     self._dir = ensure_private_dir(root)
     self.root = self._dir.path
+    migrate_legacy_session_state(self._dir, safe_key)
     self._session_store = _LockedJSONStore(self._dir, f"state_{safe_key}.json")
     self._cache: dict[str, Any] = self._session_store.read()
 
@@ -702,14 +726,23 @@ class ClaudeHookBQAAAdapter:
     except OSError:
       pass
 
+    if self.config.enabled:
+      legacy_mig = migrate_legacy_spool(self.config.spool_dir)
+      if legacy_mig.get("migrated", 0) > 0:
+        log_to_file(
+            self.config,
+            f"SessionStart migrated_legacy_envelopes={legacy_mig['migrated']}",
+        )
+    else:
+      legacy_mig = {}
+
+    messages: list[str] = []
     spool_status = inspect_spool_status(self.config.spool_dir)
     if spool_status.get("error"):
-      msg = (
+      messages.append(
           f"BQAA tracing spool warning ({self.config.spool_dir}):"
           f" {spool_status['error']}. Run /bqaa-setup for details."
       )
-      sys.stdout.write(json.dumps({"systemMessage": msg}) + "\n")
-      sys.stdout.flush()
     elif (
         spool_status["pending_count"] > 0
         or spool_status["deferred_count"] > 0
@@ -724,7 +757,33 @@ class ClaudeHookBQAAAdapter:
       if spool_status["latest_error"]:
         msg += f" [last error: {str(spool_status['latest_error'])[:160]}]"
       msg += ". Run /bqaa-setup for details."
-      sys.stdout.write(json.dumps({"systemMessage": msg}) + "\n")
+      messages.append(msg)
+
+    legacy_status = inspect_legacy_backlog(
+        self.config.state_dir, self.config.spool_dir
+    )
+    legacy_err = legacy_status.get("error") or legacy_mig.get("error")
+    if legacy_err:
+      messages.append(
+          f"BQAA tracing legacy v0.1.0 warning ({legacy_status.get('legacy_dir')}):"
+          f" {legacy_err}. Run /bqaa-setup for details."
+      )
+    elif (
+        legacy_status["unsafe_count"] > 0
+        or legacy_status["pending_count"] > 0
+        or legacy_status["deferred_count"] > 0
+        or legacy_status["dead_letter_count"] > 0
+    ):
+      messages.append(
+          f"BQAA tracing legacy v0.1.0 backlog ({legacy_status.get('legacy_dir')}):"
+          f" pending={legacy_status['pending_count']},"
+          f" deferred={legacy_status['deferred_count']},"
+          f" dead-letter={legacy_status['dead_letter_count']},"
+          f" unsafe={legacy_status['unsafe_count']}. Run /bqaa-setup for details."
+      )
+
+    if messages:
+      sys.stdout.write(json.dumps({"systemMessage": " | ".join(messages)}) + "\n")
       sys.stdout.flush()
 
   def _user_prompt_submit(

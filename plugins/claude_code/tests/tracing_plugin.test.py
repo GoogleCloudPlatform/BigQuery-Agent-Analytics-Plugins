@@ -39,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import types
 import unittest
 from pathlib import Path
@@ -1422,11 +1423,12 @@ class TestTranscriptAndHooks38(unittest.TestCase):
         )
         self.assertEqual(cursor2, 4)
         self.assertIn("Final block", text2)
-        # Incremental delta: +25 output from msg_1, plus (10, 5) from line-3.
+        # Incremental delta: +25 output from msg_1, plus (10, 5) from anonymous line 4.
         self.assertEqual(usage2["prompt_tokens"], 10)
         self.assertEqual(usage2["completion_tokens"], 30)
         self.assertIn("msg_1", seen2)
-        self.assertIn("line-4", seen2)
+        # Anonymous lines add to pass_usage without inflating seen_usage.
+        self.assertNotIn("line-4", seen2)
 
         # FIFO cap 256 in seen_usage: simulate 300 distinct ids.
         many_lines = [
@@ -2604,6 +2606,495 @@ class TestReliabilityAndSetup46(unittest.TestCase):
         self.assertIn("DRAINER storage_api_failed, falling back to insert_rows_json", log_text)
         self.assertNotIn("DRAINER unexpected_error", log_text)
         self.assertNotIn("Traceback", log_text)
+
+
+class TestRound3Fixes(unittest.TestCase):
+    """Regression coverage for deferred drainer idle, legacy migration, and O(1) dedup."""
+
+    def test_drain_run_keeps_alive_across_deferred_backoff_longer_than_idle(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_r3_defer_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        env_path = Path(spool_dir) / "event-001.json"
+        env_path.write_text(
+            json.dumps({
+                "config": {
+                    "project_id": "p",
+                    "dataset": "d",
+                    "table": "agent_events",
+                },
+                "row": {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "event_type": "LLM_REQUEST",
+                    "content": {"marker": "defer-then-ok"},
+                    "attributes": {},
+                    "latency_ms": {},
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        attempts = {"n": 0}
+        delivered = []
+
+        def _insert(table_id, rows):
+            del table_id
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("503 Service Unavailable")
+            delivered.extend(rows)
+            return []
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=os.path.join(spool_dir, "drain.log"),
+            dry_run=False,
+            drain_retry_backoff_seconds=0.2,
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+            drain_max_retry_age_seconds=86400.0,
+        )
+        asyncio.run(drain._run(cfg))
+
+        self.assertEqual(attempts["n"], 2)
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]["content"]["marker"], "defer-then-ok")
+        self.assertFalse(env_path.exists())
+        self.assertFalse((Path(spool_dir) / "event-001.json.retry").exists())
+
+    def test_drain_run_exits_idle_when_only_skipped_entry_present(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r3_skip_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        spool_dir.mkdir(mode=0o700)
+        outside = Path(tmp_root) / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+        sym = spool_dir / "event-sym.json"
+        os.symlink(str(outside), str(sym))
+
+        _install_fake_bigquery(self, insert_fn=lambda table_id, rows: [])
+
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(spool_dir),
+            state_dir=str(spool_dir),
+            log_file=str(Path(tmp_root) / "drain.log"),
+            dry_run=False,
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+        )
+        started = time.monotonic()
+        asyncio.run(drain._run(cfg))
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0)
+        log_text = (Path(tmp_root) / "drain.log").read_text(encoding="utf-8")
+        self.assertIn("DRAINER skipped", log_text)
+
+    def test_legacy_010_mid_turn_state_and_spool_migration_single_delivery(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import _user_tag
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r3_mig_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        legacy_dir = Path(tmp_root) / "bqaa-agent-tracing"
+        legacy_spool = legacy_dir / "spool"
+        legacy_spool.mkdir(parents=True, mode=0o755)
+        os.chmod(legacy_dir, 0o755)
+        os.chmod(legacy_spool, 0o755)
+
+        sid = "mig-s1"
+        legacy_state_file = legacy_dir / f"state_{sid}.json"
+        legacy_state_file.write_text(
+            json.dumps({
+                "session_id": sid,
+                "project_name": "proj",
+                "agent": "claude-code",
+                "user_id": "tester",
+                "trace_count": 1,
+                "current_trace_id": "trace-from-010",
+                "current_span_id": "span-from-010",
+                "current_invocation_id": "inv-from-010",
+                "current_start_ms": 1700000000000,
+                "transcript_line": 0,
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(legacy_state_file, 0o644)
+
+        legacy_tool_file = legacy_dir / f"tool_{sid}_tu1.json"
+        legacy_tool_file.write_text(
+            json.dumps({"start_ms": 1700000000100, "span_id": "tool-span-1", "tool_name": "Bash"}),
+            encoding="utf-8",
+        )
+        os.chmod(legacy_tool_file, 0o644)
+
+        legacy_env_file = legacy_spool / "event-001.json"
+        legacy_env_file.write_text(
+            json.dumps({
+                "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                "row": {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "event_type": "LLM_REQUEST",
+                    "session_id": sid,
+                    "trace_id": "trace-from-010",
+                    "content": {"prompt": "from 0.1.0"},
+                    "attributes": {},
+                    "latency_ms": {},
+                },
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(legacy_env_file, 0o644)
+
+        # Also plant a distinct event-001.json in the new spool to verify no overwrite/loss.
+        new_base = Path(tmp_root) / f"bqaa-agent-tracing-{_user_tag()}"
+        new_spool = new_base / "spool"
+        new_spool.mkdir(parents=True, mode=0o700)
+        os.chmod(new_base, 0o700)
+        os.chmod(new_spool, 0o700)
+        (new_spool / "event-001.json").write_text(
+            json.dumps({
+                "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                "row": {
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "event_type": "STATE_DELTA",
+                    "session_id": sid,
+                    "trace_id": "new-trace-keep",
+                    "content": {"marker": "already-in-011"},
+                    "attributes": {},
+                    "latency_ms": {},
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        # Mid-turn Stop runs under 0.1.1 without BQAA_STATE_DIR / BQAA_SPOOL_DIR set.
+        hook_env = {
+            "TMPDIR": tmp_root,
+            "BQAA_PROJECT_ID": "p",
+            "BQAA_DATASET": "d",
+            "BQAA_DRY_RUN": "false",
+            "BQAA_AUTO_CREATE_TABLE": "false",
+            "BQAA_TRACE_ENABLED": "true",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "HOME": tmp_root,
+            "PATH": os.environ.get("PATH", ""),
+        }
+        stop_res = subprocess.run(
+            ["bash", str(DIST_DIR / "hooks" / "stop.sh")],
+            input=json.dumps({
+                "session_id": sid,
+                "transcript_path": "",
+                "last_assistant_message": "answer after upgrade",
+            }),
+            capture_output=True, text=True, env=hook_env, timeout=30,
+        )
+        self.assertEqual(stop_res.returncode, 0, f"stderr={stop_res.stderr}")
+        self.assertFalse(legacy_state_file.exists())
+        self.assertFalse(legacy_tool_file.exists())
+        self.assertTrue((new_base / f"state_{sid}.json").is_file())
+        self.assertTrue((new_base / f"tool_{sid}_tu1.json").is_file())
+
+        captured = []
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda table_id, rows: (captured.extend(rows) or []),
+        )
+        env_backup = os.environ.copy()
+        try:
+            for key in ("BQAA_STATE_DIR", "BQAA_SPOOL_DIR", "BQAA_LEGACY_STATE_DIR", "BQAA_LOG_FILE"):
+                os.environ.pop(key, None)
+            os.environ.update(hook_env)
+            cfg = BQAAConfig.from_env()
+            cfg.drain_retry_backoff_seconds = 0.0
+            resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved1, 3)
+            resolved2 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved2, 0)
+        finally:
+            os.environ.clear()
+            os.environ.update(env_backup)
+
+        self.assertFalse(legacy_env_file.exists())
+        self.assertEqual(len(captured), 3)
+        traces = [r.get("trace_id") for r in captured]
+        self.assertEqual(traces.count("trace-from-010"), 2)
+        self.assertIn("new-trace-keep", traces)
+        events = [r.get("event_type") for r in captured]
+        self.assertIn("LLM_REQUEST", events)
+        self.assertIn("LLM_RESPONSE", events)
+        self.assertIn("STATE_DELTA", events)
+
+    def test_legacy_010_rejects_unsafe_entries_and_reports_in_setup_check(self):
+        from bigquery_agent_analytics_tracing import setup_check
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r3_unsafe_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        legacy_dir = Path(tmp_root) / "legacy"
+        legacy_spool = legacy_dir / "spool"
+        legacy_spool.mkdir(parents=True, mode=0o755)
+        os.chmod(legacy_dir, 0o755)
+        os.chmod(legacy_spool, 0o755)
+
+        new_state = Path(tmp_root) / "new_state"
+        new_spool = Path(tmp_root) / "new_spool"
+        new_state.mkdir(mode=0o700)
+        new_spool.mkdir(mode=0o700)
+
+        # Safe legacy envelope should migrate.
+        safe_env = legacy_spool / "event-safe.json"
+        safe_env.write_text(
+            json.dumps({"config": {"project_id": "p", "dataset": "d"}, "row": {"event_type": "LLM_REQUEST"}}),
+            encoding="utf-8",
+        )
+        os.chmod(safe_env, 0o600)
+
+        # Unsafe 1: symlink
+        outside_secret = Path(tmp_root) / "secret.json"
+        outside_secret.write_text(json.dumps({"config": {}, "row": {"secret": "leaked"}}), encoding="utf-8")
+        os.symlink(str(outside_secret), str(legacy_spool / "event-sym.json"))
+
+        # Unsafe 2: hardlink (st_nlink == 2)
+        hard_target = Path(tmp_root) / "hard_target.json"
+        hard_target.write_text(json.dumps({"config": {}, "row": {"hard": True}}), encoding="utf-8")
+        os.chmod(hard_target, 0o600)
+        os.link(str(hard_target), str(legacy_spool / "event-hard.json"))
+
+        # Unsafe 3: group/world-writable file (0o666)
+        writable_env = legacy_spool / "event-writable.json"
+        writable_env.write_text(json.dumps({"config": {}, "row": {"bad": True}}), encoding="utf-8")
+        os.chmod(writable_env, 0o666)
+
+        # Unsafe 4 & 5 in legacy state dir: symlink + 0o666 state file
+        os.symlink(str(outside_secret), str(legacy_dir / "state_sym.json"))
+        writable_state = legacy_dir / "state_writable.json"
+        writable_state.write_text(json.dumps({"session_id": "bad"}), encoding="utf-8")
+        os.chmod(writable_state, 0o666)
+
+        env_backup = os.environ.copy()
+        try:
+            os.environ.update({
+                "BQAA_PROJECT_ID": "p",
+                "BQAA_DATASET": "d",
+                "BQAA_STATE_DIR": str(new_state),
+                "BQAA_SPOOL_DIR": str(new_spool),
+                "BQAA_LEGACY_STATE_DIR": str(legacy_dir),
+            })
+            buf_json = io.StringIO()
+            with contextlib.redirect_stdout(buf_json):
+                setup_check.main(["--json"])
+            report = json.loads(buf_json.getvalue())
+            self.assertEqual(report["legacy_migrated"], 1)
+            self.assertEqual(report["spool_pending"], 1)
+            self.assertEqual(report["legacy_unsafe_count"], 5)
+            self.assertTrue((new_spool / "event-safe.json").is_file())
+            self.assertFalse(safe_env.exists())
+            self.assertFalse((new_spool / "event-sym.json").exists())
+            self.assertFalse((new_spool / "event-hard.json").exists())
+            self.assertFalse((new_spool / "event-writable.json").exists())
+
+            buf_text = io.StringIO()
+            with contextlib.redirect_stdout(buf_text):
+                setup_check.main([])
+            text_out = buf_text.getvalue()
+            self.assertIn("Legacy v0.1.0 directory", text_out)
+            self.assertIn("rejected unsafe entries: 5", text_out)
+            self.assertIn("refused unsafe legacy entry", text_out)
+        finally:
+            os.environ.clear()
+            os.environ.update(env_backup)
+
+        # Unsafe 0o777 legacy directory itself must be refused and flagged on SessionStart.
+        bad_legacy_dir = Path(tmp_root) / "bad_legacy_dir"
+        bad_legacy_dir.mkdir(mode=0o777)
+        os.chmod(bad_legacy_dir, 0o777)
+        ss_res = subprocess.run(
+            ["bash", str(DIST_DIR / "hooks" / "session_start.sh")],
+            input=json.dumps({"session_id": "ss-bad-legacy", "cwd": tmp_root}),
+            capture_output=True, text=True,
+            env={
+                "BQAA_PROJECT_ID": "p",
+                "BQAA_DATASET": "d",
+                "BQAA_STATE_DIR": str(new_state),
+                "BQAA_SPOOL_DIR": str(Path(tmp_root) / "clean_spool"),
+                "BQAA_LEGACY_STATE_DIR": str(bad_legacy_dir),
+                "BQAA_TRACE_ENABLED": "true",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "HOME": tmp_root,
+                "PATH": os.environ.get("PATH", ""),
+            },
+            timeout=30,
+        )
+        self.assertEqual(ss_res.returncode, 0)
+        ss_msg = json.loads(ss_res.stdout)
+        self.assertIn("legacy v0.1.0 warning", ss_msg["systemMessage"])
+
+    def test_transcript_streaming_dedup_memory_bound_and_non_contiguous_ids(self):
+        from bigquery_agent_analytics_tracing.claude_code import _read_transcript_delta
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r3_mem_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        big_transcript = Path(tmp_root) / "big.jsonl"
+        with big_transcript.open("w", encoding="utf-8") as fh:
+            for i in range(10_000):
+                fh.write(
+                    json.dumps({
+                        "type": "assistant",
+                        "message": {
+                            "id": f"m-{i:05d}",
+                            "model": "claude-test",
+                            "usage": {"input_tokens": 2, "output_tokens": 3},
+                            "content": [{"type": "text", "text": "ok"}],
+                        },
+                    }) + "\n"
+                )
+
+        tracemalloc.start()
+        try:
+            _, model, usage, _, cursor, next_seen = _read_transcript_delta(
+                str(big_transcript), 0, 256 * 1024, None
+            )
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertEqual(model, "claude-test")
+        self.assertEqual(cursor, 10_000)
+        self.assertEqual(len(next_seen), 256)
+        self.assertEqual(usage["prompt_tokens"], 20_000)
+        self.assertEqual(usage["completion_tokens"], 30_000)
+        self.assertEqual(usage["total_tokens"], 50_000)
+        self.assertLess(
+            peak_bytes,
+            1_048_576,
+            f"peak allocation {peak_bytes} exceeded 1 MiB",
+        )
+
+        # Non-contiguous message.id interleaved with >256 anonymous lines
+        # must preserve message.id in working_seen and deduplicate accurately.
+        anon_mix = Path(tmp_root) / "anon_mix.jsonl"
+        with anon_mix.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_A",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                    "content": [{"type": "text", "text": "part1"}],
+                },
+            }) + "\n")
+            for _ in range(300):
+                fh.write(json.dumps({
+                    "type": "assistant",
+                    "message": {
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "content": [],
+                    },
+                }) + "\n")
+            fh.write(json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_A",
+                    "usage": {"input_tokens": 10, "output_tokens": 15},
+                    "content": [{"type": "text", "text": "part2"}],
+                },
+            }) + "\n")
+
+        _, _, mix_usage, _, mix_cursor, mix_seen = _read_transcript_delta(
+            str(anon_mix), 0, 256 * 1024, None
+        )
+        self.assertEqual(mix_cursor, 302)
+        self.assertEqual(mix_usage["prompt_tokens"], 310)
+        self.assertEqual(mix_usage["completion_tokens"], 315)
+        self.assertEqual(list(mix_seen.keys()), ["msg_A"])
+
+    def test_legacy_010_dedup_cross_user_and_dead_letter(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import _utils
+        from bigquery_agent_analytics_tracing import setup_check
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r3_xuser_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        legacy_dir = Path(tmp_root) / "legacy"
+        legacy_spool = legacy_dir / "spool"
+        legacy_dl = legacy_spool / "dead-letter"
+        legacy_dl.mkdir(parents=True, mode=0o755)
+        os.chmod(legacy_dir, 0o755)
+        os.chmod(legacy_spool, 0o755)
+        os.chmod(legacy_dl, 0o755)
+
+        new_state = Path(tmp_root) / "new_state"
+        new_spool = Path(tmp_root) / "new_spool"
+        new_state.mkdir(mode=0o700)
+        new_spool.mkdir(mode=0o700)
+
+        # Duplicate crash recovery: identical payload in both dirs unlinks legacy without duplicating.
+        dup_bytes = json.dumps({
+            "config": {"project_id": "p", "dataset": "d"},
+            "row": {"event_type": "LLM_REQUEST", "content": {"k": "dup"}},
+        }).encode("utf-8")
+        (legacy_spool / "event-dup.json").write_bytes(dup_bytes)
+        (new_spool / "event-dup.json").write_bytes(dup_bytes)
+        os.chmod(legacy_spool / "event-dup.json", 0o600)
+        os.chmod(new_spool / "event-dup.json", 0o600)
+
+        # Also leave a legacy dead-letter file to confirm reporting.
+        (legacy_dl / "event-old.write-failed.json").write_text("{}", encoding="utf-8")
+
+        mig = _utils.migrate_legacy_spool(new_spool, legacy_spool_dir=legacy_spool)
+        self.assertEqual(mig["migrated"], 0)
+        self.assertFalse((legacy_spool / "event-dup.json").exists())
+        self.assertEqual(len(list(new_spool.glob("event-*.json"))), 1)
+
+        # Dead-letter legacy file is reported by setup_check without disturbing new spool.
+        env_backup = os.environ.copy()
+        try:
+            os.environ.update({
+                "BQAA_PROJECT_ID": "p",
+                "BQAA_DATASET": "d",
+                "BQAA_STATE_DIR": str(new_state),
+                "BQAA_SPOOL_DIR": str(new_spool),
+                "BQAA_LEGACY_STATE_DIR": str(legacy_dir),
+            })
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                setup_check.main(["--json"])
+            report = json.loads(buf.getvalue())
+            self.assertEqual(report["legacy_spool_dead_letter"], 1)
+        finally:
+            os.environ.clear()
+            os.environ.update(env_backup)
+
+        # Cross-user check: another uid owning legacy dir/files is refused cleanly.
+        (legacy_spool / "event-xuser.json").write_bytes(dup_bytes)
+        os.chmod(legacy_spool / "event-xuser.json", 0o600)
+        with mock.patch("os.geteuid", return_value=os.geteuid() + 1000):
+            xuser_mig = _utils.migrate_legacy_spool(
+                new_spool, legacy_spool_dir=legacy_spool
+            )
+            self.assertEqual(xuser_mig["migrated"], 0)
+            self.assertIsNotNone(xuser_mig["error"])
+            self.assertTrue((legacy_spool / "event-xuser.json").is_file())
 
 
 class TestBuildDist39(unittest.TestCase):
