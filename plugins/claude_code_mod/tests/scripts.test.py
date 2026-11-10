@@ -2201,6 +2201,8 @@ def clean_dead_letter_checks():
         to_delete = clean.plan_deletions(d)
         check('once the leftover is empty too: the source is deletable', any(p.name == 'rejected-003.jsonl' for p in to_delete),
               str(sorted(p.name for p in to_delete)))
+        # Remove unrelated non-leftover prefix behavior: rejected-003-leftover.jsonl only matches SOURCE_RE
+        # Note: rejected-003-leftover.jsonl DOES match SOURCE_RE (`^(spill|retry|rejected)-[A-Za-z0-9._-]+\.jsonl$`).
         call(clean.main, '--dir', str(d), '--execute')
         check('empty source is deleted', not source.exists(), f'{source.exists()}')
 
@@ -2216,7 +2218,7 @@ def clean_dead_letter_checks():
         check('dry-run: nothing is actually deleted', source.exists() and outcome.exists(),
               f'{source.exists()} {outcome.exists()}')
 
-    # 5. Symlinked files and symlinked subdirectories are ignored and kept.
+    # 5. Symlinked files and symlinked subdirectories are ignored/refused and kept.
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = pathlib.Path(tmp)
         base = tmp_path / 'dead-letter'
@@ -2232,25 +2234,30 @@ def clean_dead_letter_checks():
         to_delete = clean.plan_deletions(base)
         check('symlinked files and symlinked subdirectories are ignored by plan_deletions',
               to_delete == [], str(to_delete))
-        call(clean.main, '--dir', str(base), '--execute')
-        check('symlinked files, symlinked dirs, and their targets survive --execute',
-              symlink_file.is_symlink() and symlink_dir.is_symlink() and ext_file.exists(),
-              f'{symlink_file.is_symlink()} {symlink_dir.is_symlink()} {ext_file.exists()}')
+        status_sym, _out_sym, err_sym = call(clean.main, '--dir', str(base), '--execute')
+        check('symlinked files, symlinked dirs, and their targets survive --execute and exit 1 loudly on stderr',
+              status_sym == 1 and 'symlink' in err_sym
+              and symlink_file.is_symlink() and symlink_dir.is_symlink() and ext_file.exists(),
+              f'{status_sym} {err_sym!r} {symlink_file.is_symlink()} {symlink_dir.is_symlink()} {ext_file.exists()}')
 
-    # 6. A file unlink() cannot remove is reported on stderr, never as
-    #    deleted; the files after it are still deleted, the count is of the
-    #    files really deleted, and the exit status is 1. The dry run before
-    #    it reports the same plan as ever.
+    # 6. Outcomes are removed BEFORE source; if an outcome unlink() fails, its
+    #    source stays (preventing new orphans) while healthy groups after it
+    #    still delete, errors go to stderr, and exit status is 1.
     with tempfile.TemporaryDirectory() as tmp:
         d = make_dir(pathlib.Path(tmp))
         source = d / 'spill-006.jsonl'
         source.write_bytes(b'')
         outcome = d / 'outcome-spill-006.jsonl'
         outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        healthy = d / 'spill-006z.jsonl'
+        healthy.write_bytes(b'')
         status, out, err = call(clean.main, '--dir', str(d))
-        check('dry-run: each planned file (source before outcome), then the count, exit 0',
+        check('dry-run: each planned file (outcome before source), then the count, exit 0',
               status == 0 and err == '' and out.splitlines() == [
-                  'would delete: spill-006.jsonl', 'would delete: outcome-spill-006.jsonl', '2 file(s) would delete'],
+                  'would delete: outcome-spill-006.jsonl',
+                  'would delete: spill-006.jsonl',
+                  'would delete: spill-006z.jsonl',
+                  '3 file(s) would delete'],
               f'{status} {out!r} {err!r}')
         real_unlink = pathlib.Path.unlink
 
@@ -2261,15 +2268,60 @@ def clean_dead_letter_checks():
 
         with patched(pathlib.Path, unlink=unlink):
             status, out, err = call(clean.main, '--dir', str(d), '--execute')
-        check('under --execute: a file unlink() cannot remove is an ERROR on stderr, not "deleted", and the exit status is 1',
+        check('under --execute: outcome unlink failure reports ERROR on stderr, keeps source, still deletes healthy groups, exits 1',
               status == 1 and 'ERROR: outcome-spill-006.jsonl: ' in err and 'deleted: outcome-spill-006.jsonl' not in out
-              and out.splitlines() == ['deleted: spill-006.jsonl', '1 file(s) deleted'],
+              and out.splitlines() == ['deleted: spill-006z.jsonl', '1 file(s) deleted'],
               f'{status} {out!r} {err!r}')
-        check('under --execute: the file that could not be removed stays and the one before it is deleted',
-              outcome.exists() and not source.exists(), f'{outcome.exists()} {source.exists()}')
+        check('under --execute: failed outcome and its 0-byte source both stay on disk; healthy group is deleted',
+              outcome.exists() and source.exists() and not healthy.exists(), f'{outcome.exists()} {source.exists()} {healthy.exists()}')
 
-    # 6b. Source-first ordering & lstat() re-verification: if source.unlink() fails, becomes non-empty,
-    #     or is replaced by a symlink before unlink, all outcome-* tombstones in that group remain intact on disk.
+    # 6b-6d. Interrupted --execute recovery, 24h stale orphan cleanup, and upfront
+    #        source lstat() race guards before removing any outcome-*.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        for i in (1, 2, 3):
+            (d / f'spill-006b-{i}.jsonl').write_bytes(b'')
+            (d / f'outcome-done-bbbbb-spill-006b-{i}.jsonl').write_text(seal('{"retired":true}\n'), encoding='utf-8')
+
+        calls = [0]
+        real_unlink = pathlib.Path.unlink
+
+        def interrupt_on_second(path, *args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise KeyboardInterrupt
+            return real_unlink(path, *args, **kwargs)
+
+        interrupted = False
+        try:
+            with patched(pathlib.Path, unlink=interrupt_on_second):
+                clean.main(['--dir', str(d), '--execute'])
+        except KeyboardInterrupt:
+            interrupted = True
+        check('6b-1. KeyboardInterrupt simulated mid-group deletes outcome before source',
+              interrupted and not (d / 'outcome-done-bbbbb-spill-006b-1.jsonl').exists()
+              and (d / 'spill-006b-1.jsonl').exists(),
+              str(sorted(p.name for p in d.iterdir())))
+
+        status, out, err = call(clean.main, '--dir', str(d), '--execute')
+        check('6b-2. next --execute immediately finishes cleaning remaining sources and outcomes with 0 orphans left',
+              status == 0 and err == '' and list(d.iterdir()) == [],
+              f'{status} {out!r} {err!r} {sorted(p.name for p in d.iterdir())}')
+
+        # Settled orphaned outcome-* older than 24h is cleaned; fresh (<24h) orphan stays.
+        old_orphan = d / 'outcome-done-bbbbb-spill-stale-old.jsonl'
+        old_orphan.write_text(seal('{"retired":true}\n'), encoding='utf-8')
+        stale_ts = time.time() - (25 * 60 * 60)
+        os.utime(old_orphan, (stale_ts, stale_ts))
+        fresh_orphan = d / 'outcome-done-bbbbb-spill-fresh.jsonl'
+        fresh_orphan.write_text(seal('{"retired":true}\n'), encoding='utf-8')
+        status, out, err = call(clean.main, '--dir', str(d), '--execute')
+        check('6b-3. >24h orphaned outcome-* is cleaned while <24h orphan is preserved',
+              status == 0 and err == '' and not old_orphan.exists() and fresh_orphan.exists()
+              and out.splitlines() == ['deleted: outcome-done-bbbbb-spill-stale-old.jsonl', '1 file(s) deleted'],
+              f'{status} {out!r} {err!r}')
+        fresh_orphan.unlink()
+
     with tempfile.TemporaryDirectory() as tmp:
         d = make_dir(pathlib.Path(tmp))
         source = d / 'spill-006b.jsonl'
@@ -2278,22 +2330,8 @@ def clean_dead_letter_checks():
         outcome1.write_text(seal('{"journal":true}\n'), encoding='utf-8')
         outcome2 = d / 'outcome-done-w1-spill-006b.jsonl'
         outcome2.write_text(seal('{"journal":true,"done":true}\n'), encoding='utf-8')
-        real_unlink = pathlib.Path.unlink
 
-        def fail_source_unlink(path, *args, **kwargs):
-            if path.name == source.name:
-                raise PermissionError(13, 'Permission denied', str(path))
-            return real_unlink(path, *args, **kwargs)
-
-        with patched(pathlib.Path, unlink=fail_source_unlink):
-            status, out, err = call(clean.main, '--dir', str(d), '--execute')
-        check('6b. when source.unlink() fails, no outcome-* file in that group is deleted',
-              status == 1 and 'ERROR: spill-006b.jsonl:' in err
-              and out.splitlines() == ['0 file(s) deleted']
-              and source.exists() and outcome1.exists() and outcome2.exists(),
-              f'{status} {out!r} {err!r}')
-
-        # Mutate source to non-empty between plan_deletion_groups() and main()'s lstat() check.
+        # Mutate source to non-empty between plan_deletion_groups() and main()'s upfront lstat() check.
         real_plan_groups = clean.plan_deletion_groups
 
         def plan_then_grow(directory):
@@ -2309,7 +2347,7 @@ def clean_dead_letter_checks():
               and source.exists() and outcome1.exists() and outcome2.exists(),
               f'{status} {out!r} {err!r}')
 
-        # Replace source with a symlink to a 0-byte file between plan_deletion_groups() and main()'s lstat() check.
+        # Replace source with a symlink to a 0-byte file between plan_deletion_groups() and main()'s upfront lstat() check.
         source.write_bytes(b'')
         outside_empty = pathlib.Path(tmp) / 'outside-empty.jsonl'
         outside_empty.write_bytes(b'')
@@ -2330,8 +2368,8 @@ def clean_dead_letter_checks():
 
     # 7-9. A non-empty source file whose completion record cannot be read may
     #    name any source as parent: nothing in its partition directory is
-    #    deletable, so the empty parent it names and that parent's outcome
-    #    file stay (and so does the file itself).
+    #    deletable, the blocking file is named loudly on stderr (exit 1), and
+    #    healthy sibling partitions are still cleaned.
     def unreadable_leftover(leftover: pathlib.Path):
         leftover.write_text(seal('{"row":1}\n', parent='spill-parent.jsonl'), encoding='utf-8')
         real_open = builtins.open
@@ -2365,13 +2403,18 @@ def clean_dead_letter_checks():
             outcome = d / 'outcome-spill-parent.jsonl'
             outcome.write_text(seal('{"journal":true}\n'), encoding='utf-8')
             leftover = d / 'retry-leftover.jsonl'
+            sibling = base / 'proj.ds.healthy'
+            sibling.mkdir()
+            sibling_empty = sibling / 'spill-sibling.jsonl'
+            sibling_empty.write_bytes(b'')
             with prepare(leftover):
                 to_delete = clean.plan_deletions(base)
                 status, out, err = call(clean.main, '--dir', str(base), '--execute')
-            check(f'{case}. {what}: nothing in its partition directory is deletable',
-                  to_delete == [], str(sorted(p.name for p in to_delete)))
-            check(f'{case}. {what}: under --execute the empty parent, its outcome and the leftover all stay, exit 0',
-                  status == 0 and out.splitlines() == ['nothing to clean'] and parent.exists() and outcome.exists() and leftover.exists(),
+            check(f'{case}. {what}: nothing in its partition directory is deletable while healthy siblings still plan',
+                  [p.name for p in to_delete] == ['spill-sibling.jsonl'], str(sorted(p.name for p in to_delete)))
+            check(f'{case}. {what}: under --execute blocked dir stays, filename reported on stderr, healthy sibling deleted, exit 1',
+                  status == 1 and 'retry-leftover.jsonl' in err and 'incomplete' in err
+                  and not sibling_empty.exists() and parent.exists() and outcome.exists() and leftover.exists(),
                   f'{status} {out!r} {err!r}')
 
     # 10. A partition directory that cannot be listed plans nothing; the other
@@ -2485,6 +2528,102 @@ def clean_dead_letter_checks():
               and 'cannot read dead-letter directory' in err_exec
               and out_dry == '' and out_exec == '' and source.exists(),
               f'{status_dry} {err_dry!r} / {status_exec} {err_exec!r}')
+
+    # 13. Strict mod filename pattern matching, empty/whitespace DIR rejection,
+    #     hardlink & 0o777 safety checks, and BrokenPipeError handling.
+    with tempfile.TemporaryDirectory() as tmp:
+        shared = pathlib.Path(tmp) / 'shared'
+        (shared / 'sub').mkdir(parents=True)
+        for p in (
+            shared / 'spill-notes.txt',
+            shared / 'retry-later',
+            shared / 'sub' / 'rejected-ideas.md',
+        ):
+            p.write_bytes(b'')
+        (shared / 'outcome-retry-later').write_text('my own notes\n', encoding='utf-8')
+        (shared / 'other.txt').write_text('keep\n', encoding='utf-8')
+        status, out, err = call(clean.main, str(shared), '--execute')
+        check('13a. non-mod files (spill-notes.txt, retry-later, outcome-retry-later, rejected-ideas.md) stay untouched',
+              status == 0 and err == '' and out.splitlines() == ['nothing to clean']
+              and (shared / 'spill-notes.txt').exists()
+              and (shared / 'retry-later').exists()
+              and (shared / 'outcome-retry-later').exists()
+              and (shared / 'sub' / 'rejected-ideas.md').exists()
+              and (shared / 'other.txt').exists(),
+              f'{status} {out!r} {err!r}')
+
+        for empty_arg in ('', '   ', '\x00'):
+            status_e, out_e, err_e = call(clean.main, empty_arg, '--execute')
+            check(f'13b. empty/invalid DIR argument {empty_arg!r} exits 2 usage error',
+                  status_e == 2 and 'cannot be empty' in err_e and out_e == '',
+                  f'{status_e} {out_e!r} {err_e!r}')
+        status_ef, out_ef, err_ef = call(clean.main, '--dir', '', '--execute')
+        check('13c. --dir "" exits 2 usage error',
+              status_ef == 2 and 'cannot be empty' in err_ef and out_ef == '',
+              f'{status_ef} {out_ef!r} {err_ef!r}')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        hard = d / 'spill-hard.jsonl'
+        hard.write_bytes(b'')
+        alias = d / 'hardlink-alias.txt'
+        os.link(hard, alias)
+        check('13d. hardlinked source file is skipped by plan_deletions', clean.plan_deletions(d) == [], '')
+        status_h, _out_h, err_h = call(clean.main, '--dir', str(d), '--execute')
+        check('13e. hardlinked source file aborts partition with stderr error and exit 1',
+              status_h == 1 and 'hardlinked' in err_h and hard.exists() and alias.exists(),
+              f'{status_h} {err_h!r}')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for perm, label in ((0o777, 'world-writable 0o777'), (0o775, 'group-writable 0o775')):
+            dir_perm = pathlib.Path(tmp) / f'perm-{perm:o}'
+            dir_perm.mkdir()
+            (dir_perm / 'spill-perm.jsonl').write_bytes(b'')
+            os.chmod(dir_perm, perm)
+            try:
+                check(f'13f. {label} directory refused by plan_deletions', clean.plan_deletions(dir_perm) == [], '')
+                status_w, _out_w, err_w = call(clean.main, '--dir', str(dir_perm), '--execute')
+                check(f'13g. {label} directory fails loudly on stderr with exit 1 and keeps files',
+                      status_w == 1 and 'writable' in err_w and (dir_perm / 'spill-perm.jsonl').exists(),
+                      f'{status_w} {err_w!r}')
+            finally:
+                os.chmod(dir_perm, 0o755)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        parent_src = d / 'spill-legacy-parent.jsonl'
+        parent_src.write_bytes(b'')
+        outcome_legacy = d / 'outcome-spill-legacy-parent.jsonl'
+        outcome_legacy.write_text(seal('{"journal":true}\n'), encoding='utf-8')
+        leftover_legacy = d / 'retry-legacy-child.jsonl'
+        leftover_legacy.write_text(seal('{"row":1}\n', parent=str(parent_src)), encoding='utf-8')
+        check('13j. legacy full-path parent reference protects 0-byte parent and its outcome-* files',
+              clean.plan_deletions(d) == [], str(clean.plan_deletions(d)))
+        status_leg, out_leg, err_leg = call(clean.main, '--dir', str(d), '--execute')
+        check('13k. legacy full-path parent reference leaves parent and outcome-* untouched under --execute',
+              status_leg == 0 and err_leg == '' and out_leg.splitlines() == ['nothing to clean']
+              and parent_src.exists() and outcome_legacy.exists(),
+              f'{status_leg} {out_leg!r} {err_leg!r}')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = make_dir(pathlib.Path(tmp))
+        for i in range(1, 5):
+            (d / f'spill-pipe-{i}.jsonl').write_bytes(b'')
+            (d / f'outcome-done-ppppp-spill-pipe-{i}.jsonl').write_text(seal('{"retired":true}\n'), encoding='utf-8')
+        broken_clean = pathlib.Path(clean.__file__)
+        proc = subprocess.run(
+            f"{shlex.quote(sys.executable)} -B {shlex.quote(str(broken_clean))} {shlex.quote(str(d))} --execute | head -n 2",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        check('13h. piping --execute output to head handles BrokenPipeError cleanly without traceback and next --execute cleans remaining files',
+              'Traceback' not in proc.stderr and len(proc.stdout.splitlines()) <= 2,
+              f'rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}')
+        status_after, out_after, err_after = call(clean.main, str(d), '--execute')
+        check('13i. follow-up --execute after BrokenPipeError leaves directory empty with exit 0',
+              status_after == 0 and err_after == '' and list(d.iterdir()) == [],
+              f'{status_after} {out_after!r} {err_after!r} {sorted(p.name for p in d.iterdir())}')
 
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
