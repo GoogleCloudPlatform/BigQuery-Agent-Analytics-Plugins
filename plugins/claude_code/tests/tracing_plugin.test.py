@@ -1540,6 +1540,158 @@ class TestTranscriptAndHooks38(unittest.TestCase):
         self.assertEqual(stop_rows[0]["status"], "ERROR")
         self.assertEqual(stop_rows[0]["error_message"], "rate_limit_error")
 
+    def test_multiturn_session_end_flushes_turn2_without_usage_after_turn1_stop(self):
+        from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_mt_nousage_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        log_file = os.path.join(tmp_root, "mt.log")
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=True,
+            log_file=log_file,
+            state_dir=os.path.join(tmp_root, "state"),
+            spool_dir=os.path.join(tmp_root, "spool"),
+        )
+        adapter = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg))
+        transcript = Path(tmp_root) / "transcript.jsonl"
+        t1_line = json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_t1",
+                "model": "claude-test",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "content": [{"type": "text", "text": "turn 1 answer"}],
+            },
+        })
+        t2_line = json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_t2_nousage",
+                "model": "claude-test-2",
+                "content": [{"type": "text", "text": "turn 2 answer"}],
+            },
+        })
+
+        transcript.write_text("", encoding="utf-8")
+        adapter.process("SessionStart", {"session_id": "mt-s1", "cwd": tmp_root})
+        adapter.process("UserPromptSubmit", {
+            "session_id": "mt-s1",
+            "prompt": "turn 1",
+            "transcript_path": str(transcript),
+        })
+        transcript.write_text(t1_line + "\n", encoding="utf-8")
+        adapter.process("Stop", {
+            "session_id": "mt-s1",
+            "last_assistant_message": "turn 1 answer",
+            "transcript_path": str(transcript),
+        })
+
+        # Turn 2 begins cleanly, writes an assistant line with zero/absent usage,
+        # and ends via SessionEnd without an intervening Stop hook.
+        adapter.process("UserPromptSubmit", {
+            "session_id": "mt-s1",
+            "prompt": "turn 2",
+            "transcript_path": str(transcript),
+        })
+        transcript.write_text(t1_line + "\n" + t2_line + "\n", encoding="utf-8")
+        adapter.process("SessionEnd", {
+            "session_id": "mt-s1",
+            "transcript_path": str(transcript),
+        })
+
+        rows = []
+        for line in Path(log_file).read_text(encoding="utf-8").splitlines():
+            idx = line.find("DRY_RUN ")
+            if idx != -1:
+                rows.append(json.loads(line[idx + len("DRY_RUN "):]))
+        llm_resps = [r for r in rows if r["event_type"] == "LLM_RESPONSE"]
+        self.assertEqual(len(llm_resps), 2, f"expected 2 LLM_RESPONSE rows, got {llm_resps}")
+        self.assertNotEqual(llm_resps[0]["trace_id"], llm_resps[1]["trace_id"])
+        self.assertEqual(json.loads(llm_resps[0]["content"])["response"], "turn 1 answer")
+        self.assertEqual(json.loads(llm_resps[1]["content"])["response"], "turn 2 answer")
+        attrs2 = json.loads(llm_resps[1]["attributes"])
+        self.assertTrue(attrs2.get("late_transcript_flush"))
+
+    def test_multiturn_session_end_flushes_turn2_with_usage_after_turn1_stop(self):
+        from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_mt_usage_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        log_file = os.path.join(tmp_root, "mt_usage.log")
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=True,
+            log_file=log_file,
+            state_dir=os.path.join(tmp_root, "state"),
+            spool_dir=os.path.join(tmp_root, "spool"),
+        )
+        adapter = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg))
+        transcript = Path(tmp_root) / "transcript.jsonl"
+        t1_line = json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_t1",
+                "model": "claude-test",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "content": [{"type": "text", "text": "turn 1 answer"}],
+            },
+        })
+        t2_line = json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_t2_usage",
+                "model": "claude-test-2",
+                "usage": {"input_tokens": 12, "output_tokens": 9},
+                "content": [{"type": "text", "text": "turn 2 with usage"}],
+            },
+        })
+
+        transcript.write_text("", encoding="utf-8")
+        adapter.process("SessionStart", {"session_id": "mt-s2", "cwd": tmp_root})
+        adapter.process("UserPromptSubmit", {
+            "session_id": "mt-s2",
+            "prompt": "turn 1",
+            "transcript_path": str(transcript),
+        })
+        transcript.write_text(t1_line + "\n", encoding="utf-8")
+        adapter.process("Stop", {
+            "session_id": "mt-s2",
+            "last_assistant_message": "turn 1 answer",
+            "transcript_path": str(transcript),
+        })
+
+        adapter.process("UserPromptSubmit", {
+            "session_id": "mt-s2",
+            "prompt": "turn 2",
+            "transcript_path": str(transcript),
+        })
+        transcript.write_text(t1_line + "\n" + t2_line + "\n", encoding="utf-8")
+        adapter.process("SessionEnd", {
+            "session_id": "mt-s2",
+            "transcript_path": str(transcript),
+        })
+
+        rows = []
+        for line in Path(log_file).read_text(encoding="utf-8").splitlines():
+            idx = line.find("DRY_RUN ")
+            if idx != -1:
+                rows.append(json.loads(line[idx + len("DRY_RUN "):]))
+        llm_resps = [r for r in rows if r["event_type"] == "LLM_RESPONSE"]
+        self.assertEqual(len(llm_resps), 2, f"expected 2 LLM_RESPONSE rows, got {llm_resps}")
+        self.assertEqual(json.loads(llm_resps[1]["content"])["response"], "turn 2 with usage")
+        attrs2 = json.loads(llm_resps[1]["attributes"])
+        self.assertTrue(attrs2.get("late_transcript_flush"))
+        self.assertEqual(attrs2["usage_metadata"]["prompt_tokens"], 12)
+        self.assertEqual(attrs2["usage_metadata"]["completion_tokens"], 9)
+        self.assertEqual(attrs2["usage_metadata"]["total_tokens"], 21)
+
 
 class TestReliabilityAndSetup46(unittest.TestCase):
     """Issue #46: retry deferral, missing env warning, log rotation, find_spec, setup surfacing."""
@@ -1804,6 +1956,167 @@ class TestReliabilityAndSetup46(unittest.TestCase):
 
         cfg = BQAAConfig(project_id="p", dataset="d")
         self.assertEqual(drain._compute_backoff_seconds(5000, cfg), 3600.0)
+
+    def test_drain_partial_transient_failure_does_not_replay_accepted_rows(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_r2_partial_ok_retry_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        requests = []
+        accepted = []
+        call_num = {"n": 0}
+
+        def _insert(table_id, rows):
+            del table_id
+            call_num["n"] += 1
+            markers = [r["content"]["marker"] for r in rows]
+            requests.append(markers)
+            if call_num["n"] == 1:
+                accepted.append(markers[0])
+                return [{
+                    "index": 1,
+                    "errors": [{"reason": "backendError", "message": "transient"}],
+                }]
+            accepted.extend(markers)
+            return []
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+
+        for idx, marker in enumerate(("A", "B"), start=1):
+            env_file = Path(spool_dir) / f"event-00{idx}.json"
+            env_file.write_text(
+                json.dumps({
+                    "config": {
+                        "project_id": "p",
+                        "dataset": "d",
+                        "table": "agent_events",
+                    },
+                    "row": {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "event_type": "LLM_REQUEST",
+                        "content": {"marker": marker},
+                        "attributes": {},
+                        "latency_ms": {},
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=os.path.join(spool_dir, "drain.log"),
+            dry_run=False,
+            drain_retry_backoff_seconds=0.0,
+            drain_max_retry_age_seconds=86400.0,
+        )
+        resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved1, 1)
+        self.assertFalse((Path(spool_dir) / "event-001.json").exists())
+        self.assertFalse((Path(spool_dir) / "event-001.json.retry").exists())
+        self.assertTrue((Path(spool_dir) / "event-002.json").is_file())
+        self.assertTrue((Path(spool_dir) / "event-002.json.retry").is_file())
+
+        resolved2 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved2, 1)
+        self.assertEqual(requests, [["A", "B"], ["B"]])
+        self.assertEqual(accepted, ["A", "B"])
+        self.assertEqual(list(Path(spool_dir).glob("event-*.json")), [])
+        self.assertEqual(list(Path(spool_dir).glob("event-*.retry")), [])
+
+    def test_drain_partial_mixed_ok_permanent_and_retryable(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_r2_partial_mix_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        requests = []
+        accepted = []
+        call_num = {"n": 0}
+
+        def _insert(table_id, rows):
+            del table_id
+            call_num["n"] += 1
+            markers = [r["content"]["marker"] for r in rows]
+            requests.append(markers)
+            if call_num["n"] == 1:
+                accepted.append(markers[0])
+                return [
+                    {
+                        "index": 1,
+                        "errors": [{"reason": "invalid", "message": "bad field"}],
+                    },
+                    {
+                        "index": 2,
+                        "errors": [{"reason": "backendError", "message": "transient"}],
+                    },
+                ]
+            accepted.extend(markers)
+            return []
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+
+        for idx, marker in enumerate(("A", "B", "C"), start=1):
+            env_file = Path(spool_dir) / f"event-00{idx}.json"
+            env_file.write_text(
+                json.dumps({
+                    "config": {
+                        "project_id": "p",
+                        "dataset": "d",
+                        "table": "agent_events",
+                    },
+                    "row": {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "event_type": "LLM_REQUEST",
+                        "content": {"marker": marker},
+                        "attributes": {},
+                        "latency_ms": {},
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=os.path.join(spool_dir, "drain.log"),
+            dry_run=False,
+            drain_retry_backoff_seconds=0.0,
+            drain_max_retry_age_seconds=86400.0,
+        )
+        resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved1, 2)
+        self.assertFalse((Path(spool_dir) / "event-001.json").exists())
+        self.assertFalse(
+            (Path(spool_dir) / "dead-letter" / "event-001.write-failed.json").exists()
+        )
+        self.assertFalse((Path(spool_dir) / "event-002.json").exists())
+        self.assertFalse((Path(spool_dir) / "event-002.json.retry").exists())
+        self.assertTrue(
+            (Path(spool_dir) / "dead-letter" / "event-002.write-failed.json").is_file()
+        )
+        self.assertTrue((Path(spool_dir) / "event-003.json").is_file())
+        self.assertTrue((Path(spool_dir) / "event-003.json.retry").is_file())
+
+        resolved2 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved2, 1)
+        self.assertEqual(requests, [["A", "B", "C"], ["C"]])
+        self.assertEqual(accepted, ["A", "C"])
+        self.assertEqual(list(Path(spool_dir).glob("event-*.json")), [])
+        self.assertEqual(list(Path(spool_dir).glob("event-*.retry")), [])
 
 
 class TestBuildDist39(unittest.TestCase):

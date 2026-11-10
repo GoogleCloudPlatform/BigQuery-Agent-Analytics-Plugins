@@ -577,9 +577,11 @@ class ClaudeHookBQAAAdapter:
     target_trace = state.get("current_trace_id") or state.get("last_trace_id")
     if not target_trace:
       return
-    need_text = not bool(state.get("last_response_captured")) and bool(
-        text.strip()
+    captured_for_trace = (
+        bool(state.get("last_response_captured"))
+        and state.get("last_response_captured_trace_id") == target_trace
     )
+    need_text = not captured_for_trace and bool(text.strip())
     if usage["total_tokens"] <= 0 and not need_text:
       return
     inv_id = (
@@ -612,7 +614,12 @@ class ClaudeHookBQAAAdapter:
         is_truncated=was_truncated if need_text else False,
     )
     if need_text:
-      state.set("last_response_captured", True)
+      state.update(
+          {
+              "last_response_captured": True,
+              "last_response_captured_trace_id": target_trace,
+          }
+      )
 
   def _session_start(self, payload: dict[str, Any], state: StateStore) -> None:
     cwd = payload.get("cwd") or os.getcwd()
@@ -692,6 +699,11 @@ class ClaudeHookBQAAAdapter:
             "last_transcript_path": transcript,
             "transcript_start_line": start_line,
             "transcript_line": start_line,
+            "last_response_captured": False,
+            "last_response_captured_trace_id": None,
+            "last_stop_text": None,
+            "last_stop_usage": None,
+            "last_stop_model": None,
         }
     )
     self.logger.log_llm_request(
@@ -864,6 +876,7 @@ class ClaudeHookBQAAAdapter:
             "transcript_line": next_line,
             "seen_usage": next_seen,
             "last_response_captured": was_captured,
+            "last_response_captured_trace_id": trace_id if was_captured else None,
             "last_stop_model": effective_model,
         }
     )
@@ -959,6 +972,7 @@ class ClaudeHookBQAAAdapter:
             "transcript_line": next_line,
             "seen_usage": next_seen,
             "last_response_captured": was_captured,
+            "last_response_captured_trace_id": trace_id if was_captured else None,
             "last_stop_model": effective_model,
         }
     )
