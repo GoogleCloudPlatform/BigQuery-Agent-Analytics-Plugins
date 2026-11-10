@@ -319,6 +319,30 @@ def _is_permanent_write_exception(exc: Exception) -> bool:
   return msg.startswith("400 ") or "Bad Request" in msg
 
 
+def _is_not_found_error(exc: Exception) -> bool:
+  """True for HTTP 404 / NotFound / gRPC NOT_FOUND exceptions."""
+  code = getattr(exc, "code", None)
+  if callable(code):
+    try:
+      code = code()
+    except Exception:
+      code = None
+  if code == 404 or getattr(code, "name", None) == "NOT_FOUND":
+    return True
+  grpc_code = getattr(exc, "grpc_status_code", None)
+  if getattr(grpc_code, "name", None) == "NOT_FOUND":
+    return True
+  if type(exc).__name__ == "NotFound":
+    return True
+  msg = str(exc)
+  return (
+      msg.startswith("404 ")
+      or "404 Not Found" in msg
+      or "404 Not found" in msg
+      or "NOT_FOUND" in msg
+  )
+
+
 def _is_permanent_row_errors(errors: list[Any]) -> bool:
   """Classify ``insert_rows_json`` row error lists as permanent vs transient."""
   transient_reasons = frozenset(
@@ -527,9 +551,11 @@ async def _write_batch_storage_api(
             error_code = getattr(error, "code", None)
             if error_code and error_code != 0:
               error_message = getattr(error, "message", "Unknown error")
-              # gRPC: 4=DEADLINE_EXCEEDED, 13=INTERNAL, 14=UNAVAILABLE
+              # gRPC: 4=DEADLINE_EXCEEDED, 5=NOT_FOUND, 13=INTERNAL, 14=UNAVAILABLE
               if error_code in (4, 13, 14):
                 raise ServiceUnavailable(error_message)
+              if error_code == 5:
+                raise RuntimeError(f"404 NOT_FOUND: {error_message}")
               if error_code == 3:  # INVALID_ARGUMENT
                 raise ValueError(
                     f"400 Bad Request (INVALID_ARGUMENT): {error_message}"
@@ -562,6 +588,8 @@ async def _write_batch_storage_api(
         await asyncio.sleep(sleep_for)
         delay *= retry.multiplier
       except Exception as exc:
+        if _is_not_found_error(exc):
+          return _WriteOutcome("retryable", str(exc))
         log_to_file(
             config,
             f"DRAINER unexpected_error: {exc}\n{traceback.format_exc()}",
@@ -983,6 +1011,14 @@ def main(argv: list[str] | None = None) -> int:
     return 0
   try:
     asyncio.run(_run(config))
+  except (ModuleNotFoundError, ImportError) as exc:
+    log_to_file(
+        config,
+        "DRAINER_SKIPPED BigQuery client library not installed on drainer"
+        f" interpreter ({exc}); events remain in spool_dir until installed"
+        " (run /bqaa-setup).",
+    )
+    return 0
   except Exception as exc:
     log_to_file(config, f"DRAINER fatal: {exc}\n{traceback.format_exc()}")
     return 1

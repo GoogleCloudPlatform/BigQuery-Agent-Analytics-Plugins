@@ -1692,6 +1692,222 @@ class TestTranscriptAndHooks38(unittest.TestCase):
         self.assertEqual(attrs2["usage_metadata"]["completion_tokens"], 9)
         self.assertEqual(attrs2["usage_metadata"]["total_tokens"], 21)
 
+    def test_transcript_rejects_symlink_and_fifo(self):
+        from bigquery_agent_analytics_tracing.claude_code import (
+            ClaudeHookBQAAAdapter,
+            _line_count,
+            _read_transcript_delta,
+        )
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_c2_symlink_fifo_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        secret_file = Path(tmp_root) / "secret.jsonl"
+        secret_file.write_text(
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_secret",
+                    "model": "claude-test",
+                    "usage": {"input_tokens": 5, "output_tokens": 5},
+                    "content": [{"type": "text", "text": "LEAKED_SECRET"}],
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+        link_path = Path(tmp_root) / "link.jsonl"
+        try:
+            os.symlink(str(secret_file), str(link_path))
+        except OSError:
+            link_path = None
+
+        if link_path is not None:
+            self.assertEqual(_line_count(str(link_path)), 0)
+            text, model, usage, _, cursor, _ = _read_transcript_delta(
+                str(link_path), 0, 100_000, None
+            )
+            self.assertEqual(text, "")
+            self.assertEqual(model, "")
+            self.assertEqual(usage["total_tokens"], 0)
+            self.assertEqual(cursor, 0)
+
+            log_file = os.path.join(tmp_root, "symlink.log")
+            cfg = BQAAConfig(
+                project_id="p",
+                dataset="d",
+                dry_run=True,
+                log_file=log_file,
+                state_dir=os.path.join(tmp_root, "state"),
+                spool_dir=os.path.join(tmp_root, "spool"),
+            )
+            adapter = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg))
+            adapter.process("SessionStart", {"session_id": "sym-s1", "cwd": tmp_root})
+            adapter.process("UserPromptSubmit", {
+                "session_id": "sym-s1",
+                "prompt": "hi",
+                "transcript_path": str(link_path),
+            })
+            adapter.process("Stop", {
+                "session_id": "sym-s1",
+                "transcript_path": str(link_path),
+            })
+            log_text = Path(log_file).read_text(encoding="utf-8")
+            self.assertNotIn("LEAKED_SECRET", log_text)
+            self.assertIn("(No response captured)", log_text)
+
+        if hasattr(os, "mkfifo"):
+            fifo_path = Path(tmp_root) / "pipe.jsonl"
+            os.mkfifo(str(fifo_path))
+            self.assertEqual(_line_count(str(fifo_path)), 0)
+            text_f, _, usage_f, _, cursor_f, _ = _read_transcript_delta(
+                str(fifo_path), 0, 100_000, None
+            )
+            self.assertEqual(text_f, "")
+            self.assertEqual(usage_f["total_tokens"], 0)
+            self.assertEqual(cursor_f, 0)
+
+    def test_compacted_transcript_resets_cursor_in_turn2(self):
+        from bigquery_agent_analytics_tracing.claude_code import (
+            ClaudeHookBQAAAdapter,
+            StateStore,
+            _read_transcript_delta,
+        )
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_c2_compact_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        # Verify empty/truncated transcript resets cursor to 0 directly.
+        empty_t = Path(tmp_root) / "empty.jsonl"
+        empty_t.write_text("", encoding="utf-8")
+        _, _, _, _, reset_cursor, _ = _read_transcript_delta(
+            str(empty_t), 6, 100_000, None
+        )
+        self.assertEqual(reset_cursor, 0)
+
+        def _assistant_line(msg_id: str, model: str, text: str, inp: int, out: int) -> str:
+            return json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": msg_id,
+                    "model": model,
+                    "usage": {"input_tokens": inp, "output_tokens": out},
+                    "content": [{"type": "text", "text": text}],
+                },
+            })
+
+        def _user_line(n: int) -> str:
+            return json.dumps({"type": "user", "message": {"content": f"note {n}"}})
+
+        # Case A: compaction happens between Turn 1 Stop and Turn 2 UserPromptSubmit.
+        log_pre = os.path.join(tmp_root, "pre_compact.log")
+        cfg_pre = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=True,
+            log_file=log_pre,
+            state_dir=os.path.join(tmp_root, "state_pre"),
+            spool_dir=os.path.join(tmp_root, "spool_pre"),
+        )
+        adapter_pre = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg_pre))
+        t_pre = Path(tmp_root) / "pre.jsonl"
+        t_pre.write_text("", encoding="utf-8")
+        adapter_pre.process("SessionStart", {"session_id": "cmp-pre", "cwd": tmp_root})
+        adapter_pre.process("UserPromptSubmit", {
+            "session_id": "cmp-pre",
+            "prompt": "t1",
+            "transcript_path": str(t_pre),
+        })
+        t_pre.write_text(
+            "\n".join([_user_line(i) for i in range(5)] + [
+                _assistant_line("m1", "claude-test", "turn 1 pre", 10, 5)
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        adapter_pre.process("Stop", {"session_id": "cmp-pre", "transcript_path": str(t_pre)})
+
+        # Transcript compacts from 6 lines to 1 summary line before Turn 2 starts.
+        t_pre.write_text(json.dumps({"type": "summary", "summary": "compact"}) + "\n", encoding="utf-8")
+        adapter_pre.process("UserPromptSubmit", {
+            "session_id": "cmp-pre",
+            "prompt": "t2",
+            "transcript_path": str(t_pre),
+        })
+        t_pre.write_text(
+            json.dumps({"type": "summary", "summary": "compact"}) + "\n"
+            + _assistant_line("m2", "claude-test-2", "turn 2 after pre-compact", 15, 8) + "\n",
+            encoding="utf-8",
+        )
+        adapter_pre.process("Stop", {"session_id": "cmp-pre", "transcript_path": str(t_pre)})
+
+        resps_pre = [
+            json.loads(line[line.find("DRY_RUN ") + len("DRY_RUN "):])
+            for line in Path(log_pre).read_text(encoding="utf-8").splitlines()
+            if "DRY_RUN " in line
+        ]
+        llm_pre = [r for r in resps_pre if r["event_type"] == "LLM_RESPONSE"]
+        self.assertEqual(len(llm_pre), 2)
+        self.assertEqual(json.loads(llm_pre[1]["content"])["response"], "turn 2 after pre-compact")
+        attrs_pre2 = json.loads(llm_pre[1]["attributes"])
+        self.assertEqual(attrs_pre2["model"], "claude-test-2")
+        self.assertEqual(attrs_pre2["usage_metadata"]["total_tokens"], 23)
+
+        # Case B: compaction happens mid-turn after UserPromptSubmit recorded transcript_line=6.
+        log_mid = os.path.join(tmp_root, "mid_compact.log")
+        state_mid_dir = os.path.join(tmp_root, "state_mid")
+        cfg_mid = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=True,
+            log_file=log_mid,
+            state_dir=state_mid_dir,
+            spool_dir=os.path.join(tmp_root, "spool_mid"),
+        )
+        adapter_mid = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg_mid))
+        t_mid = Path(tmp_root) / "mid.jsonl"
+        t_mid.write_text("", encoding="utf-8")
+        adapter_mid.process("SessionStart", {"session_id": "cmp-mid", "cwd": tmp_root})
+        adapter_mid.process("UserPromptSubmit", {
+            "session_id": "cmp-mid",
+            "prompt": "t1",
+            "transcript_path": str(t_mid),
+        })
+        t_mid.write_text(
+            "\n".join([_user_line(i) for i in range(5)] + [
+                _assistant_line("m1", "claude-test", "turn 1 mid", 10, 5)
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        adapter_mid.process("Stop", {"session_id": "cmp-mid", "transcript_path": str(t_mid)})
+        # Turn 2 begins while transcript still has 6 lines (transcript_line = 6).
+        adapter_mid.process("UserPromptSubmit", {
+            "session_id": "cmp-mid",
+            "prompt": "t2",
+            "transcript_path": str(t_mid),
+        })
+        # Transcript compacts mid-turn to 2 lines (< 6).
+        t_mid.write_text(
+            json.dumps({"type": "summary", "summary": "compact"}) + "\n"
+            + _assistant_line("m3", "claude-test-2", "turn 2 after mid-turn compact", 20, 10) + "\n",
+            encoding="utf-8",
+        )
+        adapter_mid.process("Stop", {"session_id": "cmp-mid", "transcript_path": str(t_mid)})
+
+        resps_mid = [
+            json.loads(line[line.find("DRY_RUN ") + len("DRY_RUN "):])
+            for line in Path(log_mid).read_text(encoding="utf-8").splitlines()
+            if "DRY_RUN " in line
+        ]
+        llm_mid = [r for r in resps_mid if r["event_type"] == "LLM_RESPONSE"]
+        self.assertEqual(len(llm_mid), 2)
+        self.assertEqual(json.loads(llm_mid[1]["content"])["response"], "turn 2 after mid-turn compact")
+        attrs_mid2 = json.loads(llm_mid[1]["attributes"])
+        self.assertEqual(attrs_mid2["usage_metadata"]["total_tokens"], 30)
+        st = StateStore("cmp-mid", state_mid_dir)
+        self.assertEqual(st.get("transcript_line"), 2)
+
 
 class TestReliabilityAndSetup46(unittest.TestCase):
     """Issue #46: retry deferral, missing env warning, log rotation, find_spec, setup surfacing."""
@@ -2117,6 +2333,277 @@ class TestReliabilityAndSetup46(unittest.TestCase):
         self.assertEqual(accepted, ["A", "C"])
         self.assertEqual(list(Path(spool_dir).glob("event-*.json")), [])
         self.assertEqual(list(Path(spool_dir).glob("event-*.retry")), [])
+
+    def test_resolve_python_and_bare_bqaa_python3_no_traceback(self):
+        from bigquery_agent_analytics_tracing import logger as bq_logger
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_c2_py3_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        # Bare command resolves via PATH, while distinct venv symlinks stay distinct.
+        bin_dir = Path(tmp_root) / "fake_bin"
+        bin_dir.mkdir(mode=0o755)
+        venv_a = Path(tmp_root) / "venv_a"
+        venv_b = Path(tmp_root) / "venv_b"
+        for vdir in (venv_a, venv_b):
+            (vdir / "bin").mkdir(parents=True, mode=0o755)
+            (vdir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+            os.symlink(sys.executable, str(vdir / "bin" / "python3"))
+        self.assertNotEqual(
+            bq_logger._resolve_python_executable(str(venv_a / "bin" / "python3")),
+            bq_logger._resolve_python_executable(str(venv_b / "bin" / "python3")),
+        )
+
+        # In-process check: BQAA_PYTHON="python3" matching sys.executable skips Popen.
+        orig_find_spec = importlib.util.find_spec
+        orig_which = bq_logger.shutil.which
+        orig_popen = bq_logger.subprocess.Popen
+        saved_bq = sys.modules.pop("google.cloud.bigquery", None)
+        popens = []
+        env_backup = os.environ.copy()
+        try:
+            inproc_state = os.path.join(tmp_root, "inproc_state")
+            inproc_log = os.path.join(tmp_root, "inproc.log")
+            cfg = BQAAConfig(
+                project_id="p",
+                dataset="d",
+                state_dir=inproc_state,
+                spool_dir=os.path.join(tmp_root, "inproc_spool"),
+                log_file=inproc_log,
+                dry_run=False,
+            )
+            os.environ["BQAA_AUTO_DRAIN"] = "true"
+            os.environ["BQAA_PYTHON"] = "python3"
+            bq_logger.shutil.which = lambda cmd, *a, **kw: sys.executable if cmd == "python3" else orig_which(cmd, *a, **kw)
+            importlib.util.find_spec = lambda name, *a, **kw: None if name == "google.cloud.bigquery" else orig_find_spec(name, *a, **kw)
+            bq_logger.subprocess.Popen = lambda *a, **kw: popens.append(a)
+            bq_logger._ensure_drainer(cfg)
+            bq_logger._ensure_drainer(cfg)
+        finally:
+            importlib.util.find_spec = orig_find_spec
+            bq_logger.shutil.which = orig_which
+            bq_logger.subprocess.Popen = orig_popen
+            if saved_bq is not None:
+                sys.modules["google.cloud.bigquery"] = saved_bq
+            os.environ.clear()
+            os.environ.update(env_backup)
+
+        self.assertEqual(popens, [])
+        inproc_lines = Path(inproc_log).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(inproc_lines), 1)
+        self.assertIn("DRAINER_SKIPPED", inproc_lines[0])
+        self.assertNotIn("Traceback", "\n".join(inproc_lines))
+
+        # E2E hook subprocess with isolated venv python3 lacking google-cloud-bigquery.
+        iso_venv = Path(tmp_root) / "iso_venv"
+        venv_res = subprocess.run(
+            [sys.executable, "-m", "venv", "--without-pip", str(iso_venv)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if venv_res.returncode == 0:
+            log_file = os.path.join(tmp_root, "hook_py3.log")
+            spool_dir = os.path.join(tmp_root, "hook_spool")
+            state_dir = os.path.join(tmp_root, "hook_state")
+            env = {
+                "PATH": f"{iso_venv / 'bin'}:{os.environ.get('PATH', '')}",
+                "BQAA_PYTHON": "python3",
+                "BQAA_PROJECT_ID": "p",
+                "BQAA_DATASET": "d",
+                "BQAA_TRACE_ENABLED": "true",
+                "BQAA_DRY_RUN": "false",
+                "BQAA_AUTO_DRAIN": "true",
+                "BQAA_LOG_FILE": log_file,
+                "BQAA_STATE_DIR": state_dir,
+                "BQAA_SPOOL_DIR": spool_dir,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "HOME": tmp_root,
+            }
+            r1 = subprocess.run(
+                ["bash", str(DIST_DIR / "hooks" / "session_start.sh")],
+                input=json.dumps({"session_id": "py3-s1", "cwd": tmp_root}),
+                capture_output=True, text=True, env=env, timeout=30,
+            )
+            r2 = subprocess.run(
+                ["bash", str(DIST_DIR / "hooks" / "user_prompt_submit.sh")],
+                input=json.dumps({"session_id": "py3-s1", "prompt": "hello"}),
+                capture_output=True, text=True, env=env, timeout=30,
+            )
+            self.assertEqual(r1.returncode, 0, r1.stderr)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            self.assertNotIn("Traceback", r1.stdout + r1.stderr + r2.stdout + r2.stderr)
+            log_text = Path(log_file).read_text(encoding="utf-8")
+            self.assertNotIn("DRAINER fatal:", log_text)
+            self.assertNotIn("Traceback", log_text)
+            skipped_lines = [l for l in log_text.splitlines() if "DRAINER_SKIPPED" in l]
+            self.assertLessEqual(len(skipped_lines), 1, log_text)
+            spooled = list(Path(spool_dir).glob("event-*.json"))
+            self.assertGreaterEqual(len(spooled), 1)
+
+    def test_drain_main_without_bigquery_exits_zero_without_traceback(self):
+        from bigquery_agent_analytics_tracing._utils import PYTHON_C_RUN_MODULE
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_c2_drain_nobq_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        state_dir = Path(tmp_root) / "state"
+        spool_dir.mkdir(mode=0o700)
+        state_dir.mkdir(mode=0o700)
+        env_file = spool_dir / "event-001.json"
+        env_file.write_text(
+            json.dumps({
+                "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST"},
+            }),
+            encoding="utf-8",
+        )
+        log_file = os.path.join(tmp_root, "drain_nobq.log")
+        env = {
+            "PYTHONPATH": str(DIST_DIR / "vendor"),
+            "BQAA_PROJECT_ID": "p",
+            "BQAA_DATASET": "d",
+            "BQAA_DRY_RUN": "false",
+            "BQAA_LOG_FILE": log_file,
+            "BQAA_STATE_DIR": str(state_dir),
+            "BQAA_SPOOL_DIR": str(spool_dir),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "HOME": tmp_root,
+        }
+        # `-S` omits site-packages so `google` is guaranteed absent on subprocess python.
+        res = subprocess.run(
+            [sys.executable, "-B", "-S", "-c", PYTHON_C_RUN_MODULE, "bigquery_agent_analytics_tracing.drain"],
+            cwd=tmp_root, capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        log_text = Path(log_file).read_text(encoding="utf-8")
+        self.assertNotIn("DRAINER fatal:", log_text)
+        self.assertNotIn("Traceback", log_text)
+        self.assertIn("DRAINER_SKIPPED", log_text)
+        self.assertTrue(env_file.is_file(), "spooled file must remain when bigquery is absent")
+
+    def test_storage_write_404_falls_back_without_unexpected_error_traceback(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_c2_sw404_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        spool_dir.mkdir(mode=0o700)
+        log_file = os.path.join(tmp_root, "sw404.log")
+
+        captured = []
+        fake_classes = _install_fake_bigquery(
+            self,
+            insert_fn=lambda table_id, rows: (captured.append((table_id, rows)) or []),
+        )
+
+        # Install fake Storage Write API + pyarrow raising 404 NotFound or gRPC code=5.
+        sw_mode = {"kind": "not_found_exc"}
+
+        class FakeWriteClient:
+            async def append_rows(self, requests):
+                del requests
+                if sw_mode["kind"] == "not_found_exc":
+                    raise fake_classes["NotFound"]("404 Not found: Table p:d.agent_events")
+                async def _resp_iter():
+                    yield types.SimpleNamespace(
+                        error=types.SimpleNamespace(code=5, message="Table not found")
+                    )
+                return _resp_iter()
+
+        fake_pa = types.ModuleType("pyarrow")
+        fake_pa.string = lambda: None
+        fake_pa.bool_ = lambda: None
+        fake_pa.int64 = lambda: None
+        fake_pa.timestamp = lambda unit, tz=None: None
+        fake_pa.field = lambda name, typ, nullable=True: name
+        fake_pa.struct = lambda fields: fields
+        fake_pa.list_ = lambda item: item
+        fake_pa.schema = lambda fields: types.SimpleNamespace(
+            serialize=lambda: types.SimpleNamespace(to_pybytes=lambda: b"schema")
+        )
+        fake_pa.RecordBatch = types.SimpleNamespace(
+            from_pylist=lambda rows, schema=None: types.SimpleNamespace(
+                serialize=lambda: types.SimpleNamespace(to_pybytes=lambda: b"batch")
+            )
+        )
+
+        bs_mod = types.ModuleType("google.cloud.bigquery_storage_v1")
+        bs_types = types.ModuleType("google.cloud.bigquery_storage_v1.types")
+        bs_types.AppendRowsRequest = lambda **kw: types.SimpleNamespace(
+            arrow_rows=types.SimpleNamespace(
+                writer_schema=types.SimpleNamespace(serialized_schema=b""),
+                rows=types.SimpleNamespace(serialized_record_batch=b""),
+            )
+        )
+        bs_services = types.ModuleType("google.cloud.bigquery_storage_v1.services")
+        bs_bqw = types.ModuleType("google.cloud.bigquery_storage_v1.services.big_query_write")
+        bs_async = types.ModuleType("google.cloud.bigquery_storage_v1.services.big_query_write.async_client")
+        bs_async.BigQueryWriteAsyncClient = FakeWriteClient
+        bs_mod.types = bs_types
+        bs_mod.services = bs_services
+        bs_services.big_query_write = bs_bqw
+        bs_bqw.async_client = bs_async
+        sys.modules["google.cloud"].bigquery_storage_v1 = bs_mod
+
+        extra_mods = [
+            ("pyarrow", fake_pa),
+            ("google.cloud.bigquery_storage_v1", bs_mod),
+            ("google.cloud.bigquery_storage_v1.types", bs_types),
+            ("google.cloud.bigquery_storage_v1.services", bs_services),
+            ("google.cloud.bigquery_storage_v1.services.big_query_write", bs_bqw),
+            ("google.cloud.bigquery_storage_v1.services.big_query_write.async_client", bs_async),
+        ]
+        old_extra = {k: sys.modules.get(k) for k, _ in extra_mods}
+        for k, v in extra_mods:
+            sys.modules[k] = v
+
+        def _restore_extra():
+            for k, v in old_extra.items():
+                if v is not None:
+                    sys.modules[k] = v
+                else:
+                    sys.modules.pop(k, None)
+
+        self.addCleanup(_restore_extra)
+
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(spool_dir),
+            state_dir=str(spool_dir),
+            log_file=log_file,
+            dry_run=False,
+        )
+
+        for idx, kind in enumerate(("not_found_exc", "grpc_code_5"), start=1):
+            sw_mode["kind"] = kind
+            env_file = spool_dir / f"event-sw-{idx}.json"
+            env_file.write_text(
+                json.dumps({
+                    "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                    "row": {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "event_type": "LLM_REQUEST",
+                        "content": {},
+                        "attributes": {},
+                        "latency_ms": {},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            resolved = asyncio.run(drain._drain_once(cfg, use_storage_api=True))
+            self.assertEqual(resolved, 1)
+            self.assertFalse(env_file.exists())
+
+        self.assertEqual(len(captured), 2)
+        log_text = Path(log_file).read_text(encoding="utf-8")
+        self.assertIn("DRAINER storage_api_failed, falling back to insert_rows_json", log_text)
+        self.assertNotIn("DRAINER unexpected_error", log_text)
+        self.assertNotIn("Traceback", log_text)
 
 
 class TestBuildDist39(unittest.TestCase):
