@@ -24,6 +24,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -56,6 +57,28 @@ def _bigquery_spec_available() -> bool:
     return False
 
 
+def _resolve_python_executable(cmd: str) -> str:
+  """Resolve a Python interpreter command for same-interpreter checks."""
+  if not cmd:
+    resolved = sys.executable
+  elif os.path.sep in cmd or (os.path.altsep and os.path.altsep in cmd):
+    resolved = os.path.abspath(cmd)
+  else:
+    resolved = shutil.which(cmd) or os.path.abspath(cmd)
+  abs_resolved = os.path.abspath(resolved)
+  parent = os.path.dirname(abs_resolved)
+  grandparent = os.path.dirname(parent)
+  if (
+      os.path.isfile(os.path.join(parent, "pyvenv.cfg"))
+      or os.path.isfile(os.path.join(grandparent, "pyvenv.cfg"))
+  ):
+    return abs_resolved
+  try:
+    return os.path.realpath(resolved)
+  except OSError:
+    return abs_resolved
+
+
 def _log_missing_bigquery_once(config: BQAAConfig) -> None:
   """Log a concise notice once per state_dir/process when bigquery is absent."""
   key = (sys.prefix, str(config.state_dir))
@@ -75,10 +98,14 @@ def _log_missing_bigquery_once(config: BQAAConfig) -> None:
         return
   except OSError:
     pass
+  resolved_python = _resolve_python_executable(
+      os.environ.get("BQAA_PYTHON") or ""
+  )
   log_to_file(
       config,
-      "DRAINER_SKIPPED google-cloud-bigquery is not installed on BQAA_PYTHON;"
-      " events remain in spool_dir until installed (run /bqaa-setup).",
+      f"DRAINER_SKIPPED google-cloud-bigquery is not installed on"
+      f" {resolved_python}; events remain in spool_dir until installed"
+      " (run /bqaa-setup).",
   )
 
 
@@ -123,8 +150,9 @@ def _serialize_bq_json_fields(row: dict[str, Any]) -> dict[str, Any]:
 def _ensure_drainer(config: BQAAConfig) -> None:
   """Spawn the drainer in a detached subprocess if none is running."""
   env_python = os.environ.get("BQAA_PYTHON") or ""
-  same_python = not env_python or (
-      os.path.abspath(env_python) == os.path.abspath(sys.executable)
+  same_python = (
+      _resolve_python_executable(env_python)
+      == _resolve_python_executable(sys.executable)
   )
   if same_python and not _bigquery_spec_available():
     _log_missing_bigquery_once(config)

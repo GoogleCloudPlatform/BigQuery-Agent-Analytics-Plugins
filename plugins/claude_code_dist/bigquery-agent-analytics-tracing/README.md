@@ -139,18 +139,23 @@ Tracked in [#251](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytic
 (track B5). Until then, the self-hosted catalog above is the canonical
 install path.
 
-### Manual install from the GitHub release (fallback)
+### Manual install (fallback)
 
-If you can't use the marketplace catalog, download the plugin tarball
-attached to the matching `tracing-vX.Y.Z` GitHub release:
+If you can't use the marketplace catalog, copy the built `0.1.1` plugin
+directory directly from a shallow checkout of this repository:
 
 ```bash
 VERSION=0.1.1
 mkdir -p ~/.claude/plugins
-curl -L \
-  "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/releases/download/tracing-v${VERSION}/bigquery-agent-analytics-tracing-claude-code-${VERSION}.tar.gz" \
-  | tar -xz -C ~/.claude/plugins
+git clone --depth=1 https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins.git /tmp/bqaa-plugins \
+  && cp -R /tmp/bqaa-plugins/plugins/claude_code_dist/bigquery-agent-analytics-tracing ~/.claude/plugins/ \
+  && rm -rf /tmp/bqaa-plugins
 ```
+
+If you instead install from a published `tracing-v${VERSION}` GitHub release
+tarball once cut, always download with `curl -fsSL` and never use the legacy
+`tracing-v0.1.0` archive (which predates the `0.1.1` launcher `sys.path` and
+private-spool hardening).
 
 Then point Claude Code at the unpacked plugin directory per the
 [Claude Code plugins docs](https://docs.claude.com/en/docs/claude-code/plugins).

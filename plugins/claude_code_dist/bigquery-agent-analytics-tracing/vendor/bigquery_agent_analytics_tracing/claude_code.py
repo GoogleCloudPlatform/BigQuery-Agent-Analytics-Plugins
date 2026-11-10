@@ -86,6 +86,34 @@ def _normalize_seen_usage(raw: Any) -> dict[str, dict[str, int]]:
   return out
 
 
+_UNSET = object()
+
+
+def _open_regular_transcript(path: Path):
+  """Open ``path`` for reading only if it is a non-symlink regular file."""
+  flags = (
+      os.O_RDONLY
+      | getattr(os, "O_NOFOLLOW", 0)
+      | getattr(os, "O_NONBLOCK", 0)
+  )
+  try:
+    fd = os.open(str(path), flags)
+  except OSError:
+    return None
+  try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+      os.close(fd)
+      return None
+    return os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+  except Exception:
+    try:
+      os.close(fd)
+    except OSError:
+      pass
+    return None
+
+
 def _read_transcript_delta(
     path: str,
     start_line: int,
@@ -99,6 +127,9 @@ def _read_transcript_delta(
   - Incomplete trailing lines at EOF without a trailing newline that raise
     ``json.JSONDecodeError`` pause cursor advancement before that line so a
     subsequent flush picks up the completed record.
+  - Non-regular files (symlinks, FIFOs, directories) are safely ignored.
+  - If the transcript shrank/compacted below ``start_line``, scans from line 0
+    so post-compaction responses and cursor position are preserved.
   - Token usage is deduplicated per ``message.id`` (taking per-field ``max``
     within the pass across content-block lines, then subtracting tokens
     already emitted in prior hooks via ``seen_usage``). Anonymous lines lacking
@@ -111,29 +142,49 @@ def _read_transcript_delta(
   model = ""
   usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
   next_seen = _normalize_seen_usage(seen_usage)
-  last_consumed_line = max(0, int(start_line or 0))
+  requested_start = max(0, int(start_line or 0))
+  last_consumed_line = requested_start
   if not path:
     return "", model, usage, False, last_consumed_line, next_seen
   transcript = Path(path).expanduser()
-  if not transcript.exists():
+  fh = _open_regular_transcript(transcript)
+  if fh is None:
     return "", model, usage, False, last_consumed_line, next_seen
 
-  pass_max: dict[str, dict[str, int]] = {}
-  with transcript.open("r", encoding="utf-8", errors="replace") as fh:
+  def _scan(effective_start: int) -> tuple[int, dict[str, dict[str, int]]]:
+    nonlocal output_parts, bytes_collected, was_truncated, model
+    nonlocal last_consumed_line
+    output_parts = []
+    bytes_collected = 0
+    was_truncated = False
+    model = ""
+    last_consumed_line = effective_start
+    local_max: dict[str, dict[str, int]] = {}
+    complete_line_no = 0
     for line_no, raw_line in enumerate(fh, start=1):
-      if line_no <= last_consumed_line:
+      parsed_item: Any = _UNSET
+      if raw_line.endswith(("\n", "\r")) or not raw_line.strip():
+        complete_line_no = line_no
+      else:
+        try:
+          parsed_item = json.loads(raw_line)
+          complete_line_no = line_no
+        except json.JSONDecodeError:
+          # Incomplete line at EOF still being written by the host CLI.
+          break
+      if line_no <= effective_start:
         continue
       if not raw_line.strip():
         last_consumed_line = line_no
         continue
-      try:
-        item = json.loads(raw_line)
-      except json.JSONDecodeError:
-        if not raw_line.endswith(("\n", "\r")):
-          # Incomplete line at EOF still being written by the host CLI.
-          break
-        last_consumed_line = line_no
-        continue
+      if parsed_item is _UNSET:
+        try:
+          item = json.loads(raw_line)
+        except json.JSONDecodeError:
+          last_consumed_line = line_no
+          continue
+      else:
+        item = parsed_item
       last_consumed_line = line_no
       if not isinstance(item, dict) or item.get("type") != "assistant":
         continue
@@ -170,7 +221,7 @@ def _read_transcript_delta(
             if isinstance(msg_id, str) and msg_id.strip()
             else f"line-{line_no}"
         )
-        cur = pass_max.get(dedup_key, {f: 0 for f in _USAGE_FIELDS})
+        cur = local_max.get(dedup_key, {f: 0 for f in _USAGE_FIELDS})
         for field in _USAGE_FIELDS:
           try:
             val = int(raw_usage.get(field) or 0)
@@ -178,7 +229,14 @@ def _read_transcript_delta(
             val = 0
           if val > cur[field]:
             cur[field] = val
-        pass_max[dedup_key] = cur
+        local_max[dedup_key] = cur
+    return complete_line_no, local_max
+
+  with fh:
+    complete_line_no, pass_max = _scan(requested_start)
+    if requested_start > 0 and complete_line_no < requested_start:
+      fh.seek(0)
+      _, pass_max = _scan(0)
 
   for key, cur_fields in pass_max.items():
     prev = next_seen.get(key, {f: 0 for f in _USAGE_FIELDS})
@@ -242,10 +300,11 @@ def _line_count(path: str) -> int:
   if not path:
     return 0
   transcript = Path(path).expanduser()
-  if not transcript.exists():
+  fh = _open_regular_transcript(transcript)
+  if fh is None:
     return 0
   count = 0
-  with transcript.open("r", encoding="utf-8", errors="replace") as fh:
+  with fh:
     for raw_line in fh:
       if not raw_line.endswith(("\n", "\r")) and raw_line.strip():
         try:
@@ -682,11 +741,7 @@ class ClaudeHookBQAAAdapter:
     invocation_id = payload.get("invocation_id") or hex_id(32)
     prompt = str(payload.get("prompt") or "")
     transcript = str(payload.get("transcript_path") or "")
-    prev_path = state.get("last_transcript_path") or state.get("transcript_path")
-    if transcript and prev_path == transcript and state.get("transcript_line") is not None:
-      start_line = max(int(state.get("transcript_line") or 0), _line_count(transcript))
-    else:
-      start_line = _line_count(transcript)
+    start_line = _line_count(transcript)
     state.update(
         {
             "trace_count": trace_count,
