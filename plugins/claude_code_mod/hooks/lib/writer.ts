@@ -1672,9 +1672,6 @@ export class Writer {
   // retry files are replayed with what is left of the budget (see
   // replayAtExit).
   //
-  // Otherwise it starts no request: the rows still queued go at once to a
-  // spill file the next session sends, or in a dry run to the dry-run files,
-  // and so do the rows no answer took (they may yet land; event_id dedups).
   // The background writer's exit flush (`spillForExit`): waits up to half of
   // `budgetMs` for any in-flight batches, then (if healthy and a token is
   // already in hand) runs one bounded send — or, when `this.exitWait` caught

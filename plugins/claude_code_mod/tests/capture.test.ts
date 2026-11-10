@@ -1022,7 +1022,7 @@ test('a table-not-found answer that comes after the exit stopped waiting still r
   expect(world.statusLines.some(line => (line ?? '').includes(TABLE_NOTICE))).toBe(true)
 })
 
-test('with a writer taken over from still out too, the table-not-found answer to the last writer\'s batch makes no table: every row is spilled once and the notice raised', { options: OPTIONS }, async ($, on) => {
+test('with a writer taken over from still out too and both batches answered table-not-found during exit, no table is made: every row is spilled once and the notice raised', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
   world.replies = [{ hang: true }, { hang: true }, TABLE_CREATED, OK_INSERT]
   await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
@@ -1039,6 +1039,7 @@ test('with a writer taken over from still out too, the table-not-found answer to
   await answerDuringExit(world, TABLE_MISSING, ending)
   expect(requestsOf(world)).toEqual(['POST insertAll', 'POST insertAll'])
   const spilled = deadLetterRows(world).map(r => r.event_id)
+  expect(spilled.length).toBe(sent.length + 1)
   expect(new Set(spilled).size).toBe(spilled.length)
   expect(sent.filter(id => !spilled.includes(id))).toEqual([])
   expect(world.stderr[0] ?? '').toContain(TABLE_NOTICE)
@@ -1063,9 +1064,11 @@ test('with an earlier writer still unanswered past the exit wait cutoff, a 404 t
   // Answer ONLY the current writer's hung request at +100 ms; leave prior writer hung past +400 ms wait cutoff.
   await world.clock.advance(100)
   world.releaseHungAt(1, TABLE_MISSING.status, TABLE_MISSING.text)
-  await world.clock.advance(300)
-  expect(ended).toBe(true)
+  await world.clock.advance(299)
+  expect(ended).toBe(false)
+  await world.clock.advance(1)
   await ending
+  expect(ended).toBe(true)
   expect(requestsOf(world)).toEqual(['POST insertAll', 'POST insertAll'])
   const spilled = deadLetterRows(world).map(r => r.event_id)
   expect(spilled.length).toBe(sent.length + 1)

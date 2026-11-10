@@ -157,7 +157,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   const clock = mock.clock(on, { now: 0 })
   mock.env(on, { HOME, USER: 'dev', ...env })
   const asJson = (value: unknown): unknown => JSON.parse(JSON.stringify(value)) as unknown
-  const hung: (((answer: { value: { status: number; ok: boolean; headers: Record<string, string>; text: string } }) => void) | undefined)[] = []
+  const hung: (((answer: { value: { status: number; ok: boolean; headers: Record<string, string>; text: string } }) => void) | null | undefined)[] = []
   const heldWrites: { path: string; text: string; resolve: (answer: { value: undefined }) => void }[] = []
   const world: World = {
     clock,
@@ -206,8 +206,8 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     },
     releaseHungAt: (index, status = 200, text = '{"saved":1}') => {
       const resolve = hung[index]
-      if (resolve === undefined) return
-      hung[index] = undefined
+      if (resolve === undefined || resolve === null) throw new Error(`no pending hung request at index ${index}`)
+      hung[index] = null
       resolve({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
     },
     store: new Map(Object.entries(store).map(([key, value]) => [key, asJson(value)])),
