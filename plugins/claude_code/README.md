@@ -145,7 +145,7 @@ If you can't use the marketplace catalog, download the plugin tarball
 attached to the matching `tracing-vX.Y.Z` GitHub release:
 
 ```bash
-VERSION=0.1.0
+VERSION=0.1.1
 mkdir -p ~/.claude/plugins
 curl -L \
   "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/releases/download/tracing-v${VERSION}/bigquery-agent-analytics-tracing-claude-code-${VERSION}.tar.gz" \
@@ -154,6 +154,22 @@ curl -L \
 
 Then point Claude Code at the unpacked plugin directory per the
 [Claude Code plugins docs](https://docs.claude.com/en/docs/claude-code/plugins).
+
+## Syncing and verifying the marketplace copy
+
+Run `bash plugins/claude_code/build_dist.sh --check` (which also runs in CI)
+to verify that the source tree under `plugins/claude_code/`, the committed
+marketplace copy under
+`plugins/claude_code_dist/bigquery-agent-analytics-tracing/`,
+`.claude-plugin/marketplace.json`, the vendored `.dist-info/METADATA`, and
+this README agree, and that an existing `tracing-vX.Y.Z` release tag is
+not diverged from its committed dist snapshot. To rebuild the shared
+non-vendor files into an output directory, pass a target directory instead
+of `--check`:
+
+```bash
+bash plugins/claude_code/build_dist.sh /tmp/tracing-dist
+```
 
 ## Building the artifact
 

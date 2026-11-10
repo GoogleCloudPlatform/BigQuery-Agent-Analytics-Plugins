@@ -19,13 +19,13 @@ Keep updated whenever metadata or install model changes.
   - [ ] `keywords` cover the discoverability terms users will search
         for: `bigquery`, `agent-analytics`, `observability`, `tracing`,
         `claude-code`
-  - [ ] All nine hooks declared with `${CLAUDE_PLUGIN_ROOT}/hooks/<name>.sh`
+  - [ ] All eleven hooks declared with `${CLAUDE_PLUGIN_ROOT}/hooks/<name>.sh`
 - [ ] `/bqaa-setup` slash command discoverable via `commands/bqaa-setup.md`
 - [ ] `hooks/common.sh` and `scripts/run_setup_check.sh` are executable
       (`chmod +x`) in source control
 - [ ] Plugin tarball produced by the release pipeline contains:
   - [ ] `.claude-plugin/plugin.json` (version stamped)
-  - [ ] `hooks/` — all nine `*.sh` files + `common.sh`
+  - [ ] `hooks/` — all eleven `*.sh` files + `common.sh`
   - [ ] `commands/bqaa-setup.md`
   - [ ] `scripts/run_setup_check.sh`
   - [ ] `vendor/bigquery_agent_analytics_tracing/` (full package source)

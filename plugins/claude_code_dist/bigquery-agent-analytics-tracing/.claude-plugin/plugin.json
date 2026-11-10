@@ -1,7 +1,7 @@
 {
   "name": "bigquery-agent-analytics-tracing",
   "description": "Stream Claude Code hook traces to Google BigQuery Agent Analytics agent_events.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "Google LLC"
   },
@@ -56,12 +56,32 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_use_failure.sh\""
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.sh\""
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/stop_failure.sh\""
           }
         ]
       }

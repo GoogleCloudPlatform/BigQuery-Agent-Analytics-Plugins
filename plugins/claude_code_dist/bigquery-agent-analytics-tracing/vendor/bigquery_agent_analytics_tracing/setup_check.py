@@ -12,30 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Advisory setup check for the BQAA tracing runtime.
-
-Surfaces:
-
-  * BQAA_PROJECT_ID / BQAA_DATASET — required env vars.
-  * BQAA_PYTHON — optional, defaults to the current interpreter; we
-    sanity-check it can import the runtime deps.
-  * google-cloud-bigquery — always required.
-  * google-cloud-bigquery-storage + pyarrow — required only for the
-    Storage Write API path; absent is OK (drainer falls back to
-    insert_rows_json).
-  * bigquery_agent_analytics_tracing itself — sanity check the
-    vendored layout works on BQAA_PYTHON.
-
-This script is **advisory-only**. It never mutates the environment,
-shell rc files, GCP resources, or IAM. It only reports what is
-missing and prints the exact `pip install ...` line you'd run to fix
-it. The interactive setup that actually creates a dataset / grants
-IAM is intentionally out of scope here — keep that as a separate
-explicit step.
-
-Driver: the `bqaa-check-setup` console script and the `/bqaa-setup`
-Claude Code slash command both call ``main()``.
-"""
+"""Advisory setup check for the BQAA tracing runtime."""
 
 from __future__ import annotations
 
@@ -45,27 +22,26 @@ from dataclasses import dataclass
 from dataclasses import field
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 from typing import Iterable
 
+from ._utils import inspect_spool_status
 from ._utils import PYTHON_C_DROP_WORKING_DIR
+from .config import BQAAConfig
+from .config import DEFAULT_LOG_FILE
+from .config import DEFAULT_SPOOL_DIR
 
-# Modules whose absence blocks the writer entirely.
 _REQUIRED_IMPORTS: tuple[tuple[str, str], ...] = (
     ("google.cloud.bigquery", "google-cloud-bigquery"),
 )
 
-# Modules whose absence only disables the Storage Write API path;
-# drainer falls back to insert_rows_json.
 _STORAGE_WRITE_IMPORTS: tuple[tuple[str, str], ...] = (
     ("google.cloud.bigquery_storage_v1", "google-cloud-bigquery-storage"),
     ("pyarrow", "pyarrow"),
 )
 
-# Sanity-check the tracing package itself imports on the target
-# interpreter — catches a misconfigured PYTHONPATH on vendored
-# plugin runtimes before any hook fires.
 _PACKAGE_IMPORTS: tuple[tuple[str, str], ...] = (
     ("bigquery_agent_analytics_tracing", "bigquery-agent-analytics-tracing"),
 )
@@ -85,12 +61,19 @@ class _SetupReport:
   project_id: str | None
   dataset: str | None
   trace_enabled: bool
-  # Non-None when the configured interpreter cannot be executed
-  # (FileNotFoundError, permission denied, timeout, non-zero exit on a
-  # trivial command). Surfacing this separately tells the user "fix
-  # BQAA_PYTHON" instead of N misleading "import failed" lines that
-  # all stem from the same root cause.
+  dry_run: bool = False
+  log_file: str = DEFAULT_LOG_FILE
+  log_file_is_default: bool = True
+  log_file_is_relative: bool = False
+  spool_dir: str = DEFAULT_SPOOL_DIR
+  spool_pending: int = 0
+  spool_deferred: int = 0
+  spool_dead_letter: int = 0
+  spool_destination_mismatch: int = 0
+  spool_last_error: str | None = None
+  spool_inspect_error: str | None = None
   interpreter_error: str | None = None
+  config_error: str | None = None
   package_imports: list[_ImportProbe] = field(default_factory=list)
   required_imports: list[_ImportProbe] = field(default_factory=list)
   storage_write_imports: list[_ImportProbe] = field(default_factory=list)
@@ -104,9 +87,11 @@ class _SetupReport:
     return bool(self.project_id) and bool(self.dataset)
 
   @property
+  def config_ok(self) -> bool:
+    return self.config_error is None
+
+  @property
   def package_ok(self) -> bool:
-    # Empty list when interpreter is broken — explicitly gate on
-    # python_ok so vacuous all([]) doesn't report True.
     return self.python_ok and all(p.ok for p in self.package_imports)
 
   @property
@@ -122,28 +107,17 @@ class _SetupReport:
     return (
         self.python_ok
         and self.env_ok
+        and self.config_ok
         and self.package_ok
         and self.required_deps_ok
     )
 
 
 def _resolve_python_bin() -> str:
-  """Pick the interpreter we'll check against.
-
-  ``BQAA_PYTHON`` is what hook shell wrappers exec when firing the
-  hook, so that's the truth for the runtime. If unset, use whichever
-  python invoked us (matches the shell default of ``python3``).
-  """
   return os.environ.get("BQAA_PYTHON") or sys.executable
 
 
 def _probe_interpreter(python_bin: str) -> str | None:
-  """Verify ``python_bin`` can be executed. Returns None on success or
-  a one-line error string. Catches the common
-  misconfigurations (path doesn't exist, not executable, hangs)
-  before the import probes shell out N times and trip on the same
-  root cause.
-  """
   try:
     proc = subprocess.run(
         [python_bin, "-c", "pass"],
@@ -171,12 +145,6 @@ def _probe_imports(
 ) -> list[_ImportProbe]:
   results: list[_ImportProbe] = []
   for module, install_name in modules:
-    # Defensive catches for the same conditions ``_probe_interpreter``
-    # handles. ``collect_report`` skips this loop entirely when the
-    # interpreter is broken, but keep the catches so a direct caller
-    # never sees a raw OSError from a misconfigured python_bin.
-    # The probe runs in the caller's working directory, usually a
-    # checked-out repository, so it drops that from sys.path first.
     try:
       proc = subprocess.run(
           [python_bin, "-c", PYTHON_C_DROP_WORKING_DIR + f"import {module}"],
@@ -209,8 +177,6 @@ def _probe_imports(
           _ImportProbe(module=module, install_name=install_name, ok=True)
       )
     else:
-      # The first nonempty stderr line is the most useful — strip
-      # the traceback noise.
       err = (proc.stderr or proc.stdout or "import failed").strip()
       err = err.splitlines()[-1] if err.splitlines() else err
       results.append(
@@ -224,15 +190,40 @@ def _probe_imports(
   return results
 
 
-def collect_report(python_bin: str | None = None) -> _SetupReport:
-  """Run the full set of checks against ``python_bin`` (or BQAA_PYTHON
-  fallback) and return a structured report.
+def _probe_config() -> str | None:
+  try:
+    BQAAConfig.from_env()
+  except Exception as exc:
+    return str(exc) or type(exc).__name__
+  return None
 
-  If the interpreter can't be executed (bad ``BQAA_PYTHON`` is the most
-  common case), skip the import probes — they'd all fail with the same
-  underlying error — and surface the interpreter problem directly
-  via ``_SetupReport.interpreter_error``.
-  """
+
+def _is_relative_path(value: str | None) -> bool:
+  if not value:
+    return False
+  if value.startswith("~"):
+    return value == "~" or value.startswith("~/")
+  return not os.path.isabs(value)
+
+
+def _tilde_user_note(value: str) -> str | None:
+  if not value.startswith("~") or _is_relative_path(value):
+    return None
+  try:
+    expanded = Path(value).expanduser()
+  except RuntimeError:
+    return (
+        f'{value} (the user named after "~" was not found in the account'
+        " database, so the runtime cannot expand the path and discards"
+        " dry-run events)"
+    )
+  return (
+      f"{value} (expanded through the account database to {expanded}, the"
+      " same for every hook)"
+  )
+
+
+def collect_report(python_bin: str | None = None) -> _SetupReport:
   resolved = python_bin or _resolve_python_bin()
   interpreter_error = _probe_interpreter(resolved)
   if interpreter_error is not None:
@@ -243,9 +234,12 @@ def collect_report(python_bin: str | None = None) -> _SetupReport:
     package_imports = _probe_imports(resolved, _PACKAGE_IMPORTS)
     required_imports = _probe_imports(resolved, _REQUIRED_IMPORTS)
     storage_write_imports = _probe_imports(resolved, _STORAGE_WRITE_IMPORTS)
+  spool_dir = os.environ.get("BQAA_SPOOL_DIR", DEFAULT_SPOOL_DIR)
+  spool_status = inspect_spool_status(spool_dir)
   return _SetupReport(
       python_bin=resolved,
       interpreter_error=interpreter_error,
+      config_error=_probe_config(),
       project_id=(
           os.environ.get("BQAA_PROJECT_ID")
           or os.environ.get("GCP_PROJECT_ID")
@@ -258,14 +252,53 @@ def collect_report(python_bin: str | None = None) -> _SetupReport:
       trace_enabled=(
           os.environ.get("BQAA_TRACE_ENABLED", "true").lower() == "true"
       ),
+      dry_run=(os.environ.get("BQAA_DRY_RUN", "false").lower() == "true"),
+      log_file=os.environ.get("BQAA_LOG_FILE", DEFAULT_LOG_FILE),
+      log_file_is_default="BQAA_LOG_FILE" not in os.environ,
+      log_file_is_relative=_is_relative_path(os.environ.get("BQAA_LOG_FILE")),
+      spool_dir=spool_dir,
+      spool_pending=int(spool_status["pending_count"]),
+      spool_deferred=int(spool_status["deferred_count"]),
+      spool_dead_letter=int(spool_status["dead_letter_count"]),
+      spool_destination_mismatch=int(
+          spool_status["destination_mismatch_count"]
+      ),
+      spool_last_error=spool_status["latest_error"],
+      spool_inspect_error=spool_status["error"],
       package_imports=package_imports,
       required_imports=required_imports,
       storage_write_imports=storage_write_imports,
   )
 
 
+def _append_config_error(lines: list[str], config_error: str) -> None:
+  lines.append(f"  [INVALID] BQAA_* settings: {config_error}")
+  lines.append(
+      "  Fix: correct or unset that variable; the hooks cannot load"
+      " their configuration and emit no trace events until then."
+  )
+
+
+def _append_spool_section(lines: list[str], report: _SetupReport) -> None:
+  lines.append(f"Spool status ({report.spool_dir}):")
+  if report.spool_inspect_error:
+    lines.append(f"  [WARN] could not inspect spool: {report.spool_inspect_error}")
+    return
+  lines.append(
+      f"  Pending: {report.spool_pending} event(s),"
+      f" deferred/retrying: {report.spool_deferred},"
+      f" dead-letter: {report.spool_dead_letter}"
+      + (
+          f" (destination-mismatch: {report.spool_destination_mismatch})"
+          if report.spool_destination_mismatch
+          else ""
+      )
+  )
+  if report.spool_last_error:
+    lines.append(f"  Latest retry error: {report.spool_last_error}")
+
+
 def _format_report(report: _SetupReport) -> str:
-  """Human-readable, copy-pasteable advisory output."""
   lines: list[str] = []
   ok_mark = "OK"
   miss_mark = "MISSING"
@@ -285,12 +318,18 @@ def _format_report(report: _SetupReport) -> str:
         "  Note: emission is disabled. Set BQAA_TRACE_ENABLED=true"
         " (or unset it) to enable."
     )
+  lines.append(f"BQAA_DRY_RUN: {'on' if report.dry_run else 'off'}")
+  if report.dry_run:
+    lines.append(_dry_run_note(report))
   lines.append("")
 
   if report.interpreter_error:
-    # Skip the per-import sections — they're all empty when the
-    # interpreter is broken, and printing empty checklists is noise.
+    if report.config_error:
+      _append_config_error(lines, report.config_error)
+      lines.append("")
     lines.append("Import + env checks skipped: interpreter unavailable.")
+    lines.append("")
+    _append_spool_section(lines, report)
     lines.append("")
     lines.append("Status: ACTION NEEDED")
     return "\n".join(lines) + "\n"
@@ -311,6 +350,9 @@ def _format_report(report: _SetupReport) -> str:
       lines.append("  export BQAA_PROJECT_ID=your-gcp-project")
     if not report.dataset:
       lines.append("  export BQAA_DATASET=agent_analytics")
+  if report.config_error:
+    lines.append("")
+    _append_config_error(lines, report.config_error)
   lines.append("")
 
   lines.append("Package import:")
@@ -361,8 +403,50 @@ def _format_report(report: _SetupReport) -> str:
     lines.append(f"  {report.python_bin} -m pip install {' '.join(missing)}")
   lines.append("")
 
+  _append_spool_section(lines, report)
+  lines.append("")
+
   lines.append("Status: " + ("READY" if report.all_ok else "ACTION NEEDED"))
   return "\n".join(lines) + "\n"
+
+
+def _dry_run_note(report: _SetupReport) -> str:
+  live = " Set BQAA_DRY_RUN=false (or unset it) for live BigQuery writes."
+  if not report.trace_enabled:
+    return (
+        "  Note: dry-run mode is active, but nothing is emitted while"
+        " BQAA_TRACE_ENABLED is off."
+    )
+  if not report.log_file:
+    return (
+        "  Note: dry-run mode is active, but BQAA_LOG_FILE is empty so"
+        " dry-run events are discarded (not written to a file or"
+        " BigQuery). Unset BQAA_LOG_FILE (or set a file path) to record"
+        " dry-run events, or set BQAA_DRY_RUN=false (or unset it) for"
+        " live BigQuery writes."
+    )
+  if report.log_file_is_default:
+    target = (
+        f"the default log file ({report.log_file} for this shell's"
+        " TMPDIR; the hooks resolve it from their own TMPDIR, which"
+        " differs when shell commands run sandboxed. Set BQAA_LOG_FILE"
+        " to an absolute path to pin it)"
+    )
+  elif report.log_file_is_relative:
+    target = (
+        f"{report.log_file} (not an absolute path: each hook resolves it"
+        ' against its own working directory, and "~" or "~/" against its'
+        " own HOME. Set BQAA_LOG_FILE to an absolute path to pin it)"
+    )
+  else:
+    target = _tilde_user_note(report.log_file) or report.log_file
+  return (
+      "  Note: dry-run mode is active. The hooks try to write dry-run"
+      f" events to {target} instead of BigQuery, and drop them silently"
+      " if the runtime refuses that path (for example a read-only file,"
+      " a symlink, or a file in a directory that your group or other"
+      f" users can write).{live}"
+  )
 
 
 def _report_to_json(report: _SetupReport) -> str:
@@ -371,6 +455,7 @@ def _report_to_json(report: _SetupReport) -> str:
           **asdict(report),
           "python_ok": report.python_ok,
           "env_ok": report.env_ok,
+          "config_ok": report.config_ok,
           "package_ok": report.package_ok,
           "required_deps_ok": report.required_deps_ok,
           "storage_write_ok": report.storage_write_ok,
@@ -382,13 +467,6 @@ def _report_to_json(report: _SetupReport) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-  """Exit 0 when everything required is in place, 1 otherwise.
-
-  The non-zero exit is what lets the slash command flag "fix this"
-  vs. "you're good." Storage Write deps are intentionally not part
-  of the exit code: the drainer fallback exists so a missing pyarrow
-  is not a hard blocker.
-  """
   parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
   parser.add_argument(
       "--json",
@@ -396,6 +474,9 @@ def main(argv: list[str] | None = None) -> int:
       help="Emit a JSON report instead of human-readable text.",
   )
   args = parser.parse_args(argv)
+  reconfigure = getattr(sys.stdout, "reconfigure", None)
+  if reconfigure is not None:
+    reconfigure(errors="backslashreplace")
   report = collect_report()
   if args.json:
     sys.stdout.write(_report_to_json(report) + "\n")

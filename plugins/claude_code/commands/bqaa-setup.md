@@ -81,16 +81,25 @@ unless `BQAA_TRACE_ENABLED` is `false`, `0`, `no` or `off`.
   lower-latency Storage Write path; absence is reported as advisory
   (the drainer falls back to `insert_rows_json`).
 - Numeric `BQAA_*` settings (`BQAA_MAX_CONTENT_LENGTH`,
-  `BQAA_TRANSCRIPT_MAX_BYTES`, `BQAA_DRAIN_BATCH_SIZE`,
-  `BQAA_STATE_TTL_HOURS`, `BQAA_DRAIN_IDLE_SECONDS`,
-  `BQAA_DRAIN_POLL_SECONDS`) — must parse as numbers, and the two
-  `BQAA_DRAIN_*_SECONDS` timings must also be finite and above zero.
-  If one is not, the hooks cannot load their configuration and emit no
-  trace events. Each hook still exits 0. When tracing is enabled it prints the error
-  to stderr and tries to append it to the configured log file (a
-  logging failure does not stop the hook); when tracing is off it stays
-  silent. The check reports `[INVALID]` with the variable name (not the
-  value) and exits `1`.
+  `BQAA_MAX_LOG_BYTES`, `BQAA_TRANSCRIPT_MAX_BYTES`,
+  `BQAA_DRAIN_BATCH_SIZE`, `BQAA_STATE_TTL_HOURS`,
+  `BQAA_DRAIN_IDLE_SECONDS`, `BQAA_DRAIN_POLL_SECONDS`,
+  `BQAA_DRAIN_RETRY_BACKOFF_SECONDS`,
+  `BQAA_DRAIN_MAX_RETRY_AGE_SECONDS`) — must parse as numbers; the two
+  `BQAA_DRAIN_{IDLE,POLL}_SECONDS` timings must be finite and above zero,
+  and the two `BQAA_DRAIN_*RETRY*_SECONDS` settings (when set) must be
+  finite and non-negative. If one is not, the hooks cannot load their
+  configuration and emit no trace events. Each hook still exits 0. When
+  tracing is enabled it prints the error to stderr and tries to append it
+  to the configured log file (rotating `bqaa.log` -> `bqaa.log.1` with
+  `0600` permissions when it reaches `BQAA_MAX_LOG_BYTES`, `1 MiB` by
+  default); when tracing is off it stays silent. The check reports
+  `[INVALID]` with the variable name (not the value) and exits `1`.
+- Spool status — read-only inspection of the private (`0700`) per-user
+  spool directory reporting pending `spool/` envelopes, deferred retry
+  sidecars, quarantined `dead-letter/` (`write-failed` and
+  `destination-mismatch`) counts, and the latest error message. This
+  section is informational; backlog items do not change the exit code.
 
 ## What the check does NOT do
 

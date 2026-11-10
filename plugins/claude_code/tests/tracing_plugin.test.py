@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -36,6 +38,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -84,10 +87,12 @@ class TestSourceDistParity(unittest.TestCase):
         "hooks/notification.sh",
         "hooks/permission_request.sh",
         "hooks/post_tool_use.sh",
+        "hooks/post_tool_use_failure.sh",
         "hooks/pre_tool_use.sh",
         "hooks/session_end.sh",
         "hooks/session_start.sh",
         "hooks/stop.sh",
+        "hooks/stop_failure.sh",
         "hooks/subagent_stop.sh",
         "hooks/user_prompt_submit.sh",
         "scripts/run_setup_check.sh",
@@ -172,14 +177,13 @@ class TestSourceDistParity(unittest.TestCase):
         dist_json = json.loads(
             (self.dist / ".claude-plugin" / "plugin.json").read_text()
         )
-        metadata_path = (
-            DIST_DIR
-            / "vendor"
-            / "bigquery_agent_analytics_tracing-0.1.0.dist-info"
-            / "METADATA"
-        )
+        dist_infos = list((DIST_DIR / "vendor").glob("bigquery_agent_analytics_tracing-*.dist-info"))
+        self.assertEqual(len(dist_infos), 1, f"expected 1 dist-info dir, got {dist_infos}")
+        expected_info = DIST_DIR / "vendor" / f"bigquery_agent_analytics_tracing-{dist_json['version']}.dist-info"
+        self.assertEqual(dist_infos[0], expected_info)
+        metadata_path = expected_info / "METADATA"
         metadata = metadata_path.read_text(encoding="utf-8")
-        self.assertIn(f"Version: {dist_json['version']}", metadata)
+        self.assertIn(f"Version: {dist_json['version']}", metadata.splitlines())
 
     def test_package_version_attribute(self):
         """bigquery_agent_analytics_tracing.__version__ must resolve."""
@@ -217,6 +221,7 @@ class TestSysPathIsolation(unittest.TestCase):
             "BQAA_DATASET": "test_dataset",
             "BQAA_DRY_RUN": "true",
             "BQAA_AUTO_DRAIN": "false",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "HOME": os.environ.get("HOME", "/tmp"),
         }
 
@@ -439,16 +444,16 @@ class TestSysPathIsolation(unittest.TestCase):
 
 
 # =============================================================================
-# 3. Vendored package & all 9 hook scripts offline E2E
+# 3. Vendored package & all 11 hook scripts offline E2E
 # =============================================================================
 
 
-# The 9 Claude Code hook names (matching plugin.json hook keys).
+# The 11 Claude Code hook names (matching plugin.json hook keys).
 # SubagentStop BEFORE Stop: _stop deletes current_trace_id, which would
 # cause _subagent_stop to return early and not write a DRY_RUN line.
 HOOK_NAMES = [
     "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
-    "SubagentStop", "Stop",
+    "PostToolUseFailure", "SubagentStop", "Stop", "StopFailure",
     "Notification", "PermissionRequest", "SessionEnd",
 ]
 
@@ -476,10 +481,21 @@ HOOK_PAYLOADS = {
         "tool_name": "Write",
         "tool_response": {"is_error": False, "content": "File created"},
     },
+    "PostToolUseFailure": {
+        "session_id": "e2e-session-001",
+        "tool_use_id": "tool-use-002",
+        "tool_name": "Bash",
+        "error": "Exit code 1",
+    },
     "Stop": {
         "session_id": "e2e-session-001",
         "transcript_path": "",
         "response": "Created the file successfully.",
+    },
+    "StopFailure": {
+        "session_id": "e2e-session-001",
+        "transcript_path": "",
+        "error": "rate_limit_exceeded",
     },
     "SubagentStop": {
         "session_id": "e2e-session-001",
@@ -505,10 +521,9 @@ HOOK_PAYLOADS = {
     },
 }
 
-# SessionStart only writes state (no event). The other 8 hooks each write
-# one event line. SessionEnd also writes a STATE_DELTA event.
-# Total: 8 DRY_RUN lines from 8 event-emitting hooks.
-EXPECTED_DRY_RUN_LINES = 8
+# SessionStart only writes state (no event unless backlog exists). The other 10
+# hooks each write one event line.
+EXPECTED_DRY_RUN_LINES = 10
 
 
 class TestBQAAConfig(unittest.TestCase):
@@ -620,6 +635,7 @@ class TestHookScriptsE2E(unittest.TestCase):
             "BQAA_AUTO_DRAIN": "false",
             "BQAA_LOG_FILE": cls.log_file,
             "BQAA_TRACE_ENABLED": "true",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "HOME": os.environ.get("HOME", "/tmp"),
         }
 
@@ -634,7 +650,9 @@ class TestHookScriptsE2E(unittest.TestCase):
             "UserPromptSubmit": "user_prompt_submit.sh",
             "PreToolUse": "pre_tool_use.sh",
             "PostToolUse": "post_tool_use.sh",
+            "PostToolUseFailure": "post_tool_use_failure.sh",
             "Stop": "stop.sh",
+            "StopFailure": "stop_failure.sh",
             "SubagentStop": "subagent_stop.sh",
             "Notification": "notification.sh",
             "PermissionRequest": "permission_request.sh",
@@ -663,7 +681,7 @@ class TestHookScriptsE2E(unittest.TestCase):
                 )
 
     def test_no_errors_in_log(self):
-        """The dry-run log must not contain ERROR lines."""
+        """The dry-run log must contain only clean DRY_RUN lines and no errors."""
         if os.path.exists(self.log_file):
             os.remove(self.log_file)
         for hook_name in HOOK_NAMES:
@@ -672,11 +690,15 @@ class TestHookScriptsE2E(unittest.TestCase):
             log_text = Path(self.log_file).read_text(
                 encoding="utf-8", errors="replace"
             )
-            self.assertNotIn("ERROR", log_text,
-                            f"error in log:\n{log_text}")
+            bad_lines = [
+                line for line in log_text.splitlines()
+                if "DRY_RUN " not in line
+            ]
+            self.assertEqual(bad_lines, [],
+                             f"non-DRY_RUN lines in log:\n{log_text}")
 
     def test_dry_run_lines_written(self):
-        """All 8 event-emitting hooks must write DRY_RUN lines."""
+        """All 10 event-emitting hooks must write DRY_RUN lines."""
         if os.path.exists(self.log_file):
             os.remove(self.log_file)
         for hook_name in HOOK_NAMES:
@@ -965,6 +987,7 @@ class TestSetupCheck(unittest.TestCase):
             "BQAA_PROJECT_ID": "test-project",
             "BQAA_DATASET": "test_dataset",
             "BQAA_PYTHON": "/nonexistent/python",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "HOME": os.environ.get("HOME", "/tmp"),
         }
         script = DIST_DIR / "scripts" / "run_setup_check.sh"
@@ -984,6 +1007,7 @@ class TestSetupCheck(unittest.TestCase):
             "BQAA_PROJECT_ID": "test-project",
             "BQAA_DATASET": "test_dataset",
             "BQAA_PYTHON": "/nonexistent/python",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "HOME": os.environ.get("HOME", "/tmp"),
         }
         script = DIST_DIR / "scripts" / "run_setup_check.sh"
@@ -999,6 +1023,886 @@ class TestSetupCheck(unittest.TestCase):
                         "python_ok should be False with broken interpreter")
         self.assertTrue(bool(report.get("interpreter_error")),
                         "interpreter_error should be non-empty")
+
+
+def _install_fake_bigquery(
+    test_case: unittest.TestCase,
+    *,
+    insert_fn=None,
+    get_table_fn=None,
+    create_table_fn=None,
+):
+    """Install minimal stand-in google.cloud.bigquery modules for offline tests."""
+    class FakeNotFound(Exception):
+        code = 404
+
+    class FakeBadRequest(Exception):
+        code = 400
+
+    class FakeServiceUnavailable(Exception):
+        code = 503
+
+    class FakeTooManyRequests(Exception):
+        code = 429
+
+    class FakeInternalServerError(Exception):
+        code = 500
+
+    class FakeTable:
+        def __init__(self, table_id, schema=None):
+            self.table_id = table_id
+
+    class FakeDataset:
+        def __init__(self, dataset_id):
+            self.dataset_id = dataset_id
+            self.location = None
+
+    class FakeClient:
+        def __init__(self, project=None, location=None):
+            self.project = project
+            self.location = location
+
+        def get_dataset(self, dataset_id):
+            raise FakeNotFound(f"404 Not found: Dataset {dataset_id}")
+
+        def create_dataset(self, dataset):
+            return dataset
+
+        def get_table(self, table_id):
+            if get_table_fn is not None:
+                return get_table_fn(table_id)
+            return FakeTable(table_id)
+
+        def create_table(self, table):
+            if create_table_fn is not None:
+                return create_table_fn(table)
+
+        def insert_rows_json(self, table_id, rows):
+            if insert_fn is not None:
+                return insert_fn(table_id, rows)
+            return []
+
+    fake_bq_mod = types.ModuleType("google.cloud.bigquery")
+    fake_bq_mod.Client = FakeClient
+    fake_bq_mod.Dataset = FakeDataset
+    fake_bq_mod.NotFound = FakeNotFound
+    fake_bq_mod.Table = FakeTable
+    fake_bq_mod.SchemaField = lambda name, field_type, mode=None, fields=None: (name, field_type)
+    fake_bq_mod.TimePartitioning = lambda type_=None, field=None: None
+    fake_bq_mod.TimePartitioningType = types.SimpleNamespace(DAY="DAY")
+
+    google_mod = types.ModuleType("google")
+    cloud_mod = types.ModuleType("google.cloud")
+    exceptions_mod = types.ModuleType("google.cloud.exceptions")
+    exceptions_mod.NotFound = FakeNotFound
+    exceptions_mod.BadRequest = FakeBadRequest
+    exceptions_mod.ServiceUnavailable = FakeServiceUnavailable
+    exceptions_mod.TooManyRequests = FakeTooManyRequests
+    exceptions_mod.InternalServerError = FakeInternalServerError
+    cloud_mod.bigquery = fake_bq_mod
+    cloud_mod.exceptions = exceptions_mod
+    google_mod.cloud = cloud_mod
+
+    api_core_mod = types.ModuleType("google.api_core")
+    api_core_exceptions = types.ModuleType("google.api_core.exceptions")
+    api_core_exceptions.BadRequest = FakeBadRequest
+    api_core_exceptions.InternalServerError = FakeInternalServerError
+    api_core_exceptions.ServiceUnavailable = FakeServiceUnavailable
+    api_core_exceptions.TooManyRequests = FakeTooManyRequests
+    api_core_mod.exceptions = api_core_exceptions
+
+    injected = [
+        ("google", google_mod),
+        ("google.cloud", cloud_mod),
+        ("google.cloud.bigquery", fake_bq_mod),
+        ("google.cloud.exceptions", exceptions_mod),
+        ("google.api_core", api_core_mod),
+        ("google.api_core.exceptions", api_core_exceptions),
+    ]
+    old = {k: sys.modules.get(k) for k, _ in injected}
+    for k, v in injected:
+        sys.modules[k] = v
+
+    def _restore():
+        for k, v in old.items():
+            if v is not None:
+                sys.modules[k] = v
+            else:
+                sys.modules.pop(k, None)
+
+    test_case.addCleanup(_restore)
+    return {
+        "NotFound": FakeNotFound,
+        "BadRequest": FakeBadRequest,
+        "ServiceUnavailable": FakeServiceUnavailable,
+    }
+
+
+class TestSecurityAndConfig45(unittest.TestCase):
+    """Issue #45: private dirs, malformed config exit-0, destination mismatch quarantine."""
+
+    def test_private_dir_and_file_permissions(self):
+        from bigquery_agent_analytics_tracing._utils import (
+            ensure_private_dir,
+            log_to_file,
+        )
+        from bigquery_agent_analytics_tracing.claude_code import StateStore
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_priv_45_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        state_dir = Path(tmp_root) / "state"
+        spool_dir = Path(tmp_root) / "spool"
+        log_path = state_dir / "bqaa.log"
+
+        store = StateStore("perm-session", root=str(state_dir))
+        store.set("k", "v")
+        self.assertEqual(stat.S_IMODE(state_dir.stat().st_mode), 0o700)
+        state_file = state_dir / "state_perm-session.json"
+        self.assertEqual(stat.S_IMODE(state_file.stat().st_mode), 0o600)
+
+        with ensure_private_dir(spool_dir):
+            pass
+        self.assertEqual(stat.S_IMODE(spool_dir.stat().st_mode), 0o700)
+
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            state_dir=str(state_dir),
+            spool_dir=str(spool_dir),
+            log_file=str(log_path),
+        )
+        log_to_file(cfg, "hello")
+        self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+
+        # World-writable or symlinked directory must be refused.
+        unsafe_dir = Path(tmp_root) / "world"
+        unsafe_dir.mkdir()
+        os.chmod(unsafe_dir, 0o777)
+        with self.assertRaises(PermissionError):
+            ensure_private_dir(unsafe_dir)
+
+        symlink_dir = Path(tmp_root) / "sym"
+        symlink_dir.symlink_to(state_dir)
+        with self.assertRaises(PermissionError):
+            ensure_private_dir(symlink_dir)
+
+    def test_invalid_numeric_env_exits_zero_without_traceback(self):
+        from bigquery_agent_analytics_tracing.config import (
+            BQAAConfig,
+            InvalidConfigError,
+        )
+
+        env_backup = os.environ.copy()
+        try:
+            os.environ["BQAA_PROJECT_ID"] = "p"
+            os.environ["BQAA_DATASET"] = "d"
+            os.environ["BQAA_MAX_CONTENT_LENGTH"] = "5,000"
+            with self.assertRaises(InvalidConfigError):
+                BQAAConfig.from_env()
+            os.environ["BQAA_MAX_CONTENT_LENGTH"] = "5000"
+            os.environ["BQAA_DRAIN_IDLE_SECONDS"] = "0"
+            with self.assertRaises(InvalidConfigError):
+                BQAAConfig.from_env()
+        finally:
+            os.environ.clear()
+            os.environ.update(env_backup)
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_cfg_hook_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        log_file = os.path.join(tmp_root, "cfg.log")
+        env = {
+            "BQAA_PROJECT_ID": "p",
+            "BQAA_DATASET": "d",
+            "BQAA_MAX_CONTENT_LENGTH": "5,000",
+            "BQAA_TRACE_ENABLED": "true",
+            "BQAA_LOG_FILE": log_file,
+            "BQAA_STATE_DIR": os.path.join(tmp_root, "state"),
+            "BQAA_SPOOL_DIR": os.path.join(tmp_root, "spool"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "HOME": tmp_root,
+        }
+        res = subprocess.run(
+            ["bash", str(DIST_DIR / "hooks" / "session_start.sh")],
+            input=json.dumps({"session_id": "cfg-bad-1", "cwd": tmp_root}),
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(res.returncode, 0)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertIn("BQAA_MAX_CONTENT_LENGTH", res.stderr)
+
+        # Disabled tracing stays quiet on invalid config too.
+        env["BQAA_TRACE_ENABLED"] = "false"
+        res_off = subprocess.run(
+            ["bash", str(DIST_DIR / "hooks" / "session_start.sh")],
+            input=json.dumps({"session_id": "cfg-bad-2", "cwd": tmp_root}),
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(res_off.returncode, 0)
+        self.assertEqual(res_off.stderr, "")
+
+    def test_drain_quarantines_destination_mismatch_and_drains_legacy(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_mm_spool_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        captured = []
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda table_id, rows: (captured.append((table_id, rows)) or []),
+        )
+
+        def _row(sid):
+            return {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "event_type": "LLM_REQUEST",
+                "agent": "test-agent",
+                "session_id": sid,
+                "invocation_id": "inv",
+                "user_id": "u",
+                "trace_id": "t",
+                "span_id": "s",
+                "parent_span_id": None,
+                "content": {},
+                "attributes": {},
+                "latency_ms": {},
+                "status": "OK",
+                "error_message": None,
+                "is_truncated": False,
+            }
+
+        mismatch_path = Path(spool_dir) / "event-mismatch.json"
+        mismatch_path.write_text(
+            json.dumps({
+                "config": {"project_id": "other-proj", "dataset": "ds", "table": "agent_events"},
+                "row": _row("mm"),
+            }),
+            encoding="utf-8",
+        )
+        legacy_path = Path(spool_dir) / "event-legacy.json"
+        legacy_path.write_text(
+            json.dumps({"config": {}, "row": _row("legacy")}),
+            encoding="utf-8",
+        )
+
+        cfg = BQAAConfig(
+            project_id="target-proj",
+            dataset="target_ds",
+            table="agent_events",
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=os.path.join(spool_dir, "drain.log"),
+            dry_run=False,
+        )
+        resolved = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertGreaterEqual(resolved, 2)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][0], "target-proj.target_ds.agent_events")
+        self.assertEqual(captured[0][1][0]["session_id"], "legacy")
+        self.assertFalse(mismatch_path.exists())
+        self.assertFalse(legacy_path.exists())
+        quarantined = (
+            Path(spool_dir)
+            / "dead-letter"
+            / "destination-mismatch"
+            / "event-mismatch.destination-mismatch.json"
+        )
+        self.assertTrue(quarantined.is_file(), f"missing quarantine file {quarantined}")
+
+
+class TestTranscriptAndHooks38(unittest.TestCase):
+    """Issue #38: last_assistant_message, token dedup, late flush, failure hooks."""
+
+    def test_pick_response_preference_order(self):
+        from bigquery_agent_analytics_tracing.claude_code import _pick_response
+
+        text, ok = _pick_response(
+            {"last_assistant_message": "Final answer", "response": "Fallback"},
+            "Transcript text",
+            fallback_keys=("response", "output"),
+            default="(none)",
+        )
+        self.assertEqual((text, ok), ("Final answer", True))
+
+        text2, ok2 = _pick_response(
+            {"last_assistant_message": "   ", "response": "Fallback"},
+            "Transcript text",
+            fallback_keys=("response", "output"),
+            default="(none)",
+        )
+        self.assertEqual((text2, ok2), ("Transcript text", True))
+
+        text3, ok3 = _pick_response(
+            {"output": "Direct output"},
+            "",
+            fallback_keys=("response", "output"),
+            default="(none)",
+        )
+        self.assertEqual((text3, ok3), ("Direct output", True))
+
+        text4, ok4 = _pick_response(
+            {}, "", fallback_keys=("response",), default="(none)"
+        )
+        self.assertEqual((text4, ok4), ("(none)", False))
+
+    def test_transcript_dedup_partial_eof_and_late_flush(self):
+        from bigquery_agent_analytics_tracing.claude_code import (
+            ClaudeHookBQAAAdapter,
+            _read_transcript_delta,
+        )
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_38_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        transcript = Path(tmp_root) / "transcript.jsonl"
+
+        line1 = json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-test",
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+                "content": [{"type": "text", "text": "Part 1"}],
+            },
+        })
+        line2 = json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-test",
+                "usage": {"input_tokens": 100, "output_tokens": 55},
+                "content": [{"type": "text", "text": "Part 2"}],
+            },
+        })
+        # Write two complete lines plus one partial incomplete JSON line at EOF.
+        transcript.write_text(
+            line1 + "\n" + line2 + "\n" + '{"type": "assistant", "partial": ',
+            encoding="utf-8",
+        )
+        text, model, usage, _, cursor, seen = _read_transcript_delta(
+            str(transcript), 0, 100_000, None
+        )
+        self.assertEqual(model, "claude-test")
+        self.assertIn("Part 1", text)
+        self.assertIn("Part 2", text)
+        # Per-field max within same message.id, not 100+100=200 or 20+55=75.
+        self.assertEqual(usage["prompt_tokens"], 100)
+        self.assertEqual(usage["completion_tokens"], 55)
+        self.assertEqual(cursor, 2)
+
+        # Complete line 3 with trailing newline + anonymous line without id.
+        line3 = json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-test",
+                "usage": {"input_tokens": 100, "output_tokens": 80},
+                "content": [{"type": "text", "text": "Final block"}],
+            },
+        })
+        line4_anon = json.dumps({
+            "type": "assistant",
+            "message": {
+                "model": "claude-test",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "content": [{"type": "text", "text": "Anon"}],
+            },
+        })
+        transcript.write_text(
+            line1 + "\n" + line2 + "\n" + line3 + "\n" + line4_anon + "\n",
+            encoding="utf-8",
+        )
+        text2, _, usage2, _, cursor2, seen2 = _read_transcript_delta(
+            str(transcript), cursor, 100_000, seen
+        )
+        self.assertEqual(cursor2, 4)
+        self.assertIn("Final block", text2)
+        # Incremental delta: +25 output from msg_1, plus (10, 5) from line-3.
+        self.assertEqual(usage2["prompt_tokens"], 10)
+        self.assertEqual(usage2["completion_tokens"], 30)
+        self.assertIn("msg_1", seen2)
+        self.assertIn("line-4", seen2)
+
+        # FIFO cap 256 in seen_usage: simulate 300 distinct ids.
+        many_lines = [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": f"m_{i}",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "content": [{"type": "text", "text": "x"}],
+                },
+            })
+            for i in range(300)
+        ]
+        t_cap = Path(tmp_root) / "cap.jsonl"
+        t_cap.write_text("\n".join(many_lines) + "\n", encoding="utf-8")
+        _, _, _, _, _, seen_cap = _read_transcript_delta(str(t_cap), 0, 500_000, seen2)
+        self.assertLessEqual(len(seen_cap), 256)
+
+        # Late transcript flush at SessionEnd when extra block arrives after Stop.
+        log_file = os.path.join(tmp_root, "late.log")
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=True,
+            log_file=log_file,
+            state_dir=os.path.join(tmp_root, "state"),
+            spool_dir=os.path.join(tmp_root, "spool"),
+        )
+        adapter = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg))
+        t_late = Path(tmp_root) / "late.jsonl"
+        t_late.write_text("", encoding="utf-8")
+        adapter.process("SessionStart", {"session_id": "late-s1", "cwd": tmp_root})
+        adapter.process("UserPromptSubmit", {
+            "session_id": "late-s1",
+            "prompt": "hi",
+            "transcript_path": str(t_late),
+        })
+        t_late.write_text(line1 + "\n", encoding="utf-8")
+        adapter.process("Stop", {
+            "session_id": "late-s1",
+            "last_assistant_message": "Stop text",
+            "transcript_path": str(t_late),
+        })
+        # Extra final usage chunk flushed between Stop and SessionEnd.
+        t_late.write_text(line1 + "\n" + line3 + "\n", encoding="utf-8")
+        adapter.process("SessionEnd", {"session_id": "late-s1"})
+        log_text = Path(log_file).read_text(encoding="utf-8")
+        late_rows = []
+        for entry in log_text.splitlines():
+            idx = entry.find("DRY_RUN ")
+            if idx != -1:
+                row = json.loads(entry[idx + len("DRY_RUN "):])
+                attrs = json.loads(row["attributes"])
+                if attrs.get("late_transcript_flush"):
+                    late_rows.append((row, attrs))
+        self.assertEqual(len(late_rows), 1)
+        self.assertEqual(late_rows[0][1]["usage_metadata"]["completion_tokens"], 60)
+
+    def test_post_tool_use_failure_and_stop_failure(self):
+        from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_fail_38_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        state_dir = os.path.join(tmp_root, "state")
+        log_file = os.path.join(tmp_root, "fail.log")
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=True,
+            log_file=log_file,
+            state_dir=state_dir,
+            spool_dir=os.path.join(tmp_root, "spool"),
+        )
+        adapter = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg))
+        adapter.process("SessionStart", {"session_id": "fs1", "cwd": tmp_root})
+        adapter.process("UserPromptSubmit", {"session_id": "fs1", "prompt": "run"})
+        adapter.process("PreToolUse", {
+            "session_id": "fs1",
+            "tool_use_id": "tid-fail-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "false"},
+        })
+        tool_file = Path(state_dir) / "tool_fs1_tid-fail-1.json"
+        self.assertTrue(tool_file.is_file())
+        adapter.process("PostToolUseFailure", {
+            "session_id": "fs1",
+            "tool_use_id": "tid-fail-1",
+            "tool_name": "Bash",
+            "error": "Non-zero exit status",
+        })
+        self.assertFalse(tool_file.exists(), "tool state file not popped on PostToolUseFailure")
+
+        adapter.process("StopFailure", {
+            "session_id": "fs1",
+            "error": "rate_limit_error",
+        })
+        rows = []
+        for line in Path(log_file).read_text(encoding="utf-8").splitlines():
+            idx = line.find("DRY_RUN ")
+            if idx != -1:
+                rows.append(json.loads(line[idx + len("DRY_RUN "):]))
+        tool_rows = [r for r in rows if r["event_type"] == "TOOL_COMPLETED"]
+        self.assertEqual(len(tool_rows), 1)
+        self.assertEqual(tool_rows[0]["status"], "ERROR")
+        self.assertEqual(tool_rows[0]["error_message"], "Non-zero exit status")
+
+        stop_rows = [r for r in rows if r["event_type"] == "LLM_RESPONSE"]
+        self.assertEqual(len(stop_rows), 1)
+        self.assertEqual(stop_rows[0]["status"], "ERROR")
+        self.assertEqual(stop_rows[0]["error_message"], "rate_limit_error")
+
+
+class TestReliabilityAndSetup46(unittest.TestCase):
+    """Issue #46: retry deferral, missing env warning, log rotation, find_spec, setup surfacing."""
+
+    def test_drain_deferral_backoff_recovery_and_expiry(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_46_retry_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        fail_mode = {"mode": "404"}
+        captured = []
+
+        def _get_table(table_id):
+            if fail_mode["mode"] == "404":
+                raise fake_classes["NotFound"]("404 Not found: Dataset p:d")
+            return types.SimpleNamespace(table_id=table_id)
+
+        def _insert(table_id, rows):
+            captured.extend(rows)
+            return []
+
+        fake_classes = _install_fake_bigquery(
+            self, get_table_fn=_get_table, insert_fn=_insert
+        )
+
+        env_path = Path(spool_dir) / "event-retry-1.json"
+        env_path.write_text(
+            json.dumps({
+                "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                "row": {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "event_type": "LLM_REQUEST",
+                    "session_id": "s1",
+                    "attributes": {},
+                    "content": {},
+                    "latency_ms": {},
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        # Missing dataset/table defers cleanly instead of dead-lettering.
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=os.path.join(spool_dir, "drain.log"),
+            dry_run=False,
+            drain_retry_backoff_seconds=60.0,
+            drain_max_retry_age_seconds=86400.0,
+        )
+        resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved1, 0)
+        self.assertTrue(env_path.is_file(), "spool file should stay buffered on 404")
+        retry_path = Path(spool_dir) / "event-retry-1.json.retry"
+        self.assertTrue(retry_path.is_file())
+        self.assertEqual(stat.S_IMODE(retry_path.stat().st_mode), 0o600)
+
+        # Before next_retry_at, second pass skips without retrying; setting backoff=0 forces attempt.
+        fail_mode["mode"] = "ok"
+        resolved2 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved2, 0)
+        self.assertEqual(len(captured), 0)
+
+        cfg.drain_retry_backoff_seconds = 0.0
+        resolved3 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved3, 1)
+        self.assertEqual(len(captured), 1)
+        self.assertFalse(env_path.exists())
+        self.assertFalse(retry_path.exists())
+
+        # Expired retry age quarantines to dead-letter/<name>.write-failed.json and cleans .retry.
+        env2 = Path(spool_dir) / "event-expire-1.json"
+        env2.write_text(
+            json.dumps({
+                "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST"},
+            }),
+            encoding="utf-8",
+        )
+        retry2 = Path(spool_dir) / "event-expire-1.json.retry"
+        retry2.write_text(
+            json.dumps({
+                "first_failed_at": time.time() - 7200,
+                "attempts": 4,
+                "next_retry_at": 0,
+                "last_error": "old 404",
+            }),
+            encoding="utf-8",
+        )
+        fail_mode["mode"] = "404"
+        cfg.drain_max_retry_age_seconds = 60.0
+        resolved4 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved4, 1)
+        self.assertFalse(env2.exists())
+        self.assertFalse(retry2.exists())
+        self.assertTrue(
+            (Path(spool_dir) / "dead-letter" / "event-expire-1.write-failed.json").is_file()
+        )
+
+    def test_ensure_drainer_skips_spawn_without_bigquery(self):
+        from bigquery_agent_analytics_tracing import logger as bq_logger
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_46_spec_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        state_dir = os.path.join(tmp_root, "state")
+        log_file = os.path.join(tmp_root, "spec.log")
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            state_dir=state_dir,
+            spool_dir=os.path.join(tmp_root, "spool"),
+            log_file=log_file,
+            dry_run=False,
+        )
+
+        orig_find_spec = importlib.util.find_spec
+        orig_popen = bq_logger.subprocess.Popen
+        saved_bq = sys.modules.pop("google.cloud.bigquery", None)
+        popens = []
+        env_backup = os.environ.copy()
+        try:
+            os.environ["BQAA_AUTO_DRAIN"] = "true"
+            os.environ.pop("BQAA_PYTHON", None)
+            importlib.util.find_spec = lambda name, *a, **kw: None if name == "google.cloud.bigquery" else orig_find_spec(name, *a, **kw)
+            bq_logger.subprocess.Popen = lambda *a, **kw: popens.append(a)
+            bq_logger._ensure_drainer(cfg)
+            bq_logger._ensure_drainer(cfg)
+        finally:
+            importlib.util.find_spec = orig_find_spec
+            bq_logger.subprocess.Popen = orig_popen
+            if saved_bq is not None:
+                sys.modules["google.cloud.bigquery"] = saved_bq
+            os.environ.clear()
+            os.environ.update(env_backup)
+
+        self.assertEqual(popens, [], "must not spawn drainer without google-cloud-bigquery")
+        log_lines = Path(log_file).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(log_lines), 1, f"expected single warning, got {log_lines}")
+
+    def test_missing_env_warns_once_per_session(self):
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_46_env_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        log_file = os.path.join(tmp_root, "missing_env.log")
+        env = {
+            "BQAA_TRACE_ENABLED": "true",
+            "BQAA_DRY_RUN": "false",
+            "BQAA_LOG_FILE": log_file,
+            "BQAA_STATE_DIR": os.path.join(tmp_root, "state"),
+            "BQAA_SPOOL_DIR": os.path.join(tmp_root, "spool"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "HOME": tmp_root,
+        }
+        payload = json.dumps({"session_id": "missing-env-s1", "cwd": tmp_root})
+        r1 = subprocess.run(
+            ["bash", str(DIST_DIR / "hooks" / "session_start.sh")],
+            input=payload, capture_output=True, text=True, env=env, timeout=30,
+        )
+        r2 = subprocess.run(
+            ["bash", str(DIST_DIR / "hooks" / "user_prompt_submit.sh")],
+            input=json.dumps({"session_id": "missing-env-s1", "prompt": "hi"}),
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(r1.returncode, 0)
+        self.assertEqual(r2.returncode, 0)
+        self.assertNotIn("Traceback", r1.stderr + r2.stderr)
+        lines = Path(log_file).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1, f"expected 1 session warning, got {lines}")
+        self.assertIn("BQAA_PROJECT_ID", lines[0])
+
+    def test_log_rotation_at_max_bytes_with_0600_mode(self):
+        from bigquery_agent_analytics_tracing._utils import log_to_file
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_46_rot_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        state_dir = Path(tmp_root) / "state"
+        log_path = state_dir / "bqaa.log"
+        backup_path = state_dir / "bqaa.log.1"
+
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            state_dir=str(state_dir),
+            spool_dir=os.path.join(tmp_root, "spool"),
+            log_file=str(log_path),
+            max_log_bytes=200,
+        )
+        for i in range(6):
+            log_to_file(cfg, f"entry-{i}-" + ("x" * 60))
+
+        self.assertTrue(backup_path.is_file(), "rotated backup bqaa.log.1 missing")
+        self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(backup_path.stat().st_mode), 0o600)
+        self.assertLess(log_path.stat().st_size, 320)
+
+    def test_session_start_and_setup_check_surface_spool_backlog(self):
+        from bigquery_agent_analytics_tracing import setup_check
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_46_setup_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        state_dir = Path(tmp_root) / "state"
+        spool_dir.mkdir(mode=0o700)
+        state_dir.mkdir(mode=0o700)
+        mm_dir = spool_dir / "dead-letter" / "destination-mismatch"
+        mm_dir.mkdir(parents=True, mode=0o700)
+
+        (spool_dir / "event-1.json").write_text("{}", encoding="utf-8")
+        (spool_dir / "event-1.json.retry").write_text(
+            json.dumps({"last_error": "404 Not found: Dataset test"}), encoding="utf-8"
+        )
+        (spool_dir / "dead-letter" / "event-2.write-failed.json").write_text("{}", encoding="utf-8")
+        (mm_dir / "event-3.destination-mismatch.json").write_text("{}", encoding="utf-8")
+
+        env = {
+            "BQAA_PROJECT_ID": "test-project",
+            "BQAA_DATASET": "test_dataset",
+            "BQAA_SPOOL_DIR": str(spool_dir),
+            "BQAA_STATE_DIR": str(state_dir),
+            "BQAA_TRACE_ENABLED": "true",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "HOME": tmp_root,
+        }
+        ss = subprocess.run(
+            ["bash", str(DIST_DIR / "hooks" / "session_start.sh")],
+            input=json.dumps({"session_id": "backlog-s1", "cwd": tmp_root}),
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(ss.returncode, 0)
+        msg = json.loads(ss.stdout)
+        self.assertIn("pending=1", msg["systemMessage"])
+        self.assertIn("deferred=1", msg["systemMessage"])
+        self.assertIn("dead-letter=2", msg["systemMessage"])
+
+        env_backup = os.environ.copy()
+        try:
+            os.environ.update(env)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                setup_check.main(["--json"])
+            report = json.loads(buf.getvalue())
+            self.assertEqual(report["spool_pending"], 1)
+            self.assertEqual(report["spool_deferred"], 1)
+            self.assertEqual(report["spool_dead_letter"], 2)
+            self.assertEqual(report["spool_destination_mismatch"], 1)
+            self.assertEqual(report["spool_last_error"], "404 Not found: Dataset test")
+        finally:
+            os.environ.clear()
+            os.environ.update(env_backup)
+
+    def test_compute_backoff_caps_large_attempts_without_overflow(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        cfg = BQAAConfig(project_id="p", dataset="d")
+        self.assertEqual(drain._compute_backoff_seconds(5000, cfg), 3600.0)
+
+
+class TestBuildDist39(unittest.TestCase):
+    """Issue #39: build_dist.sh --check verifies source/dist/tag/catalog integrity."""
+
+    def test_repo_build_dist_check_passes(self):
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        res = subprocess.run(
+            ["bash", str(SRC_DIR / "build_dist.sh"), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(res.returncode, 0, f"{res.stdout}\n{res.stderr}")
+
+    def test_tag_and_sync_invariants_in_temp_repo(self):
+        tmp_repo = Path(tempfile.mkdtemp(prefix="bqaa_39_git_"))
+        self.addCleanup(shutil.rmtree, tmp_repo, ignore_errors=True)
+        env = dict(
+            os.environ,
+            PYTHONDONTWRITEBYTECODE="1",
+            GIT_AUTHOR_NAME="Test",
+            GIT_AUTHOR_EMAIL="test@example.com",
+            GIT_COMMITTER_NAME="Test",
+            GIT_COMMITTER_EMAIL="test@example.com",
+        )
+
+        # Clone worktree into temp git repo with clean HEAD + uncommitted edits included.
+        for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
+            dst = tmp_repo / item
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                REPO_ROOT / item,
+                dst,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+
+        def _git(*args, cwd=tmp_repo):
+            return subprocess.run(
+                ["git", "-C", str(cwd), *args],
+                capture_output=True, text=True, env=env, check=True, timeout=30,
+            )
+
+        _git("init", "-q")
+        _git("add", "-A")
+        _git("commit", "-q", "-m", "initial")
+
+        dist_ver = json.loads(
+            (tmp_repo / "plugins/claude_code_dist/bigquery-agent-analytics-tracing/.claude-plugin/plugin.json").read_text()
+        )["version"]
+        _git("tag", f"tracing-v{dist_ver}")
+
+        # 1. Unrelated commit after release tag stays valid.
+        (tmp_repo / "UNRELATED.txt").write_text("ok\n", encoding="utf-8")
+        _git("add", "UNRELATED.txt")
+        _git("commit", "-q", "-m", "unrelated change")
+        ok_res = subprocess.run(
+            ["bash", str(tmp_repo / "plugins/claude_code/build_dist.sh"), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(ok_res.returncode, 0, f"{ok_res.stdout}\n{ok_res.stderr}")
+
+        # 2. Editing source without syncing dist must fail.
+        readme = tmp_repo / "plugins/claude_code/README.md"
+        readme.write_text(readme.read_text() + "\n# drift\n", encoding="utf-8")
+        drift_res = subprocess.run(
+            ["bash", str(tmp_repo / "plugins/claude_code/build_dist.sh"), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(drift_res.returncode, 0)
+
+        # 3. Syncing dist without bumping version after release tag must fail.
+        subprocess.run(
+            ["bash", str(tmp_repo / "plugins/claude_code/build_dist.sh"),
+             str(tmp_repo / "plugins/claude_code_dist/bigquery-agent-analytics-tracing")],
+            check=True, capture_output=True, text=True, env=env, timeout=30,
+        )
+        same_tag_res = subprocess.run(
+            ["bash", str(tmp_repo / "plugins/claude_code/build_dist.sh"), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(same_tag_res.returncode, 0)
+        self.assertIn("changed since release tag", same_tag_res.stdout)
+
+        # 4. HEAD release tag or GITHUB_REF_NAME mismatch must fail even when version > old tag.
+        _git("commit", "-q", "-a", "-m", "synced edit")
+        _git("tag", f"tracing-v{dist_ver}-rc1")
+        rc_res = subprocess.run(
+            ["bash", str(tmp_repo / "plugins/claude_code/build_dist.sh"), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(rc_res.returncode, 0)
+        self.assertIn("HEAD carries release tag", rc_res.stdout)
+
+        env_ref = dict(env, GITHUB_REF_NAME="tracing-v9.9.9")
+        ref_res = subprocess.run(
+            ["bash", str(tmp_repo / "plugins/claude_code/build_dist.sh"), "--check"],
+            capture_output=True, text=True, env=env_ref, timeout=30,
+        )
+        self.assertNotEqual(ref_res.returncode, 0)
+        self.assertIn("GITHUB_REF_NAME=", ref_res.stdout)
 
 
 if __name__ == "__main__":

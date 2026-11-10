@@ -186,6 +186,90 @@ def check_catalog(root: Path, problems: list[Problem]) -> int:
     return len(entries)
 
 
+TRACING_SRC_REL = Path("plugins/claude_code")
+TRACING_DIST_REL = Path("plugins/claude_code_dist/bigquery-agent-analytics-tracing")
+TRACING_SHARED_FILES = ("MARKETPLACE.md", "commands/bqaa-setup.md", "scripts/run_setup_check.sh")
+
+
+def check_tracing_sync(root: Path, problems: list[Problem]) -> int:
+    """Keep plugins/claude_code and the tracing marketplace copy in sync."""
+    src_dir = root / TRACING_SRC_REL
+    dist_dir = root / TRACING_DIST_REL
+    if not src_dir.is_dir() or not dist_dir.is_dir():
+        return 0
+    checks = 0
+    src_manifest_path = src_dir / MANIFEST
+    dist_manifest_path = dist_dir / MANIFEST
+    src_manifest = load_json(root, src_manifest_path, problems) if src_manifest_path.is_file() else None
+    dist_manifest = load_json(root, dist_manifest_path, problems) if dist_manifest_path.is_file() else None
+    if isinstance(src_manifest, dict) and isinstance(dist_manifest, dict):
+        checks += 1
+        for key in sorted(set(src_manifest) | set(dist_manifest)):
+            if key == "version":
+                continue
+            if src_manifest.get(key) != dist_manifest.get(key):
+                problems.append((
+                    rel(root, dist_manifest_path), 0,
+                    f"{key} differs from {rel(root, src_manifest_path)}",
+                ))
+        dist_ver = dist_manifest.get("version")
+        vendor_dir = dist_dir / "vendor"
+        if isinstance(dist_ver, str) and vendor_dir.is_dir():
+            checks += 1
+            infos = sorted(vendor_dir.glob("bigquery_agent_analytics_tracing-*.dist-info"))
+            expected_info = vendor_dir / f"bigquery_agent_analytics_tracing-{dist_ver}.dist-info"
+            if len(infos) != 1 or infos[0] != expected_info:
+                problems.append((
+                    rel(root, vendor_dir), 0,
+                    f"expected {expected_info.name}, found {[p.name for p in infos]}",
+                ))
+            else:
+                meta = expected_info / "METADATA"
+                if not meta.is_file():
+                    problems.append((rel(root, meta), 0, "missing METADATA"))
+                elif f"Version: {dist_ver}" not in meta.read_text(encoding="utf-8").splitlines():
+                    problems.append((rel(root, meta), 0, f"METADATA lacks Version: {dist_ver}"))
+    src_hooks = src_dir / "hooks"
+    dist_hooks = dist_dir / "hooks"
+    if src_hooks.is_dir() and dist_hooks.is_dir():
+        checks += 1
+        src_sh = {p.name for p in src_hooks.glob("*.sh")}
+        dist_sh = {p.name for p in dist_hooks.glob("*.sh")}
+        for missing in sorted(src_sh - dist_sh):
+            problems.append((rel(root, dist_hooks), 0, f"missing hook script {missing} from {rel(root, src_hooks)}"))
+        for extra in sorted(dist_sh - src_sh):
+            problems.append((rel(root, dist_hooks), 0, f"extra hook script {extra} not in {rel(root, src_hooks)}"))
+        for name in sorted(src_sh & dist_sh):
+            s_path, d_path = src_hooks / name, dist_hooks / name
+            if s_path.read_bytes() != d_path.read_bytes() or (s_path.stat().st_mode & 0o111) != (d_path.stat().st_mode & 0o111):
+                problems.append((rel(root, d_path), 0, f"hook {name} differs from {rel(root, s_path)}"))
+    for rel_file in TRACING_SHARED_FILES:
+        s_path, d_path = src_dir / rel_file, dist_dir / rel_file
+        if s_path.is_file() != d_path.is_file():
+            checks += 1
+            missing = d_path if s_path.is_file() else s_path
+            problems.append((rel(root, missing), 0, f"missing counterpart for {rel_file}"))
+        elif s_path.is_file() and d_path.is_file():
+            checks += 1
+            if s_path.read_bytes() != d_path.read_bytes() or (s_path.stat().st_mode & 0o111) != (d_path.stat().st_mode & 0o111):
+                problems.append((rel(root, d_path), 0, f"differs from {rel(root, s_path)}"))
+    src_readme = src_dir / "README.md"
+    dist_readme = dist_dir / "README.md"
+    if src_readme.is_file() != dist_readme.is_file():
+        checks += 1
+        missing = dist_readme if src_readme.is_file() else src_readme
+        problems.append((rel(root, missing), 0, "missing counterpart for README.md"))
+    elif src_readme.is_file() and dist_readme.is_file():
+        checks += 1
+        expected_dist_readme = src_readme.read_text(encoding="utf-8").replace(
+            "(../../.claude-plugin/marketplace.json)",
+            "(../../../.claude-plugin/marketplace.json)",
+        )
+        if dist_readme.read_text(encoding="utf-8") != expected_dist_readme:
+            problems.append((rel(root, dist_readme), 0, f"differs from {rel(root, src_readme)}"))
+    return checks
+
+
 # --- Markdown links ---------------------------------------------------------
 
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -427,6 +511,7 @@ def main(argv: list[str]) -> int:
     files = list_files(root)
     problems: list[Problem] = []
     entries = check_catalog(root, problems)
+    check_tracing_sync(root, problems)
     json_files = check_json_files(root, files, problems)
     md_files, links = check_markdown(root, files, problems)
     text_files = check_stale_references(root, files, problems)
