@@ -20,6 +20,9 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
+import { buildRow } from '../hooks/lib/rows.ts'
+import { newStats, redactText } from '../hooks/lib/sanitize.ts'
+
 import { COMMAND, OPTIONS, type Row, type World, byType, deadLetterFiles, deadLetterRows, setUp, startSession } from './helpers.ts'
 
 const CANARY = ['canary', 'value', 'r'.repeat(12)].join('-')
@@ -353,4 +356,176 @@ test('a tool payload key named redaction has its value redacted, while the row s
   expect(JSON.stringify(row)).not.toContain('hunter2')
   // The key's value and the credential: two values, nothing past them.
   expect((JSON.parse(row?.attributes ?? '{}') as { redaction?: unknown }).redaction).toEqual({ values: 2, dropped_chars: 0 })
+})
+
+test('CLI flags, positional secrets, Markdown labels/tables, code configs, armor, and slash/query URL userinfo redact cleanly while preserving safe lookalikes', () => {
+  const s = 's3cr3tXyZ9'
+  const mustRedact: [string, RegExp][] = [
+    [`mysql -u root -p${s} app`, /mysql -u root -p\[REDACTED\] app/],
+    [`mysql -u root -p ${s} app`, /mysql -u root -p \[REDACTED\] app/],
+    [`psql -U postgres -W ${s} -h localhost`, /psql -U postgres -W \[REDACTED\] -h localhost/],
+    [`redis-cli -h host -a ${s} ping`, /redis-cli -h host -a \[REDACTED\] ping/],
+    [`mongosh -u root -p ${s}`, /mongosh -u root -p \[REDACTED\]/],
+    [`sqlcmd -S host -U sa -P ${s}`, /sqlcmd -S host -U sa -P \[REDACTED\]/],
+    [`twine upload -u __token__ -p ${s} dist/*`, /twine upload -u __token__ -p \[REDACTED\] dist\/\*/],
+    [`zip -P ${s} out.zip file.txt`, /zip -P \[REDACTED\] out\.zip file\.txt/],
+    [`curl -u admin:${s} https://api.example.com/v1/items`, /curl -u admin:\[REDACTED\] https:\/\/api\.example\.com\/v1\/items/],
+    [`curl --user admin:${s} https://api.example.com/v1/items`, /curl --user admin:\[REDACTED\] https:\/\/api\.example\.com\/v1\/items/],
+    [`docker login -u ci -p ${s} registry.example.com`, /docker login -u ci -p \[REDACTED\] registry\.example\.com/],
+    [`sshpass -p ${s} ssh root@db.internal uptime`, /sshpass -p \[REDACTED\] ssh root@db\.internal uptime/],
+    [`aws secretsmanager put-secret-value --secret-id prod/db --secret-string ${s}`, /--secret-id prod\/db --secret-string \[REDACTED\]/],
+    [`aws ssm put-parameter --name /db/pw --value ${s}`, /--name \/db\/pw --value \[REDACTED\]/],
+    [`gh secret set DB_PASS --body ${s}`, /gh secret set DB_PASS --body \[REDACTED\]/],
+    [`vault kv put secret/db value=${s}`, /vault kv put secret\/db value=\[REDACTED\]/],
+    [`aws configure set aws_secret_access_key ${s}`, /aws configure set aws_secret_access_key \[REDACTED\]/],
+    [`git config --global user.password ${s}`, /git config --global user\.password \[REDACTED\]/],
+    [`ENV DB_PASSWORD ${s}`, /ENV DB_PASSWORD \[REDACTED\]/],
+    [`**Password**: ${s}`, /\*\*Password\*\*: \[REDACTED\]/],
+    [`**Password:** ${s}`, /\*\*Password:\*\* \[REDACTED\]/],
+    [`__api_key__: ${s}`, /__api_key__: \[REDACTED\]/],
+    [`\`password\`: \`${s}\``, /`password`: `\[REDACTED\]`/],
+    [`Password (staging): ${s}`, /Password \(staging\): \[REDACTED\]/],
+    [`| \`DB_PASSWORD\` | \`${s}\` |`, /\| `DB_PASSWORD` \| `\[REDACTED\]` \|/],
+    [`| Setting | Value |\n| --- | --- |\n| api_key | ${s} |\n| region | us-central1 |`, /\| api_key \| \[REDACTED\] \|\n\| region \| us-central1 \|/],
+    [`os.environ["DB_PASSWORD"] = "${s}"`, /os\.environ\["DB_PASSWORD"\] = "\[REDACTED\]"/],
+    [`os.environ.setdefault("API_KEY", "${s}")`, /^os\.environ\.setdefault\("API_KEY", "\[REDACTED\]"\)$/],
+    [`process.env["API_KEY"] = "${s}"`, /process\.env\["API_KEY"\] = "\[REDACTED\]"/],
+    [`client.setPassword("${s}")`, /client\.setPassword\("\[REDACTED\]"\)/],
+    [`withApiKey("${s}")`, /withApiKey\("\[REDACTED\]"\)/],
+    [`<password>${s}</password>`, /<password>\[REDACTED\]<\/password>/],
+    [`CREATE USER 'app'@'%' IDENTIFIED BY '${s}';`, /CREATE USER 'app'@'%' IDENTIFIED BY '\[REDACTED\]';/],
+    [`machine api.example.com\nlogin admin\npassword ${s}`, /password \[REDACTED\]/],
+    [`-----BEGIN PGP PRIVATE KEY BLOCK-----\nsecretBody\n-----END PGP PRIVATE KEY BLOCK-----`, /^\[REDACTED:private-key\]$/],
+    [`PuTTY-User-Key-File-2: ssh-rsa\nPrivate-Lines: 2\n${s}Line1\n${s}Line2\nPrivate-MAC: deadbeef`, /^\[REDACTED:private-key\]$/],
+    ['AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ4J6M3W', /^\[REDACTED:private-key\]$/],
+    ['foo.eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U', /^foo\.\[REDACTED:jwt\]$/],
+    ['x=.eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U', /^x=\.\[REDACTED:jwt\]$/],
+    ['token=.eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U', /^token=\[REDACTED\]$/],
+    [`postgres://app:abc/${s}@db.internal:5432/app`, /^postgres:\/\/\[REDACTED\]@db\.internal:5432\/app$/],
+    [`https://user:p?a=1#${s}@example.com/path`, /^https:\/\/\[REDACTED\]@example\.com\/path$/],
+    [`http://user:${s}@[::1]:8080/api`, /^http:\/\/\[REDACTED\]@\[::1\]:8080\/api$/],
+  ]
+  for (const [input, pattern] of mustRedact) {
+    const stats1 = newStats()
+    const out1 = redactText(input, stats1)
+    expect(out1).not.toContain(s)
+    expect(out1).toMatch(pattern)
+    expect(stats1.redactions > 0).toBe(true)
+    const stats2 = newStats()
+    const out2 = redactText(out1, stats2)
+    expect(out2).toBe(out1)
+    expect(stats2.redactions).toBe(0)
+  }
+
+  const keepUntouched = [
+    'mkdir -p /tmp/foo/bar',
+    'docker run -p 8080:80 nginx',
+    'claude -p hello',
+    'git config --global credential.helper store',
+    'psql -p 5432 -U postgres',
+    'https://www.npmjs.com/package/@types/node',
+    'https://medium.com/@username/post',
+    'https://api.example.com:8443/v1?email=alice@example.com',
+  ]
+  for (const input of keepUntouched) {
+    const stats = newStats()
+    expect(redactText(input, stats)).toBe(input)
+    expect(stats.redactions).toBe(0)
+  }
+})
+
+test('multi-line YAML block scalars, K8s name/value pairs, and prose-embedded multi-line JSON redact nested secrets whole while preserving siblings', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  const prompts = [
+    'password: |\n  hunter2Line1\n\n  hunter2Line2\nuser: admin',
+    '- name: DB_PASSWORD\n  value: myK8sSecret99\n- name: LOG_LEVEL\n  value: info',
+    'Config:\n{\n  "api_keys": [\n    "Zq8wLmN4pT7vKc2R",\n    "Yx5nQpM9kR2wLs8T"\n  ],\n  "region": "us-central1"\n}',
+  ]
+  const shown = await promptRows($, world, prompts)
+  expect(shown[0]!.summary).toBe('password: [REDACTED]\nuser: admin')
+  expect(shown[1]!.summary).toBe('- name: DB_PASSWORD\n  value: [REDACTED]\n- name: LOG_LEVEL\n  value: info')
+  expect(shown[2]!.summary).toContain('Config:\n{')
+  expect(shown[2]!.summary).toContain('"region": "us-central1"')
+  for (const leaked of ['hunter2Line1', 'hunter2Line2', 'myK8sSecret99', 'Zq8wLmN4pT7vKc2R', 'Yx5nQpM9kR2wLs8T']) {
+    expect(JSON.stringify(world.acceptedRows())).not.toContain(leaked)
+  }
+})
+
+test('ordinary English prose after "basic" stays untouched while real Basic/Bearer headers and user:pass Base64 credentials redact', () => {
+  for (const prose of [
+    'The API uses basic authentication over TLS.',
+    'Here is a basic implementation of the parser.',
+    'Add basic troubleshooting steps to the README.',
+    'Follow the Basic configuration guide below.',
+  ]) {
+    const stats = newStats()
+    expect(redactText(prose, stats)).toBe(prose)
+    expect(stats.redactions).toBe(0)
+  }
+
+  for (const [cred, expected] of [
+    ['Authorization: Basic dXNlcjpwYXNz', 'Authorization: [REDACTED]'],
+    ['Proxy-Authorization: Basic secretwordonly', 'Proxy-Authorization: [REDACTED]'],
+    ['Basic YWRtaW46c2VjcmV0', 'Basic [REDACTED]'],
+    ['Bearer tok_abc123def456', 'Bearer [REDACTED]'],
+  ] as const) {
+    const stats = newStats()
+    expect(redactText(cred, stats)).toBe(expected)
+    expect(stats.redactions).toBe(1)
+  }
+})
+
+test('unclosed PEM and PGP private-key headers mark row.is_truncated and count dropped_chars', () => {
+  const pemText = 'A PKCS#8 key starts with -----BEGIN PRIVATE KEY----- and ends with a matching footer line. Check both before you parse it, and never log the body.'
+  const pemBuilt = buildRow({
+    eventType: 'AGENT_RESPONSE',
+    timestampMs: 0,
+    eventId: 'e1',
+    agent: 'a',
+    sessionId: 's',
+    invocationId: 'i',
+    userId: 'u',
+    traceId: 't',
+    spanId: 'p',
+    parentSpanId: null,
+    content: { response: pemText },
+    attributes: {},
+    maxPayloadChars: 16384,
+  })
+  expect(pemBuilt.row.is_truncated).toBe(true)
+  expect(JSON.parse(pemBuilt.row.content ?? '{}').response).toBe('A PKCS#8 key starts with [REDACTED:private-key]')
+  expect(JSON.parse(pemBuilt.row.attributes ?? '{}').redaction).toEqual({ values: 1, dropped_chars: 94 })
+
+  const pgpText = 'Header -----BEGIN PGP PRIVATE KEY BLOCK----- trailing text dropped'
+  const pgpStats = newStats()
+  expect(redactText(pgpText, pgpStats)).toBe('Header [REDACTED:private-key]')
+  expect(pgpStats.truncated).toBe(true)
+  expect(pgpStats.redactions).toBe(1)
+  expect(pgpStats.droppedChars).toBe(' trailing text dropped'.length)
+})
+
+test('redactText stays linear (O(N) <= 100 ms at n=80000) across adversarial backtracking shapes', () => {
+  const generators: Record<string, (n: number) => string> = {
+    'url + dots + x': n => 'see http://h/' + '.'.repeat(n) + 'x',
+    'eyJ-eyJ': n => 'eyJ' + 'aaaaaaaa-eyJ'.repeat((n / 12) | 0),
+    'backslash CR LF': n => '\\\r\n'.repeat((n / 3) | 0),
+    'trail-parens': n => 'https://example.com/' + '('.repeat(n),
+    'brace-chain': n => '{'.repeat(n),
+  }
+  for (const [label, gen] of Object.entries(generators)) {
+    const inp10 = gen(10_000)
+    const inp80 = gen(80_000)
+    const t0 = performance.now()
+    redactText(inp10, newStats())
+    const ms10 = Math.max(0.1, performance.now() - t0)
+    const t1 = performance.now()
+    redactText(inp80, newStats())
+    const ms80 = performance.now() - t1
+    expect({
+      label,
+      under100ms: ms80 < 100,
+      linearScaling: ms80 <= Math.max(25, ms10 * 20),
+    }).toEqual({ label, under100ms: true, linearScaling: true })
+  }
 })
