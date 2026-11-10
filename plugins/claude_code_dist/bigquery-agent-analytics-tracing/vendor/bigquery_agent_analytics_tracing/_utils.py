@@ -23,11 +23,14 @@ from datetime import datetime
 from datetime import timezone
 import errno
 import fcntl
+import fnmatch
+import getpass
 import hashlib
 import json
 import os
 from pathlib import Path
 import stat
+import tempfile
 import time
 from typing import Any, TYPE_CHECKING
 import uuid
@@ -756,3 +759,584 @@ def inspect_spool_status(spool_dir: str | os.PathLike[str]) -> dict[str, Any]:
   except (OSError, RuntimeError) as exc:
     status["error"] = str(exc)
   return status
+
+
+_MAX_LEGACY_FILE_BYTES = 10 * 1024 * 1024  # 10 MiB cap per legacy JSON file.
+_MAX_LEGACY_UNSAFE_ENTRIES = 10
+
+
+def _default_temp_root() -> str:
+  for var in ("TMPDIR", "TEMP", "TMP"):
+    val = os.environ.get(var)
+    if val:
+      return val
+  return tempfile.gettempdir()
+
+
+def _legacy_user_tag() -> str:
+  getuid = getattr(os, "getuid", None)
+  if getuid is not None:
+    return str(getuid())
+  try:
+    name = getpass.getuser()
+  except Exception:
+    name = ""
+  tag = "".join(ch for ch in name if ch.isalnum() or ch in "._-")
+  return tag or f"pid{os.getpid()}"
+
+
+def legacy_default_state_dir() -> Path:
+  """Return the v0.1.0 shared default state directory path."""
+  explicit = os.environ.get("BQAA_LEGACY_STATE_DIR", "").strip()
+  if explicit:
+    return Path(explicit).expanduser()
+  return Path(_default_temp_root()) / "bqaa-agent-tracing"
+
+
+def legacy_default_spool_dir() -> Path:
+  """Return the v0.1.0 shared default spool directory path."""
+  return legacy_default_state_dir() / "spool"
+
+
+def _is_default_user_dir(
+    path: str | os.PathLike[str] | None, *, is_spool: bool
+) -> bool:
+  if path is None:
+    return True
+  target = os.path.abspath(os.path.expanduser(str(path)))
+  tag = f"bqaa-agent-tracing-{_legacy_user_tag()}"
+  for root in {tempfile.gettempdir(), _default_temp_root()}:
+    candidate = os.path.join(root, tag, "spool") if is_spool else os.path.join(root, tag)
+    if target == os.path.abspath(candidate):
+      return True
+  return False
+
+
+def resolve_legacy_state_dir(
+    state_dir: str | os.PathLike[str] | None = None,
+    *,
+    legacy_state_dir: str | os.PathLike[str] | None = None,
+) -> Path | None:
+  """Return the legacy state dir if migration should inspect it, else None."""
+  if legacy_state_dir is not None:
+    candidate = Path(legacy_state_dir).expanduser()
+  elif os.environ.get("BQAA_LEGACY_STATE_DIR", "").strip():
+    candidate = legacy_default_state_dir()
+  elif (
+      not os.environ.get("BQAA_STATE_DIR", "").strip()
+      and _is_default_user_dir(state_dir, is_spool=False)
+  ):
+    candidate = legacy_default_state_dir()
+  else:
+    return None
+  if state_dir is not None and os.path.abspath(
+      os.path.expanduser(str(state_dir))
+  ) == os.path.abspath(str(candidate)):
+    return None
+  return candidate
+
+
+def resolve_legacy_spool_dir(
+    spool_dir: str | os.PathLike[str] | None = None,
+    *,
+    legacy_spool_dir: str | os.PathLike[str] | None = None,
+) -> Path | None:
+  """Return the legacy spool dir if migration should inspect it, else None."""
+  if legacy_spool_dir is not None:
+    candidate = Path(legacy_spool_dir).expanduser()
+  elif os.environ.get("BQAA_LEGACY_STATE_DIR", "").strip():
+    candidate = legacy_default_spool_dir()
+  elif (
+      not os.environ.get("BQAA_SPOOL_DIR", "").strip()
+      and _is_default_user_dir(spool_dir, is_spool=True)
+  ):
+    candidate = legacy_default_spool_dir()
+  else:
+    return None
+  if spool_dir is not None and os.path.abspath(
+      os.path.expanduser(str(spool_dir))
+  ) == os.path.abspath(str(candidate)):
+    return None
+  return candidate
+
+
+def _open_verified_legacy_dir(path: str | os.PathLike[str]) -> PrivateDir:
+  """Open a legacy directory securely via O_NOFOLLOW + owner/mode checks."""
+  return open_existing_private_dir(path)
+
+
+def _open_verified_legacy_spool_dir(legacy_spool: Path) -> PrivateDir:
+  """Open legacy spool dir after verifying its parent when nested under state."""
+  if legacy_spool.name == "spool" and os.path.lexists(legacy_spool.parent):
+    with _open_verified_legacy_dir(legacy_spool.parent) as parent:
+      if parent.fd is not None:
+        return _open_private_dir(legacy_spool, "spool", parent.fd)
+  return _open_verified_legacy_dir(legacy_spool)
+
+
+def _check_legacy_file_stat(
+    info: os.stat_result, path: Path, *, max_bytes: int = _MAX_LEGACY_FILE_BYTES
+) -> None:
+  euid = _euid()
+  if not stat.S_ISREG(info.st_mode):
+    problem = "is not a regular file"
+  elif euid is not None and info.st_uid != euid:
+    problem = f"is owned by uid {info.st_uid}, not {euid}"
+  elif info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    problem = "is writable by its group or other users"
+  elif info.st_nlink != 1:
+    problem = f"has {info.st_nlink} hard links (expected 1)"
+  elif info.st_size > max_bytes:
+    problem = f"exceeds max size ({info.st_size} > {max_bytes} bytes)"
+  else:
+    return
+  raise PermissionError(
+      f"Refusing legacy BQAA tracing file {path}: it {problem}."
+  )
+
+
+def _read_verified_legacy_file(
+    directory: PrivateDir,
+    name: str,
+    *,
+    max_bytes: int = _MAX_LEGACY_FILE_BYTES,
+) -> bytes:
+  """Read ``name`` inside ``directory`` only if owned, regular, non-symlink, single-link, non-writable by group/other."""
+  if not name or "/" in name or "\\" in name or name in (".", ".."):
+    raise PermissionError(f"Refusing unsafe legacy filename: {name!r}")
+  target, at = directory._at(name)
+  try:
+    fd = _open_nofollow(target, os.O_RDONLY, 0o600, **at)
+  except OSError as exc:
+    if exc.errno in (errno.ELOOP, errno.EMLINK):
+      raise PermissionError(
+          f"Refusing legacy BQAA tracing file {directory.path / name}: it is a"
+          " symlink."
+      ) from exc
+    raise
+  try:
+    info = os.fstat(fd)
+    _check_legacy_file_stat(info, directory.path / name, max_bytes=max_bytes)
+    with os.fdopen(fd, "rb", closefd=True) as handle:
+      fd = -1
+      data = handle.read(max_bytes + 1)
+    if len(data) > max_bytes:
+      raise PermissionError(
+          f"Refusing legacy BQAA tracing file {directory.path / name}: exceeds"
+          f" max size ({max_bytes} bytes)."
+      )
+    return data
+  finally:
+    if fd >= 0:
+      os.close(fd)
+
+
+def _same_private_dir(a: PrivateDir, b: PrivateDir) -> bool:
+  if a.fd is not None and b.fd is not None:
+    sa, sb = os.fstat(a.fd), os.fstat(b.fd)
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+  return os.path.abspath(str(a.path)) == os.path.abspath(str(b.path))
+
+
+def _write_atomic_private_bytes(
+    directory: PrivateDir, name: str, data: bytes
+) -> None:
+  tmp_name = f".migrate.{name}.{os.getpid()}.tmp"
+  fd = directory.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+  try:
+    if hasattr(os, "fchmod"):
+      os.fchmod(fd, 0o600)
+    view = memoryview(data)
+    while view:
+      written = os.write(fd, view)
+      view = view[written:]
+    os.fsync(fd)
+  except BaseException:
+    os.close(fd)
+    try:
+      directory.unlink(tmp_name)
+    except OSError:
+      pass
+    raise
+  os.close(fd)
+  directory.replace(tmp_name, name)
+
+
+def _read_private_bytes(directory: PrivateDir, name: str) -> bytes | None:
+  try:
+    fd = directory.open(name, os.O_RDONLY)
+  except FileNotFoundError:
+    return None
+  except OSError:
+    return None
+  with os.fdopen(fd, "rb", closefd=True) as handle:
+    return handle.read(_MAX_LEGACY_FILE_BYTES + 1)
+
+
+def migrate_legacy_session_state(
+    dst_dir: PrivateDir,
+    safe_key: str,
+    *,
+    legacy_state_dir: str | os.PathLike[str] | None = None,
+) -> int:
+  """Safely migrate owned v0.1.0 ``state_<key>.json`` and ``tool_<key>_*.json`` into ``dst_dir``."""
+  legacy_path = resolve_legacy_state_dir(
+      dst_dir.path, legacy_state_dir=legacy_state_dir
+  )
+  if legacy_path is None or not os.path.lexists(legacy_path):
+    return 0
+  try:
+    legacy = _open_verified_legacy_dir(legacy_path)
+  except (OSError, RuntimeError):
+    return 0
+  migrated = 0
+  with legacy:
+    if _same_private_dir(legacy, dst_dir):
+      return 0
+    tool_prefix = f"tool_{safe_key}_"
+    candidates = [f"state_{safe_key}.json"]
+    try:
+      for entry in sorted(legacy.names()):
+        if entry.startswith(tool_prefix) and entry.endswith(".json"):
+          candidates.append(entry)
+    except OSError:
+      return 0
+    existing_candidates = [name for name in candidates if legacy.exists(name)]
+    if not existing_candidates:
+      return 0
+    lock_fd = dst_dir.open(".migrate.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+      fcntl.flock(lock_fd, fcntl.LOCK_EX)
+      for fname in existing_candidates:
+        if not legacy.exists(fname):
+          continue
+        try:
+          raw = _read_verified_legacy_file(legacy, fname)
+          text = raw.decode("utf-8", "strict")
+        except (OSError, UnicodeDecodeError):
+          continue
+        parsed = safe_json_loads(text, None)
+        if not isinstance(parsed, dict):
+          continue
+        if dst_dir.exists(fname):
+          cur_bytes = _read_private_bytes(dst_dir, fname)
+          if cur_bytes == raw:
+            try:
+              legacy.unlink(fname)
+            except OSError:
+              pass
+          continue
+        _write_atomic_private_bytes(dst_dir, fname, raw)
+        try:
+          legacy.unlink(fname)
+        except FileNotFoundError:
+          pass
+        migrated += 1
+    finally:
+      try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+      except OSError:
+        pass
+      try:
+        os.close(lock_fd)
+      except OSError:
+        pass
+  return migrated
+
+
+def migrate_legacy_spool(
+    spool_dir: str | os.PathLike[str],
+    *,
+    legacy_spool_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+  """Safely import owned v0.1.0 spooled envelopes into ``spool_dir`` without duplicates."""
+  result: dict[str, Any] = {
+      "migrated": 0,
+      "unsafe_skipped": 0,
+      "unsafe_entries": [],
+      "skipped_reasons": {},
+      "error": None,
+  }
+  legacy_path = resolve_legacy_spool_dir(
+      spool_dir, legacy_spool_dir=legacy_spool_dir
+  )
+  if legacy_path is None or not os.path.lexists(legacy_path):
+    return result
+  try:
+    legacy = _open_verified_legacy_spool_dir(legacy_path)
+  except (OSError, RuntimeError) as exc:
+    result["error"] = str(exc)
+    return result
+
+  with legacy:
+    try:
+      event_names = sorted(
+          n for n in legacy.names() if fnmatch.fnmatchcase(n, "event-*.json")
+      )
+    except OSError as exc:
+      result["error"] = str(exc)
+      return result
+    if not event_names:
+      return result
+
+    with ensure_private_dir(spool_dir) as dst:
+      if _same_private_dir(legacy, dst):
+        return result
+      lock_fd = dst.open(".migrate.lock", os.O_CREAT | os.O_RDWR, 0o600)
+      try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        for name in event_names:
+          if not legacy.exists(name):
+            continue
+          try:
+            raw = _read_verified_legacy_file(legacy, name)
+            parsed = safe_json_loads(raw.decode("utf-8", "strict"), None)
+          except (OSError, UnicodeDecodeError) as exc:
+            result["unsafe_skipped"] += 1
+            reason = str(exc)
+            result["skipped_reasons"][name] = reason
+            if len(result["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
+              result["unsafe_entries"].append(f"{legacy_path / name}: {reason}")
+            continue
+          if not isinstance(parsed, dict):
+            result["unsafe_skipped"] += 1
+            reason = "not a JSON object envelope"
+            result["skipped_reasons"][name] = reason
+            if len(result["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
+              result["unsafe_entries"].append(f"{legacy_path / name}: {reason}")
+            continue
+
+          retry_name = f"{name}.retry"
+          retry_bytes: bytes | None = None
+          if legacy.exists(retry_name):
+            try:
+              retry_bytes = _read_verified_legacy_file(legacy, retry_name)
+            except OSError as exc:
+              result["unsafe_skipped"] += 1
+              reason = f"unsafe retry sidecar: {exc}"
+              result["skipped_reasons"][name] = reason
+              if len(result["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
+                result["unsafe_entries"].append(
+                    f"{legacy_path / retry_name}: {reason}"
+                )
+              continue
+
+          dst_name = name
+          if dst.exists(dst_name):
+            existing = _read_private_bytes(dst, dst_name)
+            if existing == raw:
+              try:
+                legacy.unlink(name)
+              except FileNotFoundError:
+                pass
+              if retry_bytes is not None:
+                try:
+                  legacy.unlink(retry_name)
+                except (FileNotFoundError, OSError):
+                  pass
+              continue
+            digest = hashlib.sha256(raw).hexdigest()[:12]
+            dst_name = f"event-legacy-{digest}-{name[len('event-'):]}"
+            if dst.exists(dst_name):
+              existing_dedup = _read_private_bytes(dst, dst_name)
+              if existing_dedup == raw:
+                try:
+                  legacy.unlink(name)
+                except FileNotFoundError:
+                  pass
+                if retry_bytes is not None:
+                  try:
+                    legacy.unlink(retry_name)
+                  except (FileNotFoundError, OSError):
+                    pass
+                continue
+
+          if retry_bytes is not None and not dst.exists(f"{dst_name}.retry"):
+            _write_atomic_private_bytes(dst, f"{dst_name}.retry", retry_bytes)
+          _write_atomic_private_bytes(dst, dst_name, raw)
+          try:
+            legacy.unlink(name)
+          except FileNotFoundError:
+            pass
+          if retry_bytes is not None:
+            try:
+              legacy.unlink(retry_name)
+            except (FileNotFoundError, OSError):
+              pass
+          result["migrated"] += 1
+      finally:
+        try:
+          fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+          pass
+        try:
+          os.close(lock_fd)
+        except OSError:
+          pass
+  return result
+
+
+def _inspect_legacy_file_safe(
+    directory: PrivateDir, name: str, *, require_json_dict: bool = False
+) -> str | None:
+  """Return None if ``name`` passes legacy security checks, else reason string."""
+  try:
+    raw = _read_verified_legacy_file(directory, name)
+    if require_json_dict:
+      parsed = safe_json_loads(raw.decode("utf-8", "strict"), None)
+      if not isinstance(parsed, dict):
+        return "not a JSON object"
+  except (OSError, UnicodeDecodeError) as exc:
+    return str(exc)
+  return None
+
+
+def inspect_legacy_backlog(
+    state_dir: str | os.PathLike[str] | None = None,
+    spool_dir: str | os.PathLike[str] | None = None,
+    *,
+    legacy_state_dir: str | os.PathLike[str] | None = None,
+    legacy_spool_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+  """Read-only summary of remaining or unsafe v0.1.0 legacy state and spool files."""
+  legacy_state = resolve_legacy_state_dir(
+      state_dir, legacy_state_dir=legacy_state_dir
+  )
+  legacy_spool = resolve_legacy_spool_dir(
+      spool_dir, legacy_spool_dir=legacy_spool_dir
+  )
+  summary: dict[str, Any] = {
+      "legacy_dir": str(legacy_state) if legacy_state else None,
+      "legacy_spool_dir": str(legacy_spool) if legacy_spool else None,
+      "state_count": 0,
+      "pending_count": 0,
+      "deferred_count": 0,
+      "dead_letter_count": 0,
+      "unsafe_count": 0,
+      "unsafe_entries": [],
+      "error": None,
+  }
+
+  def _record_unsafe(entry_path: Path, reason: str) -> None:
+    summary["unsafe_count"] += 1
+    if len(summary["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
+      summary["unsafe_entries"].append(f"{entry_path}: {reason}")
+
+  state_checked_spool = False
+  if legacy_state is not None and os.path.lexists(legacy_state):
+    try:
+      with _open_verified_legacy_dir(legacy_state) as lstate:
+        for name in sorted(lstate.names()):
+          if (
+              name.startswith("state_") or name.startswith("tool_")
+          ) and name.endswith(".json"):
+            bad = _inspect_legacy_file_safe(
+                lstate, name, require_json_dict=True
+            )
+            if bad is None:
+              summary["state_count"] += 1
+            else:
+              _record_unsafe(legacy_state / name, bad)
+          elif (
+              name == "spool"
+              and legacy_spool is not None
+              and os.path.abspath(str(legacy_spool))
+              == os.path.abspath(str(legacy_state / "spool"))
+          ):
+            state_checked_spool = True
+            _inspect_legacy_spool_dir(
+                legacy_spool, summary, _record_unsafe, parent=lstate
+            )
+    except (OSError, RuntimeError) as exc:
+      summary["error"] = str(exc)
+      return summary
+
+  if (
+      not state_checked_spool
+      and legacy_spool is not None
+      and os.path.lexists(legacy_spool)
+  ):
+    _inspect_legacy_spool_dir(legacy_spool, summary, _record_unsafe)
+  return summary
+
+
+def _inspect_legacy_spool_dir(
+    legacy_spool: Path,
+    summary: dict[str, Any],
+    record_unsafe: Any,
+    *,
+    parent: PrivateDir | None = None,
+) -> None:
+  try:
+    if parent is not None and parent.fd is not None:
+      spool_ctx = _open_private_dir(legacy_spool, "spool", parent.fd)
+    else:
+      spool_ctx = _open_verified_legacy_spool_dir(legacy_spool)
+    with spool_ctx as lspool:
+      for name in sorted(lspool.names()):
+        if fnmatch.fnmatchcase(name, "event-*.json"):
+          bad = _inspect_legacy_file_safe(
+              lspool, name, require_json_dict=True
+          )
+          if bad is None:
+            summary["pending_count"] += 1
+          else:
+            record_unsafe(legacy_spool / name, bad)
+        elif name.endswith(".retry"):
+          bad = _inspect_legacy_file_safe(lspool, name)
+          if bad is None:
+            summary["deferred_count"] += 1
+          else:
+            record_unsafe(legacy_spool / name, bad)
+        elif name == "dead-letter":
+          try:
+            dinfo = lspool.lstat("dead-letter")
+            if not stat.S_ISDIR(dinfo.st_mode):
+              record_unsafe(
+                  legacy_spool / "dead-letter", "is not a directory"
+              )
+              continue
+            dead_dir = (
+                _open_verified_legacy_dir(legacy_spool / "dead-letter")
+                if lspool.fd is None
+                else _open_private_dir(
+                    legacy_spool / "dead-letter", "dead-letter", lspool.fd
+                )
+            )
+            with dead_dir as dead:
+              for dname in dead.names():
+                if dname == "destination-mismatch":
+                  try:
+                    minfo = dead.lstat(dname)
+                    if not stat.S_ISDIR(minfo.st_mode):
+                      record_unsafe(
+                          legacy_spool / "dead-letter" / dname,
+                          "is not a directory",
+                      )
+                      continue
+                    mm_dir = (
+                        _open_verified_legacy_dir(
+                            legacy_spool / "dead-letter" / dname
+                        )
+                        if dead.fd is None
+                        else _open_private_dir(
+                            legacy_spool / "dead-letter" / dname,
+                            dname,
+                            dead.fd,
+                        )
+                    )
+                    with mm_dir as mm:
+                      summary["dead_letter_count"] += sum(
+                          1 for m in mm.names() if m.endswith(".json")
+                      )
+                  except (OSError, RuntimeError) as exc:
+                    record_unsafe(
+                        legacy_spool / "dead-letter" / dname, str(exc)
+                    )
+                elif dname.endswith(".json"):
+                  summary["dead_letter_count"] += 1
+          except (OSError, RuntimeError) as exc:
+            record_unsafe(legacy_spool / "dead-letter", str(exc))
+  except (OSError, RuntimeError) as exc:
+    if not summary["error"]:
+      summary["error"] = str(exc)

@@ -49,6 +49,15 @@ BQAA_EVENT_TYPES = frozenset(
 )
 
 
+def _temp_root() -> str:
+  """Return the active temp root, honoring env changes within a process."""
+  for var in ("TMPDIR", "TEMP", "TMP"):
+    val = os.environ.get(var)
+    if val:
+      return val
+  return tempfile.gettempdir()
+
+
 def _user_tag() -> str:
   """Tells users' default dirs apart: the uid, else the login name."""
   getuid = getattr(os, "getuid", None)  # POSIX only.
@@ -78,6 +87,33 @@ DEFAULT_DRAIN_POLL_SECONDS = 0.5
 DEFAULT_DRAIN_MAX_RETRY_AGE_SECONDS = 86400.0
 DEFAULT_MAX_LOG_BYTES = 1_048_576  # 1 MiB before rotation.
 DEFAULT_LOG_FILE = os.path.join(DEFAULT_STATE_DIR, "bqaa-agent-tracing.log")
+LEGACY_DEFAULT_STATE_DIR = os.path.join(
+    tempfile.gettempdir(), "bqaa-agent-tracing"
+)
+LEGACY_DEFAULT_SPOOL_DIR = os.path.join(LEGACY_DEFAULT_STATE_DIR, "spool")
+
+
+def default_state_dir() -> str:
+  return os.path.join(_temp_root(), f"bqaa-agent-tracing-{_user_tag()}")
+
+
+def default_spool_dir() -> str:
+  return os.path.join(default_state_dir(), "spool")
+
+
+def default_log_file() -> str:
+  return os.path.join(default_state_dir(), "bqaa-agent-tracing.log")
+
+
+def legacy_default_state_dir() -> str:
+  explicit = os.environ.get("BQAA_LEGACY_STATE_DIR", "").strip()
+  if explicit:
+    return explicit
+  return os.path.join(_temp_root(), "bqaa-agent-tracing")
+
+
+def legacy_default_spool_dir() -> str:
+  return os.path.join(legacy_default_state_dir(), "spool")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -219,12 +255,12 @@ class BQAAConfig:
         auto_create_dataset=_env_bool("BQAA_AUTO_CREATE_DATASET", False),
         location=os.environ.get("BQAA_LOCATION") or None,
         max_content_length=_env_int("BQAA_MAX_CONTENT_LENGTH", 5000),
-        log_file=os.environ.get("BQAA_LOG_FILE", DEFAULT_LOG_FILE),
+        log_file=os.environ.get("BQAA_LOG_FILE", default_log_file()),
         max_log_bytes=_env_non_negative_int(
             "BQAA_MAX_LOG_BYTES", DEFAULT_MAX_LOG_BYTES
         ),
-        spool_dir=os.environ.get("BQAA_SPOOL_DIR", DEFAULT_SPOOL_DIR),
-        state_dir=os.environ.get("BQAA_STATE_DIR", DEFAULT_STATE_DIR),
+        spool_dir=os.environ.get("BQAA_SPOOL_DIR", default_spool_dir()),
+        state_dir=os.environ.get("BQAA_STATE_DIR", default_state_dir()),
         state_ttl_hours=_env_float(
             "BQAA_STATE_TTL_HOURS", DEFAULT_STATE_TTL_HOURS
         ),

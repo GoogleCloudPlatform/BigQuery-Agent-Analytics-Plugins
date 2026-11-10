@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import fcntl
 import fnmatch
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -36,6 +37,8 @@ os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 
 from ._utils import ensure_private_dir  # noqa: E402  (after env tweak)
 from ._utils import log_to_file  # noqa: E402
+from ._utils import migrate_legacy_spool  # noqa: E402
+from ._utils import open_existing_private_dir  # noqa: E402
 from ._utils import PrivateDir  # noqa: E402
 from ._utils import safe_json_loads  # noqa: E402
 from ._writer_identity import DEFAULT_WRITER_LABEL  # noqa: E402
@@ -76,6 +79,8 @@ class _SkippedEnvelope(Exception):
 
 # Entries already reported as skipped: each is logged once per drainer.
 _reported_skips: set[str] = set()
+# Spooled filenames skipped in the active drainer so they do not hold _run alive.
+_skipped_paths: set[str] = set()
 
 
 def _retry_sidecar_name(spool_name: str) -> str:
@@ -901,6 +906,23 @@ async def _drain_group_async(
 
 async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
   resolved = 0
+  legacy_res = migrate_legacy_spool(config.spool_dir)
+  if legacy_res.get("error"):
+    key = f"legacy_error:{legacy_res['error']}"
+    if key not in _reported_skips:
+      _reported_skips.add(key)
+      log_to_file(config, f"DRAINER legacy_spool_refused {legacy_res['error']}")
+  for entry in legacy_res.get("unsafe_entries") or []:
+    key = f"legacy_unsafe:{entry}"
+    if key not in _reported_skips:
+      _reported_skips.add(key)
+      log_to_file(config, f"DRAINER legacy_skip {entry}")
+  if legacy_res.get("migrated", 0) > 0:
+    log_to_file(
+        config,
+        f"DRAINER migrated_legacy_envelopes={legacy_res['migrated']}",
+    )
+
   with ensure_private_dir(config.spool_dir) as spool:
     pending_names = _list_pending(spool)
     pending_set = set(pending_names)
@@ -937,13 +959,16 @@ async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
         if config.drain_retry_backoff_seconds != 0.0 and next_retry_at > now:
           continue
 
+      skip_key = str(spool.path / name)
       try:
         env = _read_envelope(spool, name, config)
       except _SkippedEnvelope as skipped:
+        _skipped_paths.add(skip_key)
         if str(skipped) not in _reported_skips:
           _reported_skips.add(str(skipped))
           log_to_file(config, f"DRAINER skipped {skipped}")
         continue
+      _skipped_paths.discard(skip_key)
       if env is None:
         resolved += 1
         continue
@@ -969,7 +994,44 @@ async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
     return resolved + sum(counts)
 
 
+def _next_deferred_wait_seconds(config: BQAAConfig) -> float | None:
+  """Return seconds until earliest pending/deferred envelope is due, else None."""
+  spool_path = Path(config.spool_dir).expanduser()
+  if not os.path.lexists(spool_path):
+    return None
+  try:
+    with open_existing_private_dir(spool_path) as spool:
+      pending_names = _list_pending(spool)
+      if not pending_names:
+        return None
+      now = time.time()
+      max_age = float(getattr(config, "drain_max_retry_age_seconds", 86400.0))
+      earliest: float | None = None
+      for name in pending_names:
+        if str(spool.path / name) in _skipped_paths:
+          continue
+        meta = _read_retry_meta(spool, name)
+        if meta is None or config.drain_retry_backoff_seconds == 0.0:
+          return 0.0
+        try:
+          first_failed_at = float(meta.get("first_failed_at", now))
+          due = float(meta.get("next_retry_at", 0.0))
+        except (TypeError, ValueError):
+          return 0.0
+        if not (math.isfinite(first_failed_at) and math.isfinite(due)):
+          return 0.0
+        if math.isfinite(max_age) and int(meta.get("attempts", 0) or 0) >= 1:
+          due = min(due, first_failed_at + max_age)
+        wait = max(0.0, due - now)
+        if earliest is None or wait < earliest:
+          earliest = wait
+      return earliest
+  except (OSError, RuntimeError):
+    return None
+
+
 async def _run(config: BQAAConfig) -> None:
+  _skipped_paths.clear()
   pidfile = Path(config.spool_dir).expanduser() / ".drainer.pid"
   use_storage_api = _storage_write_available()
   with _try_acquire_pidfile(pidfile) as fd:
@@ -979,8 +1041,17 @@ async def _run(config: BQAAConfig) -> None:
     while idle < config.drain_idle_seconds:
       wrote = await _drain_once(config, use_storage_api=use_storage_api)
       if wrote == 0:
-        await asyncio.sleep(config.drain_poll_seconds)
-        idle += config.drain_poll_seconds
+        wait_due = _next_deferred_wait_seconds(config)
+        if wait_due is not None:
+          idle = 0.0
+          if config.drain_retry_backoff_seconds == 0.0 and wait_due == 0.0:
+            sleep_for = config.drain_poll_seconds
+          else:
+            sleep_for = min(config.drain_poll_seconds, max(0.0, wait_due))
+          await asyncio.sleep(sleep_for)
+        else:
+          await asyncio.sleep(config.drain_poll_seconds)
+          idle += config.drain_poll_seconds
       else:
         idle = 0.0
 

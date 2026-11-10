@@ -27,9 +27,14 @@ import subprocess
 import sys
 from typing import Iterable
 
+from ._utils import inspect_legacy_backlog
 from ._utils import inspect_spool_status
+from ._utils import migrate_legacy_spool
 from ._utils import PYTHON_C_DROP_WORKING_DIR
 from .config import BQAAConfig
+from .config import default_log_file
+from .config import default_spool_dir
+from .config import default_state_dir
 from .config import DEFAULT_LOG_FILE
 from .config import DEFAULT_SPOOL_DIR
 
@@ -72,6 +77,15 @@ class _SetupReport:
   spool_destination_mismatch: int = 0
   spool_last_error: str | None = None
   spool_inspect_error: str | None = None
+  legacy_dir: str | None = None
+  legacy_migrated: int = 0
+  legacy_state_files: int = 0
+  legacy_spool_pending: int = 0
+  legacy_spool_deferred: int = 0
+  legacy_spool_dead_letter: int = 0
+  legacy_unsafe_count: int = 0
+  legacy_unsafe_entries: list[str] = field(default_factory=list)
+  legacy_inspect_error: str | None = None
   interpreter_error: str | None = None
   config_error: str | None = None
   package_imports: list[_ImportProbe] = field(default_factory=list)
@@ -234,8 +248,12 @@ def collect_report(python_bin: str | None = None) -> _SetupReport:
     package_imports = _probe_imports(resolved, _PACKAGE_IMPORTS)
     required_imports = _probe_imports(resolved, _REQUIRED_IMPORTS)
     storage_write_imports = _probe_imports(resolved, _STORAGE_WRITE_IMPORTS)
-  spool_dir = os.environ.get("BQAA_SPOOL_DIR", DEFAULT_SPOOL_DIR)
+  spool_dir = os.environ.get("BQAA_SPOOL_DIR", default_spool_dir())
+  state_dir = os.environ.get("BQAA_STATE_DIR", default_state_dir())
+  legacy_mig = migrate_legacy_spool(spool_dir)
   spool_status = inspect_spool_status(spool_dir)
+  legacy_status = inspect_legacy_backlog(state_dir, spool_dir)
+  legacy_error = legacy_status["error"] or legacy_mig.get("error")
   return _SetupReport(
       python_bin=resolved,
       interpreter_error=interpreter_error,
@@ -253,7 +271,7 @@ def collect_report(python_bin: str | None = None) -> _SetupReport:
           os.environ.get("BQAA_TRACE_ENABLED", "true").lower() == "true"
       ),
       dry_run=(os.environ.get("BQAA_DRY_RUN", "false").lower() == "true"),
-      log_file=os.environ.get("BQAA_LOG_FILE", DEFAULT_LOG_FILE),
+      log_file=os.environ.get("BQAA_LOG_FILE", default_log_file()),
       log_file_is_default="BQAA_LOG_FILE" not in os.environ,
       log_file_is_relative=_is_relative_path(os.environ.get("BQAA_LOG_FILE")),
       spool_dir=spool_dir,
@@ -265,6 +283,15 @@ def collect_report(python_bin: str | None = None) -> _SetupReport:
       ),
       spool_last_error=spool_status["latest_error"],
       spool_inspect_error=spool_status["error"],
+      legacy_dir=legacy_status["legacy_dir"],
+      legacy_migrated=int(legacy_mig.get("migrated", 0)),
+      legacy_state_files=int(legacy_status["state_count"]),
+      legacy_spool_pending=int(legacy_status["pending_count"]),
+      legacy_spool_deferred=int(legacy_status["deferred_count"]),
+      legacy_spool_dead_letter=int(legacy_status["dead_letter_count"]),
+      legacy_unsafe_count=int(legacy_status["unsafe_count"]),
+      legacy_unsafe_entries=list(legacy_status["unsafe_entries"]),
+      legacy_inspect_error=legacy_error,
       package_imports=package_imports,
       required_imports=required_imports,
       storage_write_imports=storage_write_imports,
@@ -296,6 +323,37 @@ def _append_spool_section(lines: list[str], report: _SetupReport) -> None:
   )
   if report.spool_last_error:
     lines.append(f"  Latest retry error: {report.spool_last_error}")
+
+
+def _append_legacy_section(lines: list[str], report: _SetupReport) -> bool:
+  has_legacy = bool(
+      report.legacy_inspect_error
+      or report.legacy_migrated
+      or report.legacy_state_files
+      or report.legacy_spool_pending
+      or report.legacy_spool_deferred
+      or report.legacy_spool_dead_letter
+      or report.legacy_unsafe_count
+  )
+  if not has_legacy:
+    return False
+  lines.append(f"Legacy v0.1.0 directory ({report.legacy_dir or 'default'}):")
+  if report.legacy_inspect_error:
+    lines.append(
+        f"  [WARN] unsafe legacy directory refused: {report.legacy_inspect_error}"
+    )
+    return True
+  lines.append(
+      f"  Migrated envelopes: {report.legacy_migrated},"
+      f" remaining state files: {report.legacy_state_files},"
+      f" pending events: {report.legacy_spool_pending},"
+      f" deferred: {report.legacy_spool_deferred},"
+      f" dead-letter: {report.legacy_spool_dead_letter},"
+      f" rejected unsafe entries: {report.legacy_unsafe_count}"
+  )
+  for entry in report.legacy_unsafe_entries:
+    lines.append(f"  [WARN] refused unsafe legacy entry: {entry}")
+  return True
 
 
 def _format_report(report: _SetupReport) -> str:
@@ -331,6 +389,8 @@ def _format_report(report: _SetupReport) -> str:
     lines.append("")
     _append_spool_section(lines, report)
     lines.append("")
+    if _append_legacy_section(lines, report):
+      lines.append("")
     lines.append("Status: ACTION NEEDED")
     return "\n".join(lines) + "\n"
 
@@ -405,6 +465,8 @@ def _format_report(report: _SetupReport) -> str:
 
   _append_spool_section(lines, report)
   lines.append("")
+  if _append_legacy_section(lines, report):
+    lines.append("")
 
   lines.append("Status: " + ("READY" if report.all_ok else "ACTION NEEDED"))
   return "\n".join(lines) + "\n"
