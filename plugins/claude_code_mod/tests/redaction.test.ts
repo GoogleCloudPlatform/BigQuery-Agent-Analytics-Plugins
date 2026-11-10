@@ -870,6 +870,169 @@ test('prose JSON sanitizes credential-bearing object keys inside sensitive subtr
   })
 })
 
+test('prose JSON redacts unshaped keys in sensitive subtrees and multiline JSON-encoded keys', () => {
+  const canary = ['canary', 'secret', 'z'.repeat(14)].join('_')
+  const multiKey = '{\n  "credentials":\n  {\n    "val": "' + canary + '"\n  }\n}'
+  const deepInner = JSON.stringify({ credentials: { secret_entry: canary } }, null, 2)
+  const depth3Key = JSON.stringify({ [JSON.stringify({ [JSON.stringify({ [deepInner]: 'k4' })]: 'k3' })]: 'k2' }, null, 2)
+
+  const subtreeInput = `Result: ${JSON.stringify({ credentials: { [canary]: 'enabled', text: 'secret2' } })}`
+  const subtreeStats = newStats()
+  const subtreeOut = redactText(subtreeInput, subtreeStats)
+  expect(subtreeOut).not.toContain(canary)
+  expect(subtreeOut).not.toContain('secret2')
+  expect(subtreeStats.redactions).toBeGreaterThanOrEqual(3)
+  expect(JSON.parse(subtreeOut.slice('Result: '.length))).toEqual({
+    credentials: {
+      '[REDACTED_KEY:1]': '[REDACTED]',
+      text: '[REDACTED]',
+    },
+  })
+
+  const keyInputs = [
+    `Result:\n${JSON.stringify({ text: { [multiKey]: 'ok' } }, null, 2)}`,
+    `Result:\n${JSON.stringify({ text: { [depth3Key]: 'ok' } }, null, 2)}`,
+  ]
+  for (const sample of [subtreeInput, ...keyInputs]) {
+    const out = redactText(sample, newStats())
+    expect(out).not.toContain(canary)
+    expect(out).toContain('[REDACTED_KEY:1]')
+    for (const field of ['result', 'text'] as const) {
+      const built = buildRow({
+        eventType: 'TOOL_COMPLETED',
+        timestampMs: 0,
+        eventId: 'e1',
+        agent: 'a',
+        sessionId: 's',
+        invocationId: 'i',
+        userId: 'u',
+        traceId: 't',
+        spanId: 'p',
+        parentSpanId: null,
+        content: { [field]: sample },
+        attributes: {},
+        maxPayloadChars: 16_384,
+      })
+      const serialized = JSON.stringify(built.row)
+      expect(serialized).not.toContain(canary)
+      expect(serialized).toContain('[REDACTED_KEY:1]')
+    }
+  }
+
+  const directJsonRow = buildRow({
+    eventType: 'TOOL_COMPLETED',
+    timestampMs: 0,
+    eventId: 'e1',
+    agent: 'a',
+    sessionId: 's',
+    invocationId: 'i',
+    userId: 'u',
+    traceId: 't',
+    spanId: 'p',
+    parentSpanId: null,
+    content: { result: JSON.stringify({ text: { [multiKey]: 'ok' } }) },
+    attributes: {},
+    maxPayloadChars: 16_384,
+  })
+  const directSerialized = JSON.stringify(directJsonRow.row)
+  expect(directSerialized).not.toContain(canary)
+  expect(directSerialized).toContain('[REDACTED_KEY:1]')
+
+  // Nested multiline JSON string values, truncated JSON-looking string values,
+  // and depth-3+ nested JSON string values inside prose JSON fail closed.
+  const nestedValStats = newStats()
+  const nestedValInput = `Result:\n${JSON.stringify({ text: multiKey }, null, 2)}`
+  const nestedValOut = redactText(nestedValInput, nestedValStats)
+  expect(nestedValOut).not.toContain(canary)
+  expect(nestedValOut).toContain('[REDACTED]')
+  expect(nestedValStats.truncated).toBe(false)
+
+  const truncatedValRaw = '{\n  "credentials":\n  {\n    "val": "' + canary + '"'
+  const truncatedValInput = `Result:\n${JSON.stringify({ text: truncatedValRaw }, null, 2)}`
+  const truncatedValStats = newStats()
+  const truncatedValOut = redactText(truncatedValInput, truncatedValStats)
+  expect(truncatedValOut).not.toContain(canary)
+  expect(truncatedValOut).toContain(`[TRUNCATED: ${truncatedValRaw.length} chars of JSON text that could not be parsed and checked]`)
+  expect(truncatedValStats.truncated).toBe(true)
+
+  const lvl3 = JSON.stringify({ text: multiKey }, null, 2)
+  const lvl2 = JSON.stringify({ text: lvl3 }, null, 2)
+  const lvl1 = JSON.stringify({ text: lvl2 }, null, 2)
+  const deepValInput = `Result:\n${JSON.stringify({ text: lvl1 }, null, 2)}`
+  const deepValStats = newStats()
+  const deepValOut = redactText(deepValInput, deepValStats)
+  expect(deepValOut).not.toContain(canary)
+  expect(deepValOut).toContain('[TRUNCATED: nested too deep]')
+  expect(deepValStats.truncated).toBe(true)
+  expect(deepValStats.droppedChars).toBeGreaterThan(0)
+
+  // Benign flat JSON objects and arrays inside prose JSON strings remain un-truncated.
+  for (const benignVal of ['{}', '[]', '[1, 2, 3]', '{"status":"ok","count":3}']) {
+    const sample = `Result:\n${JSON.stringify({ text: benignVal }, null, 2)}`
+    const st = newStats()
+    const out = redactText(sample, st)
+    expect(st.truncated).toBe(false)
+    expect(st.redactions).toBe(0)
+    expect(JSON.parse(out.slice('Result:\n'.length))).toEqual({ text: benignVal })
+    const built = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: sample },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    expect(built.row.is_truncated).toBe(false)
+    expect(built.redactions).toBe(0)
+  }
+
+  // Unclosed array/object mixing valid inner span + trailing truncated secret drops whole string;
+  // unclosed JSON_LOOKING object key fails closed to [REDACTED_KEY:1].
+  const badVal = `[{"ok":[1]}, {"credentials":\n{\n"val":"${canary}"`
+  const badKey = `{\n  "credentials":\n  {\n    "val": "${canary}"`
+  const badValSample = `Result:\n${JSON.stringify({ text: badVal }, null, 2)}`
+  const badKeySample = `Result:\n${JSON.stringify({ text: { [badKey]: 'ok' } }, null, 2)}`
+
+  const badValOut = redactText(badValSample, newStats())
+  expect(badValOut).not.toContain(canary)
+  expect(badValOut).toContain('[TRUNCATED:')
+
+  const badKeyOut = redactText(badKeySample, newStats())
+  expect(badKeyOut).not.toContain(canary)
+  expect(badKeyOut).toContain('[REDACTED_KEY:1]')
+
+  for (const [sample, expectedMarker] of [
+    [badValSample, '[TRUNCATED:'],
+    [badKeySample, '[REDACTED_KEY:1]'],
+  ] as const) {
+    const built = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: sample },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    const serialized = JSON.stringify(built.row)
+    expect(serialized).not.toContain(canary)
+    expect(serialized).toContain(expectedMarker)
+  }
+})
+
 test('extreme nesting (10,000+ deep arrays/objects) in prose JSON fails closed without throwing RangeError', () => {
   const secret = ['ultra', 'deep', 'secret', '006'].join('-')
   const cases = [
@@ -980,4 +1143,22 @@ test('prose JSON placeholder suffix stays linear O(N) on adversarial q<N>z token
   expect(built.row.content ?? '').not.toContain(secret)
   expect(built.row.is_truncated).toBe(false)
   expect(built.redactions).toBeGreaterThanOrEqual(1)
+})
+
+test('prose JSON placeholder suffix avoids collisions across 12-, 13-, 15-, and 16-digit q<N>z tokens', () => {
+  const secret = ['suffix', 'width', 'secret', '008'].join('-')
+  const samples = [
+    `pjspan0q1000000000000z and pjspan0q999999999999z and {"secret":"${secret}","nested":{"ok":1}}`,
+    `pjspan0q1000000000000000z and pjspan0q999999999999999z and {"secret":"${secret}","nested":{"ok":1}}`,
+  ]
+  for (const [idx, sample] of samples.entries()) {
+    const out = redactText(sample, newStats())
+    expect(out).not.toContain(secret)
+    if (idx === 0) {
+      expect(out).toContain('pjspan0q1000000000000z and pjspan0q999999999999z and ')
+    } else {
+      expect(out).toContain('pjspan0q1000000000000000z and pjspan0q999999999999999z and ')
+    }
+    expect(out).toContain('{"secret":"[REDACTED]","nested":{"ok":1}}')
+  }
 })

@@ -3096,6 +3096,104 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertIsNotNone(xuser_mig["error"])
             self.assertTrue((legacy_spool / "event-xuser.json").is_file())
 
+    def test_drain_malformed_and_non_finite_retry_sidecars(self):
+        import math
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_r3b_retry_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        malformed_sidecars = [
+            ("event-001.json", '{"first_failed_at": 0, "next_retry_at": 0, "attempts": null}'),
+            ("event-002.json", '{"attempts": 1, "first_failed_at": NaN, "next_retry_at": 99999999999.0}'),
+            ("event-003.json", '{"first_failed_at": 0, "next_retry_at": Infinity, "attempts": "bad"}'),
+            ("event-004.json", '{"first_failed_at": 0, "next_retry_at": 99999999999.0, "attempts": -3}'),
+        ]
+        for idx, (env_name, retry_raw) in enumerate(malformed_sidecars):
+            env_path = Path(spool_dir) / env_name
+            env_path.write_text(
+                json.dumps({
+                    "config": {
+                        "project_id": "p",
+                        "dataset": "d",
+                        "table": "agent_events",
+                    },
+                    "row": {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "event_type": "LLM_REQUEST",
+                        "content": {"idx": idx},
+                        "attributes": {},
+                        "latency_ms": {},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            os.chmod(env_path, 0o600)
+            retry_path = Path(spool_dir) / f"{env_name}.retry"
+            retry_path.write_text(retry_raw, encoding="utf-8")
+            os.chmod(retry_path, 0o600)
+
+        calls = {"n": 0}
+        delivered = []
+
+        def _insert(table_id, rows):
+            del table_id
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("503 Service Unavailable")
+            delivered.extend(rows)
+            return []
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=os.path.join(spool_dir, "drain.log"),
+            dry_run=False,
+            drain_retry_backoff_seconds=0.12,
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+            drain_max_retry_age_seconds=1.0,
+        )
+
+        # Before delivery: corrupt/non-finite sidecars must return 0.0 (no TypeError/ValueError/inf).
+        wait_before = drain._next_deferred_wait_seconds(cfg)
+        self.assertEqual(wait_before, 0.0)
+
+        # Call 1 hits 503: _drain_once must not crash and must reset malformed .retry fields cleanly.
+        resolved = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved, 0)
+        self.assertEqual(calls["n"], 1)
+        for env_name, _ in malformed_sidecars:
+            meta = json.loads((Path(spool_dir) / f"{env_name}.retry").read_text(encoding="utf-8"))
+            self.assertEqual(meta["attempts"], 1)
+            self.assertNotIsInstance(meta["attempts"], bool)
+            self.assertTrue(math.isfinite(meta["first_failed_at"]))
+            self.assertTrue(math.isfinite(meta["next_retry_at"]))
+            self.assertGreaterEqual(meta["next_retry_at"], meta["first_failed_at"])
+
+        # Re-inject a bool/NaN/Infinity sidecar and confirm _run completes promptly without busy-spinning.
+        (Path(spool_dir) / "event-001.json.retry").write_text(
+            '{"attempts": true, "first_failed_at": NaN, "next_retry_at": Infinity}',
+            encoding="utf-8",
+        )
+        self.assertEqual(drain._next_deferred_wait_seconds(cfg), 0.0)
+        asyncio.run(asyncio.wait_for(drain._run(cfg), timeout=2.0))
+
+        self.assertEqual(len(delivered), 4)
+        self.assertEqual({r["content"]["idx"] for r in delivered}, {0, 1, 2, 3})
+        for env_name, _ in malformed_sidecars:
+            self.assertFalse((Path(spool_dir) / env_name).exists())
+            self.assertFalse((Path(spool_dir) / f"{env_name}.retry").exists())
+        self.assertFalse((Path(spool_dir) / "dead-letter").exists())
+
 
 class TestBuildDist39(unittest.TestCase):
     """Issue #39: build_dist.sh --check verifies source/dist/tag/catalog integrity."""

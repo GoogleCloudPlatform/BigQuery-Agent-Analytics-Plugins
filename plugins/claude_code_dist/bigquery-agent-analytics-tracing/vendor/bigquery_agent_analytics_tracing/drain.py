@@ -111,6 +111,34 @@ def _read_retry_meta(spool: PrivateDir, spool_name: str) -> dict[str, Any] | Non
   return parsed
 
 
+def _parse_retry_meta(
+    meta: dict[str, Any], now: float
+) -> tuple[float, float, int] | None:
+  """Return finite ``(first_failed_at, next_retry_at, attempts)`` or None if malformed."""
+  raw_first = meta.get("first_failed_at", now)
+  raw_due = meta.get("next_retry_at", 0.0)
+  raw_attempts = meta.get("attempts", 0)
+  if (
+      isinstance(raw_first, bool)
+      or isinstance(raw_due, bool)
+      or isinstance(raw_attempts, bool)
+  ):
+    return None
+  try:
+    first_failed_at = float(raw_first)
+    next_retry_at = float(raw_due)
+    attempts = int(raw_attempts)
+  except (TypeError, ValueError, OverflowError):
+    return None
+  if (
+      not math.isfinite(first_failed_at)
+      or not math.isfinite(next_retry_at)
+      or attempts < 0
+  ):
+    return None
+  return first_failed_at, next_retry_at, attempts
+
+
 def _write_retry_meta(
     spool: PrivateDir, spool_name: str, meta: dict[str, Any]
 ) -> None:
@@ -762,13 +790,10 @@ def _defer_or_expire(
   """
   now = time.time()
   existing = _read_retry_meta(spool, name)
-  if existing is not None:
-    try:
-      first_failed_at = float(existing.get("first_failed_at", now))
-      attempts = max(0, int(existing.get("attempts", 0))) + 1
-    except (TypeError, ValueError):
-      first_failed_at = now
-      attempts = 1
+  parsed = _parse_retry_meta(existing, now) if existing is not None else None
+  if parsed is not None:
+    first_failed_at, _, prev_attempts = parsed
+    attempts = prev_attempts + 1
   else:
     first_failed_at = now
     attempts = 1
@@ -941,23 +966,20 @@ async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
         break
       retry_meta = _read_retry_meta(spool, name)
       if retry_meta is not None:
-        try:
-          first_failed_at = float(retry_meta.get("first_failed_at", now))
-          next_retry_at = float(retry_meta.get("next_retry_at", 0.0))
-        except (TypeError, ValueError):
-          first_failed_at = now
-          next_retry_at = 0.0
-        if now - first_failed_at >= max_age and retry_meta.get("attempts", 0) >= 1:
-          log_to_file(
-              config,
-              f"DRAINER retry_expired file={name} age={now - first_failed_at:.1f}s"
-              f" max_age={max_age:.1f}s last_error={retry_meta.get('last_error', '')}",
-          )
-          _quarantine(spool, name, reason="write-failed")
-          resolved += 1
-          continue
-        if config.drain_retry_backoff_seconds != 0.0 and next_retry_at > now:
-          continue
+        parsed_meta = _parse_retry_meta(retry_meta, now)
+        if parsed_meta is not None:
+          first_failed_at, next_retry_at, attempts = parsed_meta
+          if now - first_failed_at >= max_age and attempts >= 1:
+            log_to_file(
+                config,
+                f"DRAINER retry_expired file={name} age={now - first_failed_at:.1f}s"
+                f" max_age={max_age:.1f}s last_error={retry_meta.get('last_error', '')}",
+            )
+            _quarantine(spool, name, reason="write-failed")
+            resolved += 1
+            continue
+          if config.drain_retry_backoff_seconds != 0.0 and next_retry_at > now:
+            continue
 
       skip_key = str(spool.path / name)
       try:
@@ -1013,14 +1035,11 @@ def _next_deferred_wait_seconds(config: BQAAConfig) -> float | None:
         meta = _read_retry_meta(spool, name)
         if meta is None or config.drain_retry_backoff_seconds == 0.0:
           return 0.0
-        try:
-          first_failed_at = float(meta.get("first_failed_at", now))
-          due = float(meta.get("next_retry_at", 0.0))
-        except (TypeError, ValueError):
+        parsed_meta = _parse_retry_meta(meta, now)
+        if parsed_meta is None:
           return 0.0
-        if not (math.isfinite(first_failed_at) and math.isfinite(due)):
-          return 0.0
-        if math.isfinite(max_age) and int(meta.get("attempts", 0) or 0) >= 1:
+        first_failed_at, due, attempts = parsed_meta
+        if math.isfinite(max_age) and attempts >= 1:
           due = min(due, first_failed_at + max_age)
         wait = max(0.0, due - now)
         if earliest is None or wait < earliest:

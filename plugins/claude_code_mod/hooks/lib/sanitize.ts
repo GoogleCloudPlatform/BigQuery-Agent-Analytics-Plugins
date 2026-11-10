@@ -3605,10 +3605,64 @@ function droppedCharsAtDepthLimit(val: unknown): number {
   return estimateDroppedJsonChars(val)
 }
 
-function sanitizeJsonObjectKey(key: string, own: Set<string>, state: { placeholders: number }, stats: SanitizeStats): string {
+function sanitizeProseJsonString(val: string, stats: SanitizeStats, keyDepth: number): string {
+  if (JSON_LOOKING.test(val)) {
+    if (keyDepth >= 3) {
+      stats.redactions += 1
+      stats.truncated = true
+      stats.droppedChars += val.length
+      return '[TRUNCATED: nested too deep]'
+    }
+    if (val.length > PROSE_JSON_MAX_SPAN) {
+      stats.redactions += 1
+      stats.truncated = true
+      stats.droppedChars += val.length
+      return `[TRUNCATED: ${val.length} chars of JSON text that could not be parsed and checked]`
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(clipDeepJsonSlice(val.trim()))
+    } catch {
+      stats.redactions += 1
+      stats.truncated = true
+      stats.droppedChars += val.length
+      return `[TRUNCATED: ${val.length} chars of JSON text that could not be parsed and checked]`
+    }
+    const subStats = newStats()
+    const walked = typeof parsed === 'string'
+      ? sanitizeProseJsonString(parsed, subStats, keyDepth + 1)
+      : walkProseJsonValue(parsed, subStats, 0, keyDepth + 1)
+    stats.redactions += subStats.redactions
+    stats.droppedChars += subStats.droppedChars
+    if (subStats.truncated) stats.truncated = true
+    if (subStats.redactions === 0 && !subStats.truncated) return val
+    return JSON.stringify(walked, null, typeof parsed !== 'string' && val.includes('\n') ? 2 : undefined)
+  }
+  if (keyDepth >= 3) {
+    if (findBalancedProseJsonSpans(val).length > 0) {
+      stats.redactions += 1
+      stats.truncated = true
+      stats.droppedChars += val.length
+      return '[TRUNCATED: nested too deep]'
+    }
+    return redactTextPasses(val, stats)
+  }
+  return splitAndRedactProseJson(val, stats, keyDepth + 1)
+}
+
+function sanitizeJsonObjectKey(
+  key: string,
+  own: Set<string>,
+  state: { placeholders: number },
+  stats: SanitizeStats,
+  inSensitiveSubtree = false,
+  keyDepth = 0,
+): string {
   if (isListedKey(key)) return key
-  const kStats = newStats()
-  if (redactTextPasses(key, kStats) === key) return key
+  if (!inSensitiveSubtree && keyDepth < 3 && key.length <= PROSE_JSON_MAX_SPAN) {
+    const kStats = newStats()
+    if (sanitizeProseJsonString(key, kStats, keyDepth) === key && !kStats.truncated && kStats.redactions === 0) return key
+  }
   let outKey: string
   do {
     state.placeholders += 1
@@ -3619,7 +3673,7 @@ function sanitizeJsonObjectKey(key: string, own: Set<string>, state: { placehold
   return outKey
 }
 
-function redactSensitiveSubtree(val: unknown, stats: SanitizeStats, depth = 0): unknown {
+function redactSensitiveSubtree(val: unknown, stats: SanitizeStats, depth = 0, keyDepth = 0): unknown {
   if (val === null) return null
   if (typeof val === 'string') {
     if (isMarkerLike(val)) return val
@@ -3636,7 +3690,7 @@ function redactSensitiveSubtree(val: unknown, stats: SanitizeStats, depth = 0): 
     stats.droppedChars += droppedCharsAtDepthLimit(val)
     return MARKER
   }
-  if (Array.isArray(val)) return val.map(item => redactSensitiveSubtree(item, stats, depth + 1))
+  if (Array.isArray(val)) return val.map(item => redactSensitiveSubtree(item, stats, depth + 1, keyDepth))
   if (typeof val === 'object') {
     const obj = val as Record<string, unknown>
     const out: Record<string, unknown> = {}
@@ -3644,17 +3698,17 @@ function redactSensitiveSubtree(val: unknown, stats: SanitizeStats, depth = 0): 
     const own = new Set(keys)
     const state = { placeholders: 0 }
     for (const key of keys) {
-      const outKey = sanitizeJsonObjectKey(key, own, state, stats)
-      out[outKey] = redactSensitiveSubtree(obj[key], stats, depth + 1)
+      const outKey = sanitizeJsonObjectKey(key, own, state, stats, true, keyDepth)
+      out[outKey] = redactSensitiveSubtree(obj[key], stats, depth + 1, keyDepth)
     }
     return out
   }
   return MARKER
 }
 
-function walkProseJsonValue(val: unknown, stats: SanitizeStats, depth = 0): unknown {
+function walkProseJsonValue(val: unknown, stats: SanitizeStats, depth = 0, keyDepth = 0): unknown {
   if (val === null) return null
-  if (typeof val === 'string') return redactTextPasses(val, stats)
+  if (typeof val === 'string') return sanitizeProseJsonString(val, stats, keyDepth)
   if (typeof val !== 'object') return val
   if (depth > 20) {
     stats.truncated = true
@@ -3662,19 +3716,19 @@ function walkProseJsonValue(val: unknown, stats: SanitizeStats, depth = 0): unkn
     stats.droppedChars += droppedCharsAtDepthLimit(val)
     return '[TRUNCATED: nested too deep]'
   }
-  if (Array.isArray(val)) return val.map(item => walkProseJsonValue(item, stats, depth + 1))
+  if (Array.isArray(val)) return val.map(item => walkProseJsonValue(item, stats, depth + 1, keyDepth))
   const obj = val as Record<string, unknown>
   const out: Record<string, unknown> = {}
   const keys = Object.keys(obj)
   const own = new Set(keys)
   const state = { placeholders: 0 }
   for (const key of keys) {
-    const outKey = sanitizeJsonObjectKey(key, own, state, stats)
+    const outKey = sanitizeJsonObjectKey(key, own, state, stats, false, keyDepth)
     const raw = obj[key]
     if (isSensitiveKey(key)) {
-      out[outKey] = redactSensitiveSubtree(raw, stats, depth + 1)
+      out[outKey] = redactSensitiveSubtree(raw, stats, depth + 1, keyDepth)
     } else {
-      out[outKey] = walkProseJsonValue(raw, stats, depth + 1)
+      out[outKey] = walkProseJsonValue(raw, stats, depth + 1, keyDepth)
     }
   }
   return out
@@ -3843,16 +3897,18 @@ function findBalancedProseJsonSpans(text: string): JsonCandidateSpan[] {
 function proseJsonTokenSuffix(text: string): number {
   if (!text.includes('pjspan')) return 1
   let maxSeen = 0
-  const re = /q(\d{1,12})z/g
+  const re = /q(\d{1,15})z/g
   let m: RegExpExecArray | null
   while ((m = re.exec(text)) !== null) {
     const n = Number(m[1])
     if (n > maxSeen) maxSeen = n
   }
-  return maxSeen + 1
+  let suffix = maxSeen + 1
+  while (text.includes(`q${suffix}z`)) suffix += 1
+  return suffix
 }
 
-function splitAndRedactProseJson(text: string, stats: SanitizeStats): string {
+function splitAndRedactProseJson(text: string, stats: SanitizeStats, keyDepth = 0): string {
   const spans = findBalancedProseJsonSpans(text)
   if (spans.length === 0) return redactTextPasses(text, stats)
   const suffix = proseJsonTokenSuffix(text)
@@ -3873,7 +3929,7 @@ function splitAndRedactProseJson(text: string, stats: SanitizeStats): string {
       stats.redactions += 1
       return MARKER
     }
-    const sanitized = walkProseJsonValue(span.parsed, stats)
+    const sanitized = walkProseJsonValue(span.parsed, stats, 0, keyDepth)
     return JSON.stringify(sanitized, null, span.multiline ? 2 : undefined)
   })
 }
