@@ -84,6 +84,8 @@ export type World = {
   insertCalls: () => FetchCall[]
   // Lets every `{ hang: true }` request answer now.
   releaseHung: (status: number, text: string) => void
+  // Lets one `{ hang: true }` request (0-based among hung requests) answer now.
+  releaseHungAt: (index: number, status?: number, text?: string) => void
   // The mod's `$.store`, each value read back as JSON, as the host keeps it.
   store: Map<string, unknown>
   // The slash commands the mod registered and their argument hints.
@@ -155,7 +157,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   const clock = mock.clock(on, { now: 0 })
   mock.env(on, { HOME, USER: 'dev', ...env })
   const asJson = (value: unknown): unknown => JSON.parse(JSON.stringify(value)) as unknown
-  const hung: ((answer: { value: { status: number; ok: boolean; headers: Record<string, string>; text: string } }) => void)[] = []
+  const hung: (((answer: { value: { status: number; ok: boolean; headers: Record<string, string>; text: string } }) => void) | undefined)[] = []
   const heldWrites: { path: string; text: string; resolve: (answer: { value: undefined }) => void }[] = []
   const world: World = {
     clock,
@@ -200,7 +202,13 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     insertCalls: () => world.fetches.filter(f => f.url.endsWith('/insertAll')),
     sentRows: () => world.insertCalls().flatMap(f => (JSON.parse(f.body) as { rows: { json: Row }[] }).rows.map(r => r.json)),
     releaseHung: (status, text) => {
-      for (const resolve of hung.splice(0)) resolve({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
+      for (const resolve of hung.splice(0)) resolve?.({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
+    },
+    releaseHungAt: (index, status = 200, text = '{"saved":1}') => {
+      const resolve = hung[index]
+      if (resolve === undefined) return
+      hung[index] = undefined
+      resolve({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
     },
     store: new Map(Object.entries(store).map(([key, value]) => [key, asJson(value)])),
     registered: [],

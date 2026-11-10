@@ -529,3 +529,179 @@ test('redactText stays linear (O(N) <= 100 ms at n=80000) across adversarial bac
     }).toEqual({ label, under100ms: true, linearScaling: true })
   }
 })
+
+test('prose-embedded JSON fails closed beyond nesting depth 20 for both objects and arrays without leaking secrets', () => {
+  const secret = ['deep', 'secret', '001'].join('-')
+  const wrapObj = (depth: number, leaf: unknown): unknown => {
+    let cur = leaf
+    for (let i = 0; i < depth; i += 1) cur = { nest: cur }
+    return cur
+  }
+  const wrapArr = (depth: number, leaf: unknown): unknown => {
+    let cur = leaf
+    for (let i = 0; i < depth; i += 1) cur = [cur]
+    return { root: cur }
+  }
+
+  for (const depth of [19, 20]) {
+    for (const wrapped of [wrapObj(depth, { password: secret }), wrapArr(depth - 1, { password: secret })]) {
+      const input = `Result:\n${JSON.stringify(wrapped, null, 2)}`
+      const stats = newStats()
+      const out = redactText(input, stats)
+      expect(out).not.toContain(secret)
+      expect(out).toContain('"password": "[REDACTED]"')
+      expect(stats.truncated).toBe(false)
+      expect(stats.redactions).toBeGreaterThanOrEqual(1)
+
+      const built = buildRow({
+        eventType: 'TOOL_COMPLETED',
+        timestampMs: 0,
+        eventId: 'e1',
+        agent: 'a',
+        sessionId: 's',
+        invocationId: 'i',
+        userId: 'u',
+        traceId: 't',
+        spanId: 'p',
+        parentSpanId: null,
+        content: { result: input },
+        attributes: {},
+        maxPayloadChars: 65_536,
+      })
+      expect(built.row.content ?? '').not.toContain(secret)
+      expect(built.row.content ?? '').toContain('\\"password\\": \\"[REDACTED]\\"')
+      expect(built.row.is_truncated).toBe(false)
+      expect(built.redactions).toBeGreaterThanOrEqual(1)
+    }
+  }
+
+  for (const depth of [21, 22]) {
+    for (const wrapped of [wrapObj(depth, { password: secret }), wrapArr(depth - 1, { password: secret })]) {
+      const input = `Result:\n${JSON.stringify(wrapped, null, 2)}`
+      const stats = newStats()
+      const out = redactText(input, stats)
+      expect(out).not.toContain(secret)
+      expect(out).toContain('[TRUNCATED: nested too deep]')
+      expect(stats.truncated).toBe(true)
+      expect(stats.redactions).toBeGreaterThanOrEqual(1)
+      expect(stats.droppedChars).toBeGreaterThan(0)
+
+      const built = buildRow({
+        eventType: 'TOOL_COMPLETED',
+        timestampMs: 0,
+        eventId: 'e1',
+        agent: 'a',
+        sessionId: 's',
+        invocationId: 'i',
+        userId: 'u',
+        traceId: 't',
+        spanId: 'p',
+        parentSpanId: null,
+        content: { result: input },
+        attributes: {},
+        maxPayloadChars: 65_536,
+      })
+      const serialized = built.row.content ?? ''
+      expect(serialized).not.toContain(secret)
+      expect(serialized).toContain('[TRUNCATED: nested too deep]')
+      expect(built.row.is_truncated).toBe(true)
+      expect(built.redactions).toBeGreaterThanOrEqual(1)
+      const redMeta = (JSON.parse(built.row.attributes ?? '{}') as { redaction?: { values: number; dropped_chars: number } }).redaction
+      expect((redMeta?.dropped_chars ?? 0) > 0).toBe(true)
+    }
+  }
+})
+
+test('quoted secret assignments and CLI/YAML/unquoted multi-line JSON do not expose nested secret payloads', () => {
+  const secret = ['quoted', 'json', 'secret', '002'].join('-')
+  const singleQuoted = `export APP_SECRET='{\n  "payload": {\n    "value": "${secret}"\n  }\n}'`
+  const doubleQuoted = `export APP_SECRET="{\\n  \\"payload\\": {\\n    \\"value\\": \\"${secret}\\"\\n  }\\n}"`
+  const cliFlagQuoted = `aws secretsmanager put-secret-value --secret-id app/cfg --secret-string '{\n  "payload": {\n    "value": "${secret}"\n  }\n}'`
+
+  for (const [sample, expectedPrefix, expectTruncated] of [
+    [singleQuoted, 'export APP_SECRET=[REDACTED]', true],
+    [`${singleQuoted}\necho done`, 'export APP_SECRET=[REDACTED]\necho done', false],
+    [doubleQuoted, 'export APP_SECRET=[REDACTED]', false],
+    [`export APP_SECRET="{\n  \\"payload\\": {\n    \\"value\\": \\"${secret}\\"\n  }\n}"\necho done`, 'export APP_SECRET=[REDACTED]\necho done', false],
+    [`export APP_SECRET='{"payload":{"value":"${secret}"}}'`, 'export APP_SECRET=[REDACTED]', false],
+    [cliFlagQuoted, 'aws secretsmanager put-secret-value --secret-id app/cfg --secret-string [REDACTED]', true],
+    [`${cliFlagQuoted} --region us`, 'aws secretsmanager put-secret-value --secret-id app/cfg --secret-string [REDACTED] --region us', false],
+    [`aws secretsmanager put-secret-value --secret-id app/cfg --secret-string {\n  "payload": {\n    "value": "${secret}"\n  }\n}`, 'aws secretsmanager put-secret-value --secret-id app/cfg --secret-string [REDACTED]', false],
+    [`export APP_SECRET={\n  "payload": {\n    "value": "${secret}"\n  }\n}`, 'export APP_SECRET=[REDACTED]', false],
+    [`export APP_SECRET=\n{\n  "payload": {\n    "value": "${secret}"\n  }\n}\necho done`, 'export APP_SECRET=\n[REDACTED]\necho done', false],
+    [`secret: |\n  {\n    "payload": {\n      "value": "${secret}"\n    }\n  }\nmode: fast`, 'secret: [REDACTED]\nmode: fast', false],
+  ] as const) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).toBe(expectedPrefix)
+    expect(out).not.toContain(secret)
+    expect(stats.truncated).toBe(expectTruncated)
+    expect(stats.redactions).toBe(1)
+    expect(stats.droppedChars).toBe(0)
+
+    const built = buildRow({
+      eventType: 'TOOL_STARTING',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { tool: 'Bash', args: { command: sample } },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    expect(built.row.content ?? '').not.toContain(secret)
+    expect(built.row.is_truncated).toBe(expectTruncated)
+    expect(built.redactions).toBe(1)
+  }
+
+  // Quoted assignment followed by a separate benign-key prose JSON block leaves both cleanly handled.
+  const secret2 = ['prose', 'json', 'secret', '003'].join('-')
+  const mixed = `${singleQuoted}\nResult:\n{\n  "ok": true,\n  "token": "${secret2}"\n}`
+  const mixedStats = newStats()
+  const mixedOut = redactText(mixed, mixedStats)
+  expect(mixedOut).not.toContain(secret)
+  expect(mixedOut).not.toContain(secret2)
+  expect(mixedOut).toContain('export APP_SECRET=[REDACTED]')
+  expect(mixedOut).toContain('"ok": true')
+  expect(mixedOut).toContain('"token": "[REDACTED]"')
+  expect(mixedStats.truncated).toBe(false)
+  expect(mixedStats.redactions).toBe(2)
+
+  // Literal marker-like text in benign sibling JSON must never collide with internal placeholders.
+  const collisionInput = `Result:\n{\n  "marker": "pjspan0q1z",\n  "api_key": "${secret}"\n}`
+  const collisionStats = newStats()
+  const collisionOut = redactText(collisionInput, collisionStats)
+  expect(collisionOut).not.toContain(secret)
+  expect(collisionOut).toContain('"marker": "pjspan0q1z"')
+  expect(collisionOut).toContain('"api_key": "[REDACTED]"')
+})
+
+test('SQL IDENTIFIED BY / WITH PASSWORD backslash runs stay linear O(N) without ReDoS', () => {
+  const shapes = [
+    'IDENTIFIED BY "' + '\\'.repeat(48) + '\n',
+    'IDENTIFIED BY "' + '\\'.repeat(49) + '\n',
+    "WITH PASSWORD '" + '\\'.repeat(48) + '\n',
+    'IDENTIFIED BY "' + '\\'.repeat(80_000) + '\n',
+    "WITH ENCRYPTED PASSWORD '" + '\\'.repeat(80_000) + '\n',
+  ]
+  for (const inp of shapes) {
+    const stats = newStats()
+    const t0 = performance.now()
+    const out = redactText(inp, stats)
+    const elapsed = performance.now() - t0
+    expect(elapsed).toBeLessThan(100)
+    expect(out).toContain('[REDACTED]')
+    expect(stats.redactions).toBeGreaterThanOrEqual(1)
+  }
+
+  const normalStats = newStats()
+  const normalSql = `CREATE USER 'app'@'%' IDENTIFIED BY 'p''w'; ALTER USER app WITH PASSWORD "ab\\\\cd"; CREATE USER e IDENTIFIED BY "";`
+  const normalOut = redactText(normalSql, normalStats)
+  expect(normalOut).toBe(`CREATE USER 'app'@'%' IDENTIFIED BY '[REDACTED]'; ALTER USER app WITH PASSWORD "[REDACTED]"; CREATE USER e IDENTIFIED BY "";`)
+  expect(normalStats.redactions).toBe(2)
+})

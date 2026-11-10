@@ -3039,7 +3039,7 @@ const ENV_INDEX_RE = /\b((?:os\.environ(?:\.setdefault)?|process\.env|ENV|System
 const SETTER_ONE_ARG_RE = /\b((?:set|with)_?([A-Za-z][A-Za-z0-9_]{1,80}))([ \t]*\([ \t]*)("(?:\\.|[^"\n\\])*"|'(?:\\.|[^'\n\\])*')/g
 const SETTER_TWO_ARG_RE = /\b((?:set|with|put|add|setenv)_?[A-Za-z0-9_]{0,40})([ \t]*\([ \t]*)(['"])([^'"\n]{1,80})\3([ \t]*,[ \t]*)("(?:\\.|[^"\n\\])*"|'(?:\\.|[^'\n\\])*')/g
 const XML_TAG_RE = /<([A-Za-z_][A-Za-z0-9_.:-]{0,80})>([^<\r\n]{1,4096})<\/\1>/g
-const SQL_IDENT_RE = /\b(IDENTIFIED(?:\s+WITH\s+[A-Za-z0-9_]+)?\s+BY|WITH(?:\s+(?:ENCRYPTED|UNENCRYPTED))?\s+PASSWORD)([ \t]+)("(?:\\.|[^"\n])*"|'(?:''|\\.|[^'\n])*'|[^\s;]+)/gi
+const SQL_IDENT_RE = /\b(IDENTIFIED(?:\s+WITH\s+[A-Za-z0-9_]+)?\s+BY|WITH(?:\s+(?:ENCRYPTED|UNENCRYPTED))?\s+PASSWORD)([ \t]+)("(?:""|\\[^\r\n]|[^"\\\r\n])*(?:"|\\?(?=\r|\n|$))|'(?:''|\\[^\r\n]|[^'\\\r\n])*(?:'|\\?(?=\r|\n|$))|[^\s;]+)/gi
 const DOCKER_ENV_RE = /^([ \t]*(?:ENV|ARG)[ \t]+)([A-Za-z_][A-Za-z0-9_]{0,80})([ \t]+)(?![=\s])([^\r\n]+)$/gm
 const NETRC_LINE_HDR = /\b(?:machine[ \t]+\S+|default)\b/
 const NETRC_PW_RE = /\b(password)([ \t]+)(\S+)/g
@@ -3521,7 +3521,8 @@ function redactTextPasses(text: string, stats: SanitizeStats): string {
   return redactListNames(redactOptionWords(redactSingleDashSecrets(redactFlagValues(redactNamedValues(out, stats), stats), stats), stats), stats)
 }
 
-const SAME_LINE_SENSITIVE_ASSIGN = /(?:^|[^A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]{0,99})["']?[ \t]*[:=][ \t]*$/
+const PROSE_SENSITIVE_ASSIGN_BEFORE = /(?:^|[^A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]{0,99})["']?[ \t]*[:=](?:[ \t]*(?:[|>][+-]?\d*)?)?[ \t]*(?:\r?\n[ \t]*)?$/
+const PROSE_SENSITIVE_FLAG_BEFORE = /(?:^|[\s;|&(])--([A-Za-z][A-Za-z0-9_.-]{0,99})[ \t]*(?:\r?\n[ \t]*)?$/
 const PROSE_JSON_MAX_SPAN = 65_536
 const PROSE_JSON_MAX_PARSE_TRIES = 64
 
@@ -3535,7 +3536,7 @@ function hasNestedContainer(val: unknown): boolean {
   return false
 }
 
-function redactSensitiveSubtree(val: unknown, stats: SanitizeStats): unknown {
+function redactSensitiveSubtree(val: unknown, stats: SanitizeStats, depth = 0): unknown {
   if (val === null) return null
   if (typeof val === 'string') {
     if (isMarkerLike(val)) return val
@@ -3546,11 +3547,18 @@ function redactSensitiveSubtree(val: unknown, stats: SanitizeStats): unknown {
     stats.redactions += 1
     return MARKER
   }
-  if (Array.isArray(val)) return val.map(item => redactSensitiveSubtree(item, stats))
+  if (depth > 20) {
+    const droppedLen = JSON.stringify(val)?.length ?? 0
+    stats.truncated = true
+    stats.redactions += 1
+    stats.droppedChars += droppedLen
+    return MARKER
+  }
+  if (Array.isArray(val)) return val.map(item => redactSensitiveSubtree(item, stats, depth + 1))
   if (typeof val === 'object') {
     const out: Record<string, unknown> = {}
     for (const k of Object.keys(val as Record<string, unknown>)) {
-      out[k] = redactSensitiveSubtree((val as Record<string, unknown>)[k], stats)
+      out[k] = redactSensitiveSubtree((val as Record<string, unknown>)[k], stats, depth + 1)
     }
     return out
   }
@@ -3558,9 +3566,16 @@ function redactSensitiveSubtree(val: unknown, stats: SanitizeStats): unknown {
 }
 
 function walkProseJsonValue(val: unknown, stats: SanitizeStats, depth = 0): unknown {
-  if (depth > 20 || val === null) return val
+  if (val === null) return null
   if (typeof val === 'string') return redactTextPasses(val, stats)
   if (typeof val !== 'object') return val
+  if (depth > 20) {
+    const droppedLen = JSON.stringify(val)?.length ?? 0
+    stats.truncated = true
+    stats.redactions += 1
+    stats.droppedChars += droppedLen
+    return '[TRUNCATED: nested too deep]'
+  }
   if (Array.isArray(val)) return val.map(item => walkProseJsonValue(item, stats, depth + 1))
   const obj = val as Record<string, unknown>
   const out: Record<string, unknown> = {}
@@ -3581,7 +3596,7 @@ function walkProseJsonValue(val: unknown, stats: SanitizeStats, depth = 0): unkn
     }
     const raw = obj[key]
     if (isSensitiveKey(key)) {
-      out[outKey] = redactSensitiveSubtree(raw, stats)
+      out[outKey] = redactSensitiveSubtree(raw, stats, depth + 1)
     } else {
       out[outKey] = walkProseJsonValue(raw, stats, depth + 1)
     }
@@ -3590,16 +3605,18 @@ function walkProseJsonValue(val: unknown, stats: SanitizeStats, depth = 0): unkn
 }
 
 function precededBySensitiveAssignment(text: string, braceIdx: number): boolean {
-  const nl = text.lastIndexOf('\n', braceIdx - 1)
-  const linePrefix = text.slice(nl + 1, braceIdx)
-  const m = SAME_LINE_SENSITIVE_ASSIGN.exec(linePrefix)
-  return m !== null && isSensitiveKey(m[1] as string)
+  const prefix = text.slice(Math.max(0, braceIdx - 512), braceIdx)
+  const am = PROSE_SENSITIVE_ASSIGN_BEFORE.exec(prefix)
+  if (am !== null && isSensitiveKey(am[1] as string)) return true
+  const fm = PROSE_SENSITIVE_FLAG_BEFORE.exec(prefix)
+  return fm !== null && credentialOption(fm[1] as string)
 }
 
-type JsonCandidateSpan = { start: number; end: number; parsed: unknown }
+type JsonCandidateSpan = { start: number; end: number; parsed: unknown; sensitiveContext: boolean; multiline: boolean }
 
 function findBalancedProseJsonSpans(text: string): JsonCandidateSpan[] {
   if (!text.includes('{') || !text.includes('}')) return []
+  const qStates = quoteStates(text)
   const spans: JsonCandidateSpan[] = []
   const stack: number[] = []
   let inStr = false
@@ -3627,6 +3644,9 @@ function findBalancedProseJsonSpans(text: string): JsonCandidateSpan[] {
       continue
     }
     if (ch === 123) {
+      // Leave `{` inside shell quotes, ANSI-C quotes, or unknown quote states
+      // intact so enclosing assignment/flag redactors consume the whole string.
+      if (stack.length === 0 && qStates[i] !== NONE) continue
       // Only push `{` if next non-whitespace character is `"` or `}` (checked via monotonic wsCursor).
       let k = wsCursor > i + 1 ? wsCursor : i + 1
       if (k === i + 1) {
@@ -3652,13 +3672,14 @@ function findBalancedProseJsonSpans(text: string): JsonCandidateSpan[] {
         const len = i + 1 - open
         if (len <= PROSE_JSON_MAX_SPAN && parseTries < PROSE_JSON_MAX_PARSE_TRIES) {
           const slice = text.slice(open, i + 1)
-          const maybeNested = slice.includes('\n') || slice.includes('[') || slice.indexOf('{', 1) !== -1
-          if (maybeNested && !precededBySensitiveAssignment(text, open)) {
+          const multiline = slice.includes('\n')
+          const maybeNested = multiline || slice.includes('[') || slice.indexOf('{', 1) !== -1
+          if (maybeNested) {
             parseTries += 1
             try {
               const parsed = JSON.parse(slice) as unknown
-              if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) && (slice.includes('\n') || hasNestedContainer(parsed))) {
-                spans.push({ start: open, end: i + 1, parsed })
+              if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) && (multiline || hasNestedContainer(parsed))) {
+                spans.push({ start: open, end: i + 1, parsed, sensitiveContext: precededBySensitiveAssignment(text, open), multiline })
               }
             } catch {
               // Not valid JSON; leave for free-text passes.
@@ -3671,20 +3692,36 @@ function findBalancedProseJsonSpans(text: string): JsonCandidateSpan[] {
   return spans
 }
 
+function proseJsonTokenSuffix(text: string): number {
+  let suffix = 1
+  while (text.includes(`pjspan`) && text.includes(`q${suffix}z`)) suffix += 1
+  return suffix
+}
+
 function splitAndRedactProseJson(text: string, stats: SanitizeStats): string {
   const spans = findBalancedProseJsonSpans(text)
   if (spans.length === 0) return redactTextPasses(text, stats)
-  let out = ''
+  const suffix = proseJsonTokenSuffix(text)
+  let masked = ''
   let copied = 0
-  for (const span of spans) {
-    if (span.start > copied) out += redactTextPasses(text.slice(copied, span.start), stats)
-    const slice = text.slice(span.start, span.end)
-    const sanitized = walkProseJsonValue(span.parsed, stats)
-    out += JSON.stringify(sanitized, null, slice.includes('\n') ? 2 : undefined)
+  for (let idx = 0; idx < spans.length; idx += 1) {
+    const span = spans[idx]!
+    masked += text.slice(copied, span.start) + `pjspan${idx}q${suffix}z`
     copied = span.end
   }
-  if (copied < text.length) out += redactTextPasses(text.slice(copied), stats)
-  return out
+  masked += text.slice(copied)
+  const redactedMasked = redactTextPasses(masked, stats)
+  const tokenRe = new RegExp(`pjspan(\\d+)q${suffix}z`, 'g')
+  return redactedMasked.replace(tokenRe, (whole: string, rawIdx: string) => {
+    const span = spans[Number(rawIdx)]
+    if (span === undefined) return whole
+    if (span.sensitiveContext) {
+      stats.redactions += 1
+      return MARKER
+    }
+    const sanitized = walkProseJsonValue(span.parsed, stats)
+    return JSON.stringify(sanitized, null, span.multiline ? 2 : undefined)
+  })
 }
 
 // The free-text rules: prose-embedded multi-line/nested JSON objects first,

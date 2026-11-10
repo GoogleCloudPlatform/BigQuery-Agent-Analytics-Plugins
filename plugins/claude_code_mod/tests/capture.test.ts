@@ -18,7 +18,7 @@
 import { type Engine, expect, test } from 'claude-code/testing'
 
 import { PLUGIN_VERSION } from '../hooks/lib/config.ts'
-import { ACCESS_TOKEN, COMMAND, DRY_RUN_DIR, OK_INSERT, OPTIONS, type Row, SESSION_ID, USAGE, type World, byType, deadLetterFiles, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
+import { ACCESS_TOKEN, COMMAND, DRY_RUN_DIR, type FetchCall, type FetchReply, OK_INSERT, OPTIONS, type Row, SESSION_ID, USAGE, type World, byType, deadLetterFiles, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
 
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX16 = /^[0-9a-f]{16}$/
@@ -813,12 +813,16 @@ test('a short (< 5 s) session whose session.end batch hits table-not-found auto-
   const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
   const tableMissing = { status: 404, text: '{"error":{"code":404,"message":"Not found: Table my-gcp-project:agent_analytics.agent_events","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}' }
   const tableCreated = { status: 200, text: '{"kind":"bigquery#table"}' }
-  world.replies = [tableMissing, tableCreated, OK_INSERT]
+  world.replies = [OK_INSERT, tableMissing, tableCreated, OK_INSERT]
   await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
   await $.turn.start({ turnId: 't-exit-autocreate', text: 'check' })
   await $.turn.complete({ turnId: 't-exit-autocreate', answer: 'ok', durationMs: 25, isAborted: false, reason: 'answer' })
+  // The clock runs between the two, as on a host: the end-of-turn flush goes
+  // out and is answered first, so the request the 404 answers is the exit's own.
+  await world.clock.advance(0)
   await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
   expect(world.fetches.map(f => `${f.method} ${f.url.split('/').pop()?.split('?')[0]}`)).toEqual([
+    'POST insertAll',
     'POST insertAll',
     'POST tables',
     'POST insertAll',
@@ -826,6 +830,7 @@ test('a short (< 5 s) session whose session.end batch hits table-not-found auto-
   expect(world.acceptedRows().length).toBe(4)
   expect(deadLetterFiles(world)).toEqual([])
   expect(deadLetterRows(world)).toEqual([])
+  expect(world.stderr).toEqual([])
   expect(world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))).toEqual([])
 })
 
@@ -852,5 +857,220 @@ test('a short -p session with 20 ms HTTP latency whose in-flight batch hits tabl
   expect(world.acceptedRows().length).toBe(4)
   expect(deadLetterFiles(world)).toEqual([])
   expect(deadLetterRows(world)).toEqual([])
+  expect(world.stderr).toEqual([])
   expect(world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))).toEqual([])
+})
+
+// A short `-p` run as a host runs it: the clock runs between turn.complete and
+// session.end, so the 0 ms flush the turn asked for has its request out when
+// the exit begins. Each test below says what that request is answered.
+const TABLE_MISSING = { status: 404, text: '{"error":{"code":404,"message":"Not found: Table my-gcp-project:agent_analytics.agent_events","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}' }
+const DATASET_MISSING = { status: 404, text: '{"error":{"code":404,"message":"Not found: Dataset my-gcp-project:agent_analytics","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}' }
+const TABLE_CREATED = { status: 200, text: '{"kind":"bigquery#table"}' }
+const CREATE_DENIED = { status: 403, text: '{"error":{"code":403,"message":"Access Denied: Dataset my-gcp-project:agent_analytics: Permission bigquery.tables.create denied","errors":[{"reason":"accessDenied"}],"status":"PERMISSION_DENIED"}}' }
+const TABLE_NOTICE = 'BigQuery cannot find the table my-gcp-project.agent_analytics.agent_events'
+const DATASET_NOTICE = 'BigQuery cannot find the dataset my-gcp-project.agent_analytics'
+
+const requestsOf = (world: World): string[] => world.fetches.map(f => `${f.method} ${f.url.split('/').pop()?.split('?')[0]}`)
+const insertIds = (call: FetchCall | undefined): string[] => (JSON.parse(call?.body ?? '{"rows":[]}') as { rows: { insertId: string }[] }).rows.map(r => r.insertId)
+
+const runTurn = async ($: Engine, turnId: string): Promise<void> => {
+  await $.turn.start({ turnId, text: 'check' })
+  await $.turn.complete({ turnId, answer: 'ok', durationMs: 25, isAborted: false, reason: 'answer' })
+}
+
+const endSession = ($: Engine): Promise<unknown> => $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+
+// Runs the session up to the moment the exit has begun with the end-of-turn
+// request out and unanswered. In an object: `ending` is the exit, still going.
+async function exitWithTurnBatchOut($: Engine, world: World): Promise<{ ending: Promise<unknown> }> {
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await runTurn($, 't-exit-inflight')
+  await world.clock.advance(0)
+  expect(world.fetches[world.fetches.length - 1]?.answered).toBe('hang')
+  return { ending: endSession($) }
+}
+
+// The answer comes 100 ms into the exit, about what a live run sees; then
+// the rest of the exit, well past its 800 ms default budget.
+async function answerDuringExit(world: World, answer: Exclude<FetchReply, { reject: string } | { hang: true }>, ending: Promise<unknown>): Promise<void> {
+  await world.clock.advance(100)
+  world.releaseHung(answer.status, answer.text)
+  await world.clock.advance(1200)
+  await ending
+}
+
+test('a short -p run whose end-of-turn request is answered table-not-found after session.end began creates the table, and one retry lands every row', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }, TABLE_CREATED, OK_INSERT]
+  const { ending } = await exitWithTurnBatchOut($, world)
+  await answerDuringExit(world, TABLE_MISSING, ending)
+  expect(requestsOf(world)).toEqual(['POST insertAll', 'POST tables', 'POST insertAll'])
+  // The retry carries the rows of the batch the 404 answered, under the same
+  // insertIds, then the session_end row queued behind them, and BigQuery took
+  // every one without duplicating any row.
+  const [answered, retry] = world.insertCalls()
+  expect(insertIds(retry).slice(0, insertIds(answered).length)).toEqual(insertIds(answered))
+  expect(insertIds(retry).length).toBe(4)
+  expect(world.acceptedRows().length).toBe(4)
+  expect(world.acceptedRows().map(r => r.event_id)).toEqual(insertIds(retry))
+  expect(new Set(insertIds(retry)).size).toBe(4)
+  expect(deadLetterFiles(world)).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+  expect(world.stderr).toEqual([])
+})
+
+test('the same run whose end-of-turn request lands during the exit wait creates no table', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }, OK_INSERT]
+  const { ending } = await exitWithTurnBatchOut($, world)
+  await answerDuringExit(world, OK_INSERT, ending)
+  expect(requestsOf(world)).toEqual(['POST insertAll', 'POST insertAll'])
+  expect(new Set(world.sentRows().map(r => r.event_id)).size).toBe(4)
+  expect(deadLetterRows(world)).toEqual([])
+  expect(world.stderr).toEqual([])
+})
+
+test('with BQAA_AUTO_CREATE_TABLE=false, table-not-found during the exit wait creates no table: the rows are spilled and the notice raised', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN, BQAA_AUTO_CREATE_TABLE: 'false' })
+  world.replies = [{ hang: true }, TABLE_CREATED, OK_INSERT]
+  const { ending } = await exitWithTurnBatchOut($, world)
+  await answerDuringExit(world, TABLE_MISSING, ending)
+  expect(requestsOf(world)).toEqual(['POST insertAll'])
+  expect(deadLetterRows(world).length).toBe(4)
+  expect(world.stderr[0] ?? '').toContain(TABLE_NOTICE)
+})
+
+test('when this session already made the table, table-not-found during the exit wait makes no second one: the rows are spilled', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  // The end-of-turn flush makes the table at once; the send after that is
+  // the request out when the exit begins. Any second create would show.
+  world.replies = [TABLE_MISSING, TABLE_CREATED, { hang: true }, TABLE_CREATED]
+  const { ending } = await exitWithTurnBatchOut($, world)
+  await answerDuringExit(world, TABLE_MISSING, ending)
+  expect(requestsOf(world)).toEqual(['POST insertAll', 'POST tables', 'POST insertAll'])
+  expect(world.acceptedRows()).toEqual([])
+  expect(deadLetterRows(world).length).toBe(4)
+})
+
+test('a dataset-not-found answer during the exit wait creates no table: the rows are spilled and the notice names the dataset', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }, TABLE_CREATED, OK_INSERT]
+  const { ending } = await exitWithTurnBatchOut($, world)
+  await answerDuringExit(world, DATASET_MISSING, ending)
+  expect(requestsOf(world)).toEqual(['POST insertAll'])
+  expect(deadLetterRows(world).length).toBe(4)
+  expect(world.stderr[0] ?? '').toContain(DATASET_NOTICE)
+})
+
+test('when BigQuery refuses the create during the exit, the rows are spilled and the notice raised', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }, CREATE_DENIED]
+  const { ending } = await exitWithTurnBatchOut($, world)
+  await answerDuringExit(world, TABLE_MISSING, ending)
+  expect(requestsOf(world)).toEqual(['POST insertAll', 'POST tables'])
+  expect(world.acceptedRows()).toEqual([])
+  expect(deadLetterRows(world).length).toBe(4)
+  expect(world.stderr[0] ?? '').toContain(TABLE_NOTICE)
+})
+
+test('a create that does not answer during the exit is given up inside the budget: the rows are spilled and the notice raised', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }]
+  const { ending } = await exitWithTurnBatchOut($, world)
+  let ended = false
+  void ending.then(() => {
+    ended = true
+  })
+  await world.clock.advance(100)
+  world.releaseHung(TABLE_MISSING.status, TABLE_MISSING.text)
+  // 500 ms in: the create is out and unanswered, and the exit waits for it.
+  await world.clock.advance(400)
+  expect([requestsOf(world), ended]).toEqual([['POST insertAll', 'POST tables'], false])
+  // BQAA_EXIT_FLUSH_MS defaults to 800 ms: at its end the exit is over,
+  // with no answer to the create.
+  await world.clock.advance(300)
+  expect(ended).toBe(true)
+  await ending
+  expect(deadLetterRows(world).length).toBe(4)
+  expect(world.stderr[0] ?? '').toContain(TABLE_NOTICE)
+  world.releaseHung(TABLE_CREATED.status, TABLE_CREATED.text)
+})
+
+test('a table-not-found answer that comes after the exit stopped waiting creates no table: the rows are spilled once', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }, TABLE_CREATED, OK_INSERT]
+  const { ending } = await exitWithTurnBatchOut($, world)
+  // The exit waits for an answer up to half its 800 ms default budget.
+  await world.clock.advance(500)
+  world.releaseHung(TABLE_MISSING.status, TABLE_MISSING.text)
+  await world.clock.advance(300)
+  await ending
+  expect(requestsOf(world)).toEqual(['POST insertAll'])
+  const spilled = deadLetterRows(world).map(r => r.event_id)
+  expect([spilled.length, new Set(spilled).size]).toEqual([4, 4])
+})
+
+test('a table-not-found answer that comes after the exit stopped waiting still raises the notice', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }, TABLE_CREATED, OK_INSERT]
+  const { ending } = await exitWithTurnBatchOut($, world)
+  await world.clock.advance(500)
+  await ending
+  world.releaseHung(TABLE_MISSING.status, TABLE_MISSING.text)
+  await world.clock.settle()
+  expect(world.statusLines.some(line => (line ?? '').includes(TABLE_NOTICE))).toBe(true)
+})
+
+test('with a writer taken over from still out too, the table-not-found answer to the last writer\'s batch makes no table: every row is spilled once and the notice raised', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }, { hang: true }, TABLE_CREATED, OK_INSERT]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await runTurn($, 't-before-takeover')
+  await world.clock.advance(0)
+  // session.start fires again: the next writer takes over with the first
+  // writer's request still out, then has a request of its own out.
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await runTurn($, 't-after-takeover')
+  await world.clock.advance(0)
+  expect(world.insertCalls().length).toBe(2)
+  const sent = world.sentRows().map(r => r.event_id)
+  const ending = endSession($)
+  await answerDuringExit(world, TABLE_MISSING, ending)
+  expect(requestsOf(world)).toEqual(['POST insertAll', 'POST insertAll'])
+  const spilled = deadLetterRows(world).map(r => r.event_id)
+  expect(new Set(spilled).size).toBe(spilled.length)
+  expect(sent.filter(id => !spilled.includes(id))).toEqual([])
+  expect(world.stderr[0] ?? '').toContain(TABLE_NOTICE)
+})
+
+test('with an earlier writer still unanswered past the exit wait cutoff, a 404 to the current writer\'s batch creates no table and spills every row once with notice', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }, { hang: true }, TABLE_CREATED, OK_INSERT]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await runTurn($, 't-prior-unanswered')
+  await world.clock.advance(0)
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await runTurn($, 't-current-404')
+  await world.clock.advance(0)
+  expect(world.insertCalls().length).toBe(2)
+  const sent = world.sentRows().map(r => r.event_id)
+  let ended = false
+  const ending = endSession($).then(res => {
+    ended = true
+    return res
+  })
+  // Answer ONLY the current writer's hung request at +100 ms; leave prior writer hung past +400 ms wait cutoff.
+  await world.clock.advance(100)
+  world.releaseHungAt(1, TABLE_MISSING.status, TABLE_MISSING.text)
+  await world.clock.advance(300)
+  expect(ended).toBe(true)
+  await ending
+  expect(requestsOf(world)).toEqual(['POST insertAll', 'POST insertAll'])
+  const spilled = deadLetterRows(world).map(r => r.event_id)
+  expect(spilled.length).toBe(sent.length + 1)
+  expect(new Set(spilled).size).toBe(spilled.length)
+  expect(sent.filter(id => !spilled.includes(id))).toEqual([])
+  expect(world.stderr[0] ?? '').toContain(TABLE_NOTICE)
+  world.releaseHung(OK_INSERT.status, OK_INSERT.text)
 })

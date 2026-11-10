@@ -16,7 +16,8 @@
 // everything that touches the network, a process or the disk runs here, from
 // timers, never inside a hook's dispatch (session end's bounded work aside:
 // its spill write and, while BigQuery takes this session's rows, one request
-// with a token already at hand, and in a `-p` run a replay of parked files,
+// with a token already at hand (for a table it cannot find, the table's
+// creation and one more send), and in a `-p` run a replay of parked files,
 // all within its budget, none running a process).
 //
 // Delivery: batched tabledata.insertAll with a client-side timeout, retries
@@ -32,7 +33,7 @@
 // takes clears it.
 
 import { type Config, canDeliver, deadLetterPartition, destinationDir, joinPath, tableRef } from './config.ts'
-import { type HttpAnswer, TOKEN_INFO_URL, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tablesUrl } from './bigquery.ts'
+import { type HttpAnswer, TOKEN_INFO_URL, apiErrorMessage, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tablesUrl } from './bigquery.ts'
 import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, type ParsedFile, fileName, isDeadLetterKind, kindOf, lineText, packBodies, packFiles, packLines, parseFile, sealFile } from './deadletter.ts'
 import { randomHex } from './ids.ts'
 import { BoundedQueue, type Queued } from './queue.ts'
@@ -550,9 +551,6 @@ export class Writer {
   private status: { text: string | undefined | null } = { text: undefined }
   // Set once the session is ending: no new batch starts after that.
   private closing = false
-  private closingUntil = 0
-  private closingSendQueued = false
-  private exitCreateTableNeeded = false
   // After a recovery backfill finds files held by another session (or still
   // incomplete / waiting on a parent), defer the next idle recovery check for
   // 30 s via host timer without triggering error backoff.
@@ -565,6 +563,11 @@ export class Writer {
   // the exit began (it was waiting for its token or its account): the exit
   // then sends nothing of its own, and spills that batch with the rest.
   private heldAtExit = false
+  // While an exit that may send waits for this writer's batch out
+  // (spillForExit): a table-not-found answer to it is left here
+  // (`notFound`) with the batch back on the queue, so the exit makes the
+  // table and sends the batch once more before anything is parked.
+  private exitWait: { notFound: HttpAnswer | null } | null = null
   // While session end's own replay runs (`replayAtExit`): it goes on past
   // `closing` until `until` or `cutoff`, whichever comes first, and takes no
   // token but one already at hand.
@@ -991,24 +994,18 @@ export class Writer {
         await this.retryLater(batch, `authentication: ${outcome.message}`)
         return false
       case 'not-found': {
-        if (!this.closing && c.autoCreateTable && !this.createAttempted && !isDatasetMissing(outcome.message)) {
+        if (!this.closing && this.mayCreateTable(c, outcome.message)) {
           if (await this.createTable(c, token)) {
             this.queue.unshift(batch)
             return true
           }
-        }
-        // When an in-flight batch hits table-not-found after session.end
-        // began, defer auto-create + retry to sendAtExit when exit budget
-        // still permits creating the table, rather than tainting settled().
-        if (
-          this.closing &&
-          this.closingSendQueued &&
-          c.autoCreateTable &&
-          !this.createAttempted &&
-          !isDatasetMissing(outcome.message) &&
-          this.closingUntil - this.io.now() - EXIT_SPILL_RESERVE_MS >= EXIT_CREATE_TABLE_MIN_MS
-        ) {
-          this.exitCreateTableNeeded = true
+        } else if (this.exitWait !== null && this.mayCreateTable(c, outcome.message)) {
+          // Wait-for-in-flight handoff: pass this 404 to sendAtExit with the
+          // batch back on the queue so it creates the table once and retries
+          // without duplicating rows or emitting a premature missing notice.
+          this.exitWait.notFound = answer
+          this.batchOpen = false
+          this.inFlightRows = []
           this.queue.unshift(batch)
           return false
         }
@@ -1503,6 +1500,12 @@ export class Writer {
     return pending
   }
 
+  // Whether a table-not-found answer (`message`, not a dataset's) may be met
+  // by making the table: this writer's one try.
+  private mayCreateTable(c: Config, message: string): boolean {
+    return c.autoCreateTable && !this.createAttempted && !isDatasetMissing(message)
+  }
+
   private async createTable(c: Config, token: string, timeoutMs = c.requestTimeoutMs): Promise<boolean> {
     const answer = await this.post(tablesUrl(c), createTableBody(c), token, timeoutMs)
     if ('error' in answer) {
@@ -1672,6 +1675,18 @@ export class Writer {
   // Otherwise it starts no request: the rows still queued go at once to a
   // spill file the next session sends, or in a dry run to the dry-run files,
   // and so do the rows no answer took (they may yet land; event_id dedups).
+  // The background writer's exit flush (`spillForExit`): waits up to half of
+  // `budgetMs` for any in-flight batches, then (if healthy and a token is
+  // already in hand) runs one bounded send — or, when `this.exitWait` caught
+  // a table-not-found answer during that wait, makes the table first and
+  // sends that batch once more — and spills everything else to disk. With
+  // `replaySpills` too, once every row has landed, this table's spill and
+  // retry files are replayed with what is left of the budget (see
+  // replayAtExit).
+  //
+  // Otherwise it starts no request: the rows still queued go at once to a
+  // spill file the next session sends, or in a dry run to the dry-run files,
+  // and so do the rows no answer took (they may yet land; event_id dedups).
   async spillForExit(budgetMs: number, opts: ExitFlushOptions = {}): Promise<{ spilled: number }> {
     const c = this.config()
     const start = this.io.now()
@@ -1682,14 +1697,10 @@ export class Writer {
     // Read before the exit changes anything.
     const sending = opts.sendQueued === true && budgetMs >= EXIT_SEND_MIN_MS && this.canSendAtExit(c, opts.replaySpills === true)
     this.closing = true
-    this.closingUntil = until
-    this.closingSendQueued = sending
     this.soon?.cancel()
     this.soon = null
     for (const writer of writers) {
       writer.closing = true
-      writer.closingUntil = until
-      writer.closingSendQueued = sending
       writer.recoveryTimer?.cancel()
       writer.recoveryTimer = null
       writer.pauseTimer?.cancel()
@@ -1719,7 +1730,10 @@ export class Writer {
     // the wait below can leave BigQuery's state in doubt.
     const flightWriters = writers.filter(writer => writer.inFlightRows.length > 0 && writer.inFlight !== null)
     const flights = flightWriters.flatMap(writer => (writer.inFlight !== null ? [writer.inFlight] : []))
+    const wait: { notFound: HttpAnswer | null } = { notFound: null }
+    if (marks !== null) this.exitWait = wait
     if (flights.length > 0 && budgetMs > 0) await this.raceUntil(Promise.all(flights), start + Math.floor(budgetMs / 2))
+    this.exitWait = null
     // What no answer took: the rows still out, and those an answer asked
     // for again. Rows an answer refused, or parks after their retries, are
     // in a file being written already: a copy here would send them again,
@@ -1733,8 +1747,12 @@ export class Writer {
     // exit: a notice or failures it saw came before this writer's sends.
     const settled = (w: Writer): boolean => w.problem === null && w.consecutiveFailures === 0 && !w.heldAtExit
     if (marks !== null && out.length === 0 && this.persisting.size === 0 && settled(this) && this.before.every(w => !w.heldAtExit) && flightWriters.every(settled)) {
-      if ((await this.sendAtExit(c, marks, park, writes, until)) && opts.replaySpills === true && spilled === 0) await this.replayAtExit(c, marks, until)
-    } else park([...out, ...this.queue.takeAll()])
+      if ((await this.sendAtExit(c, marks, park, writes, until, wait.notFound)) && opts.replaySpills === true && spilled === 0) await this.replayAtExit(c, marks, until)
+    } else {
+      // No send follows, so no table is made: the answer kept is told now.
+      if (wait.notFound !== null) this.missingDestination(apiErrorMessage(wait.notFound))
+      park([...out, ...this.queue.takeAll()])
+    }
     const pending = [...writes, ...this.persisting]
     if (pending.length > 0) {
       if (marks === null) await this.raceUntil(Promise.all(pending), until)
@@ -1788,10 +1806,17 @@ export class Writer {
   // (`exitToken`), answered by the `post` mark at the latest. What it does
   // not land is parked by `park` (refused rows to a `rejected` file), in the
   // time left after that mark. True when every row landed (or none waited).
-  private async sendAtExit(c: Config, marks: ExitMarks, park: (rows: Queued[]) => void, writes: Promise<void>[], until: number): Promise<boolean> {
+  // `notFound`, a table-not-found answer the exit wait kept (spillForExit),
+  // stands for the first request's answer, so the table is made first, in
+  // the same bounds, and the batch is sent once.
+  private async sendAtExit(c: Config, marks: ExitMarks, park: (rows: Queued[]) => void, writes: Promise<void>[], until: number, notFound: HttpAnswer | null): Promise<boolean> {
     if (this.queue.length === 0) return true
     const token = await this.exitToken(marks.token)
-    if (token === null || marks.token.passed() || until - this.io.now() < EXIT_SEND_MIN_MS) {
+    // A request of its own needs a send's time. With `notFound` the first
+    // request is answered already, and the table's creation has its own bound.
+    const tooLate = marks.token.passed() || until - this.io.now() < EXIT_SEND_MIN_MS
+    if (token === null || (tooLate && notFound === null)) {
+      if (notFound !== null) this.missingDestination(apiErrorMessage(notFound))
       park(this.queue.takeAll())
       return false
     }
@@ -1807,37 +1832,8 @@ export class Writer {
         marks.post.at.then(() => ({ error: 'no answer before the session ended' })),
       ])
 
-    const createNeeded = this.exitCreateTableNeeded || this.before.some(w => w.exitCreateTableNeeded)
-    if (createNeeded) {
-      this.exitCreateTableNeeded = false
-      for (const w of this.before) w.exitCreateTableNeeded = false
-      const createBudget = until - this.io.now() - EXIT_SPILL_RESERVE_MS
-      const missingTableMsg = `Not found: Table ${c.project}:${c.dataset}.${c.table}`
-      if (!c.autoCreateTable || this.createAttempted || marks.post.passed() || createBudget < EXIT_CREATE_TABLE_MIN_MS) {
-        this.missingDestination(missingTableMsg)
-        this.recordError(`session end: ${missingTableMsg}`)
-        park(batch)
-        return false
-      }
-      const created = await Promise.race([
-        this.createTable(c, token, Math.max(50, createBudget)),
-        marks.post.at.then(() => false),
-      ])
-      if (!created) {
-        this.missingDestination(missingTableMsg)
-        this.recordError(marks.post.passed() ? 'session end: no answer before the session ended' : `session end: create table failed (${tableRef(c)})`)
-        park(batch)
-        return false
-      }
-      if (marks.post.passed() || until - this.io.now() < EXIT_SEND_MIN_MS) {
-        this.recordError(`session end: table created (${tableRef(c)}); rows spilled`)
-        park(batch)
-        return false
-      }
-    }
-
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const answer = await postBatch()
+      const answer = attempt === 0 && notFound !== null ? notFound : await postBatch()
       if ('error' in answer) {
         this.recordError(`session end: ${answer.error}`)
         park(batch)
@@ -1878,9 +1874,7 @@ export class Writer {
           const createBudget = until - this.io.now() - EXIT_SPILL_RESERVE_MS
           if (
             attempt === 0 &&
-            c.autoCreateTable &&
-            !this.createAttempted &&
-            !isDatasetMissing(outcome.message) &&
+            this.mayCreateTable(c, outcome.message) &&
             !marks.post.passed() &&
             createBudget >= EXIT_CREATE_TABLE_MIN_MS
           ) {
