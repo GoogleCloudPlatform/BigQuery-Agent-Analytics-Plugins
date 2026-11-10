@@ -823,12 +823,16 @@ test('a short (< 5 s) session whose session.end batch hits table-not-found auto-
   const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
   const tableMissing = { status: 404, text: '{"error":{"code":404,"message":"Not found: Table my-gcp-project:agent_analytics.agent_events","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}' }
   const tableCreated = { status: 200, text: '{"kind":"bigquery#table"}' }
-  world.replies = [tableMissing, tableCreated, OK_INSERT]
+  world.replies = [OK_INSERT, tableMissing, tableCreated, OK_INSERT]
   await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
   await $.turn.start({ turnId: 't-exit-autocreate', text: 'check' })
   await $.turn.complete({ turnId: 't-exit-autocreate', answer: 'ok', durationMs: 25, isAborted: false, reason: 'answer' })
+  // The clock runs between the two, as on a host: the end-of-turn flush goes
+  // out and is answered first, so the request the 404 answers is the exit's own.
+  await world.clock.advance(0)
   await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
   expect(world.fetches.map(f => `${f.method} ${f.url.split('/').pop()?.split('?')[0]}`)).toEqual([
+    'POST insertAll',
     'POST insertAll',
     'POST tables',
     'POST insertAll',
@@ -985,6 +989,17 @@ test('a table-not-found answer that comes after the exit stopped waiting creates
   expect(requestsOf(world)).toEqual(['POST insertAll'])
   const spilled = deadLetterRows(world).map(r => r.event_id)
   expect([spilled.length, new Set(spilled).size]).toEqual([4, 4])
+})
+
+test('a table-not-found answer that comes after the exit stopped waiting still raises the notice', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }, TABLE_CREATED, OK_INSERT]
+  const { ending } = await exitWithTurnBatchOut($, world)
+  await world.clock.advance(500)
+  await ending
+  world.releaseHung(TABLE_MISSING.status, TABLE_MISSING.text)
+  await world.clock.settle()
+  expect(world.statusLines.some(line => (line ?? '').includes(TABLE_NOTICE))).toBe(true)
 })
 
 test('with a writer taken over from still out too, the table-not-found answer to the last writer\'s batch makes no table: every row is spilled once and the notice raised', { options: OPTIONS }, async ($, on) => {

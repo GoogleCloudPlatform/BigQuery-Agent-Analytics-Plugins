@@ -1176,9 +1176,9 @@ test('when an in-flight post gets 401 and the refreshed token arrives during the
   expect(new Set(spilled.map(r => r.event_id)).size).toBe(4)
 })
 
-test('a table-not-found answer that comes during the exit wait creates no table: the batch is spilled with the rest', { options: { ...OPTIONS, autoCreateTable: true } }, async ($, on) => {
+test('a table-not-found answer that comes during the exit wait makes the table and sends the batch once more: nothing is spilled', { options: { ...OPTIONS, autoCreateTable: true } }, async ($, on) => {
   const world = setUp(on)
-  world.replies = [{ hang: true }, { status: 200, text: '{"kind":"bigquery#table"}' }]
+  world.replies = [{ hang: true }, { status: 200, text: '{"kind":"bigquery#table"}' }, OK_INSERT]
   await startSession($)
   await world.clock.advance(5000)
   expect(world.insertCalls().length).toBe(1)
@@ -1187,9 +1187,11 @@ test('a table-not-found answer that comes during the exit wait creates no table:
   await world.clock.advance(100)
   world.releaseHung(TABLE_MISSING.status, TABLE_MISSING.text)
   await ending
-  // No request, a table creation included, started after session end began.
-  expect(world.fetches.map(f => f.url.split('/').slice(-2).join('/'))).toEqual(['agent_events/insertAll'])
-  expect(deadLetterRows(world).map(r => r.content).sort()).toEqual(['{"session_end":true}', '{"session_start":true}'])
+  // The table comes first; then the batch that was out, the rows queued
+  // behind it with it, in one request BigQuery takes.
+  expect(world.fetches.map(f => f.url.split('/').slice(-2).join('/'))).toEqual(['agent_events/insertAll', 'agent_analytics/tables', 'agent_events/insertAll'])
+  expect(world.acceptedRows().map(r => r.content)).toEqual(['{"session_start":true}', '{"session_end":true}'])
+  expect(deadLetterRows(world)).toEqual([])
 })
 
 test('a 401 that comes during the exit wait fetches no fresh token and sends nothing again: the batch is spilled with the rest', { options: OPTIONS }, async ($, on) => {
