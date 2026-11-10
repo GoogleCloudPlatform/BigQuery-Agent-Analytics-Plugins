@@ -809,3 +809,175 @@ test('prose JSON scanner resets on non-NONE shell quotes and catches unclosed ou
   expect(benignOut).not.toContain('[REDACTED]')
   expect(benignStats.redactions).toBe(0)
 })
+
+test('prose JSON sanitizes credential-bearing object keys inside sensitive subtrees', () => {
+  const ghpToken = ['ghp', 'Synthetic0123456789AbCdEfGhIjKlMnOpQr'].join('_')
+  const urlPass = ['synthetic', 'url', 'pass', '123'].join('-')
+  const urlKeyWithPass = `https://svc-user:${urlPass}@example.com/a`
+  const samples = [
+    `Result: ${JSON.stringify({ credentials: { [ghpToken]: 'enabled' } })}`,
+    `Result: ${JSON.stringify({ secret: { [urlKeyWithPass]: [{ [ghpToken]: 'v' }] } })}`,
+    `Result:\n${JSON.stringify({ credentials: { '[REDACTED_KEY:1]': 'present', [ghpToken]: 'enabled', [urlKeyWithPass]: 'enabled' } }, null, 2)}`,
+  ]
+  for (const sample of samples) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).not.toContain(ghpToken)
+    expect(out).not.toContain(urlPass)
+    expect(out).toContain('[REDACTED_KEY:')
+    expect(stats.truncated).toBe(false)
+    expect(stats.redactions).toBeGreaterThanOrEqual(2)
+
+    // Placeholder keys are never trusted on re-scan (matching `walk` in sanitize()),
+    // and secrets remain absent with exact key preservation.
+    const reStats = newStats()
+    const out2 = redactText(out, reStats)
+    expect(out2).not.toContain(ghpToken)
+    expect(out2).not.toContain(urlPass)
+    expect(out2).toContain('[REDACTED_KEY:')
+
+    const built = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: sample },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    const serialized = JSON.stringify(built.row)
+    expect(serialized).not.toContain(ghpToken)
+    expect(serialized).not.toContain(urlPass)
+    expect(serialized).toContain('[REDACTED_KEY:')
+    expect(built.row.is_truncated).toBe(false)
+    expect(built.redactions).toBeGreaterThanOrEqual(2)
+  }
+
+  // Collision check (matching `walk` in units.test.ts): an untrusted `[REDACTED_KEY:1]` key is renumbered
+  // without colliding with existing keys (`[REDACTED_KEY:2]`, `[REDACTED_KEY:3]`, `[REDACTED_KEY:4]`).
+  const collisionOut = redactText(samples[2]!, newStats())
+  const parsed = JSON.parse(collisionOut.slice('Result:\n'.length)) as { credentials: Record<string, string> }
+  expect(parsed.credentials).toEqual({
+    '[REDACTED_KEY:2]': '[REDACTED]',
+    '[REDACTED_KEY:3]': '[REDACTED]',
+    '[REDACTED_KEY:4]': '[REDACTED]',
+  })
+})
+
+test('extreme nesting (10,000+ deep arrays/objects) in prose JSON fails closed without throwing RangeError', () => {
+  const secret = ['ultra', 'deep', 'secret', '006'].join('-')
+  const cases = [
+    `Result:\n{"root":${'['.repeat(10_000)}{"password":"${secret}"}${']'.repeat(10_000)}}`,
+    `Result:\n${'{"a":'.repeat(2_500)}{"password":"${secret}"}${'}'.repeat(2_500)}`,
+    `Result:\n{"root":${'[{"a":['.repeat(1_700)}{"password":"${secret}"}${']}]'.repeat(1_700)}}`,
+    `Result:\n{"credentials":${'['.repeat(10_000)}{"password":"${secret}"}${']'.repeat(10_000)}}`,
+    `Result:\n{"root":${'['.repeat(19)}[{"password":"${secret}"},{"token":"${secret}"}]${']'.repeat(19)}}`,
+  ]
+  for (const sample of cases) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).not.toContain(secret)
+    expect(stats.truncated).toBe(true)
+    expect(stats.redactions).toBeGreaterThanOrEqual(1)
+    expect(stats.droppedChars).toBeGreaterThan(0)
+
+    const built = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: sample },
+      attributes: {},
+      maxPayloadChars: 100_000,
+    })
+    const serialized = JSON.stringify(built.row)
+    expect(serialized).not.toContain(secret)
+    expect(built.row.is_truncated).toBe(true)
+    expect(built.redactions).toBeGreaterThanOrEqual(1)
+    const redMeta = (JSON.parse(built.row.attributes ?? '{}') as { redaction?: { values: number; dropped_chars: number } }).redaction
+    expect((redMeta?.dropped_chars ?? 0) > 0).toBe(true)
+  }
+})
+
+test('prose JSON placeholder suffix stays linear O(N) on adversarial q<N>z token floods', () => {
+  const secret = ['linear', 'suffix', 'secret', '007'].join('-')
+  redactText('Result:\n{"ok":true}\npjspan q1z', newStats())
+
+  const makeSample = (count: number): string => {
+    const tokens = Array.from({ length: count }, (_, i) => `q${i + 1}z`).join(' ')
+    return `Result:\n{\n  "ok": true,\n  "api_keys": [\n    "${secret}"\n  ]\n}\npjspan ${tokens}`
+  }
+
+  const sample10 = makeSample(10_000)
+  const tWarm0 = performance.now()
+  redactText(sample10, newStats())
+  const redact10Ms = Math.max(0.1, performance.now() - tWarm0)
+  const tWarm1 = performance.now()
+  buildRow({
+    eventType: 'TOOL_COMPLETED',
+    timestampMs: 0,
+    eventId: 'e1',
+    agent: 'a',
+    sessionId: 's',
+    invocationId: 'i',
+    userId: 'u',
+    traceId: 't',
+    spanId: 'p',
+    parentSpanId: null,
+    content: { result: sample10 },
+    attributes: {},
+    maxPayloadChars: 500_000,
+  })
+  const build10Ms = Math.max(0.1, performance.now() - tWarm1)
+
+  const sample = makeSample(50_000)
+  const t0 = performance.now()
+  const stats = newStats()
+  const out = redactText(sample, stats)
+  const redactMs = performance.now() - t0
+
+  expect(redactMs).toBeLessThan(500)
+  expect(redactMs <= Math.max(80, redact10Ms * 15)).toBe(true)
+  expect(out).not.toContain(secret)
+  expect(out).toContain('"api_keys": [\n    "[REDACTED]"\n  ]')
+  expect(out).toContain('pjspan q1z')
+  expect(out).toContain('q50000z')
+  expect(stats.truncated).toBe(false)
+  expect(stats.redactions).toBeGreaterThanOrEqual(1)
+
+  const t1 = performance.now()
+  const built = buildRow({
+    eventType: 'TOOL_COMPLETED',
+    timestampMs: 0,
+    eventId: 'e1',
+    agent: 'a',
+    sessionId: 's',
+    invocationId: 'i',
+    userId: 'u',
+    traceId: 't',
+    spanId: 'p',
+    parentSpanId: null,
+    content: { result: sample },
+    attributes: {},
+    maxPayloadChars: 500_000,
+  })
+  const buildMs = performance.now() - t1
+
+  expect(buildMs).toBeLessThan(500)
+  expect(buildMs <= Math.max(80, build10Ms * 15)).toBe(true)
+  expect(built.row.content ?? '').not.toContain(secret)
+  expect(built.row.is_truncated).toBe(false)
+  expect(built.redactions).toBeGreaterThanOrEqual(1)
+})
