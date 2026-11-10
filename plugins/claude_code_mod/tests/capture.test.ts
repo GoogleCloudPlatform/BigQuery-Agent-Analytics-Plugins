@@ -893,7 +893,9 @@ test('a short -p run whose end-of-turn request is answered table-not-found after
   // every one.
   const [answered, retry] = world.insertCalls()
   expect(insertIds(retry).slice(0, insertIds(answered).length)).toEqual(insertIds(answered))
+  expect(insertIds(retry).length).toBe(4)
   expect(world.acceptedRows().map(r => r.event_id)).toEqual(insertIds(retry))
+  expect(world.acceptedRows().length).toBe(4)
   expect(new Set(insertIds(retry)).size).toBe(4)
   expect(deadLetterFiles(world)).toEqual([])
   expect(deadLetterRows(world)).toEqual([])
@@ -906,6 +908,7 @@ test('the same run whose end-of-turn request lands during the exit wait creates 
   const { ending } = await exitWithTurnBatchOut($, world)
   await answerDuringExit(world, OK_INSERT, ending)
   expect(requestsOf(world)).toEqual(['POST insertAll', 'POST insertAll'])
+  expect(world.sentRows().length).toBe(4)
   expect(new Set(world.sentRows().map(r => r.event_id)).size).toBe(4)
   expect(deadLetterRows(world)).toEqual([])
   expect(world.stderr).toEqual([])
@@ -1016,9 +1019,44 @@ test('with a writer taken over from still out too, the table-not-found answer to
   expect(world.insertCalls().length).toBe(2)
   const sent = world.sentRows().map(r => r.event_id)
   const ending = endSession($)
+  let ended = false
+  void ending.then(() => {
+    ended = true
+  })
+  // Answer only the last writer's batch 100 ms into the exit, keeping the
+  // earlier writer's request unanswered past the 400 ms wait cutoff.
+  await world.clock.advance(100)
+  world.releaseHungAt(1, TABLE_MISSING.status, TABLE_MISSING.text)
+  await world.clock.advance(299)
+  expect(ended).toBe(false)
+  await world.clock.advance(1)
+  await ending
+  expect(ended).toBe(true)
+  expect(requestsOf(world)).toEqual(['POST insertAll', 'POST insertAll'])
+  const spilled = deadLetterRows(world).map(r => r.event_id)
+  expect(spilled.length).toBe(sent.length + 1)
+  expect(new Set(spilled).size).toBe(spilled.length)
+  expect(sent.filter(id => !spilled.includes(id))).toEqual([])
+  expect(world.stderr[0] ?? '').toContain(TABLE_NOTICE)
+  world.releaseHung(OK_INSERT.status, OK_INSERT.text)
+})
+
+test('with a writer taken over from still out too and both batches answered table-not-found during exit, no table is made: every row is spilled once and the notice raised', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [{ hang: true }, { hang: true }, TABLE_CREATED, OK_INSERT]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await runTurn($, 't-before-takeover')
+  await world.clock.advance(0)
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await runTurn($, 't-after-takeover')
+  await world.clock.advance(0)
+  expect(world.insertCalls().length).toBe(2)
+  const sent = world.sentRows().map(r => r.event_id)
+  const ending = endSession($)
   await answerDuringExit(world, TABLE_MISSING, ending)
   expect(requestsOf(world)).toEqual(['POST insertAll', 'POST insertAll'])
   const spilled = deadLetterRows(world).map(r => r.event_id)
+  expect(spilled.length).toBe(sent.length + 1)
   expect(new Set(spilled).size).toBe(spilled.length)
   expect(sent.filter(id => !spilled.includes(id))).toEqual([])
   expect(world.stderr[0] ?? '').toContain(TABLE_NOTICE)
