@@ -22,7 +22,7 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
-import { PLUGIN_VERSION, resolveConfig } from '../hooks/lib/config.ts'
+import { type Config, PLUGIN_VERSION, resolveConfig } from '../hooks/lib/config.ts'
 import { packFiles, parseFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
@@ -1333,4 +1333,107 @@ test('sendAtExit spills without noisy missing-table stderr when retried insertAl
   expect(fetchOps(world)).toEqual(['POST insertAll', 'POST tables', 'POST insertAll'])
   expect(spillRowCount(world.files)).toBe(4)
   expect(world.stderr).toEqual([])
+})
+
+// The exit-wait boundaries that follow the writer's own clock, on a writer
+// built by hand (the test clock of the other tests leaves Io.now alone): one
+// row's batch out when the exit begins, each request answered as `script`
+// says, `afterMs` after it is sent, then OK_INSERT. A token comes from the
+// command.
+function exitWithBatchOut(script: { afterMs: number; answer: { status: number; text: string } }[], overrides: Partial<Config> = {}) {
+  const token = ['ya29', 'exit-batch-out-006'].join('.')
+  const config: Config = { ...resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, {}), ...overrides }
+  const clock = probeClock()
+  const asked: string[] = []
+  const files = new Map<string, string>()
+  const io: Io = {
+    ...makeProbeIo(
+      clock,
+      async (reqUrl, init) => {
+        asked.push(`${init.method} ${reqUrl.split('/').pop()?.split('?')[0]}`)
+        const step = script[asked.length - 1] ?? { afterMs: 0, answer: OK_INSERT }
+        return new Promise(resolve => { clock.after(step.afterMs, () => resolve(step.answer)) })
+      },
+      async () => ({ exitCode: 0, stdout: `${token}\n`, stderr: '' }),
+    ),
+    writeFile: async (p, text) => { files.set(p, text) },
+  }
+  const writer = new Writer(io, () => config, () => 'exit-batch-out')
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'f'.repeat(32), agent: 'coding-agent', sessionId: 'exit-batch-out', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+  // Time moves a millisecond at a time, so what a timer sets going settles
+  // before the clock reads later than the moment under test.
+  const run = async (ms: number): Promise<void> => {
+    for (let i = 0; i < ms; i += 1) await clock.advance(1)
+  }
+  // The flush sends its request, with the clock still on the exit's first moment.
+  const sendBatch = async (): Promise<void> => {
+    writer.requestFlush(0)
+    for (let i = 0; i < 20 && asked.length === 0; i += 1) await clock.advance(0)
+    expect(asked).toEqual(['POST insertAll'])
+  }
+  return { asked, files, writer, run, sendBatch }
+}
+
+test('a create answered too late for a retry leaves the table made: the batch out at the exit is spilled, with no notice', { options: OPTIONS }, async () => {
+  // The insertAll's 404 100 ms into the exit, the table made 400 ms later:
+  // 300 ms of the 800 ms budget are left, under the 450 ms a send needs.
+  const { asked, files, writer, run, sendBatch } = exitWithBatchOut([
+    { afterMs: 100, answer: EXIT_TABLE_MISSING },
+    { afterMs: 400, answer: EXIT_TABLE_CREATED },
+  ])
+  await sendBatch()
+  let result: { spilled: number } | undefined
+  void writer.spillForExit(800, { sendQueued: true }).then(v => { result = v })
+  await run(800)
+  expect(result).toEqual({ spilled: 1 })
+  expect(asked).toEqual(['POST insertAll', 'POST tables'])
+  expect(spillRowCount(files)).toBe(1)
+  expect(writer.problem).toBe(null)
+  expect(writer.snapshot().lastError?.message).toBe('session end: table created (my-gcp-project.agent_analytics.agent_events); rows spilled')
+})
+
+test('with too little of the exit budget left for a create, table-not-found during the exit wait creates no table: the batch is spilled and the notice raised', { options: OPTIONS }, async () => {
+  // 240 ms into a 500 ms budget, inside its 250 ms wait: of the 260 ms left,
+  // 150 ms are kept for the spill, which leaves under the 250 ms a create needs.
+  const { asked, files, writer, run, sendBatch } = exitWithBatchOut([{ afterMs: 240, answer: EXIT_TABLE_MISSING }])
+  await sendBatch()
+  let result: { spilled: number } | undefined
+  void writer.spillForExit(500, { sendQueued: true }).then(v => { result = v })
+  await run(500)
+  expect(result).toEqual({ spilled: 1 })
+  expect(asked).toEqual(['POST insertAll'])
+  expect(spillRowCount(files)).toBe(1)
+  expect(writer.problem?.missing).toBe('table')
+})
+
+test('when the answer comes too late for a send but a create still fits the budget, the table is made and the batch spilled, with no notice', { options: OPTIONS }, async () => {
+  // 360 ms into the 800 ms budget: 440 ms left is under the 450 ms a send
+  // needs, and past the 150 ms kept for the spill leaves 290 ms, over the
+  // 250 ms a create needs.
+  const { asked, files, writer, run, sendBatch } = exitWithBatchOut([
+    { afterMs: 360, answer: EXIT_TABLE_MISSING },
+    { afterMs: 0, answer: EXIT_TABLE_CREATED },
+  ])
+  await sendBatch()
+  let result: { spilled: number } | undefined
+  void writer.spillForExit(800, { sendQueued: true }).then(v => { result = v })
+  await run(800)
+  expect(result).toEqual({ spilled: 1 })
+  expect(asked).toEqual(['POST insertAll', 'POST tables'])
+  expect(spillRowCount(files)).toBe(1)
+  expect(writer.problem).toBe(null)
+})
+
+test('a token that runs out during the exit wait: no create without one, the batch is spilled and the notice raised', { options: OPTIONS }, async () => {
+  // The token, good for 100 ms, carries the insertAll; its 404 comes 200 ms
+  // into the exit, when no token is at hand and none may be fetched.
+  const { asked, files, writer, run, sendBatch } = exitWithBatchOut([{ afterMs: 200, answer: EXIT_TABLE_MISSING }, { afterMs: 0, answer: EXIT_TABLE_CREATED }], { tokenTtlMs: 100 })
+  await sendBatch()
+  let result: { spilled: number } | undefined
+  void writer.spillForExit(800, { sendQueued: true }).then(v => { result = v })
+  await run(800)
+  expect(result).toEqual({ spilled: 1 })
+  expect(asked).toEqual(['POST insertAll'])
+  expect(spillRowCount(files)).toBe(1)
+  expect(writer.problem?.missing).toBe('table')
 })
