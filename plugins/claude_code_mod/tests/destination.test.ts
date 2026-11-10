@@ -36,7 +36,7 @@ const BAND = {
   component: 'AbovePrompt',
   requestId: 'above-prompt',
   viewport: { columns: 120, rows: 40 },
-  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 115, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+  props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 10, bodyColumns: 115, scroll: { offset: 0, bodyRows: 10 }, view: {} },
 } as const
 
 const DATASET_MISSING = {
@@ -200,7 +200,7 @@ test('while BigQuery cannot find the dataset, the backoff before the next retry 
 test('session.start clears the status line an earlier load pinned: the host keeps it across a reload', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [DATASET_MISSING]
-  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.start({ surface: 'web', isInteractive: true, cwd: '/work/my-repo' })
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: BigQuery cannot find the dataset /)
@@ -409,7 +409,7 @@ test('a project the redaction mistakes for a credential name still gets the setu
   // BigQuery names the dataset project:dataset, which the redaction takes,
   // with the rest of the line, for a credential.
   world.replies = [{ status: 404, text: '{"error":{"code":404,"message":"Not found: Dataset auth-service-123:agent_analytics","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}' }]
-  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.start({ surface: 'web', isInteractive: true, cwd: '/work/my-repo' })
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   const command = /^bqaa: Run: BQAA_PROJECT_ID=auth-service-123 BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '\/[^']*\/setup\.sh'$/
@@ -604,32 +604,33 @@ test('headless /bqaa-status and interactive /bqaa-status check probe tables.get 
   expect(healed).not.toContain('BigQuery cannot find the dataset')
 })
 
-test('headless session.end writes a single redacted diagnostic line to stderr when rows could not be sent, and stays silent when healthy or interactive', { options: OPTIONS }, async ($, on) => {
+test('headless session.end writes a single redacted diagnostic line when rows could not be sent, and stays silent when healthy or interactive', { options: OPTIONS }, async ($, on) => {
   const secret = ['canary', 'stderr', 'secret', '9876543210'].join('-')
   const world = setUp(on, { BQAA_ACCESS_TOKEN_COMMAND: `my-token-helper --password=${secret}` })
   world.processReply = { exitCode: 1, stdout: '', stderr: `auth failed: password=${secret}\n` }
   await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
   await world.clock.advance(5000)
   await $.session.end({ reason: 'other', sessionId: 'headless-err', resume: { id: 'headless-err' } })
-  expect(world.stderr.length).toBe(1)
-  expect(world.stderr[0]).toBe('BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, check the token command `my-token-helper`).')
-  expect(world.stderr[0]?.includes(secret)).toBe(false)
+  const headlessNotices = () => world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))
+  expect(headlessNotices().length).toBe(1)
+  expect(headlessNotices()[0]).toBe('BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, check the token command `my-token-helper`).')
+  expect(headlessNotices()[0]?.includes(secret)).toBe(false)
 
-  // Healthy headless session writes 0 stderr lines.
-  world.stderr.length = 0
+  // Healthy headless session writes 0 headless diagnostic lines.
+  world.logs.length = 0
   world.processReply = { exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }
   world.replies = [OK_INSERT]
   await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
   await world.clock.settle()
   await $.session.end({ reason: 'other', sessionId: 'headless-ok', resume: { id: 'headless-ok' } })
-  expect(world.stderr).toEqual([])
+  expect(headlessNotices()).toEqual([])
 
-  // Interactive session with a problem writes 0 stderr lines (uses AbovePrompt/statusLine instead).
+  // Interactive session with a problem writes 0 headless diagnostic lines (uses AbovePrompt/statusLine instead).
   world.replies = [{ status: 403, text: '{"error":{"code":403,"message":"Access Denied","errors":[{"reason":"accessDenied"}]}}' }]
   await startSession($)
   await world.clock.advance(5000)
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'interactive-err', resume: { id: 'interactive-err' } })
-  expect(world.stderr).toEqual([])
+  expect(headlessNotices()).toEqual([])
 })
 
 // tables.get, which /bqaa-status check asks, proves the dataset, the table
@@ -731,7 +732,7 @@ test('/bqaa-status check that finds a dataset BigQuery could not find clears the
   await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
   // A surface that draws no band above the prompt: the notice is the
   // status line.
-  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.start({ surface: 'web', isInteractive: true, cwd: '/work/my-repo' })
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: BigQuery cannot find the dataset my-gcp-project\.agent_analytics\. /)
@@ -776,8 +777,9 @@ test('a headless run whose own rows all landed still writes the stderr line when
   // that alone makes the line.
   expect(deadLetterFiles(world)).toEqual([[earlier, file]])
   // One line, ending in the setup.sh command that makes the dataset.
-  expect(world.stderr.length).toBe(1)
-  const line = world.stderr[0] ?? ''
+  const notices = world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))
+  expect(notices.length).toBe(1)
+  const line = notices[0] ?? ''
   const head = `BigQuery Agent Analytics: rows could not be sent (${HEADLINE}; to fix, ${FIX}). Run: `
   expect(line.startsWith(head)).toBe(true)
   expect(line.slice(head.length)).toMatch(SETUP)
@@ -1184,14 +1186,9 @@ test('a destination check refused for a token another send has since replaced ke
 })
 
 test('/bqaa-status registers with the argument hint [check], as /bqaa-backfill does with its words', { options: OPTIONS }, async ($, on) => {
-  const hints = new Map<string, string | undefined>()
-  on('command.register', ($, e, next) => {
-    hints.set(e.name, e.argumentHint)
-    return next(e)
-  })
-  setUp(on)
+  const world = setUp(on)
   await startSession($)
-  expect(Object.fromEntries(hints)).toEqual({ 'bqaa-status': '[check]', 'bqaa-flush': undefined, 'bqaa-backfill': '[force] [wait]', 'bqaa-mod-setup': undefined, 'bqaa-setup': undefined })
+  expect(world.commandHints).toEqual({ 'bqaa-status': '[check]', 'bqaa-flush': undefined, 'bqaa-backfill': '[force] [wait]', 'bqaa-mod-setup': undefined, 'bqaa-setup': undefined })
 })
 
 const EXIT_TABLE_MISSING = {
@@ -1332,5 +1329,77 @@ test('sendAtExit spills without noisy missing-table stderr when retried insertAl
   await $.session.end({ reason: 'other', sessionId, resume: { id: sessionId } })
   expect(fetchOps(world)).toEqual(['POST insertAll', 'POST tables', 'POST insertAll'])
   expect(spillRowCount(world.files)).toBe(4)
-  expect(world.stderr).toEqual([])
+  expect(world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))).toEqual([])
+})
+
+test('/bqaa-status check stays within the 10 s command.run budget when the token helper hangs (15 s) and never sends a late tables.get after its deadline', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.processDelayMs = 15_000
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  const started = world.clock.now()
+  let finishedAt = -1
+  const checking = $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND }).then(res => {
+    finishedAt = world.clock.now()
+    return res
+  })
+  await world.clock.advance(8_000)
+  const text = (await checking).text ?? ''
+  expect(finishedAt - started).toBeLessThanOrEqual(8_000)
+  expect(text).toContain('destination check: no token within 5000 ms')
+  expect(world.fetches).toEqual([])
+
+  // Direct Writer check: clamped token timeout reaches runCommand and an exhausted deadline skips tables.get.
+  const fresh = ['ya29', 'budget-cap-token-0012'].join('.')
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/probe-cmd-budget' }, {})
+  const clock = probeClock()
+  const runTimeouts: number[] = []
+  const asked: string[] = []
+  const writer = new Writer(
+    makeProbeIo(
+      clock,
+      async (reqUrl, init) => {
+        asked.push(`${init.method} ${reqUrl}`)
+        return TABLE_FOUND
+      },
+      async (_argv, timeoutMs) => {
+        runTimeouts.push(timeoutMs)
+        return new Promise(resolve => {
+          clock.after(2_000, () => resolve({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' }))
+        })
+      },
+    ),
+    () => config,
+    () => 'probe-cmd-budget',
+  )
+  let answer: string | null | undefined
+  void writer.probeDestination(3000, true, 2000).then(v => { answer = v })
+  await clock.advance(2000)
+  expect(runTimeouts).toEqual([1000])
+  expect(answer).toBe('no token within 1000 ms')
+  expect(asked).toEqual([])
+
+  // Even if token resolves right at the deadline (no time left for tables.get), tables.get is skipped.
+  const clock2 = probeClock()
+  const asked2: string[] = []
+  const writer2 = new Writer(
+    makeProbeIo(
+      clock2,
+      async (reqUrl, init) => {
+        asked2.push(`${init.method} ${reqUrl}`)
+        return TABLE_FOUND
+      },
+      async () => new Promise(resolve => {
+        clock2.after(1500, () => resolve({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' }))
+      }),
+    ),
+    () => config,
+    () => 'probe-deadline-expired',
+  )
+  // First seed an in-flight token fetch with long timeout; then call probeDestination with 1500 ms budget.
+  writer2.prefetchToken()
+  let answer2: string | null | undefined
+  void writer2.probeDestination(3000, true, 1500).then(v => { answer2 = v })
+  await clock2.advance(1500)
+  expect(answer2).not.toBeNull()
+  expect(asked2).toEqual([])
 })

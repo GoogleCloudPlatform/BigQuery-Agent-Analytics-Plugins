@@ -57,8 +57,29 @@ declare module 'claude-code' {
     usage: Usage | null
   }
 
+  export type RenderSurface = 'terminal' | 'web'
+
+  export type ToolCallName =
+    | 'Bash'
+    | 'Read'
+    | 'Write'
+    | 'Edit'
+    | 'MultiEdit'
+    | 'Glob'
+    | 'LS'
+    | 'WebFetch'
+    | 'WebSearch'
+    | 'TodoWrite'
+    | 'NotebookEdit'
+    | 'Agent'
+    | 'Skill'
+    | 'SlashCommand'
+    | 'ExitPlanMode'
+    | 'AskUserQuestion'
+    | `mcp__${string}`
+
   export interface SessionStartInput {
-    surface: 'terminal' | 'ide' | 'web' | string | null
+    surface: RenderSurface | null
     isInteractive: boolean
     cwd?: string
   }
@@ -132,24 +153,45 @@ declare module 'claude-code' {
     answer: string
     durationMs: number
     isAborted: boolean
-    reason: 'answer' | 'error' | 'refusal' | 'aborted' | 'max_turns' | string
+    reason: 'answer' | 'error' | 'refusal' | 'aborted'
     refusal?: { category: string | null; explanation: string | null }
     usage?: Usage
+  }
+
+  export interface AbovePromptProps {
+    readonly isCollapsed: boolean
+    hasSurvey?: boolean
+    isWorking?: boolean
+    maxRows: number
+    bodyColumns?: number
+    scroll?: { offset: number; bodyRows: number }
+    view?: Record<string, unknown>
+    [key: string]: unknown
   }
 
   export interface UiRenderInput {
     component: string
     requestId?: string
     viewport?: { columns: number; rows: number }
-    props: {
-      hasSurvey?: boolean
-      isWorking?: boolean
-      maxRows: number
-      bodyColumns?: number
-      scroll?: { offset: number; bodyRows: number }
-      view?: Record<string, unknown>
-      [key: string]: unknown
-    }
+    props: AbovePromptProps
+  }
+
+  export interface RenderElement {
+    readonly type?: string
+    readonly props?: Record<string, unknown>
+    readonly children?: unknown
+    readonly key?: string
+    readonly text?: string
+    readonly image: unknown
+  }
+
+  export interface MountUiOptions {
+    plugin: string
+    surface: RenderSurface | null
+    component: string
+    requestId?: string
+    viewport?: { columns: number; rows: number }
+    props: AbovePromptProps
   }
 
   export interface UiNode {
@@ -214,8 +256,8 @@ declare module 'claude-code' {
     }
     'ui.render': {
       event: UiRenderInput
-      result: unknown
-      next: (e: UiRenderInput) => Promise<UiNode | null>
+      result: RenderElement
+      next: (e: UiRenderInput) => Promise<RenderElement>
     }
     'telemetry.log': {
       event: TelemetryLogInput
@@ -233,9 +275,9 @@ declare module 'claude-code' {
       next: (e: TurnStepInput) => AsyncGenerator<StepChunk, StepResult, unknown>
     }
     'tool.call': {
-      event: Record<string, unknown> & { tool: string }
+      event: Record<string, unknown> & { tool: ToolCallName }
       result: ToolOutcome
-      next: (e: Record<string, unknown> & { tool: string }) => Promise<ToolOutcome>
+      next: (e: Record<string, unknown> & { tool: ToolCallName }) => Promise<ToolOutcome>
     }
     'turn.complete': {
       event: TurnCompleteInput
@@ -245,7 +287,7 @@ declare module 'claude-code' {
     'command.run': {
       event: CommandRunInput
       result: { text?: string }
-      next: (e: CommandRunInput) => Promise<{ text?: string }>
+      next: ((e: CommandRunInput) => Promise<{ text?: string }>) & { budget: { remainingMs: number } }
     }
     'command.register': {
       event: { name: string; description: string; argumentHint?: string; immediate?: boolean }
@@ -416,7 +458,7 @@ declare module 'claude-code' {
     }
     readonly tool: {
       call(
-        e: Record<string, unknown> & { tool: string },
+        e: Record<string, unknown> & { tool: ToolCallName },
       ): Promise<{ isError?: boolean; text?: string; result?: unknown; deny?: string }>
     }
     readonly telemetry: {
@@ -459,7 +501,7 @@ declare module 'claude-code' {
         Text(props: Record<string, unknown>): UiNode
         Button(props: Record<string, unknown>): UiNode
       }
-      mount(options: Record<string, unknown>): Promise<MountedUi>
+      mount(options: MountUiOptions): Promise<MountedUi>
     }
   }
 
@@ -470,7 +512,10 @@ declare module 'claude-code' {
 declare module 'claude-code/testing' {
   import type { EngineInterface, OnFunction } from 'claude-code'
 
-  export type Engine = EngineInterface
+  export type Engine = Pick<EngineInterface, 'plugin' | 'session' | 'classic' | 'prompt' | 'turn' | 'tool' | 'telemetry'> & {
+    readonly command: Pick<EngineInterface['command'], 'run'>
+    readonly ui: Pick<EngineInterface['ui'], 'mount'>
+  }
 
   export interface Matchers<T> {
     toBe(expected: unknown): void

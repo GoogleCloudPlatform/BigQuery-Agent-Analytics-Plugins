@@ -236,8 +236,37 @@ export function splitArgv(line: string): string[] {
   return out
 }
 
-export const joinPath = (dir: string, name: string): string =>
-  dir.endsWith('/') || dir.endsWith('\\') ? dir + name : `${dir}/${name}`
+export const joinPath = (dir: string, name: string): string => {
+  const win = /^[A-Za-z]:\\|^\\\\/.test(dir) || (!dir.includes('/') && dir.includes('\\'))
+  const sep = win ? '\\' : '/'
+  const normName = win ? name.replaceAll('/', '\\') : name
+  return dir.endsWith('/') || dir.endsWith('\\') ? dir + normName : `${dir}${sep}${normName}`
+}
+
+export const isAbsoluteAnyOs = (p: string): boolean => /^(\/|\\\\|[A-Za-z]:[\\/])/.test(p)
+
+function resolveDeadLetterDir(
+  rawDeadLetter: string,
+  home: string,
+  warnings: string[],
+): { deadLetterDir: string; deadLetterDirIsDefault: boolean } {
+  const fallback = home ? joinPath(home, '.bqaa-mod/dead-letter') : ''
+  if (rawDeadLetter === '') return { deadLetterDir: fallback, deadLetterDirIsDefault: fallback !== '' }
+  let expanded = rawDeadLetter
+  if (rawDeadLetter === '~') expanded = home
+  else if (rawDeadLetter.startsWith('~/') || rawDeadLetter.startsWith('~\\')) {
+    expanded = home ? joinPath(home, rawDeadLetter.slice(2).replaceAll('\\', '/')) : rawDeadLetter
+  }
+  if (expanded !== '' && isAbsoluteAnyOs(expanded)) {
+    return { deadLetterDir: expanded, deadLetterDirIsDefault: false }
+  }
+  if (fallback !== '') {
+    warnings.push(`deadLetterDir (${JSON.stringify(rawDeadLetter)}) is not an absolute path; using default ${fallback}`)
+    return { deadLetterDir: fallback, deadLetterDirIsDefault: true }
+  }
+  warnings.push(`deadLetterDir (${JSON.stringify(rawDeadLetter)}) is not an absolute path and HOME is unset; disabling dead-letter directory`)
+  return { deadLetterDir: '', deadLetterDirIsDefault: false }
+}
 
 export function resolveConfig(options: Options, env: EnvSnapshot): Config {
   const problems: string[] = []
@@ -247,11 +276,8 @@ export function resolveConfig(options: Options, env: EnvSnapshot): Config {
   const table = firstSet(text(options.table), env.BQAA_TABLE, env.BQ_TABLE, DEFAULT_TABLE)
   const location = firstSet(text(options.location), env.BQAA_LOCATION, DEFAULT_LOCATION)
   const home = firstSet(env.HOME, env.USERPROFILE)
-  const deadLetterDir = firstSet(
-    text(options.deadLetterDir),
-    env.BQAA_DEAD_LETTER_DIR,
-    home ? joinPath(home, '.bqaa-mod/dead-letter') : '',
-  )
+  const rawDeadLetter = firstSet(text(options.deadLetterDir), env.BQAA_DEAD_LETTER_DIR)
+  const { deadLetterDir, deadLetterDirIsDefault } = resolveDeadLetterDir(rawDeadLetter, home, warnings)
   // Kill switch and dry-run switch, as the tracing plugin spells them.
   const optEnabled = readBoolOption('enabled', options.enabled, true, warnings)
   const optDryRun = readBoolOption('dryRun', options.dryRun, false, warnings)
@@ -287,7 +313,7 @@ export function resolveConfig(options: Options, env: EnvSnapshot): Config {
     maxRetries: 3,
     exitFlushMs: clampEnvInt(env.BQAA_EXIT_FLUSH_MS, 800, 0, 1200),
     deadLetterDir,
-    deadLetterDirIsDefault: text(options.deadLetterDir) === '' && (env.BQAA_DEAD_LETTER_DIR ?? '').trim() === '' && home !== '',
+    deadLetterDirIsDefault,
     dryRunDir: deadLetterDir ? joinPath(deadLetterDir, 'dry-run') : '',
     accessTokenCommand: splitArgv(tokenLine),
     tokenCommandTimeoutMs: 15_000,

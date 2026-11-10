@@ -201,7 +201,7 @@ test('when the last main-loop tool call is rejected by the user and the turn end
   await $.tool.call({ tool: 'Bash', command: 'rm -rf /tmp/demo3', tool_use_id: 'toolu_rej_3' })
   await decision($, 'toolu_rej_3', 'reject', 'user_reject')
   await runStep($, { turnId: 'turn-rej-later-step', index: 1 })
-  await $.turn.complete({ turnId: 'turn-rej-later-step', answer: '', durationMs: 400, isAborted: true, reason: 'interrupted' })
+  await $.turn.complete({ turnId: 'turn-rej-later-step', answer: '', durationMs: 400, isAborted: true, reason: 'aborted' })
   await world.clock.advance(5000)
 
   const inv3 = world.sentRows().find(r => r.invocation_id === 'turn-rej-later-step' && r.event_type === 'INVOCATION_COMPLETED')

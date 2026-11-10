@@ -59,8 +59,11 @@ let ranModCommand = false
 // /bqaa-backfill waits for its result, /bqaa-status asks BigQuery for the
 // table, and a problem that kept rows out writes a diagnostic via `writeStderr`.
 let isInteractiveSession = true
-// How long /bqaa-backfill waits for its result in a `-p` run (or with `wait`).
-const BACKFILL_WAIT_MS = 15_000
+// How long /bqaa-backfill waits for its result in a `-p` run (or with `wait`),
+// within the host CLI's 10 s command.run hook budget.
+const BACKFILL_WAIT_MS = 8_000
+const commandBudgetMs = (next?: { budget?: { remainingMs?: number } }): number =>
+  Math.min(8_000, Math.max(1_000, (next?.budget?.remainingMs ?? 10_000) - 1_500))
 // The host's timer, from session.start's `$`, for work that waits briefly
 // outside any hook (a finished tool call waiting for its decision).
 let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null = null
@@ -194,7 +197,7 @@ const say = (text: string): { text: string } => ({ text: clean(text, 8000) })
 // `process.stderr` (such as Claude Code CLI 2.1.319+): a `-p` run draws no
 // band and shows no toast. A test captures the line instead through
 // `globalThis.__bqaaStderr`.
-function writeStderr(line: string): void {
+export function writeStderr(line: string): void {
   const host = globalThis as {
     __bqaaStderr?: (line: string) => void
     process?: { stderr?: { write?: (text: string) => unknown } }
@@ -213,11 +216,12 @@ function writeStderr(line: string): void {
 // At the end of a `-p` run that recorded something (`hadActivity`, read
 // before session end resets it, or rows spilled or parked), while a problem
 // keeps rows from BigQuery: what is wrong and the fix, redacted, on one line
-// via `writeStderr` (`stderr` when exposed by the host, else `--debug-file`),
+// via `writeStderr` (`stderr` when exposed by the host, else `--debug-file`)
+// and `$.ui.log(..., { to: 'debug' })`,
 // with the setup command where the fix is one (a dataset or table BigQuery
 // cannot find). The command goes whole, after the rest is cut; where redaction
 // would change it, the line names /bqaa-mod-setup, which prints it.
-function headlessNotice(current: Writer, hadActivity: boolean): void {
+function headlessNotice(current: Writer, hadActivity: boolean, logDebug?: (line: string) => void): void {
   const { counters } = current.snapshot()
   if (current.problem === null || !(hadActivity || counters.spilled > 0 || counters.failed > 0)) return
   const { headline, fix } = current.problemText()
@@ -225,7 +229,9 @@ function headlessNotice(current: Writer, hadActivity: boolean): void {
   const run = current.commandLine()
   const withCommand = run === null ? base : clean(`${base} ${run}`, 2100)
   const line = run === null || withCommand.includes(run) ? withCommand : `${base} Run /bqaa-mod-setup for the setup.sh command.`
-  writeStderr(line.replace(/[\r\n]+/g, ' '))
+  const oneLine = line.replace(/[\r\n]+/g, ' ')
+  writeStderr(oneLine)
+  logDebug?.(oneLine)
 }
 
 async function readEnv($: EngineInterface): Promise<EnvSnapshot> {
@@ -1121,6 +1127,7 @@ export const register: Register = (on, registered) => {
   // itself.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const theirs = await next(e)
+    const asRender = (node: ReturnType<ReturnType<typeof $.ui.resolve>['Box']>): typeof theirs => node as unknown as typeof theirs
     const current = writer
     if (current === null || e.props.hasSurvey) return theirs
     if (current.problem === null) {
@@ -1135,7 +1142,7 @@ export const register: Register = (on, registered) => {
               Text({ children: 'rows are not being written: target not set. Set project and dataset in /config (or BQAA_PROJECT_ID and BQAA_DATASET), or run /bqaa-mod-setup.' }),
             ],
           })
-          return Box({ flexDirection: 'column', children: [line, theirs] })
+          return asRender(Box({ flexDirection: 'column', children: [line, theirs] }))
         }
         return theirs
       }
@@ -1181,7 +1188,7 @@ export const register: Register = (on, registered) => {
       const lines = card.lines.map(line => Text({ ...(line.tone ? { color: line.tone } : {}), ...(line.dim ? { dimColor: true } : {}), children: clean(line.text, 500) }))
       // In a box where the band has the rows for its border; lines alone where not.
       const frame = e.props.maxRows >= lines.length + 3 ? { borderStyle: 'round', borderColor: card.tone, paddingX: 1 } : {}
-      return Box({ flexDirection: 'column', children: [Box({ flexDirection: 'column', ...frame, children: [title, ...lines] }), theirs] })
+      return asRender(Box({ flexDirection: 'column', children: [Box({ flexDirection: 'column', ...frame, children: [title, ...lines] }), theirs] }))
     }
     const { headline, fix } = current.problemText()
     const run = current.commandLine()
@@ -1196,7 +1203,7 @@ export const register: Register = (on, registered) => {
       ],
     })
     const lines = run === null ? [line] : [line, Text({ dimColor: true, children: clean(run, COMMAND_LINE_CHARS) })]
-    return Box({ flexDirection: 'column', children: [...lines, theirs] })
+    return asRender(Box({ flexDirection: 'column', children: [...lines, theirs] }))
   })
 
   // Permission decisions, from the host's own collector records: each record
@@ -1311,24 +1318,22 @@ export const register: Register = (on, registered) => {
         } catch {
           internalErrors += 1
         }
-        if (!isInteractiveSession) safely(() => headlessNotice(ending, hadActivity))
+        if (!isInteractiveSession) safely(() => headlessNotice(ending, hadActivity, line => $.ui.log(line, { to: 'debug' })))
       }
     }
     return next(e)
   })
 
-  on('command.run', { command: 'bqaa-status' }, async ($, e) => {
+  on('command.run', { command: 'bqaa-status' }, async ($, e, next) => {
     ranModCommand = true
     if (!writer) return say('BigQuery Agent Analytics mod: not started (session.start has not run).')
     const current = writer
     // A `-p` run sends nothing before it prints this (and `check` asks
-    // anywhere): BigQuery is asked for the table, up to 3 seconds for each
-    // HTTP request and the token command's timeout for a token, a retry with
-    // a fresh token after a 401 included within that token time and two
-    // requests' time in all, so a refused token, denied access or a missing
-    // table shows now.
+    // anywhere): BigQuery is asked for the table, bounded within the host's
+    // command hook budget (leaving room for a retry with a fresh token after
+    // a 401 when time remains).
     const explicitCheck = (e.args ?? '').trim() === 'check'
-    const destinationCheck = !isInteractiveSession || explicitCheck ? await current.probeDestination(3000, explicitCheck) : null
+    const destinationCheck = !isInteractiveSession || explicitCheck ? await current.probeDestination(3000, explicitCheck, commandBudgetMs(next)) : null
     const summary = await deadLetterSummary($)
     const snap = current.snapshot()
     const maskTransientSessionStart =
@@ -1352,6 +1357,7 @@ export const register: Register = (on, registered) => {
     ranModCommand = true
     if (!writer) return say('BigQuery Agent Analytics mod: not started.')
     if (!canDeliver(config)) return say(`BigQuery Agent Analytics mod: nothing to flush to (${config.problems.join('; ') || 'disabled'}).`)
+    writer.resetHeldCooldown()
     // A session that has run only mod commands queues at most its own
     // session_start row, which session.end drops: sent now, it would keep a
     // session of commands alone (the flush tick holds it back too).
@@ -1363,7 +1369,7 @@ export const register: Register = (on, registered) => {
     return say(`BigQuery Agent Analytics mod: flush requested for ${queued} queued row(s); /bqaa-status shows the result.`)
   })
 
-  on('command.run', { command: 'bqaa-backfill' }, async ($, e) => {
+  on('command.run', { command: 'bqaa-backfill' }, async ($, e, next) => {
     ranModCommand = true
     const current = writer
     if (!current) return say('BigQuery Agent Analytics mod: not started.')
@@ -1379,7 +1385,7 @@ export const register: Register = (on, registered) => {
     // mid-replay. Runs in the background: the command returns now, and its
     // result is a transcript line. A `-p` run ends once the command returns,
     // so there (and with `wait`) it waits for the result instead, up to
-    // BACKFILL_WAIT_MS.
+    // `waitMs` (`BACKFILL_WAIT_MS` capped inside the command hook budget).
     const words = (e.args ?? '').trim().split(/\s+/)
     const running = current.backfill(['spill', 'retry', 'rejected'], words.includes('force') ? 'force' : 'command')
     const logWhenDone = (): void => {
@@ -1393,9 +1399,10 @@ export const register: Register = (on, registered) => {
       logWhenDone()
       return say(`BigQuery Agent Analytics mod: backfill started for ${summary.files} file(s) in ${summary.dir}; /bqaa-status shows progress.`)
     }
+    const waitMs = Math.min(BACKFILL_WAIT_MS, commandBudgetMs(next))
     let stopWaiting = (): void => undefined
     const waited = new Promise<null>(resolve => (stopWaiting = () => resolve(null)))
-    const timer = $.clock.after(BACKFILL_WAIT_MS, () => stopWaiting())
+    const timer = $.clock.after(waitMs, () => stopWaiting())
     const report = await Promise.race([running, waited])
     timer.cancel()
     if (report !== null) return say(formatBackfillReport(report))
@@ -1407,11 +1414,11 @@ export const register: Register = (on, registered) => {
         internalErrors += 1
       })
       return say(
-        `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} did not finish within ${BACKFILL_WAIT_MS / 1000} s before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
+        `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} did not finish within ${waitMs / 1000} s before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
       )
     }
     logWhenDone()
-    return say(`BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} still running after ${BACKFILL_WAIT_MS / 1000} s; /bqaa-status shows progress.`)
+    return say(`BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} still running after ${waitMs / 1000} s; /bqaa-status shows progress.`)
   })
 
   // /bqaa-mod-setup, and /bqaa-setup, its earlier name: the setup.sh command

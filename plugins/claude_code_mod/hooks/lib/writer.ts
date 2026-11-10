@@ -367,7 +367,10 @@ const fitsLines = (file: ParsedFile, outcome: Outcome): boolean =>
   outcome.refusals.length === outcome.fates.split('R').length - 1 &&
   outcome.refusals.every(k => outcome.reasons[k] !== undefined)
 
-const sameNames = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((name, i) => name === b[i])
+const baseOf = (p: string): string => p.split(/[\\/]/).pop() ?? p
+
+const sameNames = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && a.every((name, i) => baseOf(name) === baseOf(b[i] ?? ''))
 
 // A record as a writer finds it, and whether one may be in a file beside the
 // source (to empty along with it).
@@ -547,6 +550,13 @@ export class Writer {
   private status: { text: string | undefined | null } = { text: undefined }
   // Set once the session is ending: no new batch starts after that.
   private closing = false
+  private closingUntil = 0
+  private closingSendQueued = false
+  private exitCreateTableNeeded = false
+  // After a recovery backfill finds files held by another session (or still
+  // incomplete / waiting on a parent), defer the next idle recovery check for
+  // 30 s via host timer without triggering error backoff.
+  private heldCheckTimer: Timer | null = null
   // The replay of parked rows that a send after failures set going
   // (`succeeded`), due a second later: the exit cancels it, and sends
   // nothing of its own while it is due.
@@ -719,9 +729,17 @@ export class Writer {
       .catch(err => this.recordError(`authentication: ${messageOf(err)}`))
   }
 
+  // Prompts, manual flushes, and explicit commands clear the held-file poll
+  // cooldown so recovery can look again immediately.
+  resetHeldCooldown(): void {
+    this.heldCheckTimer?.cancel()
+    this.heldCheckTimer = null
+  }
+
   // A prompt while a problem stands: the person may have just fixed it, so
   // the paused writer tries again now rather than at the end of its backoff.
   retrySoon(): void {
+    this.resetHeldCooldown()
     if (this.problem === null || this.closing) return
     this.resume()
     this.requestFlush(0)
@@ -741,17 +759,21 @@ export class Writer {
   // (autoCreateTable) is no notice. The table found clears only what finding
   // it proves fixed (see foundTable). What it found, for /bqaa-status, or
   // null where it did not ask. Never throws.
-  async probeDestination(timeoutMs = 3000, explicit = false): Promise<string | null> {
+  async probeDestination(timeoutMs = 3000, explicit = false, budgetMs?: number): Promise<string | null> {
     const c = this.config()
     if (!canDeliver(c) || c.dryRun || this.closing || (!explicit && (this.problem !== null || this.lastSuccessAt !== null || this.lastError !== null))) return null
-    const tokenTimeoutMs = Math.max(timeoutMs, c.tokenCommandTimeoutMs)
+    if (explicit) this.resetHeldCooldown()
+    const startedAt = this.io.now()
+    const totalBudgetMs = budgetMs !== undefined ? Math.max(100, budgetMs) : Math.max(timeoutMs, c.tokenCommandTimeoutMs) + timeoutMs * 2
     // When the whole check is over, the fresh token after a 401 included.
-    const deadline = this.io.now() + tokenTimeoutMs + timeoutMs * 2
+    const deadline = startedAt + totalBudgetMs
+    const reqBudgetMs = budgetMs !== undefined ? Math.min(timeoutMs, Math.max(200, Math.floor(totalBudgetMs / 2))) : timeoutMs
+    const tokenTimeoutMs = Math.min(Math.max(timeoutMs, c.tokenCommandTimeoutMs), Math.max(1, totalBudgetMs - reqBudgetMs))
     const url = `${tablesUrl(c)}/${encodeURIComponent(c.table)}?fields=tableReference`
     for (let attempt = 0; attempt < 2; attempt += 1) {
       // A token's time, out of what is left: a request's time is kept for
       // the request it is for.
-      const tokenMs = Math.min(tokenTimeoutMs, Math.max(0, deadline - this.io.now() - timeoutMs))
+      const tokenMs = Math.min(tokenTimeoutMs, Math.max(0, deadline - this.io.now() - reqBudgetMs))
       if (tokenMs <= 0) {
         this.recordError(`destination check: no token within ${tokenTimeoutMs} ms`)
         return `no token within ${tokenTimeoutMs} ms`
@@ -760,7 +782,7 @@ export class Writer {
       let token: string | symbol | null
       try {
         const tokenDeadline = this.moment(tokenMs, tokenTimers)
-        token = await Promise.race([this.getToken().catch(() => null), tokenDeadline.at.then(() => TIMED_OUT)])
+        token = await Promise.race([this.getToken(tokenMs).catch(() => null), tokenDeadline.at.then(() => TIMED_OUT)])
       } finally {
         for (const timer of tokenTimers) timer.cancel()
       }
@@ -770,7 +792,12 @@ export class Writer {
         this.recordError(`destination check: no token within ${tokenMs} ms`)
         return `no token within ${tokenMs} ms`
       }
-      const requestMs = Math.min(timeoutMs, Math.max(1, deadline - this.io.now()))
+      const remaining = deadline - this.io.now()
+      if (remaining <= 0) {
+        this.recordError(`destination check: did not finish within ${totalBudgetMs} ms`)
+        return `did not finish within ${totalBudgetMs} ms`
+      }
+      const requestMs = Math.min(timeoutMs, remaining)
       const httpTimers: Timer[] = []
       let answer: HttpAnswer | { error: string }
       try {
@@ -818,15 +845,31 @@ export class Writer {
     // retries, in a session left idle too, until one sends them all. A
     // replay BigQuery takes clears the notice (`tookRequest`).
     const current = this.config()
-    if (this.queue.length === 0 && this.replayDue.has(deadLetterPartition(current))) {
-      if (this.pauseTimer !== null || this.closing || !current.autoBackfill || !canDeliver(current) || current.dryRun) return
-      await this.backfill(['spill', 'retry'], 'recovery')
-      // Rows still wait: the next replay comes after the backoff. Rows
-      // queued meanwhile (the replay stops for them) go first, at the next
-      // flush, and their send sets its own backoff.
-      if (this.replayDue.has(deadLetterPartition(this.config())) && this.queue.length === 0) {
+    const partition = deadLetterPartition(current)
+    if (this.queue.length === 0 && this.replayDue.has(partition)) {
+      if (this.pauseTimer !== null || this.heldCheckTimer !== null || this.closing || !current.autoBackfill || !canDeliver(current) || current.dryRun) return
+      const report = await this.backfill(['spill', 'retry'], 'recovery')
+      // Only actual errors trigger exponential backoff; held files from other
+      // sessions clear prior live failures so exit flushing stays enabled and
+      // idle checks pause via host timer without setting backoff.
+      if (report.error !== null) {
         this.consecutiveFailures += 1
         this.pause()
+      } else {
+        this.consecutiveFailures = 0
+        if (report.rowsLeft - report.rowsRefused === 0 && !this.closing && this.queue.length === 0) this.parked.recoverable = false
+        if (
+          (report.held !== null || report.incompleteFiles.length > 0) &&
+          this.replayDue.has(partition) &&
+          this.queue.length === 0 &&
+          !this.closing
+        ) {
+          this.resetHeldCooldown()
+          const cooldownMs = report.held !== null ? 30_000 : 45_000
+          this.heldCheckTimer = this.io.after(cooldownMs, () => {
+            this.heldCheckTimer = null
+          })
+        }
       }
       return
     }
@@ -942,14 +985,26 @@ export class Writer {
         await this.retryLater(batch, `authentication: ${outcome.message}`)
         return false
       case 'not-found': {
-        // Once the exit began, no table is created: the batch waits, and the
-        // exit spills it.
         if (!this.closing && c.autoCreateTable && !this.createAttempted && !isDatasetMissing(outcome.message)) {
-          this.createAttempted = true
           if (await this.createTable(c, token)) {
             this.queue.unshift(batch)
             return true
           }
+        }
+        // When an in-flight batch hits table-not-found after session.end
+        // began, defer auto-create + retry to sendAtExit when exit budget
+        // still permits creating the table, rather than tainting settled().
+        if (
+          this.closing &&
+          this.closingSendQueued &&
+          c.autoCreateTable &&
+          !this.createAttempted &&
+          !isDatasetMissing(outcome.message) &&
+          this.closingUntil - this.io.now() - EXIT_SPILL_RESERVE_MS >= EXIT_CREATE_TABLE_MIN_MS
+        ) {
+          this.exitCreateTableNeeded = true
+          this.queue.unshift(batch)
+          return false
         }
         // Not made yet, or made so recently that streaming inserts do not
         // see it (minutes, after setup.sh): the person is told how to make
@@ -1407,12 +1462,13 @@ export class Writer {
     }
   }
 
-  private getToken(): Promise<string> {
+  private getToken(maxTimeoutMs?: number): Promise<string> {
     const c = this.config()
     if (this.token && this.io.now() < this.token.expiresAt) return Promise.resolve(this.token.value)
     // Expired: let it go now, so a refresh that fails leaves no token behind.
     if (this.token) this.dropToken()
     if (this.tokenPending) return this.tokenPending
+    const timeoutMs = maxTimeoutMs !== undefined ? Math.min(c.tokenCommandTimeoutMs, Math.max(1, maxTimeoutMs)) : c.tokenCommandTimeoutMs
     const pending = (async (): Promise<string> => {
       const fromEnv = (await this.io.envToken())?.trim()
       if (fromEnv) {
@@ -1424,7 +1480,7 @@ export class Writer {
       this.tokenSource = 'command'
       if (c.accessTokenCommand.length === 0) throw new Error('no access token source: set BQAA_ACCESS_TOKEN or accessTokenCommand')
       const command = `token command \`${programName(c.accessTokenCommand)}\``
-      const result = await this.io.runCommand(c.accessTokenCommand, c.tokenCommandTimeoutMs)
+      const result = await this.io.runCommand(c.accessTokenCommand, timeoutMs)
       if (result.exitCode !== 0) throw new Error(`${command} exited ${result.exitCode}: ${diagnostic(errorLine(result.stderr), 300)}`)
       const value = result.stdout.trim().split(/\s+/)[0] ?? ''
       if (!/^[A-Za-z0-9._~+/=-]{16,}$/.test(value)) throw new Error(`${command} printed no access token`)
@@ -1448,9 +1504,13 @@ export class Writer {
       return false
     }
     if ((answer.status >= 200 && answer.status < 300) || answer.status === 409) {
+      this.createAttempted = true
       this.tableCreatedAt = this.io.now()
       this.io.debug(`bqaa: created ${tableRef(c)} (day-partitioned on timestamp, clustered on event_type, agent, user_id)`)
       return true
+    }
+    if (answer.status === 400 || answer.status === 403 || answer.status === 404) {
+      this.createAttempted = true
     }
     this.recordError(`create table: HTTP ${answer.status}: ${answer.text}`)
     return false
@@ -1486,6 +1546,7 @@ export class Writer {
   // A dead-letter write, held among those under way until it ends: how many
   // of the rows no file took.
   private deadLetter(kind: DeadLetterKind, rows: Queued[], reason: string): Promise<number> {
+    this.resetHeldCooldown()
     const write = this.writeDeadLetter(kind, rows, reason)
     const ended = write.then(
       () => undefined,
@@ -1615,15 +1676,20 @@ export class Writer {
     // Read before the exit changes anything.
     const sending = opts.sendQueued === true && budgetMs >= EXIT_SEND_MIN_MS && this.canSendAtExit(c, opts.replaySpills === true)
     this.closing = true
+    this.closingUntil = until
+    this.closingSendQueued = sending
     this.soon?.cancel()
     this.soon = null
     for (const writer of writers) {
       writer.closing = true
+      writer.closingUntil = until
+      writer.closingSendQueued = sending
       writer.recoveryTimer?.cancel()
       writer.recoveryTimer = null
       writer.pauseTimer?.cancel()
       writer.pauseTimer = null
       writer.pausedUntil = 0
+      writer.resetHeldCooldown()
     }
     const toDryRun = c.dryRun && c.dryRunDir !== ''
     const writes: Promise<void>[] = []
@@ -1735,6 +1801,35 @@ export class Writer {
         marks.post.at.then(() => ({ error: 'no answer before the session ended' })),
       ])
 
+    const createNeeded = this.exitCreateTableNeeded || this.before.some(w => w.exitCreateTableNeeded)
+    if (createNeeded) {
+      this.exitCreateTableNeeded = false
+      for (const w of this.before) w.exitCreateTableNeeded = false
+      const createBudget = until - this.io.now() - EXIT_SPILL_RESERVE_MS
+      const missingTableMsg = `Not found: Table ${c.project}:${c.dataset}.${c.table}`
+      if (!c.autoCreateTable || this.createAttempted || marks.post.passed() || createBudget < EXIT_CREATE_TABLE_MIN_MS) {
+        this.missingDestination(missingTableMsg)
+        this.recordError(`session end: ${missingTableMsg}`)
+        park(batch)
+        return false
+      }
+      const created = await Promise.race([
+        this.createTable(c, token, Math.max(50, createBudget)),
+        marks.post.at.then(() => false),
+      ])
+      if (!created) {
+        this.missingDestination(missingTableMsg)
+        this.recordError(marks.post.passed() ? 'session end: no answer before the session ended' : `session end: create table failed (${tableRef(c)})`)
+        park(batch)
+        return false
+      }
+      if (marks.post.passed() || until - this.io.now() < EXIT_SEND_MIN_MS) {
+        this.recordError(`session end: table created (${tableRef(c)}); rows spilled`)
+        park(batch)
+        return false
+      }
+    }
+
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const answer = await postBatch()
       if ('error' in answer) {
@@ -1783,7 +1878,6 @@ export class Writer {
             !marks.post.passed() &&
             createBudget >= EXIT_CREATE_TABLE_MIN_MS
           ) {
-            this.createAttempted = true
             const created = await Promise.race([
               this.createTable(c, token, Math.max(50, createBudget)),
               marks.post.at.then(() => false),
@@ -1897,6 +1991,7 @@ export class Writer {
   // again stay, and so does every line recorded for another table, as
   // written.
   backfill(kinds: DeadLetterKind[], trigger: BackfillReport['trigger']): Promise<BackfillReport> {
+    if (trigger === 'command' || trigger === 'force') this.resetHeldCooldown()
     if (this.backfilling) return this.backfilling
     const parked = this.parked.seq
     const dir = deadLetterPartition(this.config())
@@ -1953,6 +2048,9 @@ export class Writer {
         this.backfillReport !== null &&
         (this.backfillReport.files > 0 || this.backfillReport.rowsSent > 0 || this.backfillReport.error !== null)
       if (!emptyAuto || !hasPrevious) this.backfillReport = report
+      else if (this.backfillReport !== null && this.backfillReport.held !== null && !this.replayDue.has(dir)) {
+        this.backfillReport = { ...this.backfillReport, held: null }
+      }
       return report
     }
     if (!canDeliver(c) || c.dryRun) {
@@ -2196,7 +2294,8 @@ export class Writer {
             if (kindOf(name) !== 'rejected' && !(await this.io.listDir(dir)).some(x => x.size > 0 && doneMarkerOf(x.name, name) !== null)) tally.waiting += 1
           } else {
             this.seenSince.delete(path)
-            const fate = parsed.parent === null ? 'go' : await this.parentFate(dir, parsed.parent, path, listed.get(parsed.parent) ?? 0, c)
+            const parentName = parsed.parent === null ? null : baseOf(parsed.parent)
+            const fate = parentName === null ? 'go' : await this.parentFate(dir, parentName, path, listed.get(parentName) ?? 0, c)
             if (fate === 'wait') {
               // Written by a replay of another file whose record does not have
               // it as written yet: it waits until that replay is finished.
@@ -2425,15 +2524,17 @@ export class Writer {
   // record that did the parent does not name: a late copy of another
   // session's outcome, whose rows that outcome has.
   private async parentFate(dir: string, parent: string, path: string, size: number, c: Config): Promise<'go' | 'wait' | 'drop'> {
+    const parentName = baseOf(parent)
     let found: Found | Pending | 'torn' | undefined
     try {
-      found = await this.readJournal(size > 0 ? sourceFor(dir, parent, size, c) : { ...sourceFor(dir, parent, -1, c), live: false })
+      found = await this.readJournal(size > 0 ? sourceFor(dir, parentName, size, c) : { ...sourceFor(dir, parentName, -1, c), live: false })
     } catch {
       return 'wait'
     }
     if (found === 'torn' || (found !== undefined && 'pending' in found)) return size > 0 ? 'wait' : 'go'
     if (found === undefined) return 'go'
-    const at = (Array.isArray(found.journal.files) ? found.journal.files : []).indexOf(path)
+    const targetName = baseOf(path)
+    const at = (Array.isArray(found.journal.files) ? found.journal.files : []).findIndex(entry => entry === path || baseOf(entry) === targetName)
     // Not named: a late copy of another session's outcome, where the record
     // is the mark the parent was done, or a whole one of an emptied parent
     // with every file it names written (its done mark lost, or never written:
@@ -2494,7 +2595,7 @@ export class Writer {
     const paths = Array.isArray(journal.files) ? journal.files : []
     const written = writtenOf(journal)
     const outcome: Outcome = { fates: typeof journal.fates === 'string' ? journal.fates : '', reasons: Array.isArray(journal.reasons) ? journal.reasons : [], refusals: Array.isArray(journal.refusals) ? journal.refusals : [] }
-    const rewrite: Rewrite = { ...outcome, ...source, waits: journal.waits === true, filed: found.filed, seq: seqOf(journal), files: paths.map(p => ({ path: p, text: null })) }
+    const rewrite: Rewrite = { ...outcome, ...source, waits: journal.waits === true, filed: found.filed, seq: seqOf(journal), files: paths.map(p => ({ path: joinPath(source.dir, baseOf(p)), text: null })) }
     if (written.every(Boolean)) return rewrite
     const text = await this.io.readFile(path)
     // Emptied meanwhile (another writer finished it): nothing to resume, and
@@ -2516,7 +2617,7 @@ export class Writer {
       if (found.filed) await this.emptyRecordFiles(source)
       return held
     }
-    rewrite.files = paths.map((p, i) => ({ path: p, text: written[i] === true ? null : (texts[i]?.text ?? '') }))
+    rewrite.files = paths.map((p, i) => ({ path: joinPath(source.dir, baseOf(p)), text: written[i] === true ? null : (texts[i]?.text ?? '') }))
     return rewrite
   }
 
@@ -2564,7 +2665,7 @@ export class Writer {
     const record = async (): Promise<void> => {
       rewrite.seq += 1
       const { fates, reasons, refusals, size, waits, seq } = rewrite
-      const journal: Journal = { fates, reasons, refusals, size, waits, seq, files: rewrite.files.map(f => f.path), written: rewrite.files.map(f => f.text === null) }
+      const journal: Journal = { fates, reasons, refusals, size, waits, seq, files: rewrite.files.map(f => baseOf(f.path)), written: rewrite.files.map(f => f.text === null) }
       if (utf8Length(JSON.stringify(journal)) <= STORE_RECORD_BYTES) {
         try {
           await this.io.storeSet(rewrite.recordKey, journal)
@@ -2655,7 +2756,7 @@ export class Writer {
     rewrite.seq += 1
     const { size, waits, seq } = rewrite
     const { fates, reasons, refusals } = rewrite
-    const journal: Journal = { fates, reasons, refusals, size, waits, seq, files: rewrite.files.map(f => f.path), written: rewrite.files.map(() => true), retired: true, retiredAt: this.io.now() }
+    const journal: Journal = { fates, reasons, refusals, size, waits, seq, files: rewrite.files.map(f => baseOf(f.path)), written: rewrite.files.map(() => true), retired: true, retiredAt: this.io.now() }
     try {
       await this.io.writeFile(doneFileOf(rewrite.dir, rewrite.name, this.mark), journalText(journal))
       return true
@@ -2835,6 +2936,18 @@ export class Writer {
         }
         outcome = classifyInsert(answer, chunk.length)
         if (outcome.kind === 'auth') this.noteProblem('credentials', `BigQuery refused a fresh token too: ${outcome.message}`)
+      }
+      if (outcome.kind === 'not-found' && !this.closing && c.autoCreateTable && !this.createAttempted && !isDatasetMissing(outcome.message)) {
+        if (await this.createTable(c, token)) {
+          if (this.replayHalted()) break
+          tally.requests += 1
+          answer = await this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs)
+          if ('error' in answer) {
+            report.error = diagnostic(answer.error)
+            continue
+          }
+          outcome = classifyInsert(answer, chunk.length)
+        }
       }
       if (outcome.kind === 'ok' || outcome.kind === 'partial') {
         // BigQuery took the request: the table is there and the credentials

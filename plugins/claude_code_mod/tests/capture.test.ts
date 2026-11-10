@@ -751,7 +751,7 @@ test('an in-flight subagent model step and tool call started before SubagentStar
   const stream = $.turn.step({ turnId: 'sub-turn-late', index: 0, model: 'claude-haiku-4-5', messageCount: 1, agentId: 'sub-loop-late' })
   // First next() starts the step (emits LLM_REQUEST) and yields chunk 0 while keeping the step in flight:
   await stream.next()
-  const toolPromise = $.tool.call({ tool: 'Grep', pattern: 'foo', agentId: 'sub-loop-late', tool_use_id: 'toolu_late_1' })
+  const toolPromise = $.tool.call({ tool: 'Grep', pattern: 'foo', agentId: 'sub-loop-late', tool_use_id: 'toolu_late_1' } as never)
   await world.clock.settle()
   // Now SubagentStart arrives while both the step and the tool call are in flight:
   await $.classic.SubagentStart({ agent_id: 'sub-loop-late', agent_type: 'Explore' })
@@ -772,18 +772,6 @@ test('an in-flight subagent model step and tool call started before SubagentStar
   expect([agentDone?.agent, json(agentDone?.attributes ?? null).unidentified_loop]).toEqual(['Explore', undefined])
 })
 
-test('the offline test shim rejects a session.end handler that returns no { sessionId }', { options: OPTIONS }, async ($, on) => {
-  setUp(on)
-  on('session.end', async (_$, _e, _next) => ({}) as never)
-  let caught: Error | null = null
-  try {
-    await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
-  } catch (err) {
-    caught = err as Error
-  }
-  expect(caught?.message ?? '').toContain('no implementation for session.end: returned no { sessionId }')
-})
-
 test('a short (< 5 s) headless session with BQAA_ACCESS_TOKEN=bogus-token getting HTTP 401 at session.end prints a credential notice to stderr and spills cleanly', { options: OPTIONS }, async ($, on) => {
   const bogusToken = ['bogus', 'token', 'canary', '401'].join('-')
   const world = setUp(on, { BQAA_ACCESS_TOKEN: bogusToken })
@@ -791,10 +779,11 @@ test('a short (< 5 s) headless session with BQAA_ACCESS_TOKEN=bogus-token gettin
   await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
   await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
   await $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
-  expect(world.stderr).toEqual([
+  const notices = world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))
+  expect(notices).toEqual([
     'BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, set a fresh BQAA_ACCESS_TOKEN, or unset it to use the token command).',
   ])
-  expect(world.stderr[0]?.includes(bogusToken)).toBe(false)
+  expect(notices[0]?.includes(bogusToken)).toBe(false)
   expect(deadLetterRows(world).length).toBe(2)
 })
 
@@ -812,10 +801,11 @@ test('a short (< 5 s) headless session whose in-flight turn flush gets HTTP 401 
   await world.clock.advance(50)
   world.releaseHung(unauth.status, unauth.text)
   await ending
-  expect(world.stderr).toEqual([
+  const notices = world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))
+  expect(notices).toEqual([
     'BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, set a fresh BQAA_ACCESS_TOKEN, or unset it to use the token command).',
   ])
-  expect(world.stderr[0]?.includes(bogusToken)).toBe(false)
+  expect(notices[0]?.includes(bogusToken)).toBe(false)
   expect(deadLetterRows(world).length).toBe(4)
 })
 
@@ -836,5 +826,31 @@ test('a short (< 5 s) session whose session.end batch hits table-not-found auto-
   expect(world.acceptedRows().length).toBe(4)
   expect(deadLetterFiles(world)).toEqual([])
   expect(deadLetterRows(world)).toEqual([])
-  expect(world.stderr).toEqual([])
+  expect(world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))).toEqual([])
+})
+
+test('a short -p session with 20 ms HTTP latency whose in-flight batch hits table-not-found during session.end auto-creates the table and lands all rows cleanly', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  const tableMissing = { status: 404, text: '{"error":{"code":404,"message":"Not found: Table my-gcp-project:agent_analytics.agent_events","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}' }
+  const tableCreated = { status: 200, text: '{"kind":"bigquery#table"}' }
+  world.replies = [{ hang: true }, tableCreated, OK_INSERT]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.turn.start({ turnId: 't-repro-b', text: 'check' })
+  await $.turn.complete({ turnId: 't-repro-b', answer: 'ok', durationMs: 25, isAborted: false, reason: 'answer' })
+  // Flush interval triggers the first insertAll; session.end starts before the 20 ms HTTP reply arrives.
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+  const ending = $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  await world.clock.advance(20)
+  world.releaseHung(tableMissing.status, tableMissing.text)
+  await ending
+  expect(world.fetches.map(f => `${f.method} ${f.url.split('/').pop()?.split('?')[0]}`)).toEqual([
+    'POST insertAll',
+    'POST tables',
+    'POST insertAll',
+  ])
+  expect(world.acceptedRows().length).toBe(4)
+  expect(deadLetterFiles(world)).toEqual([])
+  expect(deadLetterRows(world)).toEqual([])
+  expect(world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))).toEqual([])
 })

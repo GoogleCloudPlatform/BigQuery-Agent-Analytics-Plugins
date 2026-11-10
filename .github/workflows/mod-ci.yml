@@ -97,9 +97,12 @@ jobs:
         run: |
           npm ci --ignore-scripts --prefix tests
           ./tests/node_modules/.bin/tsc -p tsconfig.ci.json --noEmit
+          ./tests/node_modules/.bin/tsc -p . --noEmit
 
-      - name: TypeScript test suites and state-contract check
-        run: node --import ./tests/shim/register.mjs --test --test-concurrency=1 tests/*.test.ts tests/state-contract/state.contract.ts
+      - name: Test shim self-checks and TypeScript test suites
+        run: |
+          node tests/shim/shim-self.check.mjs
+          node --import ./tests/shim/register.mjs --test --test-concurrency=1 tests/*.test.ts tests/state-contract/state.contract.ts
 
       - name: Test SQL views and sample/value queries (DuckDB)
         run: |

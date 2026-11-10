@@ -22,7 +22,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { classifyInsert, insertAllBody } from '../hooks/lib/bigquery.ts'
-import { PLUGIN_VERSION, destinationDir, resolveConfig, splitArgv } from '../hooks/lib/config.ts'
+import { PLUGIN_VERSION, destinationDir, isAbsoluteAnyOs, resolveConfig, splitArgv } from '../hooks/lib/config.ts'
 import { FILE_PATTERN, MAX_FILE_BYTES, encodeLines, fileName, kindOf, parseFile } from '../hooks/lib/deadletter.ts'
 import { randomIds } from '../hooks/lib/ids.ts'
 import { BoundedQueue } from '../hooks/lib/queue.ts'
@@ -30,6 +30,7 @@ import { buildRow, utf8Length } from '../hooks/lib/rows.ts'
 import { isSensitiveKey, limitsFor, newStats, redactDiagnostic, redactText, sanitize, toJsonColumn } from '../hooks/lib/sanitize.ts'
 import { Tracer } from '../hooks/lib/tracer.ts'
 import { type Welcome, welcomeCard, welcomeNotice } from '../hooks/lib/welcome.ts'
+import { writeStderr } from '../hooks/register.ts'
 
 import { utf8Bytes } from './helpers.ts'
 
@@ -334,6 +335,52 @@ test('configuration: userConfig wins, then BQAA_* variables, then defaults', () 
   expect(resolveConfig({ project: 'old-project', dataset: 'agent_analytics' }, envWithNewProject).project).toBe('old-project')
   expect(resolveConfig({ project: 'new-project', dataset: 'agent_analytics' }, envWithNewProject).project).toBe('new-project')
   expect(resolveConfig({ project: '', dataset: 'agent_analytics' }, envWithNewProject).project).toBe('new-project')
+})
+
+test('deadLetterDir expands leading ~ against HOME/USERPROFILE and rejects relative or non-absolute paths with a config notice', () => {
+  expect(isAbsoluteAnyOs('/abs/path')).toBe(true)
+  expect(isAbsoluteAnyOs('C:\\dl')).toBe(true)
+  expect(isAbsoluteAnyOs('C:/dl')).toBe(true)
+  expect(isAbsoluteAnyOs('\\\\server\\share')).toBe(true)
+  expect(isAbsoluteAnyOs('./rel')).toBe(false)
+  expect(isAbsoluteAnyOs('C:rel')).toBe(false)
+  expect(isAbsoluteAnyOs('~other/dl')).toBe(false)
+
+  const tilde = resolveConfig({ ...{ project: 'p1', dataset: 'd1' }, deadLetterDir: '~/custom-dl' }, { HOME: '/home/alice' })
+  expect(tilde.deadLetterDir).toBe('/home/alice/custom-dl')
+  expect(tilde.deadLetterDirIsDefault).toBe(false)
+  expect(tilde.dryRunDir).toBe('/home/alice/custom-dl/dry-run')
+  expect(tilde.warnings).toEqual([])
+
+  const bareTilde = resolveConfig({ project: 'p1', dataset: 'd1', deadLetterDir: '~' }, { HOME: '/home/alice' })
+  expect(bareTilde.deadLetterDir).toBe('/home/alice')
+  expect(bareTilde.warnings).toEqual([])
+
+  const winTilde = resolveConfig({ project: 'p1', dataset: 'd1' }, { BQAA_DEAD_LETTER_DIR: '~\\bqaa-dl', USERPROFILE: 'C:\\Users\\alice' })
+  expect(winTilde.deadLetterDir).toBe('C:\\Users\\alice\\bqaa-dl')
+  expect(winTilde.dryRunDir).toBe('C:\\Users\\alice\\bqaa-dl\\dry-run')
+  expect(winTilde.warnings).toEqual([])
+
+  const relative = resolveConfig({ project: 'p1', dataset: 'd1', deadLetterDir: './rel-dl' }, { HOME: '/home/alice' })
+  expect(relative.deadLetterDir).toBe('/home/alice/.bqaa-mod/dead-letter')
+  expect(relative.deadLetterDirIsDefault).toBe(true)
+  expect(relative.warnings).toEqual(['deadLetterDir ("./rel-dl") is not an absolute path; using default /home/alice/.bqaa-mod/dead-letter'])
+
+  const driveRel = resolveConfig({ project: 'p1', dataset: 'd1', deadLetterDir: 'C:rel' }, { USERPROFILE: 'C:\\Users\\alice' })
+  expect(driveRel.deadLetterDir).toBe('C:\\Users\\alice\\.bqaa-mod\\dead-letter')
+  expect(driveRel.deadLetterDirIsDefault).toBe(true)
+  expect(driveRel.warnings.length).toBe(1)
+
+  const otherUser = resolveConfig({ project: 'p1', dataset: 'd1', deadLetterDir: '~bob/dl' }, { HOME: '/home/alice' })
+  expect(otherUser.deadLetterDir).toBe('/home/alice/.bqaa-mod/dead-letter')
+  expect(otherUser.warnings.length).toBe(1)
+
+  const noHome = resolveConfig({ project: 'p1', dataset: 'd1', deadLetterDir: '~/dl' }, {})
+  expect(noHome.deadLetterDir).toBe('')
+  expect(noHome.dryRunDir).toBe('')
+  expect(noHome.deadLetterDirIsDefault).toBe(false)
+  expect(noHome.warnings).toEqual(['deadLetterDir ("~/dl") is not an absolute path and HOME is unset; disabling dead-letter directory'])
+  expect(noHome.problems.some(p => p.includes('no dead-letter directory'))).toBe(true)
 })
 
 // The host checks option values against plugin.json's userConfig types before
@@ -2967,4 +3014,60 @@ test('the single-dash password options redact in linear time: 100,000 characters
   const stats = newStats()
   const out = redactText(large, stats)
   expect([out.includes('Canary'), stats.redactions, out.split(SINGLE_DASH_KEPT[0] as string).length - 1]).toEqual([false, unitRedactions * (large.length / unit.length), large.length / unit.length])
+})
+
+test('writeStderr routes lines to __bqaaStderr, process.stderr.write, or console.error fallback and never throws', () => {
+  const host = globalThis as {
+    __bqaaStderr?: (line: string) => void
+    process?: { stderr?: { write?: (text: string) => unknown } }
+    console?: { error?: (text: string) => void }
+  }
+  const origHook = host.__bqaaStderr
+  const origProcess = host.process
+  const origConsole = host.console
+  try {
+    const hookLines: string[] = []
+    host.__bqaaStderr = line => {
+      hookLines.push(line)
+    }
+    writeStderr('hook-notice')
+    expect(hookLines).toEqual(['hook-notice'])
+
+    delete host.__bqaaStderr
+    const stderrWrites: string[] = []
+    host.process = {
+      stderr: {
+        write: text => {
+          stderrWrites.push(text)
+          return true
+        },
+      },
+    }
+    writeStderr('stderr-notice')
+    expect(stderrWrites).toEqual(['stderr-notice\n'])
+
+    host.process = {}
+    const consoleErrors: string[] = []
+    host.console = {
+      error: line => {
+        consoleErrors.push(line)
+      },
+    }
+    writeStderr('console-notice')
+    expect(consoleErrors).toEqual(['console-notice'])
+
+    host.console = {
+      error: () => {
+        throw new Error('broken stream')
+      },
+    }
+    writeStderr('ignored-failure')
+  } finally {
+    if (origHook === undefined) delete host.__bqaaStderr
+    else host.__bqaaStderr = origHook
+    if (origProcess === undefined) delete host.process
+    else host.process = origProcess
+    if (origConsole === undefined) delete host.console
+    else host.console = origConsole
+  }
 })
