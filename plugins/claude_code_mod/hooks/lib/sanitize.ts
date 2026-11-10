@@ -194,7 +194,10 @@ const PEM_PRIVATE_END = /-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----/g
 const PGP_PRIVATE_BEGIN = '-----BEGIN PGP PRIVATE KEY BLOCK-----'
 const PGP_PRIVATE_END = '-----END PGP PRIVATE KEY BLOCK-----'
 const PUTTY_HEADER = /PuTTY-User-Key-File-[23]:[ \t]*[^\r\n]*/g
-const PUTTY_PRIVATE_LINES = /(?:^|\r?\n)Private-Lines:[ \t]*(\d+)[ \t]*(?:\r?\n|$)/g
+const PUTTY_NEXT_HDR = /\r?\nPuTTY-User-Key-File-\d+:/
+const PUTTY_PRIVATE_LINES_NL = /\r?\nPrivate-Lines:[ \t]*(\d+)[ \t]*\r?\n/
+const PUTTY_PRIVATE_LINES_EOF = /\r?\nPrivate-Lines:[ \t]*(\d+)[ \t]*(?:\r?\n|$)/
+const PUTTY_TRUNC_SUBHDR = /^\r?\n(?:Encryption|Comment|Public-Lines):/
 
 // Redacts PEM private keys, PGP private key blocks and PuTTY .ppk private
 // material before other passes. Unclosed PEM/PGP private blocks cut to EOF and
@@ -247,17 +250,27 @@ function redactPrivateKeys(text: string, stats: SanitizeStats): string {
 
   // 3. PuTTY .ppk files (`PuTTY-User-Key-File-2:` / `PuTTY-User-Key-File-3:`).
   if (current.includes('PuTTY-User-Key-File-')) {
+    const hasPrivateLines = current.includes('Private-Lines:')
     PUTTY_HEADER.lastIndex = 0
     let ppkOut = ''
     let ppkCopied = 0
     for (let hm = PUTTY_HEADER.exec(current); hm !== null; hm = PUTTY_HEADER.exec(current)) {
       if (hm.index < ppkCopied) continue
       const headerEnd = hm.index + hm[0].length
-      PUTTY_PRIVATE_LINES.lastIndex = headerEnd
-      const pm = PUTTY_PRIVATE_LINES.exec(current)
-      if (pm !== null && pm.index - headerEnd <= 8192) {
+      let pm: RegExpExecArray | null = null
+      if (hasPrivateLines) {
+        const rawWindow = current.slice(headerEnd, headerEnd + 8256)
+        const nextHdrMatch = PUTTY_NEXT_HDR.exec(rawWindow)
+        const searchWindow =
+          nextHdrMatch === null
+            ? rawWindow
+            : rawWindow.slice(0, nextHdrMatch.index + (rawWindow[nextHdrMatch.index] === '\r' ? 2 : 1))
+        const atEof = nextHdrMatch === null && headerEnd + rawWindow.length >= current.length
+        pm = (atEof ? PUTTY_PRIVATE_LINES_EOF : PUTTY_PRIVATE_LINES_NL).exec(searchWindow)
+      }
+      if (pm !== null && pm.index <= 8192) {
         const lineCount = Number(pm[1])
-        const bodyStart = pm.index + pm[0].length
+        const bodyStart = headerEnd + pm.index + pm[0].length
         if (lineCount > 0 && current.slice(bodyStart, bodyStart + 22) === '[REDACTED:private-key]') continue
         if (lineCount <= 0) continue
         let cursor = bodyStart
@@ -290,7 +303,7 @@ function redactPrivateKeys(text: string, stats: SanitizeStats): string {
       } else {
         // Multi-line .ppk header cut short before Private-Lines.
         const nextLine = current.slice(headerEnd, headerEnd + 256)
-        if (/^\r?\n(?:Encryption|Comment|Public-Lines):/.test(nextLine)) {
+        if (PUTTY_TRUNC_SUBHDR.test(nextLine)) {
           ppkOut += current.slice(ppkCopied, hm.index) + '[REDACTED:private-key]'
           noteCut(current, hm.index, hm.index + hm[0].length, current.length, stats)
           stats.redactions += 1
@@ -477,7 +490,7 @@ const isLikelyBasicCredentialToken = (token: string): boolean => {
   return false
 }
 
-const AUTH_SCHEME_RE = /\b(Bearer|Basic)([ \t]+)([A-Za-z0-9._~+/=-]{4,})/gi
+const AUTH_SCHEME_RE = /\b(Bearer|Basic)([ \t]+|[ \t]*\r?\n[ \t]*)([A-Za-z0-9._~+/=-]{4,})/gi
 const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:\\*["'])?$/i
 
 function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
@@ -489,18 +502,33 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const scheme = m[1] as string
     const space = m[2] as string
     const token = m[3] as string
-    const tokStart = m.index + scheme.length + space.length
+    const matchEnd = m.index + m[0].length
+    const before = text.slice(Math.max(0, m.index - 40), m.index)
+    const inHeader = AUTH_HEADER_PREFIX.test(before)
+    if (space.includes('\n')) {
+      const after = text.slice(matchEnd, matchEnd + 16)
+      if (
+        /^[ \t]*[:=]/.test(after) ||
+        /^[A-Za-z_][A-Za-z0-9_.-]*=[^=]/.test(token) ||
+        (/^[A-Za-z_][A-Za-z0-9_.-]*=$/.test(token) && /^['"$`]/.test(after))
+      ) {
+        continue
+      }
+    }
     if (scheme.toLowerCase() === 'bearer') {
       if (token.length < 12) continue
+      if (space.includes('\n') && !inHeader && !isLikelyBasicCredentialToken(token)) continue
     } else {
-      const before = text.slice(Math.max(0, m.index - 40), m.index)
-      const inHeader = AUTH_HEADER_PREFIX.test(before)
-      if (!inHeader && !isLikelyBasicCredentialToken(token)) continue
+      if (space.includes('\n')) {
+        if (!inHeader && !decodeBase64PrintableColon(token)) continue
+      } else {
+        if (!inHeader && !isLikelyBasicCredentialToken(token)) continue
+      }
       if (inHeader && token.length < 4) continue
     }
-    out += text.slice(copied, tokStart) + MARKER
+    out += text.slice(copied, m.index) + scheme + ' ' + MARKER
     stats.redactions += 1
-    copied = m.index + m[0].length
+    copied = matchEnd
   }
   return copied === 0 ? text : out + text.slice(copied)
 }
@@ -3157,7 +3185,9 @@ function redactCodeAndConfigForms(text: string, stats: SanitizeStats): string {
   return out
 }
 
-const SHELL_WRAPPERS = new Set(['sudo', 'env', 'command', 'nohup', 'time', 'builtin', 'exec'])
+const SHELL_WRAPPERS = new Set(['sudo', 'env', 'command', 'nohup', 'time', 'timeout', 'gtimeout', 'builtin', 'exec'])
+const SUDO_ARG_OPTS = new Set(['-u', '--user', '-g', '--group', '-h', '--host', '-p', '--prompt', '-r', '--role', '-t', '--type', '-U', '--other-user', '-C', '--close-from', '-D', '--chdir', '-R', '--chroot', '-T', '--command-timeout'])
+const ENV_ARG_OPTS = new Set(['-u', '--unset', '-C', '--chdir', '-S', '--split-string'])
 const ATTACHED_P_CMDS = new Set(['mysql', 'mysqldump', 'mariadb', 'mariadb-dump', 'mongosh', 'mongo', 'sshpass', 'twine', '7z', '7za', '7zr', 'psql', 'redis-cli', 'valkey-cli'])
 const ATTACHED_P_PORT_CMDS = new Set(['psql', 'redis-cli', 'valkey-cli'])
 const SPACED_P_PASS_CMDS = new Set(['mysql', 'mysqldump', 'mariadb', 'mariadb-dump', 'mongosh', 'mongo', 'sshpass', 'twine', 'htpasswd', 'htdigest', 'smbclient', 'rpcclient', 'net', 'mosquitto_passwd', 'kadmin'])
@@ -3207,9 +3237,24 @@ function scanCliSegment(text: string, tokens: CliToken[], edits: CliEdit[], stat
     const base = cmdBaseName(t)
     if (SHELL_WRAPPERS.has(base)) {
       idx += 1
-      if (base === 'env' || base === 'sudo' || base === 'timeout') {
-        while (idx < tokens.length && (tokens[idx]!.unquoted.startsWith('-') || ENV_ASSIGN_TOK.test(tokens[idx]!.unquoted))) idx += 1
-        if (base === 'timeout' && idx < tokens.length && /^\d+[smhd]?$/.test(tokens[idx]!.unquoted)) idx += 1
+      if (base === 'timeout' || base === 'gtimeout') {
+        while (idx < tokens.length && tokens[idx]!.unquoted.startsWith('-')) {
+          const opt = tokens[idx]!.unquoted
+          idx += 1
+          if (opt === '--') break
+          if ((opt === '-k' || opt === '--kill-after' || opt === '-s' || opt === '--signal') && idx < tokens.length) {
+            idx += 1
+          }
+        }
+        if (idx < tokens.length && /^(?:\d+(?:\.\d+)?|\.\d+)[smhd]?$/i.test(tokens[idx]!.unquoted)) idx += 1
+      } else if (base === 'env' || base === 'sudo' || base === 'command' || base === 'time') {
+        while (idx < tokens.length && (tokens[idx]!.unquoted.startsWith('-') || ENV_ASSIGN_TOK.test(tokens[idx]!.unquoted))) {
+          const opt = tokens[idx]!.unquoted
+          idx += 1
+          if (opt === '--') break
+          if (base === 'sudo' && SUDO_ARG_OPTS.has(opt) && idx < tokens.length) idx += 1
+          else if (base === 'env' && ENV_ARG_OPTS.has(opt) && idx < tokens.length) idx += 1
+        }
       }
       continue
     }

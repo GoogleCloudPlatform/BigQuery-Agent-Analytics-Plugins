@@ -18,7 +18,7 @@
 #
 # Usage:
 #   bash plugins/claude_code/build_dist.sh OUT_DIR [VERSION]
-#   bash plugins/claude_code/build_dist.sh --check
+#   bash plugins/claude_code/build_dist.sh --check [--sdk-repo PATH_OR_URL]
 #
 # In --check mode, verifies:
 #   - plugins/claude_code_dist/bigquery-agent-analytics-tracing/.claude-plugin/plugin.json
@@ -32,12 +32,17 @@
 #     match identically between plugins/claude_code and dist (including
 #     executable bits on all .sh scripts), with zero Python bytecode in dist;
 #   - if git checkout is full (fails on shallow clones so release tags are
-#     never skipped), and release tags tracing-v* exist:
-#     * if tracing-v<dist_version> already exists, dist/ must have zero diff
-#       against that tag (editing dist after release requires a version bump);
+#     never skipped), discovers tracing-v* release tags from BQAA_SDK_REPO /
+#     --sdk-repo, remote 'sdk', sibling BigQuery-Agent-Analytics-SDK, or
+#     derived SDK origin remote, and checks local tracing-v* / tracing-dist-v*:
+#     * if tracing-v<dist_version> exists (in SDK or this repo), dist/ must
+#       have zero diff against that release's built snapshot (reconstructed
+#       from plugins/claude_code + producers/src on SDK tags, or committed dist);
 #     * if tracing-v<dist_version> does not exist yet, dist_version must be
 #       strictly greater than the highest existing tracing-vX.Y.Z tag;
-#     * any tracing-dist-v* tags agree on their version across dist and catalog.
+#     * if tracing-dist-v<dist_version> exists locally, dist/ must have zero
+#       diff against it; otherwise dist_version must exceed max tracing-dist-v*;
+#     * every tracing-dist-v* tag holds matching dist and catalog versions.
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 
@@ -112,8 +117,18 @@ pathlib.Path(sys.argv[2]).write_text(
 )
 PY
 
-  # Preserve vendor/ from existing out dir if present, else committed dist/vendor.
-  if [[ -d "$out/vendor" ]]; then
+  # Vendor directly from producers/ when building from an SDK layout, else
+  # preserve vendor/ from existing out dir or committed dist/vendor.
+  local sdk_pkg_src="$src/../../producers/src/bigquery_agent_analytics_tracing"
+  if [[ -d "$sdk_pkg_src" ]]; then
+    mkdir -p "$tmp_stage/vendor"
+    cp -Rp "$sdk_pkg_src" "$tmp_stage/vendor/bigquery_agent_analytics_tracing"
+    local dist_info_dir="$tmp_stage/vendor/bigquery_agent_analytics_tracing-${target_version}.dist-info"
+    mkdir -p "$dist_info_dir"
+    printf 'Metadata-Version: 2.1\nName: bigquery-agent-analytics-tracing\nVersion: %s\n' \
+      "$target_version" > "$dist_info_dir/METADATA"
+    chmod 0644 "$dist_info_dir/METADATA"
+  elif [[ -d "$out/vendor" ]]; then
     cp -Rp "$out/vendor" "$tmp_stage/vendor"
   elif [[ -d "$dist/vendor" ]]; then
     cp -Rp "$dist/vendor" "$tmp_stage/vendor"
@@ -151,10 +166,113 @@ sys.exit(1 if differ else 0)
 PY
 }
 
-if [[ "${1:-}" != "--check" ]]; then
-  out_dir="${1:?usage: build_dist.sh OUT_DIR [VERSION] | --check}"
-  build "$here" "$out_dir" "${2:-}"
+is_git_url() {
+  [[ "$1" =~ ^(https?|ssh|git|file|rpc):// ]] || [[ "$1" == git@* ]]
+}
+
+git_sdk() {
+  local repo_dir="$1"
+  shift
+  if [[ -d "$repo_dir" && ! -e "$repo_dir/.git" && -f "$repo_dir/HEAD" && -d "$repo_dir/objects" ]]; then
+    git --git-dir="$repo_dir" "$@"
+  else
+    git -C "$repo_dir" "$@"
+  fi
+}
+
+is_git_repo_root() {
+  local repo_dir="$1"
+  [[ -d "$repo_dir" ]] || return 1
+  if ! git_sdk "$repo_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    return 1
+  fi
+  if [[ "$(git_sdk "$repo_dir" rev-parse --is-bare-repository 2>/dev/null || echo false)" == true ]]; then
+    return 0
+  fi
+  local top
+  top="$(git_sdk "$repo_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$top" ]] || return 1
+  local resolved_dir resolved_top
+  resolved_dir="$(cd "$repo_dir" 2>/dev/null && pwd -P)"
+  resolved_top="$(cd "$top" 2>/dev/null && pwd -P)"
+  [[ "$resolved_dir" == "$resolved_top" ]]
+}
+
+check_monotonic_tags() {
+  python3 -B - "$1" "$2" "$3" "$4" <<'PY'
+import re, sys
+
+dist_ver_str, raw_tags, prefix, label = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+dist_v = tuple(int(x) for x in dist_ver_str.split("."))
+pattern = re.compile(re.escape(prefix) + r"(\d+)\.(\d+)\.(\d+)")
+tag_vers = []
+for raw in raw_tags.splitlines():
+    m = pattern.fullmatch(raw.strip())
+    if m:
+        tag_vers.append((tuple(int(x) for x in m.groups()), raw.strip()))
+if tag_vers:
+    max_v, max_tag = max(tag_vers)
+    if dist_v <= max_v:
+        print(f"not ok - dist version {dist_ver_str} is not newer than existing {label} {max_tag}")
+        sys.exit(1)
+    print(f"ok - unreleased dist version {dist_ver_str} > highest {label} {max_tag}")
+else:
+    print(f"ok - no release {prefix}X.Y.Z tags exist yet")
+PY
+}
+
+mode="build"
+sdk_repo_arg=""
+sdk_repo_arg_set=0
+positional=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check)
+      mode="check"
+      shift
+      ;;
+    --sdk-repo=*)
+      sdk_repo_arg="${1#--sdk-repo=}"
+      sdk_repo_arg_set=1
+      shift
+      ;;
+    --sdk-repo)
+      if [[ $# -lt 2 ]]; then
+        echo "not ok - --sdk-repo requires a path or URL" >&2
+        exit 2
+      fi
+      sdk_repo_arg="$2"
+      sdk_repo_arg_set=1
+      shift 2
+      ;;
+    --)
+      shift
+      positional+=("$@")
+      break
+      ;;
+    -*)
+      echo "usage: build_dist.sh OUT_DIR [VERSION] | --check [--sdk-repo PATH_OR_URL]" >&2
+      exit 2
+      ;;
+    *)
+      positional+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ "$mode" != "check" ]]; then
+  if [[ "$sdk_repo_arg_set" -ne 0 || ${#positional[@]} -lt 1 || ${#positional[@]} -gt 2 ]]; then
+    echo "usage: build_dist.sh OUT_DIR [VERSION] | --check [--sdk-repo PATH_OR_URL]" >&2
+    exit 2
+  fi
+  build "$here" "${positional[0]}" "${positional[1]:-}"
   exit 0
+fi
+
+if [[ ${#positional[@]} -gt 0 ]]; then
+  echo "usage: build_dist.sh OUT_DIR [VERSION] | --check [--sdk-repo PATH_OR_URL]" >&2
+  exit 2
 fi
 
 work="$(mktemp -d)"
@@ -235,6 +353,40 @@ else
   status=1
 fi
 
+verify_tag_snapshot() {
+  local tag_repo="$1"
+  local tag_name="$2"
+  local target_ver="${3:-$dist_version}"
+  local tag_stage tag_built
+
+  if git_sdk "$tag_repo" cat-file -e "$tag_name:plugins/claude_code_dist/bigquery-agent-analytics-tracing/.claude-plugin/plugin.json" 2>/dev/null; then
+    tag_stage="$(mktemp -d "$work/tag_dist_XXXXXX")"
+    if ! git_sdk "$tag_repo" archive "$tag_name" plugins/claude_code_dist/bigquery-agent-analytics-tracing | tar -x -C "$tag_stage"; then
+      return 1
+    fi
+    same_tree "$tag_stage/plugins/claude_code_dist/bigquery-agent-analytics-tracing" "$dist"
+    return $?
+  elif git_sdk "$tag_repo" cat-file -e "$tag_name:plugins/claude_code/.claude-plugin/plugin.json" 2>/dev/null; then
+    tag_stage="$(mktemp -d "$work/sdk_tag_XXXXXX")"
+    tag_built="$(mktemp -d "$work/sdk_built_XXXXXX")"
+    if git_sdk "$tag_repo" cat-file -e "$tag_name:producers/src/bigquery_agent_analytics_tracing/__init__.py" 2>/dev/null; then
+      if ! git_sdk "$tag_repo" archive "$tag_name" plugins/claude_code producers | tar -x -C "$tag_stage"; then
+        return 1
+      fi
+    else
+      if ! git_sdk "$tag_repo" archive "$tag_name" plugins/claude_code | tar -x -C "$tag_stage"; then
+        return 1
+      fi
+    fi
+    build "$tag_stage/plugins/claude_code" "$tag_built" "$target_ver" || return 1
+    same_tree "$tag_built" "$dist"
+    return $?
+  else
+    echo "not ok - release tag $tag_name has neither plugins/claude_code_dist/bigquery-agent-analytics-tracing nor plugins/claude_code"
+    return 1
+  fi
+}
+
 # 3. Release tag immutability, zero tracked bytecode, and monotonic tag bump verification.
 if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   tracked_pyc="$(git -C "$repo" ls-files plugins/claude_code plugins/claude_code_dist/bigquery-agent-analytics-tracing | python3 -B -c 'import sys; bad = [l.strip() for l in sys.stdin if "__pycache__" in l or l.strip().endswith((".pyc", ".pyo"))]; print("\n".join(bad))')"
@@ -247,51 +399,170 @@ if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "not ok - this checkout is shallow, so tracing-v tags cannot be checked: fetch them (fetch-depth: 0)"
     status=1
   else
-    tag="tracing-v$dist_version"
-    if git -C "$repo" rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null; then
-      if git -C "$repo" diff --quiet "$tag" -- plugins/claude_code_dist/bigquery-agent-analytics-tracing; then
-        echo "ok - $tag exists and committed dist matches $tag"
+    sdk_repo=""
+    sdk_candidate=""
+    sdk_explicit=0
+    if [[ "$sdk_repo_arg_set" -eq 1 ]]; then
+      sdk_candidate="$sdk_repo_arg"
+      sdk_explicit=1
+    elif [[ -n "${BQAA_SDK_REPO:-}" ]]; then
+      sdk_candidate="$BQAA_SDK_REPO"
+      sdk_explicit=1
+    fi
+
+    if [[ "$sdk_explicit" -eq 1 ]]; then
+      if [[ -z "$sdk_candidate" ]]; then
+        echo "not ok - BQAA_SDK_REPO= is not a git repository"
+        status=1
+      elif is_git_url "$sdk_candidate"; then
+        git init -q "$work/sdk_override"
+        if GIT_TERMINAL_PROMPT=0 git -C "$work/sdk_override" fetch -q --depth=1 "$sdk_candidate" 'refs/tags/tracing-v*:refs/tags/tracing-v*' >/dev/null 2>&1; then
+          sdk_repo="$work/sdk_override"
+        else
+          echo "not ok - BQAA_SDK_REPO=$sdk_candidate is not a git repository"
+          status=1
+        fi
+      elif is_git_repo_root "$sdk_candidate"; then
+        if [[ "$(git_sdk "$sdk_candidate" rev-parse --is-shallow-repository 2>/dev/null || echo true)" == true ]]; then
+          echo "not ok - SDK repository is shallow"
+          status=1
+        else
+          sdk_repo="$sdk_candidate"
+        fi
       else
-        echo "not ok - plugins/claude_code_dist/bigquery-agent-analytics-tracing changed since release tag $tag; bump dist version"
+        echo "not ok - BQAA_SDK_REPO=$sdk_candidate is not a git repository"
         status=1
       fi
     else
-      tags_list="$(git -C "$repo" tag -l 'tracing-v*')"
-      if [[ -n "$tags_list" ]]; then
-        python3 -B - "$dist_version" "$tags_list" <<'PY' || status=1
-import re, sys
-dist_v = tuple(int(x) for x in sys.argv[1].split("."))
-tag_vers = []
-for raw in sys.argv[2].splitlines():
-    m = re.fullmatch(r"tracing-v(\d+)\.(\d+)\.(\d+)", raw.strip())
-    if m:
-        tag_vers.append((tuple(int(x) for x in m.groups()), raw.strip()))
-if tag_vers:
-    max_v, max_tag = max(tag_vers)
-    if dist_v <= max_v:
-        print(f"not ok - dist version {sys.argv[1]} is not newer than existing tag {max_tag}")
-        sys.exit(1)
-    print(f"ok - unreleased dist version {sys.argv[1]} > highest tag {max_tag}")
-else:
-    print(f"ok - no release tracing-vX.Y.Z tags exist yet")
-PY
+      sdk_remote_url="$(git -C "$repo" remote get-url sdk 2>/dev/null || true)"
+      if [[ -n "$sdk_remote_url" ]]; then
+        if ! is_git_url "$sdk_remote_url" && is_git_repo_root "$sdk_remote_url"; then
+          if [[ "$(git_sdk "$sdk_remote_url" rev-parse --is-shallow-repository 2>/dev/null || echo true)" == true ]]; then
+            echo "not ok - SDK repository at remote sdk is shallow"
+            status=1
+          else
+            sdk_repo="$sdk_remote_url"
+          fi
+        else
+          git init -q "$work/sdk_remote"
+          if GIT_TERMINAL_PROMPT=0 git -C "$work/sdk_remote" fetch -q --depth=1 "$sdk_remote_url" 'refs/tags/tracing-v*:refs/tags/tracing-v*' >/dev/null 2>&1; then
+            sdk_repo="$work/sdk_remote"
+          fi
+        fi
+      else
+        sibling_sdk=""
+        direct_sibling="$(dirname "$repo")/BigQuery-Agent-Analytics-SDK"
+        if [[ -d "$direct_sibling" ]]; then
+          sibling_sdk="$direct_sibling"
+        else
+          common_git_dir="$(git -C "$repo" rev-parse --git-common-dir 2>/dev/null || true)"
+          if [[ -n "$common_git_dir" ]]; then
+            if [[ "$common_git_dir" != /* ]]; then
+              common_git_dir="$repo/$common_git_dir"
+            fi
+            common_git_dir="$(cd "$common_git_dir" 2>/dev/null && pwd || true)"
+            if [[ -n "$common_git_dir" && "$(basename "$common_git_dir")" == ".git" ]]; then
+              main_parent="$(dirname "$(dirname "$common_git_dir")")"
+              if [[ -d "$main_parent/BigQuery-Agent-Analytics-SDK" ]]; then
+                sibling_sdk="$main_parent/BigQuery-Agent-Analytics-SDK"
+              fi
+            fi
+          fi
+        fi
+        if [[ -n "$sibling_sdk" ]] && is_git_repo_root "$sibling_sdk"; then
+          if [[ "$(git_sdk "$sibling_sdk" rev-parse --is-shallow-repository 2>/dev/null || echo true)" != true ]]; then
+            sdk_repo="$sibling_sdk"
+          fi
+        fi
+        if [[ -z "$sdk_repo" && -z "$(git -C "$repo" tag -l 'tracing-v*')" ]]; then
+          origin_url="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+          if [[ "$origin_url" == *BigQuery-Agent-Analytics-Plugins* ]]; then
+            sdk_url="${origin_url%BigQuery-Agent-Analytics-Plugins*}BigQuery-Agent-Analytics-SDK${origin_url##*BigQuery-Agent-Analytics-Plugins}"
+            git init -q "$work/sdk_remote"
+            GIT_TERMINAL_PROMPT=0 git -C "$work/sdk_remote" fetch -q --depth=1 "$sdk_url" 'refs/tags/tracing-v*:refs/tags/tracing-v*' >/dev/null 2>&1 || true
+            if [[ -n "$(git -C "$work/sdk_remote" tag -l 'tracing-v*')" ]]; then
+              sdk_repo="$work/sdk_remote"
+            fi
+          fi
+        fi
+      fi
+    fi
+
+    tag="tracing-v$dist_version"
+    found_tag_repos=()
+    if [[ -n "$sdk_repo" ]] && git_sdk "$sdk_repo" rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null 2>&1; then
+      found_tag_repos+=("$sdk_repo")
+    fi
+    if git -C "$repo" rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null 2>&1; then
+      found_tag_repos+=("$repo")
+    fi
+
+    if [[ ${#found_tag_repos[@]} -gt 0 ]]; then
+      for tag_repo in "${found_tag_repos[@]}"; do
+        if verify_tag_snapshot "$tag_repo" "$tag" "$dist_version"; then
+          echo "ok - $tag exists and committed dist matches $tag"
+        else
+          echo "not ok - plugins/claude_code_dist/bigquery-agent-analytics-tracing changed since release tag $tag; bump dist version"
+          status=1
+        fi
+      done
+    else
+      all_tracing_tags=""
+      if [[ -n "$sdk_repo" ]]; then
+        all_tracing_tags="$(git_sdk "$sdk_repo" tag -l 'tracing-v*')"
+      fi
+      repo_tracing_tags="$(git -C "$repo" tag -l 'tracing-v*')"
+      if [[ -n "$repo_tracing_tags" ]]; then
+        all_tracing_tags="${all_tracing_tags:+$all_tracing_tags$'\n'}$repo_tracing_tags"
+      fi
+      if [[ -n "$all_tracing_tags" ]]; then
+        check_monotonic_tags "$dist_version" "$all_tracing_tags" "tracing-v" "tag" || status=1
       else
         echo "ok - no tracing-v release tags exist yet"
       fi
     fi
 
-    for head_tag in $(git -C "$repo" tag --points-at HEAD 'tracing-v*'); do
+    while IFS= read -r head_tag; do
+      [[ -n "$head_tag" ]] || continue
       if [[ "$head_tag" != "$tag" ]]; then
         echo "not ok - HEAD carries release tag $head_tag which does not match dist version $dist_version ($tag)"
         status=1
       fi
-    done
+    done < <(git -C "$repo" tag --points-at HEAD 'tracing-v*')
     if [[ "${GITHUB_REF_NAME:-}" == tracing-v* && "${GITHUB_REF_NAME:-}" != "$tag" ]]; then
       echo "not ok - GITHUB_REF_NAME=${GITHUB_REF_NAME} does not match dist version $dist_version ($tag)"
       status=1
     fi
 
-    for dist_tag in $(git -C "$repo" tag -l 'tracing-dist-v*'); do
+    dist_tag_curr="tracing-dist-v$dist_version"
+    if git -C "$repo" rev-parse -q --verify "refs/tags/$dist_tag_curr^{commit}" >/dev/null 2>&1; then
+      if verify_tag_snapshot "$repo" "$dist_tag_curr" "$dist_version"; then
+        echo "ok - $dist_tag_curr exists and committed dist matches $dist_tag_curr"
+      else
+        echo "not ok - plugins/claude_code_dist/bigquery-agent-analytics-tracing changed since release tag $dist_tag_curr; bump dist version"
+        status=1
+      fi
+    else
+      dist_tags_list="$(git -C "$repo" tag -l 'tracing-dist-v*')"
+      if [[ -n "$dist_tags_list" ]]; then
+        check_monotonic_tags "$dist_version" "$dist_tags_list" "tracing-dist-v" "dist tag" || status=1
+      fi
+    fi
+
+    while IFS= read -r head_dist_tag; do
+      [[ -n "$head_dist_tag" ]] || continue
+      if [[ "$head_dist_tag" != "$dist_tag_curr" ]]; then
+        echo "not ok - HEAD carries release tag $head_dist_tag which does not match dist version $dist_version ($dist_tag_curr)"
+        status=1
+      fi
+    done < <(git -C "$repo" tag --points-at HEAD 'tracing-dist-v*')
+    if [[ "${GITHUB_REF_NAME:-}" == tracing-dist-v* && "${GITHUB_REF_NAME:-}" != "$dist_tag_curr" ]]; then
+      echo "not ok - GITHUB_REF_NAME=${GITHUB_REF_NAME} does not match dist version $dist_version ($dist_tag_curr)"
+      status=1
+    fi
+
+    while IFS= read -r dist_tag; do
+      [[ -n "$dist_tag" ]] || continue
       want="${dist_tag#tracing-dist-v}"
       at_copy="$(
         git -C "$repo" show "$dist_tag:plugins/claude_code_dist/bigquery-agent-analytics-tracing/.claude-plugin/plugin.json" 2>/dev/null \
@@ -307,7 +578,7 @@ PY
         echo "not ok - $dist_tag holds dist at $at_copy and catalog at $at_catalog, not $want"
         status=1
       fi
-    done
+    done < <(git -C "$repo" tag -l 'tracing-dist-v*')
   fi
 fi
 

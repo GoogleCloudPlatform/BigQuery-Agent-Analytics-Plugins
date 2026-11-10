@@ -3194,6 +3194,45 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertFalse((Path(spool_dir) / f"{env_name}.retry").exists())
         self.assertFalse((Path(spool_dir) / "dead-letter").exists())
 
+        # Expired sidecar with string "attempts": "1" must parse cleanly and quarantine
+        # instead of raising TypeError on integer comparison.
+        str_env = Path(spool_dir) / "event-str-attempts.json"
+        str_env.write_text(
+            json.dumps({
+                "config": {
+                    "project_id": "p",
+                    "dataset": "d",
+                    "table": "agent_events",
+                },
+                "row": {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "event_type": "LLM_REQUEST",
+                    "content": {"idx": 99},
+                    "attributes": {},
+                    "latency_ms": {},
+                },
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(str_env, 0o600)
+        str_retry = Path(spool_dir) / "event-str-attempts.json.retry"
+        str_retry.write_text(
+            '{"attempts": "1", "first_failed_at": 0.0}',
+            encoding="utf-8",
+        )
+        os.chmod(str_retry, 0o600)
+
+        calls_before = calls["n"]
+        self.assertEqual(drain._next_deferred_wait_seconds(cfg), 0.0)
+        resolved_expired = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved_expired, 1)
+        self.assertEqual(calls["n"], calls_before)
+        self.assertFalse(str_env.exists())
+        self.assertFalse(str_retry.exists())
+        self.assertTrue(
+            (Path(spool_dir) / "dead-letter" / "event-str-attempts.write-failed.json").is_file()
+        )
+
 
 class TestBuildDist39(unittest.TestCase):
     """Issue #39: build_dist.sh --check verifies source/dist/tag/catalog integrity."""
@@ -3292,6 +3331,204 @@ class TestBuildDist39(unittest.TestCase):
         )
         self.assertNotEqual(ref_res.returncode, 0)
         self.assertIn("GITHUB_REF_NAME=", ref_res.stdout)
+
+    def test_two_repo_sdk_release_tag_parity(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bqaa_two_repo_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        env = dict(
+            os.environ,
+            PYTHONDONTWRITEBYTECODE="1",
+            GIT_AUTHOR_NAME="Test",
+            GIT_AUTHOR_EMAIL="test@example.com",
+            GIT_COMMITTER_NAME="Test",
+            GIT_COMMITTER_EMAIL="test@example.com",
+        )
+        env.pop("BQAA_SDK_REPO", None)
+
+        sdk_repo = tmp / "BigQuery-Agent-Analytics-SDK"
+        plugins_repo = tmp / "BigQuery-Agent-Analytics-Plugins"
+
+        def _git(*args, cwd):
+            return subprocess.run(
+                ["git", "-C", str(cwd), *args],
+                capture_output=True, text=True, env=env, check=True, timeout=30,
+            )
+
+        # Populate plugins repo without any local tracing-v* tags.
+        for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
+            dst = plugins_repo / item
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                REPO_ROOT / item,
+                dst,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+        _git("init", "-q", cwd=plugins_repo)
+        _git("add", "-A", cwd=plugins_repo)
+        _git("commit", "-q", "-m", "plugins initial", cwd=plugins_repo)
+
+        dist_dir = plugins_repo / "plugins/claude_code_dist/bigquery-agent-analytics-tracing"
+        dist_ver = json.loads((dist_dir / ".claude-plugin/plugin.json").read_text())["version"]
+
+        # Populate SDK repo with plugins/claude_code + producers/src layout.
+        shutil.copytree(
+            REPO_ROOT / "plugins/claude_code",
+            sdk_repo / "plugins/claude_code",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        shutil.copytree(
+            VENDOR_DIR,
+            sdk_repo / "producers/src/bigquery_agent_analytics_tracing",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        pyproject = sdk_repo / "producers/pyproject.toml"
+        pyproject.write_text(
+            '[project]\nname = "bigquery-agent-analytics-tracing"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        _git("init", "-q", cwd=sdk_repo)
+        _git("add", "-A", cwd=sdk_repo)
+        _git("commit", "-q", "-m", "sdk 0.1.0", cwd=sdk_repo)
+        _git("tag", "tracing-v0.1.0", cwd=sdk_repo)
+
+        pyproject.write_text(
+            f'[project]\nname = "bigquery-agent-analytics-tracing"\nversion = "{dist_ver}"\n',
+            encoding="utf-8",
+        )
+        _git("add", "-A", cwd=sdk_repo)
+        _git("commit", "-q", "-m", f"sdk {dist_ver}", cwd=sdk_repo)
+        _git("tag", f"tracing-v{dist_ver}", cwd=sdk_repo)
+
+        check_script = plugins_repo / "plugins/claude_code/build_dist.sh"
+
+        # 1. Sibling SDK tag tracing-v<dist_ver> matches plugins checkout.
+        ok_res = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(ok_res.returncode, 0, f"{ok_res.stdout}\n{ok_res.stderr}")
+        self.assertIn(f"tracing-v{dist_ver} exists", ok_res.stdout)
+
+        # 2a. Editing vendored dist code in plugins repo must fail against SDK tag.
+        vendored_drain = dist_dir / "vendor/bigquery_agent_analytics_tracing/drain.py"
+        vendored_drain.write_text(vendored_drain.read_text() + "\n# post-tag dist edit\n", encoding="utf-8")
+        vendor_drift = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(vendor_drift.returncode, 0)
+        self.assertIn("differs: vendor/bigquery_agent_analytics_tracing/drain.py", vendor_drift.stdout)
+        self.assertIn(f"changed since release tag tracing-v{dist_ver}", vendor_drift.stdout)
+        _git("checkout", "--", ".", cwd=plugins_repo)
+
+        # 2b. Editing source AND rebuilding dist at the same version keeps local parity
+        #     but still diverges from SDK tag tracing-v<dist_ver>, so --check must fail.
+        common_sh = plugins_repo / "plugins/claude_code/hooks/common.sh"
+        common_sh.write_text(common_sh.read_text() + "\n# post-tag hook edit\n", encoding="utf-8")
+        subprocess.run(
+            ["bash", str(check_script), str(dist_dir)],
+            check=True, capture_output=True, text=True, env=env, timeout=30,
+        )
+        synced_drift = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(synced_drift.returncode, 0)
+        self.assertIn("ok - committed dist matches what plugins/claude_code builds", synced_drift.stdout)
+        self.assertIn("differs: hooks/common.sh", synced_drift.stdout)
+        self.assertIn(f"changed since release tag tracing-v{dist_ver}", synced_drift.stdout)
+        _git("checkout", "--", ".", cwd=plugins_repo)
+
+        # 3. Auto-discovery via derived origin remote works without a sibling SDK checkout.
+        isolated_dir = tmp / "isolated"
+        isolated_plugins = isolated_dir / "BigQuery-Agent-Analytics-Plugins"
+        for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
+            dst = isolated_plugins / item
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                REPO_ROOT / item,
+                dst,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+        _git("init", "-q", cwd=isolated_plugins)
+        _git("remote", "add", "origin", str(plugins_repo), cwd=isolated_plugins)
+        _git("add", "-A", cwd=isolated_plugins)
+        _git("commit", "-q", "-m", "isolated plugins", cwd=isolated_plugins)
+        isolated_script = isolated_plugins / "plugins/claude_code/build_dist.sh"
+        origin_ok = subprocess.run(
+            ["bash", str(isolated_script), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(origin_ok.returncode, 0, f"{origin_ok.stdout}\n{origin_ok.stderr}")
+        self.assertIn(f"tracing-v{dist_ver} exists", origin_ok.stdout)
+
+        # 4. Higher SDK release tag (e.g. tracing-v0.1.2) without matching tag fails 0.1.1.
+        ahead_sdk = tmp / "ahead_sdk"
+        shutil.copytree(sdk_repo, ahead_sdk)
+        _git("tag", "-d", f"tracing-v{dist_ver}", cwd=ahead_sdk)
+        _git("tag", "tracing-v0.1.2", cwd=ahead_sdk)
+        ahead_res = subprocess.run(
+            ["bash", str(check_script), "--check", "--sdk-repo", str(ahead_sdk)],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(ahead_res.returncode, 0)
+        self.assertIn("not newer than existing tag tracing-v0.1.2", ahead_res.stdout)
+
+        env_ahead = dict(env, BQAA_SDK_REPO=str(ahead_sdk))
+        ahead_env_res = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=env_ahead, timeout=30,
+        )
+        self.assertNotEqual(ahead_env_res.returncode, 0)
+        self.assertIn("not newer than existing tag tracing-v0.1.2", ahead_env_res.stdout)
+
+        # 5. Invalid and shallow SDK repo overrides must fail explicitly.
+        bad_env = dict(env, BQAA_SDK_REPO=str(plugins_repo / "plugins"))
+        bad_res = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=bad_env, timeout=30,
+        )
+        self.assertNotEqual(bad_res.returncode, 0)
+        self.assertIn("is not a git repository", bad_res.stdout)
+
+        shallow_sdk = tmp / "shallow_sdk"
+        subprocess.run(
+            ["git", "clone", "-q", "--depth=1", f"file://{sdk_repo}", str(shallow_sdk)],
+            check=True, capture_output=True, text=True, env=env, timeout=30,
+        )
+        shallow_res = subprocess.run(
+            ["bash", str(check_script), "--check", f"--sdk-repo={shallow_sdk}"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(shallow_res.returncode, 0)
+        self.assertIn("SDK repository is shallow", shallow_res.stdout)
+
+        # 6. Local tracing-dist-v* snapshot immutability and monotonicity.
+        _git("tag", f"tracing-dist-v{dist_ver}", cwd=plugins_repo)
+        dist_tag_ok = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(dist_tag_ok.returncode, 0, f"{dist_tag_ok.stdout}\n{dist_tag_ok.stderr}")
+        self.assertIn(f"tracing-dist-v{dist_ver} exists", dist_tag_ok.stdout)
+
+        vendored_drain.write_text(vendored_drain.read_text() + "\n# dist-tag edit\n", encoding="utf-8")
+        dist_tag_drift = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(dist_tag_drift.returncode, 0)
+        self.assertIn(f"changed since release tag tracing-dist-v{dist_ver}", dist_tag_drift.stdout)
+        _git("checkout", "--", ".", cwd=plugins_repo)
+
+        _git("tag", "-d", f"tracing-dist-v{dist_ver}", cwd=plugins_repo)
+        _git("tag", "tracing-dist-v9.9.9", cwd=plugins_repo)
+        dist_mono_fail = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(dist_mono_fail.returncode, 0)
+        self.assertIn("not newer than existing dist tag tracing-dist-v9.9.9", dist_mono_fail.stdout)
 
 
 if __name__ == "__main__":

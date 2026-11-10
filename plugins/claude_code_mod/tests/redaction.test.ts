@@ -1162,3 +1162,213 @@ test('prose JSON placeholder suffix avoids collisions across 12-, 13-, 15-, and 
     expect(out).toContain('{"secret":"[REDACTED]","nested":{"ok":1}}')
   }
 })
+
+test('cross-line Bearer and Basic credentials redact while multi-line Basic prose and NBSP stay untouched', () => {
+  const token = 'reviewFixtureOnly9472'
+  const redactCases = [
+    [`Authorization: Bearer\n${token}`, 'Authorization: [REDACTED]'],
+    [`Authorization: Bearer\r\n ${token}`, 'Authorization: [REDACTED]'],
+    [`Bearer\n${token}`, 'Bearer [REDACTED]'],
+    ['Authorization: Basic\ndXNlcjpwYXNz', 'Authorization: [REDACTED]'],
+    ['Basic\ndXNlcjpwYXNz', 'Basic [REDACTED]'],
+  ] as const
+  for (const [sample, expected] of redactCases) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).toBe(expected)
+    expect(out).not.toContain(token)
+    expect(out).not.toContain('dXNlcjpwYXNz')
+    expect(stats.redactions).toBe(1)
+  }
+
+  for (const rowSample of [
+    `Authorization: Bearer\n${token}`,
+    `Authorization: Bearer\r\n ${token}`,
+  ]) {
+    const built = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: rowSample },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    const serialized = JSON.stringify(built.row)
+    expect(serialized).not.toContain(token)
+    expect(serialized).toContain('Authorization: [REDACTED]')
+    expect(built.redactions).toBe(1)
+  }
+
+  for (const prose of [
+    'Basic\nconfiguration guide',
+    'Bearer\u00a0ConfigurationWord',
+    'Authentication scheme: Bearer\nConfiguration details follow',
+  ]) {
+    const stats = newStats()
+    expect(redactText(prose, stats)).toBe(prose)
+    expect(stats.redactions).toBe(0)
+  }
+
+  for (const [sample, expected] of [
+    [`scheme: bearer\nclient_secret: ${CANARY}`, 'scheme: bearer\nclient_secret: [REDACTED]'],
+    [`scheme: bearer\npassword_hash: ${CANARY}`, 'scheme: bearer\npassword_hash: [REDACTED]'],
+    [`MODE=bearer\nCLIENT_SECRET="${CANARY}"`, 'MODE=bearer\nCLIENT_SECRET=[REDACTED]'],
+  ] as const) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).not.toContain(CANARY)
+    expect(out).toBe(expected)
+    expect(stats.redactions).toBe(1)
+
+    const built = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: sample },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    const serialized = JSON.stringify(built.row)
+    expect(serialized).not.toContain(CANARY)
+    expect(built.redactions).toBe(1)
+  }
+})
+
+test('timeout-wrapped CLI commands redact embedded credentials across duration and signal options', () => {
+  const secret = ['Fake', 'Secret', '123'].join('')
+  const cases = [
+    [`timeout 5 mysql -p${secret}`, 'timeout 5 mysql -p[REDACTED]'],
+    [`gtimeout 5 mysql -p${secret}`, 'gtimeout 5 mysql -p[REDACTED]'],
+    [`timeout 5s mysql -p${secret}`, 'timeout 5s mysql -p[REDACTED]'],
+    [`timeout 5 redis-cli -a ${secret}`, 'timeout 5 redis-cli -a [REDACTED]'],
+    [`env timeout 5 mysql -p${secret}`, 'env timeout 5 mysql -p[REDACTED]'],
+    [`sudo -u app timeout 5 mysql -p${secret}`, 'sudo -u app timeout 5 mysql -p[REDACTED]'],
+    [`env -u HOME timeout 5 redis-cli -a ${secret}`, 'env -u HOME timeout 5 redis-cli -a [REDACTED]'],
+    [`time timeout 5 mysql -p${secret}`, 'time timeout 5 mysql -p[REDACTED]'],
+    [`timeout -k 2s 5s mysql -p${secret}`, 'timeout -k 2s 5s mysql -p[REDACTED]'],
+    [`timeout --signal KILL 0.5m mysql -p${secret}`, 'timeout --signal KILL 0.5m mysql -p[REDACTED]'],
+  ] as const
+  for (const [cmd, expected] of cases) {
+    const stats = newStats()
+    const out = redactText(cmd, stats)
+    expect(out).not.toContain(secret)
+    expect(out).toBe(expected)
+    expect(stats.redactions).toBe(1)
+
+    const built = buildRow({
+      eventType: 'TOOL_STARTING',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { command: cmd },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    const serialized = JSON.stringify(built.row)
+    expect(serialized).not.toContain(secret)
+    expect(serialized).toContain(expected)
+    expect(built.redactions).toBe(1)
+  }
+
+  const safeStats = newStats()
+  const safeCmd = 'timeout 5 psql -p 5432 -U postgres'
+  expect(redactText(safeCmd, safeStats)).toBe(safeCmd)
+  expect(safeStats.redactions).toBe(0)
+})
+
+test('PuTTY .ppk scanner scales linearly over repeated headers and still redacts trailing real keys', () => {
+  const warmFlood = 'PuTTY-User-Key-File-3: x\n'.repeat(4_200)
+  const w0 = performance.now()
+  redactText(warmFlood, newStats())
+  const redactSmallMs = Math.max(1, performance.now() - w0)
+  const w1 = performance.now()
+  buildRow({
+    eventType: 'TOOL_COMPLETED',
+    timestampMs: 0,
+    eventId: 'e1',
+    agent: 'a',
+    sessionId: 's',
+    invocationId: 'i',
+    userId: 'u',
+    traceId: 't',
+    spanId: 'p',
+    parentSpanId: null,
+    content: { result: warmFlood },
+    attributes: {},
+    maxPayloadChars: 500_000,
+  })
+  const buildSmallMs = Math.max(1, performance.now() - w1)
+
+  const flood = 'PuTTY-User-Key-File-3: x\n'.repeat(21_000)
+
+  const t0 = performance.now()
+  const floodStats = newStats()
+  const floodOut = redactText(flood, floodStats)
+  const redactMs = performance.now() - t0
+  expect(redactMs).toBeLessThan(250)
+  expect(redactMs <= Math.max(120, redactSmallMs * 12)).toBe(true)
+  expect(floodOut === 'PuTTY-User-Key-File-3: [REDACTED]\n'.repeat(21_000)).toBe(true)
+  expect(floodStats.redactions).toBe(21_000)
+
+  const t1 = performance.now()
+  const built = buildRow({
+    eventType: 'TOOL_COMPLETED',
+    timestampMs: 0,
+    eventId: 'e1',
+    agent: 'a',
+    sessionId: 's',
+    invocationId: 'i',
+    userId: 'u',
+    traceId: 't',
+    spanId: 'p',
+    parentSpanId: null,
+    content: { result: flood },
+    attributes: {},
+    maxPayloadChars: 500_000,
+  })
+  const buildMs = performance.now() - t1
+  expect(buildMs).toBeLessThan(250)
+  expect(buildMs <= Math.max(120, buildSmallMs * 12)).toBe(true)
+  expect(built.redactions).toBeGreaterThan(20_000)
+  expect(built.row.is_truncated).toBe(true)
+
+  const secret = ['ppk', 'trail', 'secret', '009'].join('-')
+  for (const eol of ['\n', '\r\n'] as const) {
+    const prefix = `PuTTY-User-Key-File-3: x${eol}`.repeat(10_000)
+    const expectedPrefix = `PuTTY-User-Key-File-3: [REDACTED]${eol}`.repeat(10_000)
+    const realKey = [
+      'PuTTY-User-Key-File-2: ssh-rsa',
+      'Private-Lines: 2',
+      `${secret}Line1`,
+      `${secret}Line2`,
+      'Private-MAC: deadbeef',
+    ].join(eol)
+    const stats = newStats()
+    const t2 = performance.now()
+    const out = redactText(prefix + realKey, stats)
+    expect(performance.now() - t2).toBeLessThan(250)
+    expect(out).not.toContain(secret)
+    expect(out === `${expectedPrefix}[REDACTED:private-key]`).toBe(true)
+    expect(stats.redactions).toBe(10_001)
+  }
+})
