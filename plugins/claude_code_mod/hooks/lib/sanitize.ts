@@ -3363,6 +3363,28 @@ function scanCliSegment(text: string, tokens: CliToken[], edits: CliEdit[], stat
       }
     }
 
+    // Attached `-P<pass>` on DB / archive CLIs (`sqlcmd`, `zip`, `unzip`, `7z*`)
+    if (P_UPPER_PASS_CMDS.has(cmd) && u.startsWith('-P') && u.length > 2) {
+      const pass = u.slice(2)
+      if (!isMarkerLike(pass) && !SHELL_VAR_LITERAL.test(pass)) {
+        const qOff = tok.quote !== '' ? 1 : 0
+        edits.push({ start: tok.start + qOff + 2, end: tok.end - qOff, replacement: MARKER })
+        stats.redactions += 1
+        continue
+      }
+    }
+
+    // Attached `-a<pass>` on Redis / Valkey CLIs
+    if (REDIS_A_CMDS.has(cmd) && u.startsWith('-a') && u.length > 2) {
+      const pass = u.slice(2)
+      if (!isMarkerLike(pass) && !SHELL_VAR_LITERAL.test(pass)) {
+        const qOff = tok.quote !== '' ? 1 : 0
+        edits.push({ start: tok.start + qOff + 2, end: tok.end - qOff, replacement: MARKER })
+        stats.redactions += 1
+        continue
+      }
+    }
+
     // Spaced `-p <pass>`
     if (u === '-p' && !SPACED_P_EXCLUDED.has(cmd)) {
       const allow = SPACED_P_PASS_CMDS.has(cmd) || (LOGIN_SUBCMD_CMDS.has(cmd) && hasLoginSubcmd) || sawUserFlag
@@ -3604,12 +3626,42 @@ function walkProseJsonValue(val: unknown, stats: SanitizeStats, depth = 0): unkn
   return out
 }
 
-function precededBySensitiveAssignment(text: string, braceIdx: number): boolean {
-  const prefix = text.slice(Math.max(0, braceIdx - 512), braceIdx)
-  const am = PROSE_SENSITIVE_ASSIGN_BEFORE.exec(prefix)
+function hasSensitiveAssignmentOrFlag(before: string): boolean {
+  const am = PROSE_SENSITIVE_ASSIGN_BEFORE.exec(before)
   if (am !== null && isSensitiveKey(am[1] as string)) return true
-  const fm = PROSE_SENSITIVE_FLAG_BEFORE.exec(prefix)
+  const fm = PROSE_SENSITIVE_FLAG_BEFORE.exec(before)
   return fm !== null && credentialOption(fm[1] as string)
+}
+
+function precededBySensitiveAssignment(text: string, braceIdx: number, qStates: Uint8Array): boolean {
+  const start = Math.max(0, braceIdx - 512)
+  const prefix = text.slice(start, braceIdx)
+  if (hasSensitiveAssignmentOrFlag(prefix)) return true
+  // Also catch nested JSON inside an unclosed non-JSON outer `{` or `[`
+  // opened immediately after a sensitive assignment or CLI flag, e.g.
+  // `export APP_SECRET={\n  payload: {\n    "nested": ...\n  }\n}`.
+  const unclosed: { rel: number; ch: number }[] = []
+  for (let k = 0; k < prefix.length; k += 1) {
+    if (qStates[start + k] !== NONE) continue
+    const ch = prefix.charCodeAt(k)
+    if (ch === 123 || ch === 91) {
+      unclosed.push({ rel: k, ch })
+    } else if (ch === 125 || ch === 93) {
+      const want = ch === 125 ? 123 : 91
+      for (let s = unclosed.length - 1; s >= 0; s -= 1) {
+        if (unclosed[s]!.ch === want) {
+          unclosed.length = s
+          break
+        }
+      }
+    }
+  }
+  for (let s = unclosed.length - 1; s >= 0; s -= 1) {
+    const absOpen = start + unclosed[s]!.rel
+    const beforeOpen = text.slice(Math.max(0, absOpen - 256), absOpen)
+    if (hasSensitiveAssignmentOrFlag(beforeOpen)) return true
+  }
+  return false
 }
 
 type JsonCandidateSpan = { start: number; end: number; parsed: unknown; sensitiveContext: boolean; multiline: boolean }
@@ -3639,14 +3691,18 @@ function findBalancedProseJsonSpans(text: string): JsonCandidateSpan[] {
       }
       continue
     }
+    // Leave text inside shell quotes, ANSI-C quotes, or unknown quote states
+    // intact so enclosing assignment/flag redactors consume the whole string,
+    // and invalidate partially open candidate frames if non-NONE quotes intervene.
+    if (qStates[i] !== NONE) {
+      stack.length = 0
+      continue
+    }
     if (stack.length > 0 && ch === 34) {
       inStr = true
       continue
     }
     if (ch === 123) {
-      // Leave `{` inside shell quotes, ANSI-C quotes, or unknown quote states
-      // intact so enclosing assignment/flag redactors consume the whole string.
-      if (stack.length === 0 && qStates[i] !== NONE) continue
       // Only push `{` if next non-whitespace character is `"` or `}` (checked via monotonic wsCursor).
       let k = wsCursor > i + 1 ? wsCursor : i + 1
       if (k === i + 1) {
@@ -3679,7 +3735,7 @@ function findBalancedProseJsonSpans(text: string): JsonCandidateSpan[] {
             try {
               const parsed = JSON.parse(slice) as unknown
               if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) && (multiline || hasNestedContainer(parsed))) {
-                spans.push({ start: open, end: i + 1, parsed, sensitiveContext: precededBySensitiveAssignment(text, open), multiline })
+                spans.push({ start: open, end: i + 1, parsed, sensitiveContext: precededBySensitiveAssignment(text, open, qStates), multiline })
               }
             } catch {
               // Not valid JSON; leave for free-text passes.

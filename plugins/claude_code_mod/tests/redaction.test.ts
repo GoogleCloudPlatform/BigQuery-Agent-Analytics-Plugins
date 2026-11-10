@@ -705,3 +705,107 @@ test('SQL IDENTIFIED BY / WITH PASSWORD backslash runs stay linear O(N) without 
   expect(normalOut).toBe(`CREATE USER 'app'@'%' IDENTIFIED BY '[REDACTED]'; ALTER USER app WITH PASSWORD "[REDACTED]"; CREATE USER e IDENTIFIED BY "";`)
   expect(normalStats.redactions).toBe(2)
 })
+
+test('attached -P and -a CLI flags redact secrets across sqlcmd/zip/unzip/7z and redis-cli/valkey-cli while keeping safe lookalikes', () => {
+  const s = ['attached', 'flag', 'secret', '004'].join('-')
+  const mustRedact: [string, string][] = [
+    [`sqlcmd -S host -U sa -P${s}`, 'sqlcmd -S host -U sa -P[REDACTED]'],
+    [`zip -P${s} out.zip file.txt`, 'zip -P[REDACTED] out.zip file.txt'],
+    [`unzip -P${s} archive.zip`, 'unzip -P[REDACTED] archive.zip'],
+    [`7z a -P${s} archive.7z file.txt`, '7z a -P[REDACTED] archive.7z file.txt'],
+    [`7za a -P${s} archive.7z file.txt`, '7za a -P[REDACTED] archive.7z file.txt'],
+    [`7zr a "-P${s}" archive.7z file.txt`, '7zr a "-P[REDACTED]" archive.7z file.txt'],
+    [`redis-cli -h host -a${s} ping`, 'redis-cli -h host -a[REDACTED] ping'],
+    [`valkey-cli -h host "-a${s}" ping`, 'valkey-cli -h host "-a[REDACTED]" ping'],
+    [`sh -c "sqlcmd -S host -U sa -P${s} && redis-cli -a${s} ping"`, 'sh -c "sqlcmd -S host -U sa -P[REDACTED] && redis-cli -a[REDACTED] ping"'],
+  ]
+  for (const [input, expected] of mustRedact) {
+    const stats1 = newStats()
+    const out1 = redactText(input, stats1)
+    expect(out1).toBe(expected)
+    expect(out1).not.toContain(s)
+    expect(stats1.redactions).toBeGreaterThanOrEqual(1)
+
+    const stats2 = newStats()
+    expect(redactText(out1, stats2)).toBe(out1)
+    expect(stats2.redactions).toBe(0)
+  }
+
+  const keepUntouched = [
+    '7z x -aoa archive.7z',
+    '7za x -aoa archive.7z',
+    'sqlcmd -S host -U sa -p1 -Q "SELECT 1"',
+    'zip -P$ZIP_PASS out.zip file.txt',
+    'sqlcmd -S host -P${SQL_PASS}',
+    'redis-cli -p6379 -a$REDIS_AUTH ping',
+  ]
+  for (const input of keepUntouched) {
+    const stats = newStats()
+    expect(redactText(input, stats)).toBe(input)
+    expect(stats.redactions).toBe(0)
+  }
+})
+
+test('prose JSON scanner resets on non-NONE shell quotes and catches unclosed outer braces/brackets after sensitive assignments', () => {
+  const secret = ['nested', 'brace', 'secret', '005'].join('-')
+
+  // Non-NONE quote state inside malformed candidate resets stack so subsequent valid JSON still redacts
+  // (including multi-line array under sensitive key `"api_keys"`, which only JSON span parsing catches).
+  const quoteInterruptedCases = [
+    `broken { "k": 1, note: 'a " {' } Result:\n{\n  "nested": {\n    "api_keys": [\n      "${secret}"\n    ]\n  }\n}`,
+    `broken {\n  "k": 1,\n  note: 'a "b" {'\n}\nResult:\n{\n  "nested": {\n    "api_keys": [\n      "${secret}"\n    ]\n  }\n}`,
+    `broken {\n  "k": 1, note: 'unclosed " {\n'\n}\nResult:\n{\n  "nested": {\n    "api_keys": [\n      "${secret}"\n    ]\n  }\n}`,
+  ]
+  for (const sample of quoteInterruptedCases) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).not.toContain(secret)
+    expect(out).toContain('[REDACTED]')
+    expect(stats.redactions).toBeGreaterThanOrEqual(1)
+  }
+
+  // Unclosed non-JSON outer `{` or `[` after sensitive assignment/flag marks nested JSON span sensitive.
+  const nestedSensitiveSamples = [
+    `export APP_SECRET={\n  payload: {\n    "nested": {\n      "value": "${secret}"\n    }\n  }\n}`,
+    `export APP_SECRET=[\n  {\n    "nested": {\n      "value": "${secret}"\n    }\n  }\n]`,
+    `aws secretsmanager put-secret-value --secret-id app/cfg --secret-string {\n  payload: {\n    "nested": {\n      "value": "${secret}"\n    }\n  }\n}`,
+    `export APP_SECRET={\n  note: 'keeps } and { quoted',\n  payload: {\n    "nested": {\n      "value": "${secret}"\n    }\n  }\n}`,
+  ]
+  for (const sample of nestedSensitiveSamples) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).not.toContain(secret)
+    expect(out).toContain('[REDACTED]')
+    expect(stats.redactions).toBeGreaterThanOrEqual(1)
+
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
+
+    const built = buildRow({
+      eventType: 'TOOL_STARTING',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { tool: 'Bash', args: { command: sample } },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    expect(built.row.content ?? '').not.toContain(secret)
+    expect(built.redactions).toBeGreaterThanOrEqual(1)
+  }
+
+  // Benign unclosed outer `{` must not trigger false-positive redactions.
+  const benignWrapper = `const config = {\n  payload: {\n    "nested": {\n      "region": "us-central1"\n    }\n  }\n}`
+  const benignStats = newStats()
+  const benignOut = redactText(benignWrapper, benignStats)
+  expect(benignOut).toContain('"region": "us-central1"')
+  expect(benignOut).not.toContain('[REDACTED]')
+  expect(benignStats.redactions).toBe(0)
+})
