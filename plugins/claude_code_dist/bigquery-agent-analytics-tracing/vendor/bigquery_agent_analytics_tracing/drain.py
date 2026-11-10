@@ -58,8 +58,9 @@ class _RetryConfig:
 
 @dataclass
 class _WriteOutcome:
-  status: str  # "ok", "retryable", or "permanent"
+  status: str  # "ok", "retryable", "permanent", or "partial"
   error: str = ""
+  row_outcomes: dict[int, tuple[str, str]] | None = None
 
 
 @dataclass
@@ -665,7 +666,25 @@ def _write_batch_insert_rows_json(
       errors = client.insert_rows_json(table_id, rows)
       if errors:
         log_to_file(config, f"DRAINER insert_rows_json errors: {errors}")
-        status = "permanent" if _is_permanent_row_errors(errors) else "retryable"
+        if isinstance(errors, (list, tuple)) and all(
+            isinstance(e, dict)
+            and isinstance(e.get("index"), int)
+            and not isinstance(e.get("index"), bool)
+            and 0 <= e["index"] < len(rows)
+            for e in errors
+        ):
+          grouped_errors: dict[int, list[dict[str, Any]]] = {}
+          for e in errors:
+            grouped_errors.setdefault(e["index"], []).append(e)
+          row_outcomes: dict[int, tuple[str, str]] = {}
+          for idx, entries in grouped_errors.items():
+            row_status = (
+                "permanent" if _is_permanent_row_errors(entries) else "retryable"
+            )
+            row_outcomes[idx] = (row_status, str(entries))
+          return _WriteOutcome("partial", str(errors), row_outcomes=row_outcomes)
+        err_list = list(errors) if isinstance(errors, (list, tuple)) else [errors]
+        status = "permanent" if _is_permanent_row_errors(err_list) else "retryable"
         return _WriteOutcome(status, str(errors))
       return _WriteOutcome("ok")
     except (
@@ -810,6 +829,34 @@ async def _drain_group_async(
         pass
       _unlink_retry(spool, env.path.name)
     return len(envelopes)
+
+  if outcome.row_outcomes is not None:
+    resolved = 0
+    has_retryable = False
+    first_retry_err = ""
+    for idx, env in enumerate(envelopes):
+      row_res = outcome.row_outcomes.get(idx)
+      if row_res is None:
+        try:
+          spool.unlink(env.path.name)
+        except FileNotFoundError:
+          pass
+        _unlink_retry(spool, env.path.name)
+        resolved += 1
+      elif row_res[0] == "permanent":
+        _quarantine(spool, env.path.name, reason="write-failed")
+        resolved += 1
+      else:
+        has_retryable = True
+        if not first_retry_err:
+          first_retry_err = row_res[1]
+        resolved += _defer_or_expire(spool, env.path.name, config, row_res[1])
+    if has_retryable:
+      log_to_file(
+          config,
+          f"DRAINER partial batch retryable failure: {first_retry_err}",
+      )
+    return resolved
 
   if outcome.status == "permanent":
     for env in envelopes:
