@@ -12,23 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared helpers for serialization, hashing, timestamps, file locking, log
-emission, and starting Python subprocesses. No dependencies on other package
-modules so this can be safely imported from anywhere in the package."""
+"""Shared helpers for serialization, hashing, timestamps, private
+directories, log emission, and starting Python subprocesses. No
+dependencies on other package modules so this can be safely imported
+from anywhere in the package."""
 
 from __future__ import annotations
 
-import contextlib
 from datetime import datetime
 from datetime import timezone
+import errno
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import time
-from typing import Any, Iterator, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 import uuid
+import weakref
 
 if TYPE_CHECKING:
   from .config import BQAAConfig
@@ -157,31 +160,599 @@ def safe_json_loads(value: str | None, default: Any) -> Any:
     return default
 
 
-@contextlib.contextmanager
-def file_lock(path: Path, mode: int = fcntl.LOCK_EX) -> Iterator[int]:
-  """Open a lockfile exclusively. Blocks until the lock is acquired."""
-  path.parent.mkdir(parents=True, exist_ok=True)
-  fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
-  try:
-    fcntl.flock(fd, mode)
-    yield fd
-  finally:
+# POSIX-only pieces (the effective uid, O_NOFOLLOW and other open flags,
+# the *at() calls behind ``dir_fd``) are looked up when used. Where one is
+# missing, protection degrades to best effort instead of breaking import
+# or the first write.
+
+
+def _flag(name: str) -> int:
+  """``os.<name>`` open flag, or 0 where this platform lacks it."""
+  return getattr(os, name, 0)
+
+
+def _euid() -> int | None:
+  """Effective uid, or None without POSIX ownership (e.g. Windows)."""
+  geteuid = getattr(os, "geteuid", None)
+  return geteuid() if geteuid is not None else None
+
+
+def _dir_fd_supported() -> bool:
+  """Whether files can be used relative to a directory descriptor."""
+  needed = {"open", "stat", "mkdir", "rename", "unlink"}
+  return (
+      hasattr(os, "O_DIRECTORY")
+      and hasattr(os, "O_NOFOLLOW")
+      and needed <= {f.__name__ for f in os.supports_dir_fd}
+      and "listdir" in {f.__name__ for f in os.supports_fd}
+  )
+
+
+def _check_dir(info: os.stat_result, path: Path) -> None:
+  """Raise unless ``info`` is a directory that only we can modify."""
+  euid = _euid()
+  if not stat.S_ISDIR(info.st_mode):
+    problem = "is a symlink or not a directory"
+  elif euid is None:
+    return
+  elif info.st_uid != euid:
+    problem = f"is owned by uid {info.st_uid}, not {euid}"
+  elif info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    problem = "is writable by its group or other users"
+  else:
+    return
+  raise PermissionError(f"Refusing BQAA tracing dir {path}: it {problem}.")
+
+
+def _check_own_file(info: os.stat_result, path: Path) -> None:
+  """Raise unless ``info`` is a regular file that we own."""
+  euid = _euid()
+  if not stat.S_ISREG(info.st_mode):
+    problem = "is not a regular file"
+  elif euid is not None and info.st_uid != euid:
+    problem = f"is owned by uid {info.st_uid}, not {euid}"
+  else:
+    return
+  raise PermissionError(f"Refusing BQAA tracing file {path}: it {problem}.")
+
+
+def _open_nofollow(target: str | Path, flags: int, mode: int, **at: int) -> int:
+  """``os.open`` that never follows a symlink as the last component.
+
+  O_NONBLOCK keeps a FIFO planted under the name from hanging the open.
+  """
+  if not _flag("O_NOFOLLOW") and os.path.islink(target):
+    raise PermissionError(
+        f"Refusing BQAA tracing file {target}: it is a symlink."
+    )
+  flags |= _flag("O_NOFOLLOW") | _flag("O_CLOEXEC") | _flag("O_NONBLOCK")
+  return os.open(target, flags, mode, **at)
+
+
+def _require_trusted_chain(directory: Path) -> None:
+  """Raise unless ``directory`` and all its parents belong to root or us."""
+  euid = _euid()
+  if euid is None:
+    return
+  real = Path(os.path.realpath(directory))
+  for current in (real, *real.parents):
+    owner = os.stat(current).st_uid
+    if owner not in (0, euid):
+      raise PermissionError(
+          f"Refusing BQAA tracing path under {current}: it is owned by uid"
+          f" {owner}."
+      )
+
+
+def _require_trusted_parents(fd: int, path: Path) -> None:
+  """``_require_trusted_chain`` for the parents of the directory ``fd``."""
+  euid = _euid()
+  if euid is None:
+    return
+  current, up = os.fstat(fd), ".."
+  for _ in range(256):
+    parent = os.stat(up, dir_fd=fd)
+    if (parent.st_dev, parent.st_ino) == (current.st_dev, current.st_ino):
+      return  # "/" is its own parent.
+    if parent.st_uid not in (0, euid):
+      raise PermissionError(
+          f"Refusing BQAA tracing path under {path / up}: it is owned by"
+          f" uid {parent.st_uid}."
+      )
+    current, up = parent, f"{up}/.."
+  raise PermissionError(f"Refusing BQAA tracing dir {path}: it is too deep.")
+
+
+class PrivateDir:
+  """A directory only we can modify, pinned by the descriptor checked."""
+
+  def __init__(self, path: Path, fd: int | None):
+    self.path = path
+    self.fd = fd
+    self._close = None if fd is None else weakref.finalize(self, os.close, fd)
+
+  def __enter__(self) -> PrivateDir:
+    return self
+
+  def __exit__(self, *exc_info: object) -> None:
+    self.close()
+
+  def close(self) -> None:
+    if self._close is not None:
+      self._close()
+
+  def _at(self, name: str) -> tuple[str, dict[str, int]]:
+    if self.fd is None:
+      return os.path.join(self.path, name), {}
+    return name, {"dir_fd": self.fd}
+
+  def names(self) -> list[str]:
+    return os.listdir(self.path if self.fd is None else self.fd)
+
+  def lstat(self, name: str) -> os.stat_result:
+    target, at = self._at(name)
+    return os.lstat(target, **at)
+
+  def exists(self, name: str) -> bool:
     try:
-      fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
+      self.lstat(name)
+    except FileNotFoundError:
+      return False
+    return True
+
+  def open(self, name: str, flags: int, mode: int = 0o600) -> int:
+    """Open a regular file of ours in this dir, never through a symlink."""
+    target, at = self._at(name)
+    fd = _open_nofollow(target, flags, mode, **at)
+    try:
+      _check_own_file(os.fstat(fd), self.path / name)
+    except BaseException:
       os.close(fd)
+      raise
+    return fd
+
+  def unlink(self, name: str) -> None:
+    target, at = self._at(name)
+    os.unlink(target, **at)
+
+  def replace(
+      self, name: str, new_name: str, new_dir: PrivateDir | None = None
+  ) -> None:
+    """Rename ``name`` to ``new_name`` in ``new_dir`` (default: here)."""
+    new_dir = new_dir or self
+    if self.fd is None or new_dir.fd is None:
+      os.replace(
+          os.path.join(self.path, name), os.path.join(new_dir.path, new_name)
+      )
+    else:
+      os.replace(name, new_name, src_dir_fd=self.fd, dst_dir_fd=new_dir.fd)
+
+  def subdir(self, name: str) -> PrivateDir:
+    """``ensure_private_dir`` for ``name`` inside this dir."""
+    if self.fd is None:
+      return ensure_private_dir(self.path / name)
+    try:
+      os.mkdir(name, 0o700, dir_fd=self.fd)
+    except FileExistsError:
+      pass
+    return _open_private_dir(self.path / name, name, self.fd)
+
+
+def ensure_private_dir(path: str | os.PathLike[str]) -> PrivateDir:
+  """Create ``path`` owner-only (0o700), or verify an existing one."""
+  directory = Path(path).expanduser()
+  missing = []
+  current = directory
+  while not os.path.lexists(current):
+    missing.append(current)
+    current = current.parent
+  for component in reversed(missing):
+    try:
+      os.mkdir(component, 0o700)
+    except FileExistsError:
+      pass
+  if not _dir_fd_supported():
+    _check_dir(os.lstat(directory), directory)
+    _require_trusted_chain(directory.parent)
+    return PrivateDir(directory, None)
+  return _open_private_dir(directory, directory, None)
+
+
+def _open_private_dir(
+    path: Path, target: str | Path, dir_fd: int | None
+) -> PrivateDir:
+  flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | _flag("O_CLOEXEC")
+  try:
+    fd = os.open(target, flags, dir_fd=dir_fd)
+  except OSError as exc:
+    if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+      raise PermissionError(
+          f"Refusing BQAA tracing dir {path}: it is a symlink or not a"
+          " directory."
+      ) from exc
+    raise
+  try:
+    _check_dir(os.fstat(fd), path)
+    _require_trusted_parents(fd, path)
+  except BaseException:
+    os.close(fd)
+    raise
+  return PrivateDir(path, fd)
+
+
+# The process's own standard streams: written to as they are.
+_STREAM_ALIASES = frozenset({"/dev/stdout", "/dev/stderr"})
+
+
+def _check_log_dir(info: os.stat_result, path: Path) -> bool:
+  """Raise unless ``info`` may hold our log; return whether others own it."""
+  euid = _euid()
+  if euid is not None and info.st_uid not in (0, euid):
+    raise PermissionError(
+        f"Refusing BQAA tracing dir {path}: it is owned by uid {info.st_uid}."
+    )
+  shared = info.st_uid != euid  # Root's, such as /tmp or /dev.
+  if not shared:
+    _check_dir(info, path)
+  return shared
+
+
+def _rotate_log_in_private_dir(
+    directory: PrivateDir,
+    path: Path,
+    fd: int,
+    info: os.stat_result,
+    append: int,
+    max_bytes: int,
+) -> int:
+  """Rotate ``path.name`` -> ``path.name.1`` if ``st_size >= max_bytes``.
+
+  On entry owns ``fd``; closes ``fd`` before raising or returning a new
+  descriptor when rotation runs, and leaves ``fd`` open only when no
+  rotation is needed.
+  """
+  if max_bytes <= 0 or info.st_size < max_bytes:
+    return fd
+  try:
+    try:
+      fcntl.flock(fd, fcntl.LOCK_EX)
+      cur_info = os.fstat(fd)
+      if cur_info.st_size >= max_bytes:
+        try:
+          disk_info = directory.lstat(path.name)
+        except FileNotFoundError:
+          disk_info = None
+        if (
+            disk_info is not None
+            and (disk_info.st_dev, disk_info.st_ino)
+            == (cur_info.st_dev, cur_info.st_ino)
+        ):
+          backup = f"{path.name}.1"
+          if directory.exists(backup):
+            backup_info = directory.lstat(backup)
+            _check_own_file(backup_info, path.parent / backup)
+          if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+          directory.replace(path.name, backup)
+    finally:
+      try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+      except OSError:
+        pass
+  finally:
+    os.close(fd)
+  new_fd = directory.open(path.name, append | os.O_CREAT, 0o600)
+  try:
+    new_info = os.fstat(new_fd)
+    _check_own_file(new_info, path)
+    if new_info.st_mode & 0o077 and hasattr(os, "fchmod"):
+      os.fchmod(new_fd, 0o600)
+  except BaseException:
+    os.close(new_fd)
+    raise
+  return new_fd
+
+
+def _maybe_rotate_fd_in_log_dir(
+    path: Path,
+    dir_fd: int | None,
+    shared: bool,
+    fd: int,
+    flags: int,
+    max_bytes: int,
+) -> int:
+  """Validate ``fd``, rotate to ``<path>.1`` if oversized, return open ``fd``.
+
+  Closes ``fd`` on any exception so the caller never double-closes.
+  """
+  closed = False
+  try:
+    info = os.fstat(fd)
+    if stat.S_ISCHR(info.st_mode):
+      return fd
+    _check_own_file(info, path)
+    if shared and info.st_nlink != 1:
+      raise PermissionError(
+          f"Refusing BQAA tracing file {path}: it has other hard links."
+      )
+    if info.st_mode & 0o077 and hasattr(os, "fchmod"):
+      os.fchmod(fd, 0o600)
+    if max_bytes <= 0 or info.st_size < max_bytes:
+      return fd
+
+    try:
+      try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        cur_info = os.fstat(fd)
+        if cur_info.st_size >= max_bytes:
+          try:
+            disk_info = (
+                os.lstat(path)
+                if dir_fd is None
+                else os.lstat(path.name, dir_fd=dir_fd)
+            )
+          except FileNotFoundError:
+            disk_info = None
+          if (
+              disk_info is not None
+              and (disk_info.st_dev, disk_info.st_ino)
+              == (cur_info.st_dev, cur_info.st_ino)
+          ):
+            backup_name = f"{path.name}.1"
+            backup_path = path.parent / backup_name
+            try:
+              binfo = (
+                  os.lstat(backup_path)
+                  if dir_fd is None
+                  else os.lstat(backup_name, dir_fd=dir_fd)
+              )
+            except FileNotFoundError:
+              binfo = None
+            if binfo is not None:
+              _check_own_file(binfo, backup_path)
+              if shared and binfo.st_nlink != 1:
+                raise PermissionError(
+                    f"Refusing BQAA tracing file {backup_path}: it has other"
+                    " hard links."
+                )
+            if hasattr(os, "fchmod"):
+              os.fchmod(fd, 0o600)
+            if dir_fd is None:
+              os.replace(path, backup_path)
+            else:
+              os.replace(
+                  path.name,
+                  backup_name,
+                  src_dir_fd=dir_fd,
+                  dst_dir_fd=dir_fd,
+              )
+      finally:
+        try:
+          fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+          pass
+    finally:
+      closed = True
+      os.close(fd)
+
+    new_fd = (
+        _open_nofollow(path, flags, 0o600)
+        if dir_fd is None
+        else _open_nofollow(path.name, flags, 0o600, dir_fd=dir_fd)
+    )
+    fd = new_fd
+    closed = False
+    new_info = os.fstat(fd)
+    if stat.S_ISCHR(new_info.st_mode):
+      return fd
+    _check_own_file(new_info, path)
+    if shared and new_info.st_nlink != 1:
+      raise PermissionError(
+          f"Refusing BQAA tracing file {path}: it has other hard links."
+      )
+    if new_info.st_mode & 0o077 and hasattr(os, "fchmod"):
+      os.fchmod(fd, 0o600)
+    return fd
+  except BaseException:
+    if not closed:
+      os.close(fd)
+    raise
+
+
+def _open_in_log_dir(
+    path: Path, flags: int, max_bytes: int
+) -> tuple[int, bool]:
+  """Open ``path`` relative to its existing dir, checked on a descriptor.
+
+  Rotates to ``<name>.1`` (preserving ``0600`` and verifying the backup
+  is safe) if ``st_size >= max_bytes > 0``.
+  """
+  directory = path.parent
+  if not _dir_fd_supported():  # Best effort, by path.
+    _require_trusted_chain(directory)
+    shared = _check_log_dir(os.stat(directory), directory)
+    fd = _open_nofollow(path, flags, 0o600)
+    return _maybe_rotate_fd_in_log_dir(
+        path, None, shared, fd, flags, max_bytes
+    ), shared
+
+  lookup = _flag("O_SEARCH") or _flag("O_PATH") or os.O_RDONLY
+  dir_fd = os.open(directory, lookup | os.O_DIRECTORY | _flag("O_CLOEXEC"))
+  try:
+    shared = _check_log_dir(os.fstat(dir_fd), directory)
+    _require_trusted_parents(dir_fd, directory)
+    fd = _open_nofollow(path.name, flags, 0o600, dir_fd=dir_fd)
+    return _maybe_rotate_fd_in_log_dir(
+        path, dir_fd, shared, fd, flags, max_bytes
+    ), shared
+  finally:
+    os.close(dir_fd)
+
+
+def _open_log(config: "BQAAConfig") -> int:
+  """Open ``config.log_file`` for appending; raise if it is unsafe.
+
+  Rotates to ``<log_file>.1`` with ``0600`` mode when size reaches
+  ``config.max_log_bytes`` (default 1 MiB).
+  """
+  path = Path(config.log_file).expanduser()
+  append = os.O_WRONLY | os.O_APPEND | _flag("O_CLOEXEC") | _flag("O_NOCTTY")
+  if str(path) in _STREAM_ALIASES:
+    return os.open(path, append)  # Symlinks into /dev/fd or /proc.
+  max_bytes = getattr(config, "max_log_bytes", 1_048_576)
+  in_state_dir = path.parent == Path(config.state_dir).expanduser()
+  if in_state_dir or not path.parent.is_dir():
+    with ensure_private_dir(path.parent) as directory:
+      fd = directory.open(path.name, append | os.O_CREAT, 0o600)
+      rotated = False
+      try:
+        info = os.fstat(fd)
+        if stat.S_ISCHR(info.st_mode):
+          if hasattr(os, "set_blocking"):
+            os.set_blocking(fd, True)
+          return fd
+        _check_own_file(info, path)
+        if info.st_mode & 0o077 and hasattr(os, "fchmod"):
+          os.fchmod(fd, 0o600)
+        if max_bytes > 0 and info.st_size >= max_bytes:
+          rotated = True
+          fd = _rotate_log_in_private_dir(
+              directory, path, fd, info, append, max_bytes
+          )
+      except BaseException:
+        if not rotated:
+          os.close(fd)
+        raise
+      return fd
+  else:
+    fd, shared = _open_in_log_dir(path, append | os.O_CREAT, max_bytes)
+    try:
+      info = os.fstat(fd)
+      if stat.S_ISCHR(info.st_mode):
+        if hasattr(os, "set_blocking"):
+          os.set_blocking(fd, True)
+        return fd
+      _check_own_file(info, path)
+      if shared and info.st_nlink != 1:
+        raise PermissionError(
+            f"Refusing BQAA tracing file {path}: it has other hard links."
+        )
+      if info.st_mode & 0o077 and hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
+    except BaseException:
+      os.close(fd)
+      raise
+    return fd
 
 
 def log_to_file(config: "BQAAConfig", message: str) -> None:
-  """Append a single log line to ``config.log_file``. Silent on failure.
-
-  The drainer and the spool writer share this — debugging signal lives in
-  one place, and a broken log path never crashes the agent's hot path.
-  """
+  """Append a single log line to ``config.log_file``. Silent on failure."""
   if not config.log_file:
     return
   try:
-    with open(config.log_file, "a", encoding="utf-8") as handle:
+    fd = _open_log(config)
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
       handle.write(f"[{iso_timestamp()}] {message}\n")
-  except OSError:
+  except (OSError, RuntimeError):  # RuntimeError: "~" with no home dir.
     pass
+
+
+def open_existing_private_dir(path: str | os.PathLike[str]) -> PrivateDir:
+  """Open an existing owner-only dir without creating it."""
+  directory = Path(path).expanduser()
+  if not _dir_fd_supported():
+    _check_dir(os.lstat(directory), directory)
+    _require_trusted_chain(directory.parent)
+    return PrivateDir(directory, None)
+  return _open_private_dir(directory, directory, None)
+
+
+def inspect_spool_status(spool_dir: str | os.PathLike[str]) -> dict[str, Any]:
+  """Read-only summary of pending, deferred, and dead-letter spool counts.
+
+  Never creates directories or modifies spool state; refuses unsafe
+  symlinks/directories and surfaces any inspection error cleanly.
+  """
+  status: dict[str, Any] = {
+      "pending_count": 0,
+      "deferred_count": 0,
+      "dead_letter_count": 0,
+      "destination_mismatch_count": 0,
+      "latest_error": None,
+      "error": None,
+  }
+  if not spool_dir:
+    return status
+  base = Path(spool_dir).expanduser()
+  if not os.path.lexists(base):
+    return status
+  try:
+    with open_existing_private_dir(base) as spool:
+      names = spool.names()
+      pending_names = [
+          n
+          for n in names
+          if n.startswith("event-") and n.endswith(".json")
+      ]
+      status["pending_count"] = len(pending_names)
+
+      retry_names = [n for n in names if n.endswith(".retry")]
+      status["deferred_count"] = len(retry_names)
+      latest_mtime = -1
+      for rname in retry_names:
+        try:
+          rinfo = spool.lstat(rname)
+          if not stat.S_ISREG(rinfo.st_mode):
+            continue
+          fd = spool.open(rname, os.O_RDONLY)
+          with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+            meta = safe_json_loads(handle.read(), {})
+          if isinstance(meta, dict):
+            err = str(meta.get("last_error") or "").strip()
+            if err and rinfo.st_mtime_ns >= latest_mtime:
+              latest_mtime = rinfo.st_mtime_ns
+              status["latest_error"] = err
+        except OSError:
+          continue
+
+      if spool.exists("dead-letter"):
+        try:
+          dinfo = spool.lstat("dead-letter")
+          if stat.S_ISDIR(dinfo.st_mode):
+            dead_dir = (
+                open_existing_private_dir(base / "dead-letter")
+                if spool.fd is None
+                else _open_private_dir(
+                    base / "dead-letter", "dead-letter", spool.fd
+                )
+            )
+            with dead_dir as dead:
+              for dname in dead.names():
+                if dname == "destination-mismatch":
+                  try:
+                    minfo = dead.lstat(dname)
+                    if stat.S_ISDIR(minfo.st_mode):
+                      mm_dir = (
+                          open_existing_private_dir(
+                              base / "dead-letter" / dname
+                          )
+                          if dead.fd is None
+                          else _open_private_dir(
+                              base / "dead-letter" / dname, dname, dead.fd
+                          )
+                      )
+                      with mm_dir as mm:
+                        mm_files = [
+                            m for m in mm.names() if m.endswith(".json")
+                        ]
+                        status["destination_mismatch_count"] = len(mm_files)
+                        status["dead_letter_count"] += len(mm_files)
+                  except OSError:
+                    pass
+                elif dname.endswith(".json"):
+                  status["dead_letter_count"] += 1
+        except OSError as exc:
+          status["error"] = str(exc)
+  except (OSError, RuntimeError) as exc:
+    status["error"] = str(exc)
+  return status

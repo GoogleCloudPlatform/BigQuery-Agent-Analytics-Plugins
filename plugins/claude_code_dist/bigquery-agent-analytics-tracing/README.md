@@ -20,7 +20,7 @@ plugins/claude_code/
 └── vendor/                  # generated at build time (git-ignored)
     ├── bigquery_agent_analytics_tracing/
     │                          # vendored package source — copied from
-    │                          # producers/src/ by build_claude_plugin.py
+    │                          # the SDK repo's producers/src/ by build_claude_plugin.py
     └── bigquery_agent_analytics_tracing-<version>.dist-info/
                                # PEP 376 metadata so importlib.metadata
                                # resolves the right version at runtime
@@ -28,9 +28,10 @@ plugins/claude_code/
 
 `vendor/` is never source-controlled. The build script
 [`producers/scripts/build_claude_plugin.py`](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/blob/main/producers/scripts/build_claude_plugin.py)
-copies the canonical package source into `vendor/` and stamps the
-resolved version into `.claude-plugin/plugin.json` at release time —
-so the wheel and the plugin always ship the same code.
+in the [SDK repository](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK),
+which owns the Python package, copies the canonical package source into
+`vendor/` and stamps the resolved version into `.claude-plugin/plugin.json`
+at release time — so the wheel and the plugin always ship the same code.
 
 ## Runtime model
 
@@ -70,33 +71,49 @@ BigQuery IAM requirements and submission checklist live in
 
 > **If you previously installed an older BQAA Claude Code plugin from
 > another marketplace or local path, remove or disable it before
-> installing this version.** Running multiple BQAA tracing plugins at
-> once can duplicate hook events in BigQuery. Check existing installs
-> with `/plugin list` and uninstall any duplicates with
-> `/plugin uninstall <name>@<marketplace>` before continuing.
+> installing this catalog version.** Running multiple BQAA tracing
+> plugins at once can duplicate hook events in BigQuery. Check
+> existing installs with `/plugin list` and uninstall any duplicates
+> with `/plugin uninstall <name>@<marketplace>` before continuing.
 
-Until the plugin is submitted to the Claude Code marketplace, install
-from a GitHub release tarball:
+This repo serves a Claude Code marketplace catalog at
+[`/.claude-plugin/marketplace.json`](../../../.claude-plugin/marketplace.json).
+From a Claude Code session:
 
-```bash
-# Pick a released version from
-# https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/releases
-VERSION=0.1.0
-
-mkdir -p ~/.claude/plugins
-curl -L \
-  "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/releases/download/tracing-v${VERSION}/bigquery-agent-analytics-tracing-claude-code-${VERSION}.tar.gz" \
-  | tar -xz -C ~/.claude/plugins
-
-# Configure BigQuery destination + runtime deps (one-time).
-export BQAA_PROJECT_ID=your-gcp-project
-export BQAA_DATASET=agent_analytics
-pip install google-cloud-bigquery               # always
-pip install google-cloud-bigquery-storage pyarrow  # Storage Write path
+```
+/plugin marketplace add GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins
+/plugin install bigquery-agent-analytics-tracing@bqaa-tracing
 ```
 
-Then point Claude Code at the unpacked plugin directory per the
-[Claude Code plugins docs](https://docs.claude.com/en/docs/claude-code/plugins).
+> **Important: add the marketplace via the Git source form
+> (`<owner>/<repo>`), not via a direct URL to `marketplace.json`.**
+> The catalog uses a relative `source` path
+> (`./plugins/claude_code_dist/...`), which Claude Code can only
+> resolve when the marketplace was added as a Git checkout — that's
+> what provides the surrounding repo files the relative path points
+> into. A direct-URL `add` would fetch only the catalog JSON and the
+> plugin install would fail to resolve.
+
+For a faster clone — this repo carries the plugins' sources + tests
+in addition to the built plugin copies — use a sparse checkout if your
+Claude Code version supports it:
+
+```
+/plugin marketplace add GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins --sparse .claude-plugin plugins/claude_code_dist
+/plugin install bigquery-agent-analytics-tracing@bqaa-tracing
+```
+
+Then configure BigQuery destination + runtime deps (one-time):
+
+```bash
+export BQAA_PROJECT_ID=your-gcp-project
+export BQAA_DATASET=agent_analytics
+pip install google-cloud-bigquery                  # always
+pip install google-cloud-bigquery-storage pyarrow  # Storage Write path (optional)
+```
+
+Run `/bqaa-setup` inside Claude Code to verify the env vars and runtime
+deps are correctly configured before relying on tracing.
 
 ### Switching Google Cloud projects
 
@@ -116,10 +133,49 @@ To switch to a new Google Cloud project:
    then run `/bqaa-setup` to confirm `BQAA_PROJECT_ID` points to the new
    project.
 
-Marketplace submission is tracked in
-[#234 step 5](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/234).
+### Submission to Anthropic's official marketplace
+
+Tracked in [#251](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/251)
+(track B5). Until then, the self-hosted catalog above is the canonical
+install path.
+
+### Manual install from the GitHub release (fallback)
+
+If you can't use the marketplace catalog, download the plugin tarball
+attached to the matching `tracing-vX.Y.Z` GitHub release:
+
+```bash
+VERSION=0.1.1
+mkdir -p ~/.claude/plugins
+curl -L \
+  "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/releases/download/tracing-v${VERSION}/bigquery-agent-analytics-tracing-claude-code-${VERSION}.tar.gz" \
+  | tar -xz -C ~/.claude/plugins
+```
+
+Then point Claude Code at the unpacked plugin directory per the
+[Claude Code plugins docs](https://docs.claude.com/en/docs/claude-code/plugins).
+
+## Syncing and verifying the marketplace copy
+
+Run `bash plugins/claude_code/build_dist.sh --check` (which also runs in CI)
+to verify that the source tree under `plugins/claude_code/`, the committed
+marketplace copy under
+`plugins/claude_code_dist/bigquery-agent-analytics-tracing/`,
+`.claude-plugin/marketplace.json`, the vendored `.dist-info/METADATA`, and
+this README agree, and that an existing `tracing-vX.Y.Z` release tag is
+not diverged from its committed dist snapshot. To rebuild the shared
+non-vendor files into an output directory, pass a target directory instead
+of `--check`:
+
+```bash
+bash plugins/claude_code/build_dist.sh /tmp/tracing-dist
+```
 
 ## Building the artifact
+
+The build runs from a checkout of the
+[SDK repository](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK),
+which holds the Python package under `producers/`:
 
 ```bash
 cd producers
@@ -128,7 +184,7 @@ python scripts/build_claude_plugin.py
 # → producers/dist/bigquery-agent-analytics-tracing-claude-code-X.Y.Z.tar.gz
 ```
 
-CI builds the same tarball on every release tag (see
-[producers/RELEASING.md](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/blob/main/producers/RELEASING.md)). On regular PRs
-the plugin tarball is uploaded as a workflow artifact via the
-`producers-ci.yml` `build` job.
+CI there builds the same tarball on every release tag (see
+[producers/RELEASING.md](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/blob/main/producers/RELEASING.md)).
+On regular PRs the plugin tarball is uploaded as a workflow artifact via
+the `producers-ci.yml` `build` job.

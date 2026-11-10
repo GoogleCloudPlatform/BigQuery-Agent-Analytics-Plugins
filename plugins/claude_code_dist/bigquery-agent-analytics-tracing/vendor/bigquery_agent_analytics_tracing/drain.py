@@ -12,35 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Background drainer for the BQAA spool.
-
-The drainer is launched as a detached subprocess by the logger (see
-``_ensure_drainer`` in ``logger.py``). Its job is to take BQAA rows that
-the producer spooled to disk and write them to BigQuery without blocking
-the host agent.
-
-Design choices:
-
-- Single drainer per spool dir, enforced by an exclusive ``fcntl.flock`` on
-  ``.drainer.pid``. New producer fires that try to spawn a drainer no-op
-  out immediately if the lock is held.
-- Writes use the BigQuery Storage Write API via ``BigQueryWriteAsyncClient``
-  + PyArrow batches when both libraries are importable. Matches the ADK
-  BQAA plugin and avoids streaming-insert quotas.
-- When the Storage Write client or PyArrow are not available, falls back to
-  ``bigquery.Client.insert_rows_json``. Same row contents in either path.
-- Retries transient failures with exponential backoff.
-- Rows that exhaust retries or hit non-retryable errors are moved to
-  ``dead-letter/`` so they can be inspected and replayed.
-- Drainer exits after ``BQAA_DRAIN_IDLE_SECONDS`` of empty polling; the
-  next producer fire spawns a fresh one.
-
-Invocation: ``python -m bigquery_agent_analytics_tracing.drain``. Plugin
-runtimes that vendor the package source without installing the wheel must
-either prepend the vendored package root to ``PYTHONPATH`` on the spawned
-drainer's environment, or ship a small wrapper script that performs the
-``sys.path`` insert and calls ``main()`` directly.
-"""
+"""Background drainer for the BQAA spool."""
 
 from __future__ import annotations
 
@@ -48,6 +20,7 @@ import asyncio
 import contextlib
 from dataclasses import dataclass
 import fcntl
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -61,10 +34,18 @@ from typing import Any, Iterator
 # plugin behavior and keeps the channel safe if the host agent forks us.
 os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 
-from ._utils import log_to_file  # noqa: E402  (after env tweak)
+from ._utils import ensure_private_dir  # noqa: E402  (after env tweak)
+from ._utils import log_to_file  # noqa: E402
+from ._utils import PrivateDir  # noqa: E402
+from ._utils import safe_json_loads  # noqa: E402
 from ._writer_identity import DEFAULT_WRITER_LABEL  # noqa: E402
 from .config import BQAAConfig  # noqa: E402
+from .config import DEFAULT_LOG_FILE  # noqa: E402
+from .config import DEFAULT_STATE_DIR  # noqa: E402
 from .schema import bq_schema  # noqa: E402
+
+_RETRY_MAX_BACKOFF_SECONDS = 3600.0
+_RETRY_BASE_SECONDS = 5.0
 
 
 @dataclass
@@ -76,17 +57,140 @@ class _RetryConfig:
 
 
 @dataclass
+class _WriteOutcome:
+  status: str  # "ok", "retryable", or "permanent"
+  error: str = ""
+
+
+@dataclass
 class _Envelope:
   path: Path
   config_dict: dict[str, Any]
   row: dict[str, Any]
 
 
+class _SkippedEnvelope(Exception):
+  """A spooled entry that is not a regular file we own."""
+
+
+# Entries already reported as skipped: each is logged once per drainer.
+_reported_skips: set[str] = set()
+
+
+def _retry_sidecar_name(spool_name: str) -> str:
+  return f"{spool_name}.retry"
+
+
+def _unlink_retry(spool: PrivateDir, spool_name: str) -> None:
+  try:
+    spool.unlink(_retry_sidecar_name(spool_name))
+  except (FileNotFoundError, OSError):
+    pass
+
+
+def _read_retry_meta(spool: PrivateDir, spool_name: str) -> dict[str, Any] | None:
+  """Read ``<spool_name>.retry`` if present; None if absent or corrupt."""
+  rname = _retry_sidecar_name(spool_name)
+  try:
+    fd = spool.open(rname, os.O_RDONLY)
+    with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+      raw = handle.read()
+  except FileNotFoundError:
+    return None
+  except OSError:
+    return None
+  parsed = safe_json_loads(raw, None)
+  if not isinstance(parsed, dict):
+    return None
+  return parsed
+
+
+def _write_retry_meta(
+    spool: PrivateDir, spool_name: str, meta: dict[str, Any]
+) -> None:
+  rname = _retry_sidecar_name(spool_name)
+  tmp_name = f".{rname}.{os.getpid()}.tmp"
+  fd = spool.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+  with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(meta, sort_keys=True))
+  spool.replace(tmp_name, rname)
+
+
+def _compute_backoff_seconds(attempts: int, config: BQAAConfig) -> float:
+  override = getattr(config, "drain_retry_backoff_seconds", None)
+  if override is not None:
+    return max(0.0, float(override))
+  exp = min(max(0, int(attempts) - 1), 16)
+  return min(
+      _RETRY_MAX_BACKOFF_SECONDS,
+      _RETRY_BASE_SECONDS * (2 ** exp),
+  )
+
+
+def _extract_envelope_config(data: dict[str, Any]) -> dict[str, Any]:
+  """Return destination config dict from a spool envelope."""
+  cfg = data.get("config")
+  if isinstance(cfg, dict) and any(
+      cfg.get(k) for k in ("project_id", "dataset", "table")
+  ):
+    return cfg
+  bqaa = data.get("_bqaa")
+  if isinstance(bqaa, dict) and isinstance(bqaa.get("config"), dict):
+    return bqaa["config"]
+  return cfg if isinstance(cfg, dict) else {}
+
+
+def is_destination_mismatch(
+    envelope_cfg: dict[str, Any], config: BQAAConfig
+) -> bool:
+  """Return True if an envelope embeds a different non-empty destination."""
+  for key, expected in (
+      ("project_id", config.project_id),
+      ("dataset", config.dataset),
+      ("table", config.table),
+  ):
+    raw_val = envelope_cfg.get(key)
+    val = (
+        raw_val.strip()
+        if isinstance(raw_val, str)
+        else (str(raw_val).strip() if raw_val is not None else "")
+    )
+    if not val:
+      continue
+    if val != expected:
+      return True
+  return False
+
+
+def _quarantine(
+    spool: PrivateDir,
+    name: str,
+    reason: str,
+    *,
+    subdir: str | None = None,
+) -> None:
+  try:
+    with spool.subdir("dead-letter") as dead:
+      if subdir:
+        with dead.subdir(subdir) as sub:
+          try:
+            spool.replace(name, f"{Path(name).stem}.{reason}.json", sub)
+          except (FileNotFoundError, OSError):
+            pass
+      else:
+        try:
+          spool.replace(name, f"{Path(name).stem}.{reason}.json", dead)
+        except (FileNotFoundError, OSError):
+          pass
+  finally:
+    _unlink_retry(spool, name)
+
+
 @contextlib.contextmanager
 def _try_acquire_pidfile(pidfile: Path) -> Iterator[int | None]:
   """Acquire the drainer pidfile non-blockingly. Yields None if held."""
-  pidfile.parent.mkdir(parents=True, exist_ok=True)
-  fd = os.open(str(pidfile), os.O_CREAT | os.O_RDWR, 0o600)
+  with ensure_private_dir(pidfile.parent) as directory:
+    fd = directory.open(pidfile.name, os.O_CREAT | os.O_RDWR)
   try:
     try:
       fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -113,71 +217,127 @@ def _try_acquire_pidfile(pidfile: Path) -> Iterator[int | None]:
       pass
 
 
-def _list_pending(spool: Path) -> list[Path]:
-  if not spool.exists():
-    return []
-  return sorted(p for p in spool.glob("event-*.json") if p.is_file())
+def _list_pending(spool: PrivateDir) -> list[str]:
+  """Envelope names, oldest first. ``_read_envelope`` vets each one."""
+  names = spool.names()
+  return sorted(n for n in names if fnmatch.fnmatchcase(n, "event-*.json"))
 
 
-def _read_envelope(path: Path) -> _Envelope | None:
+def _read_envelope(
+    spool: PrivateDir, name: str, config: BQAAConfig
+) -> _Envelope | None:
+  """Parse one envelope; quarantine if corrupt/mismatched/missing-config."""
   try:
-    raw = path.read_text(encoding="utf-8")
+    fd = spool.open(name, os.O_RDONLY)
+    with os.fdopen(fd, encoding="utf-8") as handle:
+      raw = handle.read()
   except FileNotFoundError:
+    _unlink_retry(spool, name)
     return None
-  except OSError:
-    return None
+  except OSError as exc:  # A symlink, or not a regular file of ours.
+    raise _SkippedEnvelope(f"{spool.path / name}: {exc}") from exc
   try:
     data = json.loads(raw)
   except json.JSONDecodeError:
-    # Corrupt spool entry — dead-letter and move on.
-    _quarantine(path, reason="corrupt-json")
+    _quarantine(spool, name, reason="corrupt-json")
     return None
+  if not isinstance(data, dict):
+    _quarantine(spool, name, reason="corrupt-json")
+    return None
+
+  env_cfg = _extract_envelope_config(data)
+  if is_destination_mismatch(env_cfg, config):
+    dest_desc = (
+        f"{env_cfg.get('project_id')}.{env_cfg.get('dataset')}."
+        f"{env_cfg.get('table')}"
+    )
+    expected_desc = f"{config.project_id}.{config.dataset}.{config.table}"
+    log_to_file(
+        config,
+        f"DRAINER destination_mismatch file={name} envelope_dest={dest_desc}"
+        f" expected_dest={expected_desc}",
+    )
+    _quarantine(
+        spool, name, reason="destination-mismatch", subdir="destination-mismatch"
+    )
+    return None
+
+  row = data.get("row")
+  if not isinstance(row, dict):
+    row = {}
   return _Envelope(
-      path=path,
-      config_dict=data.get("config") or {},
-      row=data.get("row") or {},
+      path=spool.path / name,
+      config_dict=env_cfg,
+      row=row,
   )
 
 
 def _group_envelopes(
     envelopes: list[_Envelope],
+    config: BQAAConfig,
 ) -> dict[tuple, list[_Envelope]]:
-  """Group by destination table + writer label + auto-create policy.
+  """Group by configured destination + writer label + effective auto-create.
 
-  The writer label is part of the key so a single drainer process can
-  serve envelopes from differently-labeled deployments without bleeding
-  their ``AppendRowsRequest.trace_id`` values together. Auto-create flags
-  are part of the key so the fallback path honors each producer's policy
-  instead of clobbering it with hard-coded defaults.
+  Legacy envelopes with empty config fall back to ``config`` destination.
+  Envelope flags may opt down from ``config`` (e.g. ``auto_create_table=False``)
+  but never escalate creation privileges above ``config``.
   """
   grouped: dict[tuple, list[_Envelope]] = {}
   for env in envelopes:
     cfg = env.config_dict
     auto_create_table = cfg.get("auto_create_table")
     auto_create_dataset = cfg.get("auto_create_dataset")
+    eff_table = bool(config.auto_create_table) and (
+        True if auto_create_table is None else bool(auto_create_table)
+    )
+    eff_dataset = bool(config.auto_create_dataset) and bool(
+        auto_create_dataset
+    )
     key = (
-        cfg.get("project_id"),
-        cfg.get("dataset"),
-        cfg.get("table"),
-        cfg.get("location"),
-        cfg.get("writer_label") or DEFAULT_WRITER_LABEL,
-        True if auto_create_table is None else bool(auto_create_table),
-        False if auto_create_dataset is None else bool(auto_create_dataset),
+        config.project_id,
+        config.dataset,
+        config.table,
+        cfg.get("location") or config.location,
+        cfg.get("writer_label") or config.writer_label or DEFAULT_WRITER_LABEL,
+        eff_table,
+        eff_dataset,
     )
     grouped.setdefault(key, []).append(env)
   return grouped
 
 
-def _quarantine(path: Path, reason: str) -> None:
-  dead = path.parent / "dead-letter"
-  dead.mkdir(parents=True, exist_ok=True)
-  target = dead / f"{path.stem}.{reason}.json"
-  try:
-    os.replace(path, target)
-  except FileNotFoundError:
-    pass
-  except OSError:
-    pass
+def _is_permanent_write_exception(exc: Exception) -> bool:
+  """True for 400 BadRequest / schema rejection; False for 404/429/5xx/net."""
+  code = getattr(exc, "code", None)
+  if code == 400:
+    return True
+  name = type(exc).__name__
+  if name == "BadRequest":
+    return True
+  msg = str(exc)
+  return msg.startswith("400 ") or "Bad Request" in msg
+
+
+def _is_permanent_row_errors(errors: list[Any]) -> bool:
+  """Classify ``insert_rows_json`` row error lists as permanent vs transient."""
+  transient_reasons = frozenset(
+      {"timeout", "backendError", "internalError", "rateLimitExceeded", "quotaExceeded", "unavailable"}
+  )
+  saw_any_reason = False
+  for entry in errors:
+    if not isinstance(entry, dict):
+      continue
+    for item in entry.get("errors") or []:
+      if isinstance(item, dict):
+        reason = str(item.get("reason") or "")
+        if reason:
+          saw_any_reason = True
+          if reason not in transient_reasons and reason != "stopped":
+            return True
+  if saw_any_reason:
+    return False
+  msg = str(errors)
+  return "invalid" in msg.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -265,8 +425,6 @@ def _row_to_arrow_dict(row: dict[str, Any]) -> dict[str, Any]:
       if details is not None and not isinstance(details, str):
         ref = dict(ref)
         ref["details"] = json.dumps(details, sort_keys=True)
-    # part_attributes is declared as pa.string() in the Arrow schema;
-    # match the insert_rows_json path by serializing structured values.
     part_attrs = part.get("part_attributes")
     if part_attrs is not None and not isinstance(part_attrs, str):
       part_attrs = json.dumps(part_attrs, sort_keys=True)
@@ -319,8 +477,8 @@ async def _write_batch_storage_api(
     retry: _RetryConfig,
     config: BQAAConfig,
     writer_label: str,
-) -> bool:
-  """Write a batch via the Storage Write API. Returns True on success."""
+) -> _WriteOutcome:
+  """Write a batch via the Storage Write API."""
   from google.api_core.exceptions import InternalServerError
   from google.api_core.exceptions import ServiceUnavailable
   from google.api_core.exceptions import TooManyRequests
@@ -328,7 +486,7 @@ async def _write_batch_storage_api(
   from google.cloud.bigquery_storage_v1.services.big_query_write.async_client import BigQueryWriteAsyncClient
   import pyarrow as pa
 
-  del location  # Storage Write API resolves location from the table itself.
+  del location
 
   schema = _arrow_schema()
   arrow_rows = [_row_to_arrow_dict(r) for r in rows]
@@ -336,7 +494,7 @@ async def _write_batch_storage_api(
     record_batch = pa.RecordBatch.from_pylist(arrow_rows, schema=schema)
   except Exception as exc:
     log_to_file(config, f"DRAINER arrow_serialize_failed: {exc}")
-    return False
+    return _WriteOutcome("retryable", str(exc))
 
   serialized_schema = schema.serialize().to_pybytes()
   serialized_batch = record_batch.serialize().to_pybytes()
@@ -348,10 +506,6 @@ async def _write_batch_storage_api(
   try:
     req = bq_storage_types.AppendRowsRequest(
         write_stream=write_stream,
-        # Writer attribution. Recorded server-side for Google support
-        # diagnostics; not surfaced as a column in
-        # INFORMATION_SCHEMA.WRITE_API_TIMELINE_BY_*. Adoption analytics
-        # use the row-level attributes.writer block instead.
         trace_id=writer_label,
     )
     req.arrow_rows.writer_schema.serialized_schema = serialized_schema
@@ -375,12 +529,16 @@ async def _write_batch_storage_api(
               # gRPC: 4=DEADLINE_EXCEEDED, 13=INTERNAL, 14=UNAVAILABLE
               if error_code in (4, 13, 14):
                 raise ServiceUnavailable(error_message)
+              if error_code == 3:  # INVALID_ARGUMENT
+                raise ValueError(
+                    f"400 Bad Request (INVALID_ARGUMENT): {error_message}"
+                )
               raise RuntimeError(
-                  f"non_retryable_storage_error: {error_message}"
+                  f"storage_write_error code={error_code}: {error_message}"
               )
 
         await asyncio.wait_for(_perform(), timeout=30.0)
-        return True
+        return _WriteOutcome("ok")
 
       except (
           ServiceUnavailable,
@@ -392,9 +550,9 @@ async def _write_batch_storage_api(
         if attempt > retry.max_retries:
           log_to_file(
               config,
-              f"DRAINER batch_dropped_after_{retry.max_retries + 1}: {exc}",
+              f"DRAINER batch_deferred_after_{retry.max_retries + 1}: {exc}",
           )
-          return False
+          return _WriteOutcome("retryable", str(exc))
         sleep_for = min(delay * (1 + random.random()), retry.max_delay)
         log_to_file(
             config,
@@ -407,9 +565,10 @@ async def _write_batch_storage_api(
             config,
             f"DRAINER unexpected_error: {exc}\n{traceback.format_exc()}",
         )
-        return False
+        if _is_permanent_write_exception(exc) or isinstance(exc, ValueError):
+          return _WriteOutcome("permanent", str(exc))
+        return _WriteOutcome("retryable", str(exc))
   finally:
-    # Close the gRPC channel cleanly; ignore errors during shutdown.
     try:
       transport = getattr(client, "transport", None)
       close = getattr(transport, "close", None) if transport else None
@@ -476,7 +635,7 @@ def _write_batch_insert_rows_json(
     config: BQAAConfig,
     auto_create_table: bool,
     auto_create_dataset: bool,
-) -> bool:
+) -> _WriteOutcome:
   from google.api_core.exceptions import InternalServerError
   from google.api_core.exceptions import ServiceUnavailable
   from google.api_core.exceptions import TooManyRequests
@@ -493,7 +652,9 @@ def _write_batch_insert_rows_json(
     )
   except Exception as exc:
     log_to_file(config, f"DRAINER ensure_table_failed: {exc}")
-    return False
+    if _is_permanent_write_exception(exc):
+      return _WriteOutcome("permanent", str(exc))
+    return _WriteOutcome("retryable", str(exc))
 
   client = bigquery.Client(project=project, location=location)
   table_id = f"{project}.{dataset}.{table}"
@@ -504,8 +665,9 @@ def _write_batch_insert_rows_json(
       errors = client.insert_rows_json(table_id, rows)
       if errors:
         log_to_file(config, f"DRAINER insert_rows_json errors: {errors}")
-        return False
-      return True
+        status = "permanent" if _is_permanent_row_errors(errors) else "retryable"
+        return _WriteOutcome(status, str(errors))
+      return _WriteOutcome("ok")
     except (
         ServiceUnavailable,
         TooManyRequests,
@@ -515,9 +677,9 @@ def _write_batch_insert_rows_json(
       if attempt > retry.max_retries:
         log_to_file(
             config,
-            f"DRAINER batch_dropped_after_{retry.max_retries + 1}: {exc}",
+            f"DRAINER batch_deferred_after_{retry.max_retries + 1}: {exc}",
         )
-        return False
+        return _WriteOutcome("retryable", str(exc))
       sleep_for = min(delay * (1 + random.random()), retry.max_delay)
       time.sleep(sleep_for)
       delay *= retry.multiplier
@@ -526,12 +688,61 @@ def _write_batch_insert_rows_json(
           config,
           f"DRAINER unexpected_error: {exc}\n{traceback.format_exc()}",
       )
-      return False
+      if _is_permanent_write_exception(exc):
+        return _WriteOutcome("permanent", str(exc))
+      return _WriteOutcome("retryable", str(exc))
 
 
 # ---------------------------------------------------------------------------
 # Drain loop
 # ---------------------------------------------------------------------------
+
+
+def _defer_or_expire(
+    spool: PrivateDir,
+    name: str,
+    config: BQAAConfig,
+    error_message: str,
+) -> int:
+  """Defer ``name`` with ``<name>.retry``, or quarantine if retry age expired.
+
+  Returns 1 if resolved via expiry quarantine, 0 if deferred in spool.
+  """
+  now = time.time()
+  existing = _read_retry_meta(spool, name)
+  if existing is not None:
+    try:
+      first_failed_at = float(existing.get("first_failed_at", now))
+      attempts = max(0, int(existing.get("attempts", 0))) + 1
+    except (TypeError, ValueError):
+      first_failed_at = now
+      attempts = 1
+  else:
+    first_failed_at = now
+    attempts = 1
+
+  max_age = float(getattr(config, "drain_max_retry_age_seconds", 86400.0))
+  if now - first_failed_at >= max_age:
+    log_to_file(
+        config,
+        f"DRAINER retry_expired file={name} age={now - first_failed_at:.1f}s"
+        f" max_age={max_age:.1f}s last_error={error_message}",
+    )
+    _quarantine(spool, name, reason="write-failed")
+    return 1
+
+  backoff = _compute_backoff_seconds(attempts, config)
+  meta = {
+      "first_failed_at": first_failed_at,
+      "attempts": attempts,
+      "next_retry_at": now + backoff,
+      "last_error": str(error_message)[:500],
+  }
+  try:
+    _write_retry_meta(spool, name, meta)
+  except OSError:
+    pass
+  return 0
 
 
 async def _drain_group_async(
@@ -541,7 +752,9 @@ async def _drain_group_async(
     retry: _RetryConfig,
     config: BQAAConfig,
     use_storage_api: bool,
-) -> None:
+    spool: PrivateDir,
+) -> int:
+  """Drain one destination group; return count of resolved (non-deferred) files."""
   (
       project,
       dataset,
@@ -553,13 +766,13 @@ async def _drain_group_async(
   ) = key
   if not project or not dataset or not table:
     for env in envelopes:
-      _quarantine(env.path, reason="missing-config")
-    return
+      _quarantine(spool, env.path.name, reason="missing-config")
+    return len(envelopes)
 
   rows = [env.row for env in envelopes]
-  success = False
+  outcome = _WriteOutcome("retryable")
   if use_storage_api:
-    success = await _write_batch_storage_api(
+    outcome = await _write_batch_storage_api(
         project=project,
         dataset=dataset,
         table=table,
@@ -569,18 +782,14 @@ async def _drain_group_async(
         config=config,
         writer_label=writer_label or DEFAULT_WRITER_LABEL,
     )
-    if not success:
+    if outcome.status != "ok":
       log_to_file(
           config,
           "DRAINER storage_api_failed, falling back to insert_rows_json",
       )
 
-  if not success:
-    # Fallback / second attempt path. Run in a thread so the event loop
-    # isn't blocked by the synchronous BQ client. Use the per-envelope
-    # auto-create policy that the producer recorded in the spool, not a
-    # hard-coded default that would silently override their settings.
-    success = await asyncio.to_thread(
+  if outcome.status != "ok":
+    outcome = await asyncio.to_thread(
         _write_batch_insert_rows_json,
         project=project,
         dataset=dataset,
@@ -593,50 +802,100 @@ async def _drain_group_async(
         auto_create_dataset=auto_create_dataset,
     )
 
-  if success:
+  if outcome.status == "ok":
     for env in envelopes:
       try:
-        env.path.unlink()
+        spool.unlink(env.path.name)
       except FileNotFoundError:
         pass
-  else:
+      _unlink_retry(spool, env.path.name)
+    return len(envelopes)
+
+  if outcome.status == "permanent":
     for env in envelopes:
-      _quarantine(env.path, reason="write-failed")
+      _quarantine(spool, env.path.name, reason="write-failed")
+    return len(envelopes)
+
+  resolved = 0
+  for env in envelopes:
+    resolved += _defer_or_expire(
+        spool, env.path.name, config, outcome.error or "transient write error"
+    )
+  return resolved
 
 
 async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
-  spool = Path(config.spool_dir).expanduser()
-  pending = _list_pending(spool)
-  if not pending:
-    return 0
-  envelopes: list[_Envelope] = []
-  for path in pending[: max(1, config.drain_batch_size)]:
-    env = _read_envelope(path)
-    if env is not None:
-      envelopes.append(env)
-  if not envelopes:
-    return 0
-  grouped = _group_envelopes(envelopes)
-  retry = _RetryConfig()
-  await asyncio.gather(
-      *(
-          _drain_group_async(
-              key=key,
-              envelopes=batch,
-              retry=retry,
-              config=config,
-              use_storage_api=use_storage_api,
+  resolved = 0
+  with ensure_private_dir(config.spool_dir) as spool:
+    pending_names = _list_pending(spool)
+    pending_set = set(pending_names)
+    for extra in spool.names():
+      if extra.endswith(".retry"):
+        event_name = extra[:-len(".retry")]
+        if event_name not in pending_set:
+          _unlink_retry(spool, event_name)
+
+    envelopes: list[_Envelope] = []
+    now = time.time()
+    max_age = float(getattr(config, "drain_max_retry_age_seconds", 86400.0))
+
+    for name in pending_names:
+      if len(envelopes) >= max(1, config.drain_batch_size):
+        break
+      retry_meta = _read_retry_meta(spool, name)
+      if retry_meta is not None:
+        try:
+          first_failed_at = float(retry_meta.get("first_failed_at", now))
+          next_retry_at = float(retry_meta.get("next_retry_at", 0.0))
+        except (TypeError, ValueError):
+          first_failed_at = now
+          next_retry_at = 0.0
+        if now - first_failed_at >= max_age and retry_meta.get("attempts", 0) >= 1:
+          log_to_file(
+              config,
+              f"DRAINER retry_expired file={name} age={now - first_failed_at:.1f}s"
+              f" max_age={max_age:.1f}s last_error={retry_meta.get('last_error', '')}",
           )
-          for key, batch in grouped.items()
-      )
-  )
-  return len(envelopes)
+          _quarantine(spool, name, reason="write-failed")
+          resolved += 1
+          continue
+        if config.drain_retry_backoff_seconds != 0.0 and next_retry_at > now:
+          continue
+
+      try:
+        env = _read_envelope(spool, name, config)
+      except _SkippedEnvelope as skipped:
+        if str(skipped) not in _reported_skips:
+          _reported_skips.add(str(skipped))
+          log_to_file(config, f"DRAINER skipped {skipped}")
+        continue
+      if env is None:
+        resolved += 1
+        continue
+      envelopes.append(env)
+
+    if not envelopes:
+      return resolved
+    grouped = _group_envelopes(envelopes, config)
+    retry = _RetryConfig()
+    counts = await asyncio.gather(
+        *(
+            _drain_group_async(
+                key=key,
+                envelopes=batch,
+                retry=retry,
+                config=config,
+                use_storage_api=use_storage_api,
+                spool=spool,
+            )
+            for key, batch in grouped.items()
+        )
+    )
+    return resolved + sum(counts)
 
 
 async def _run(config: BQAAConfig) -> None:
-  spool = Path(config.spool_dir).expanduser()
-  spool.mkdir(parents=True, exist_ok=True)
-  pidfile = spool / ".drainer.pid"
+  pidfile = Path(config.spool_dir).expanduser() / ".drainer.pid"
   use_storage_api = _storage_write_available()
   with _try_acquire_pidfile(pidfile) as fd:
     if fd is None:
@@ -651,9 +910,28 @@ async def _run(config: BQAAConfig) -> None:
         idle = 0.0
 
 
+def _report_invalid_config(exc: Exception) -> int:
+  """One-line diagnostic for BQAA_* settings ``from_env()`` rejects."""
+  message = f"DRAINER invalid BQAA configuration: {exc}"
+  print(f"bqaa-drainer: {message}", file=sys.stderr)
+  log_to_file(
+      BQAAConfig(
+          project_id="",
+          dataset="",
+          log_file=os.environ.get("BQAA_LOG_FILE", DEFAULT_LOG_FILE),
+          state_dir=os.environ.get("BQAA_STATE_DIR", DEFAULT_STATE_DIR),
+      ),
+      message,
+  )
+  return 1
+
+
 def main(argv: list[str] | None = None) -> int:
   del argv
-  config = BQAAConfig.from_env()
+  try:
+    config = BQAAConfig.from_env()
+  except Exception as exc:
+    return _report_invalid_config(exc)
   if config.dry_run:
     return 0
   try:
