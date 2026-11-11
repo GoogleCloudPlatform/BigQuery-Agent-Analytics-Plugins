@@ -594,8 +594,47 @@ const isNonQuoteSingleQuote = (text: string, i: number): boolean => {
   return false
 }
 
-const opensQuotedAssignmentValue = (text: string, quoteIdx: number, q: string): boolean => {
-  const lineStop = lineEndIndex(text, quoteIdx + 1)
+const addQuoteParity = (rem: number): number => (rem === 0 ? 1 : rem === 1 ? 2 : rem === 2 ? 3 : 2)
+
+const isDelimOrSpaceAfterQuote = (ch: string | undefined): boolean =>
+  ch === undefined || /^[\s.,;:!?)\]}'"`]/.test(ch)
+
+const hasSpacedSameQuoteOpen = (
+  text: string,
+  afterStart: number,
+  lineStop: number,
+  q: string,
+  escaped: boolean,
+): boolean => {
+  let p = afterStart
+  while (p < lineStop && (text[p] === ' ' || text[p] === '\t')) p += 1
+  if (p === afterStart) return false
+  if (escaped) {
+    return p + 2 < lineStop && text[p] === '\\' && text[p + 1] === q && !/[\s"'`,;)}\]]/.test(text[p + 2] as string)
+  }
+  return p + 1 < lineStop && text[p] === q && !/[\s"'`,;)}\]]/.test(text[p + 1] as string)
+}
+
+const evalQuoteRemainder = (
+  text: string,
+  afterStart: number,
+  lineStop: number,
+  q: string,
+  escaped: boolean,
+  rem: number,
+): boolean => {
+  if (rem === 0) return afterStart < lineStop && !isDelimOrSpaceAfterQuote(text[afterStart])
+  if (rem === 2) return false
+  if (rem === 3) return true
+  return !hasSpacedSameQuoteOpen(text, afterStart, lineStop, q, escaped)
+}
+
+const opensQuotedAssignmentValue = (
+  text: string,
+  quoteIdx: number,
+  q: string,
+  lineStop = lineEndIndex(text, quoteIdx + 1),
+): boolean => {
   if (q === '`' && text[quoteIdx + 1] === '`') return false
   let count = 1
   let ansiSingle = false
@@ -642,17 +681,16 @@ const opensQuotedAssignmentValue = (text: string, quoteIdx: number, q: string): 
     }
     i += 1
   }
-  if (count >= 2) {
-    if (count % 2 !== 0) return false
-    const m2 = /^[ \t]+(["'`])[^\s"'`,;)}\]]/.exec(text.slice(quoteIdx + 1, lineStop))
-    if (count === 2 && m2 && m2[1] === q) return false
-    return true
-  }
-  return quoteIdx + 1 < lineStop && !/^[\s.,;:!?)}\]'"`]/.test(text[quoteIdx + 1] as string)
+  const rem = count === 1 ? 0 : count === 2 ? 1 : count % 2 === 1 ? 2 : 3
+  return evalQuoteRemainder(text, quoteIdx + 1, lineStop, q, false, rem)
 }
 
-const opensEscapedQuotedAssignmentValue = (text: string, quoteIdx: number, q: string): boolean => {
-  const lineStop = lineEndIndex(text, quoteIdx + 2)
+const opensEscapedQuotedAssignmentValue = (
+  text: string,
+  quoteIdx: number,
+  q: string,
+  lineStop = lineEndIndex(text, quoteIdx + 2),
+): boolean => {
   let count = 1
   let i = quoteIdx + 2
   while (i < lineStop) {
@@ -671,22 +709,98 @@ const opensEscapedQuotedAssignmentValue = (text: string, quoteIdx: number, q: st
     }
     i += 1
   }
-  if (count >= 2) {
-    if (count % 2 !== 0) return false
-    const m2 = /^[ \t]+\\(["'])[^\s"'`,;)}\]]/.exec(text.slice(quoteIdx + 2, lineStop))
-    if (count === 2 && m2 && m2[1] === q) return false
-    return true
+  const rem = count === 1 ? 0 : count === 2 ? 1 : count % 2 === 1 ? 2 : 3
+  return evalQuoteRemainder(text, quoteIdx + 2, lineStop, q, true, rem)
+}
+
+type LineQuoteTable = { lineStart: number; lineStop: number; s1: Uint8Array }
+
+function buildUnescapedLineTable(text: string, lineStart: number, lineStop: number, q: string): LineQuoteTable {
+  const len = lineStop - lineStart
+  const s0 = new Uint8Array(len + 1)
+  const s1 = new Uint8Array(len + 1)
+  const s2 = q === "'" ? new Uint8Array(len + 1) : undefined
+  for (let i = lineStop - 1; i >= lineStart; i -= 1) {
+    const idx = i - lineStart
+    const ch = text[i] as string
+    const next = i + 1 < lineStop ? (text[i + 1] as string) : ''
+    if (q !== "'" && ch === '\\' && (next === '\\' || next === q)) {
+      s1[idx] = s1[idx + 2] as number
+    } else if (ch === q) {
+      s1[idx] = addQuoteParity(s0[idx + 1] as number)
+    } else {
+      s1[idx] = s1[idx + 1] as number
+    }
+    if (s2 !== undefined) {
+      if (ch === '\\' && (next === '\\' || next === "'")) {
+        s2[idx] = s2[idx + 2] as number
+      } else if (ch === "'") {
+        s2[idx] = addQuoteParity(s0[idx + 1] as number)
+      } else {
+        s2[idx] = s2[idx + 1] as number
+      }
+    }
+    if (isHashCommentStart(text, i) || isSlashCommentStart(text, i)) {
+      s0[idx] = 0
+    } else if (ch === '\\' && (next === '\\' || next === '"' || next === "'" || next === '`' || next === '$')) {
+      s0[idx] = s0[idx + 2] as number
+    } else if (q === "'" && ch === '$' && next === "'") {
+      s0[idx] = addQuoteParity(s2![idx + 2] as number)
+    } else if (ch === q && !(q === "'" && isNonQuoteSingleQuote(text, i))) {
+      s0[idx] = addQuoteParity(s1[idx + 1] as number)
+    } else {
+      s0[idx] = s0[idx + 1] as number
+    }
   }
-  return quoteIdx + 2 < lineStop && !/^[\s.,;:!?)}\]'"`]/.test(text[quoteIdx + 2] as string)
+  return { lineStart, lineStop, s1 }
+}
+
+function buildEscapedLineTable(text: string, lineStart: number, lineStop: number, q: string): LineQuoteTable {
+  const len = lineStop - lineStart
+  const s1 = new Uint8Array(len + 1)
+  for (let i = lineStop - 1; i >= lineStart; i -= 1) {
+    const idx = i - lineStart
+    if (text[i] === '\\' && i + 1 < lineStop) {
+      const next = text[i + 1] as string
+      if (next === q) s1[idx] = addQuoteParity(s1[idx + 2] as number)
+      else if (next === '\\') s1[idx] = s1[idx + 2] as number
+      else s1[idx] = s1[idx + 1] as number
+    } else {
+      s1[idx] = s1[idx + 1] as number
+    }
+  }
+  return { lineStart, lineStop, s1 }
 }
 
 const AUTH_SCHEME_RE = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=-]{4,})/gi
 const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t\u00a0]*[:=]\s*(?:\\*["'])?$/i
 const CAMEL_CASE_KEY_RE = /^[a-z]+(?:[A-Z][a-z]+)+$/
 const LOWER_WORD_KEY_RE = /^[a-z]+$/
+const STRUCTURED_CONFIG_KEY_RE = /^(?:[A-Z][A-Z0-9_]*_[A-Z0-9_]*|[a-z]+(?:[_.-][a-z]+)+|[A-Z][a-z]+(?:[A-Z][a-z]+)+)$/
+const DIAGNOSTIC_SINGLE_WORD_RE =
+  /^(?:unauthorized|forbidden|expired|rejected|denied|failed|invalid|missing|revoked|malformed|unauthenticated|unavailable|blocked|disabled|error|invalid_token|invalid_request|invalid_grant|access_denied|unauthorized_client|insufficient_scope|server_error)(?=$|[\s.,;:!?)\]}'"])/i
+const DIAGNOSTIC_PROSE_RE = /^(?:[A-Za-z]{2,}(?:[ \t]+[A-Za-z]{2,})+|(?:HTTP(?:\/[\d.]+)?[ \t]+)?(?:4\d\d|5\d\d)(?:[ \t]+[A-Za-z]+)*)(?=$|[\s.,;:!?)\]}'"])/
 const ASSIGN_RHS_VAR_RE = /^\$(?:[A-Za-z_({'"$])/
 const ASSIGN_RHS_REDACTED_RE = /^\[REDACTED(?::[a-z-]+)?\](?:$|[\s,;:|)&'"`\].!?])/
 const ASSIGN_RHS_PUNCT_RE = /^(?:[@#%^*({[]|[!?:&](?!$|[\s'")\]},;!?])|\\(?:\\|\$|[^nrt"'\\]))/
+
+const isDiagnosticColonRhs = (rhs: string, keyName: string): boolean => {
+  if (/^(?:["'`\$]|\\["']|\[REDACTED(?::[a-z-]+)?\])/.test(rhs)) return false
+  if (DIAGNOSTIC_PROSE_RE.test(rhs) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhs)) return true
+  if (!STRUCTURED_CONFIG_KEY_RE.test(keyName) && /^[a-z]{3,}(?=$|[\s.,;:!?)\]}'"])/.test(rhs)) return true
+  return false
+}
+
+type QuoteContext = {
+  activeQuote: string
+  innerQuote: string
+  activeEscapedQuote: string
+  inComment: boolean
+  commentQuote: string
+  commentEscapedQuote: string
+}
+
+const toggleEscapedQuote = (cur: string, q: string): string => (cur === q ? '' : cur === '' ? q : cur)
 
 function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
   if (!/bearer|basic/i.test(text)) return text
@@ -696,49 +810,305 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
   let quotePos = 0
   let activeQuote = ''
   let ansiSingle = false
-  let cachedNl = -2
-  let cachedCr = -2
-  const nextLineBreakAfter = (pos: number): number => {
-    if (cachedNl !== -1 && cachedNl < pos) cachedNl = text.indexOf('\n', pos)
-    if (cachedCr !== -1 && cachedCr < pos) cachedCr = text.indexOf('\r', pos)
-    if (cachedNl === -1) return cachedCr
-    if (cachedCr === -1) return cachedNl
-    return Math.min(cachedNl, cachedCr)
+  let activeEscapedQuote = ''
+  let innerQuote = ''
+  let innerAnsiSingle = false
+  let inComment = false
+  let commentLineBreak = -1
+  let commentQuote = ''
+  let commentAnsiSingle = false
+  let commentEscapedQuote = ''
+  const hasNl = text.includes('\n')
+  const hasCr = text.includes('\r')
+  let cachedQuoteNl = hasNl ? -2 : -1
+  let cachedQuoteCr = hasCr ? -2 : -1
+  // Strictly monotonic helper for quoteAt only (quotePos never rewinds).
+  const quoteNextLineBreakAfter = (pos: number): number => {
+    if (cachedQuoteNl !== -1 && cachedQuoteNl < pos) cachedQuoteNl = text.indexOf('\n', pos)
+    if (cachedQuoteCr !== -1 && cachedQuoteCr < pos) cachedQuoteCr = text.indexOf('\r', pos)
+    if (cachedQuoteNl === -1) return cachedQuoteCr
+    if (cachedQuoteCr === -1) return cachedQuoteNl
+    return Math.min(cachedQuoteNl, cachedQuoteCr)
   }
-  const quoteAt = (target: number): string => {
+  const lineTables = new Map<string, LineQuoteTable>()
+  let lastLineQueryPos = -1
+  let cachedLineNl = hasNl ? -2 : -1
+  let cachedLineCr = hasCr ? -2 : -1
+  let cachedBoundsLineStop = -1
+  let cachedBoundsLineStart = -1
+  const lineStartFor = (pos: number): number => {
+    let i = pos
+    while (i > 0) {
+      const c = text.charCodeAt(i - 1)
+      if (c === 10 || c === 13) break
+      i -= 1
+    }
+    return i
+  }
+  const lineStopFor = (pos: number): number => {
+    if (pos < lastLineQueryPos) {
+      cachedLineNl = hasNl ? text.indexOf('\n', pos) : -1
+      cachedLineCr = hasCr ? text.indexOf('\r', pos) : -1
+    } else {
+      if (cachedLineNl !== -1 && cachedLineNl < pos) cachedLineNl = text.indexOf('\n', pos)
+      if (cachedLineCr !== -1 && cachedLineCr < pos) cachedLineCr = text.indexOf('\r', pos)
+    }
+    lastLineQueryPos = pos
+    const lb =
+      cachedLineNl === -1
+        ? cachedLineCr
+        : cachedLineCr === -1
+          ? cachedLineNl
+          : Math.min(cachedLineNl, cachedLineCr)
+    return lb === -1 ? text.length : lb
+  }
+  const opensUnescapedFast = (quoteIdx: number, q: string): boolean => {
+    const afterStart = quoteIdx + 1
+    if (q === '`' && text[afterStart] === '`') return false
+    const lineStop = lineStopFor(afterStart)
+    if (lineStop - quoteIdx <= 256) return opensQuotedAssignmentValue(text, quoteIdx, q, lineStop)
+    const cacheKey = `u:${q}`
+    let tbl = lineTables.get(cacheKey)
+    if (tbl === undefined || tbl.lineStop !== lineStop) {
+      if (cachedBoundsLineStop !== lineStop) {
+        cachedBoundsLineStop = lineStop
+        cachedBoundsLineStart = lineStartFor(quoteIdx)
+      }
+      tbl = buildUnescapedLineTable(text, cachedBoundsLineStart, lineStop, q)
+      lineTables.set(cacheKey, tbl)
+    }
+    const rem = afterStart >= lineStop ? 0 : (tbl.s1[afterStart - tbl.lineStart] as number)
+    return evalQuoteRemainder(text, afterStart, lineStop, q, false, rem)
+  }
+  const opensEscapedFast = (quoteIdx: number, q: string): boolean => {
+    const afterStart = quoteIdx + 2
+    const lineStop = lineStopFor(afterStart)
+    if (lineStop - quoteIdx <= 256) return opensEscapedQuotedAssignmentValue(text, quoteIdx, q, lineStop)
+    const cacheKey = `e:${q}`
+    let tbl = lineTables.get(cacheKey)
+    if (tbl === undefined || tbl.lineStop !== lineStop) {
+      if (cachedBoundsLineStop !== lineStop) {
+        cachedBoundsLineStop = lineStop
+        cachedBoundsLineStart = lineStartFor(quoteIdx)
+      }
+      tbl = buildEscapedLineTable(text, cachedBoundsLineStart, lineStop, q)
+      lineTables.set(cacheKey, tbl)
+    }
+    const rem = afterStart >= lineStop ? 0 : (tbl.s1[afterStart - tbl.lineStart] as number)
+    return evalQuoteRemainder(text, afterStart, lineStop, q, true, rem)
+  }
+  const quoteAt = (target: number): QuoteContext => {
     while (quotePos < target) {
       const ch = text[quotePos] as string
-      if (activeQuote !== '') {
-        if ((activeQuote !== "'" || ansiSingle) && ch === '\\') {
-          const next = text[quotePos + 1]
-          if (next === '\\' || next === activeQuote) {
+      if (inComment) {
+        if (commentLineBreak !== -1 && commentLineBreak < target) {
+          quotePos =
+            text[commentLineBreak] === '\r' && text[commentLineBreak + 1] === '\n'
+              ? commentLineBreak + 2
+              : commentLineBreak + 1
+          inComment = false
+          commentLineBreak = -1
+          commentQuote = ''
+          commentAnsiSingle = false
+          commentEscapedQuote = ''
+          activeEscapedQuote = ''
+          continue
+        }
+        const next = text[quotePos + 1]
+        if (commentQuote !== '') {
+          if ((commentQuote !== "'" || commentAnsiSingle) && ch === '\\') {
+            if (next === '\\' || next === commentQuote) {
+              quotePos += 2
+              continue
+            }
+            if (next === '"' || next === "'") {
+              commentEscapedQuote = toggleEscapedQuote(commentEscapedQuote, next)
+              quotePos += 2
+              continue
+            }
+          } else if (commentQuote === "'" && !commentAnsiSingle && ch === '\\' && next === '"') {
+            commentEscapedQuote = toggleEscapedQuote(commentEscapedQuote, '"')
             quotePos += 2
             continue
           }
+          if (ch === commentQuote) {
+            commentQuote = ''
+            commentAnsiSingle = false
+            commentEscapedQuote = ''
+          }
+          quotePos += 1
+          continue
         }
-        if (ch === activeQuote) {
-          activeQuote = ''
-          ansiSingle = false
+        if (ch === '\\') {
+          if (next === '"' || next === "'") {
+            commentEscapedQuote = toggleEscapedQuote(commentEscapedQuote, next)
+            quotePos += 2
+            continue
+          }
+          if (quotePos + 1 < target && (next === '\\' || next === '`' || next === '$')) {
+            quotePos += 2
+            continue
+          }
+          quotePos += 1
+          continue
+        }
+        if (ch === '$' && next === "'") {
+          commentQuote = "'"
+          commentAnsiSingle = true
+          quotePos += 2
+          continue
+        }
+        if (ch === '"') {
+          commentQuote = '"'
+          quotePos += 1
+          continue
+        }
+        if (ch === "'") {
+          if (!isNonQuoteSingleQuote(text, quotePos)) commentQuote = "'"
+          quotePos += 1
+          continue
+        }
+        if (ch === '`') {
+          let runLen = 1
+          while (quotePos + runLen < target && text[quotePos + runLen] === '`') runLen += 1
+          if (runLen === 1) commentQuote = '`'
+          quotePos += runLen
+          continue
         }
         quotePos += 1
         continue
       }
+      if (activeQuote !== '') {
+        const next = text[quotePos + 1]
+        if (innerQuote !== '') {
+          if ((innerQuote !== "'" || innerAnsiSingle) && ch === '\\') {
+            if (next === '\\' || next === innerQuote) {
+              quotePos += 2
+              continue
+            }
+            if ((next === '"' || next === "'") && next !== innerQuote) {
+              activeEscapedQuote = toggleEscapedQuote(activeEscapedQuote, next)
+              quotePos += 2
+              continue
+            }
+          } else if (innerQuote === "'" && !innerAnsiSingle && ch === '\\' && next === '"') {
+            activeEscapedQuote = toggleEscapedQuote(activeEscapedQuote, '"')
+            quotePos += 2
+            continue
+          }
+          if (ch === activeQuote) {
+            activeQuote = ''
+            ansiSingle = false
+            activeEscapedQuote = ''
+            innerQuote = ''
+            innerAnsiSingle = false
+            quotePos += 1
+            continue
+          }
+          if (ch === innerQuote) {
+            innerQuote = ''
+            innerAnsiSingle = false
+            quotePos += 1
+            continue
+          }
+          quotePos += 1
+          continue
+        }
+        if ((activeQuote !== "'" || ansiSingle) && ch === '\\') {
+          if (next === '\\') {
+            quotePos += 2
+            continue
+          }
+          if (next === '"' || next === "'") {
+            activeEscapedQuote = toggleEscapedQuote(activeEscapedQuote, next)
+            quotePos += 2
+            continue
+          }
+        } else if (activeQuote === "'" && !ansiSingle && ch === '\\' && next === '"') {
+          activeEscapedQuote = toggleEscapedQuote(activeEscapedQuote, '"')
+          quotePos += 2
+          continue
+        }
+        if (ch === activeQuote) {
+          activeQuote = ''
+          ansiSingle = false
+          activeEscapedQuote = ''
+          innerQuote = ''
+          innerAnsiSingle = false
+          quotePos += 1
+          continue
+        }
+        if (activeEscapedQuote === '') {
+          if (ch === '$' && next === "'" && activeQuote !== "'") {
+            innerQuote = "'"
+            innerAnsiSingle = true
+            quotePos += 2
+            continue
+          }
+          if (ch === '"' && activeQuote !== '"') {
+            innerQuote = '"'
+            quotePos += 1
+            continue
+          }
+          if (ch === "'" && activeQuote !== "'") {
+            if (!isNonQuoteSingleQuote(text, quotePos)) innerQuote = "'"
+            quotePos += 1
+            continue
+          }
+          if (ch === '`' && activeQuote !== '`') {
+            let runLen = 1
+            while (quotePos + runLen < target && text[quotePos + runLen] === '`') runLen += 1
+            if (runLen === 1) innerQuote = '`'
+            quotePos += runLen
+            continue
+          }
+        }
+        quotePos += 1
+        continue
+      }
+      if (ch === '\n' || ch === '\r') {
+        activeEscapedQuote = ''
+        quotePos += 1
+        continue
+      }
       if (isHashCommentStart(text, quotePos)) {
-        const lb = nextLineBreakAfter(quotePos + 1)
-        quotePos = lb === -1 ? text.length : text[lb] === '\r' && text[lb + 1] === '\n' ? lb + 2 : lb + 1
+        const lb = quoteNextLineBreakAfter(quotePos + 1)
+        if (lb !== -1 && lb < target) {
+          quotePos = text[lb] === '\r' && text[lb + 1] === '\n' ? lb + 2 : lb + 1
+          activeEscapedQuote = ''
+          continue
+        }
+        inComment = true
+        commentLineBreak = lb
+        commentQuote = ''
+        commentAnsiSingle = false
+        commentEscapedQuote = ''
+        quotePos += 1
         continue
       }
       if (isSlashCommentStart(text, quotePos)) {
-        const lb = nextLineBreakAfter(quotePos + 2)
-        quotePos = lb === -1 ? text.length : text[lb] === '\r' && text[lb + 1] === '\n' ? lb + 2 : lb + 1
+        const lb = quoteNextLineBreakAfter(quotePos + 2)
+        if (lb !== -1 && lb < target) {
+          quotePos = text[lb] === '\r' && text[lb + 1] === '\n' ? lb + 2 : lb + 1
+          activeEscapedQuote = ''
+          continue
+        }
+        inComment = true
+        commentLineBreak = lb
+        commentQuote = ''
+        commentAnsiSingle = false
+        commentEscapedQuote = ''
+        quotePos += 2
         continue
       }
       if (ch === '\\') {
         const next = text[quotePos + 1]
-        if (
-          quotePos + 1 < target &&
-          (next === '\\' || next === '"' || next === "'" || next === '`' || next === '$' || next === '#' || next === '/')
-        ) {
+        if (quotePos + 1 < target && (next === '"' || next === "'")) {
+          activeEscapedQuote = toggleEscapedQuote(activeEscapedQuote, next)
+          quotePos += 2
+          continue
+        }
+        if (quotePos + 1 < target && (next === '\\' || next === '`' || next === '$' || next === '#' || next === '/')) {
           quotePos += 2
           continue
         }
@@ -748,29 +1118,76 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
       if (ch === '$' && text[quotePos + 1] === "'") {
         activeQuote = "'"
         ansiSingle = true
+        activeEscapedQuote = ''
+        innerQuote = ''
+        innerAnsiSingle = false
         quotePos += 2
         continue
       }
       if (ch === '"') {
         activeQuote = '"'
+        activeEscapedQuote = ''
+        innerQuote = ''
+        innerAnsiSingle = false
         quotePos += 1
         continue
       }
       if (ch === "'") {
-        if (!isNonQuoteSingleQuote(text, quotePos)) activeQuote = "'"
+        if (!isNonQuoteSingleQuote(text, quotePos)) {
+          activeQuote = "'"
+          activeEscapedQuote = ''
+          innerQuote = ''
+          innerAnsiSingle = false
+        }
         quotePos += 1
         continue
       }
       if (ch === '`') {
         let runLen = 1
         while (quotePos + runLen < target && text[quotePos + runLen] === '`') runLen += 1
-        if (runLen === 1) activeQuote = '`'
+        if (runLen === 1) {
+          activeQuote = '`'
+          activeEscapedQuote = ''
+          innerQuote = ''
+          innerAnsiSingle = false
+        }
         quotePos += runLen
         continue
       }
       quotePos += 1
     }
-    return activeQuote
+    return { activeQuote, innerQuote, activeEscapedQuote, inComment, commentQuote, commentEscapedQuote }
+  }
+  const isOpeningUnescapedQuote = (
+    quoteIdx: number,
+    q: string,
+    qState: QuoteContext,
+    token: string,
+    isLowerWordKey: boolean,
+  ): boolean => {
+    const outerQuote = qState.inComment ? '' : qState.activeQuote
+    if (outerQuote === q) return false
+    const nextAfter = text[quoteIdx + 1]
+    if (isBase64PaddedToken(token) && !isLowerWordKey && isDelimOrSpaceAfterQuote(nextAfter)) return false
+    const openSameOrInner = qState.inComment ? qState.commentQuote : qState.innerQuote
+    if (openSameOrInner === q && isDelimOrSpaceAfterQuote(nextAfter)) return false
+    return opensUnescapedFast(quoteIdx, q)
+  }
+  const isOpeningEscapedQuote = (
+    quoteIdx: number,
+    q: string,
+    qState: QuoteContext,
+    token: string,
+    isLowerWordKey: boolean,
+  ): boolean => {
+    const nextAfter = text[quoteIdx + 2]
+    if (isBase64PaddedToken(token) && !isLowerWordKey && isDelimOrSpaceAfterQuote(nextAfter)) return false
+    const openEsc = qState.inComment ? qState.commentEscapedQuote : qState.activeEscapedQuote
+    if (openEsc === q) {
+      const outer = qState.inComment ? '' : qState.activeQuote
+      if (isDelimOrSpaceAfterQuote(nextAfter) || (outer === '' && nextAfter === '\\')) return false
+    }
+    return opensEscapedFast(quoteIdx, q)
   }
   for (let m = AUTH_SCHEME_RE.exec(text); m !== null; m = AUTH_SCHEME_RE.exec(text)) {
     const scheme = m[1] as string
@@ -790,21 +1207,25 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
       const eqIdx = token.indexOf('=')
       const rawKeyPart = eqIdx > 0 ? token.slice(0, eqIdx) : ''
       const isPlainAssignKey = eqIdx > 0 && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(rawKeyPart)
+      const flagStripped = rawKeyPart.startsWith('--') ? rawKeyPart.slice(2) : rawKeyPart.startsWith('-') ? rawKeyPart.slice(1) : ''
+      const isDoubleFlag = rawKeyPart.startsWith('--')
       const isFlagAssignKey =
         !isPlainAssignKey &&
-        eqIdx > 2 &&
-        rawKeyPart.startsWith('--') &&
-        /^[A-Za-z][A-Za-z0-9_.-]*$/.test(rawKeyPart.slice(2)) &&
-        isSensitiveKey(rawKeyPart.slice(2))
+        flagStripped !== '' &&
+        /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(flagStripped) &&
+        isSensitiveKey(flagStripped)
       const isAssignKey = isPlainAssignKey || isFlagAssignKey
-      const assignKey = isFlagAssignKey ? rawKeyPart.slice(2) : rawKeyPart
+      const assignKey = isFlagAssignKey ? flagStripped : rawKeyPart
       const isLowerWordKey = isAssignKey && LOWER_WORD_KEY_RE.test(assignKey)
       const isEmptyAssignIdentifier =
         isAssignKey &&
-        (isFlagAssignKey ||
+        ((isFlagAssignKey && isDoubleFlag) ||
           ALL_CAPS_SNAKE_KEY_RE.test(assignKey) ||
           LOWER_SNAKE_KEY_RE.test(assignKey) ||
           CAMEL_CASE_KEY_RE.test(assignKey))
+      const endsWithEq = isAssignKey && eqIdx === token.length - 1
+      const endsWithDoubleEq = isAssignKey && eqIdx === token.length - 2 && token[eqIdx + 1] === '='
+      const isEqPaddedEnd = endsWithEq || endsWithDoubleEq
 
       if (hasNewline) {
         if (/^[ \t\u00a0]*[:=]/.test(after) && (!isBase64PaddedToken(token) || isEmptyAssignIdentifier || isLowerWordKey)) {
@@ -812,48 +1233,108 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
           continue
         }
         if (isAssignKey) {
-          if (eqIdx < token.length - 1) {
+          if (!isEqPaddedEnd) {
             const safeAfter =
               after === '' ||
               /^(?:[\s),;}\]"'`]|[:.!?](?:$|[\s'")\]},;])|\$(?:$|[\s),;}\]"'`]))/.test(after) ||
               ((after.startsWith('\\"') || after.startsWith("\\'"))
-                ? !opensEscapedQuotedAssignmentValue(text, matchEnd, after[1] as string)
+                ? !opensEscapedFast(matchEnd, after[1] as string)
                 : /^\\[nrt]/.test(after))
             if (!isBase64PaddedToken(token) || isEmptyAssignIdentifier || token[eqIdx + 1] === '~' || !safeAfter) {
               rewind()
               continue
             }
           } else {
+            const qState = quoteAt(m.index)
             const hasAssignRhsInAfter = (): boolean =>
               ASSIGN_RHS_VAR_RE.test(after) ||
               ASSIGN_RHS_REDACTED_RE.test(after) ||
               ((after[0] === '"' || after[0] === "'" || after[0] === '`') &&
-                quoteAt(m.index) !== after[0] &&
-                opensQuotedAssignmentValue(text, matchEnd, after[0])) ||
+                isOpeningUnescapedQuote(matchEnd, after[0], qState, token, isLowerWordKey)) ||
               (after.startsWith('\\"') || after.startsWith("\\'")
-                ? opensEscapedQuotedAssignmentValue(text, matchEnd, after[1] as string)
+                ? isOpeningEscapedQuote(matchEnd, after[1] as string, qState, token, isLowerWordKey)
                 : ASSIGN_RHS_PUNCT_RE.test(after))
-            if (
-              isEmptyAssignIdentifier ||
-              (isLowerWordKey && (after === '' || /^[\s#]/.test(after))) ||
-              (!isBase64PaddedToken(token) && !isSensitiveKey(assignKey)) ||
-              hasAssignRhsInAfter()
-            ) {
-              rewind()
-              continue
+            if (endsWithDoubleEq) {
+              if (hasAssignRhsInAfter()) {
+                rewind()
+                continue
+              }
+            } else {
+              const closedByEnclosingQuote =
+                isBase64PaddedToken(token) &&
+                !isLowerWordKey &&
+                !/=\s*$/.test(before) &&
+                !hasAssignRhsInAfter() &&
+                ((!qState.inComment && qState.activeQuote !== '' && after[0] === qState.activeQuote) ||
+                  (!qState.inComment &&
+                    qState.innerQuote !== '' &&
+                    after[0] === qState.innerQuote &&
+                    isDelimOrSpaceAfterQuote(after[1])) ||
+                  ((qState.inComment ? qState.commentEscapedQuote : qState.activeEscapedQuote) !== '' &&
+                    after.startsWith('\\' + (qState.inComment ? qState.commentEscapedQuote : qState.activeEscapedQuote)) &&
+                    (isDelimOrSpaceAfterQuote(after[2]) ||
+                      (!qState.inComment && qState.activeQuote === '' && after[2] === '\\'))))
+              if (
+                (isEmptyAssignIdentifier && !closedByEnclosingQuote) ||
+                (isLowerWordKey && (after === '' || /^[\s#]/.test(after))) ||
+                (!isBase64PaddedToken(token) && !isSensitiveKey(assignKey)) ||
+                hasAssignRhsInAfter()
+              ) {
+                rewind()
+                continue
+              }
             }
           }
         }
-      } else if (isAssignKey && (isEmptyAssignIdentifier || isLowerWordKey) && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
-        if (eqIdx === token.length - 1) {
+      } else if (eqIdx === -1) {
+        const keyCand = token.startsWith('--') ? token.slice(2) : token.startsWith('-') ? token.slice(1) : token
+        if (
+          keyCand.length <= 100 &&
+          /^[A-Za-z_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$/.test(keyCand) &&
+          isSensitiveKey(keyCand)
+        ) {
+          const afterLine = text.slice(matchEnd, Math.min(text.length, matchEnd + 96))
+          const spacedEq = /^[ \t\u00a0]+=(?!=)[ \t\u00a0]*\S/.test(afterLine)
+          const colonMatch = /^[ \t\u00a0]*:(?!:)[ \t\u00a0]*(\S[^\r\n]*)/.exec(afterLine)
+          if (spacedEq || (colonMatch !== null && !isDiagnosticColonRhs(colonMatch[1] as string, keyCand))) {
+            rewind()
+            continue
+          }
+        }
+      } else if (isAssignKey && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
+        if (isEqPaddedEnd) {
+          const qState = quoteAt(m.index)
           const singleAssignRhs =
             ASSIGN_RHS_VAR_RE.test(after) ||
             ASSIGN_RHS_REDACTED_RE.test(after) ||
-            ((after[0] === '"' || after[0] === "'" || after[0] === '`') && quoteAt(m.index) !== after[0]) ||
-            after.startsWith('\\"') ||
-            after.startsWith("\\'") ||
-            ASSIGN_RHS_PUNCT_RE.test(after)
-          if (singleAssignRhs) {
+            ((after[0] === '"' || after[0] === "'" || after[0] === '`') &&
+              isOpeningUnescapedQuote(matchEnd, after[0], qState, token, isLowerWordKey)) ||
+            (after.startsWith('\\"') || after.startsWith("\\'")
+              ? isOpeningEscapedQuote(matchEnd, after[1] as string, qState, token, isLowerWordKey)
+              : ASSIGN_RHS_PUNCT_RE.test(after))
+          const spaceBeforeQuoteRhs =
+            !isBase64PaddedToken(token) &&
+            /^[ \t]+["'$\\]/.test(after) &&
+            (() => {
+              let sp = 1
+              while (sp < after.length && (after[sp] === ' ' || after[sp] === '\t')) sp += 1
+              const qIdx = matchEnd + sp
+              const ch = text[qIdx]
+              if (ch === '"' || ch === "'" || ch === '`') {
+                return isOpeningUnescapedQuote(qIdx, ch, qState, token, isLowerWordKey)
+              }
+              if (ch === '\\' && (text[qIdx + 1] === '"' || text[qIdx + 1] === "'")) {
+                return isOpeningEscapedQuote(qIdx, text[qIdx + 1] as string, qState, token, isLowerWordKey)
+              }
+              return /^\$(?:[A-Za-z_({'"$])/.test(after.slice(sp))
+            })()
+          const emptyNonPaddedEnv =
+            !endsWithDoubleEq &&
+            !isBase64PaddedToken(token) &&
+            isEmptyAssignIdentifier &&
+            (qState.inComment || qState.activeQuote === '') &&
+            (after === '' || /^[\s#]/.test(after))
+          if (singleAssignRhs || spaceBeforeQuoteRhs || emptyNonPaddedEnv) {
             rewind()
             continue
           }

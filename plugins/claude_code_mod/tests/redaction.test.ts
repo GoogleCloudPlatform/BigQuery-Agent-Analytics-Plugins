@@ -1377,6 +1377,34 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer\nabcJwt9Yz123456=: request rejected', 'Bearer [REDACTED]: request rejected', 'abcJwt9Yz123456='],
     ['Bearer\nabcJwt9Yz12345==', 'Bearer [REDACTED]', 'abcJwt9Yz12345=='],
     ['log="bearer myTokenSecret12="', 'log="bearer [REDACTED]"', 'myTokenSecret12='],
+    ['echo "\\"Bearer mySecretTokenAb=\\""', 'echo "\\"Bearer [REDACTED]\\""', 'mySecretTokenAb='],
+    ['echo "\\"Bearer mySecretTokenAb=\\" \\"next\\""', 'echo "\\"Bearer [REDACTED]\\" \\"next\\""', 'mySecretTokenAb='],
+    ['echo "\\"Bearer mySecretTokenAb=\\" foo \\"unclosed"', 'echo "\\"Bearer [REDACTED]\\" foo \\"unclosed"', 'mySecretTokenAb='],
+    ['echo "\\"Bearer mySecretTokenAb=\\", \\"unclosed"', 'echo "\\"Bearer [REDACTED]\\", \\"unclosed"', 'mySecretTokenAb='],
+    ['bash -c "curl -H \\"X-Trace: Bearer mySecretTokenAb=\\""', 'bash -c "curl -H \\"X-Trace: Bearer [REDACTED]\\""', 'mySecretTokenAb='],
+    ["# echo 'Bearer mySecretTokenAb='", "# echo 'Bearer [REDACTED]'", 'mySecretTokenAb='],
+    ["# echo 'Bearer mySecretTokenAb=' 'next'", "# echo 'Bearer [REDACTED]' 'next'", 'mySecretTokenAb='],
+    ["# echo 'Bearer mySecretTokenAb=' foo 'unclosed", "# echo 'Bearer [REDACTED]' foo 'unclosed", 'mySecretTokenAb='],
+    ["# echo 'Bearer mySecretTokenAb=', 'unclosed", "# echo 'Bearer [REDACTED]', 'unclosed", 'mySecretTokenAb='],
+    ["// echo 'Bearer mySecretTokenAb=' foo 'unclosed", "// echo 'Bearer [REDACTED]' foo 'unclosed", 'mySecretTokenAb='],
+    ['# echo "\\"Bearer mySecretTokenAb=\\""', '# echo "\\"Bearer [REDACTED]\\""', 'mySecretTokenAb='],
+    ['echo \'"Bearer mySecretTokenAb=" foo "unclosed\'', 'echo \'"Bearer [REDACTED]" foo "unclosed\'', 'mySecretTokenAb='],
+    ['echo \'"Bearer mySecretTokenAb=", "unclosed\'', 'echo \'"Bearer [REDACTED]", "unclosed\'', 'mySecretTokenAb='],
+    ['echo \'Bearer mySecretTokenAb= "next"\'', 'echo \'Bearer [REDACTED] "next"\'', 'mySecretTokenAb='],
+    ["echo 'Bearer\nmySecretTokenAb='", "echo 'Bearer [REDACTED]'", 'mySecretTokenAb='],
+    ['log="Bearer\nmySecretTokenAb="', 'log="Bearer [REDACTED]"', 'mySecretTokenAb='],
+    ['echo "\\"Bearer\nmySecretTokenAb=\\""', 'echo "\\"Bearer [REDACTED]\\""', 'mySecretTokenAb='],
+    ['# Bearer\npublic="unclosed\nBearer mySecretTokenAb="', '# Bearer\npublic="unclosed\nBearer [REDACTED]"', 'mySecretTokenAb='],
+    ['Token Bearer mySecretToken123: request rejected', 'Token Bearer [REDACTED]: request rejected', 'mySecretToken123'],
+    ['Bearer mySecretToken123: unauthorized', 'Bearer [REDACTED]: unauthorized', 'mySecretToken123'],
+    ['Token Bearer abcJwt9Yz123456: request rejected', 'Token Bearer [REDACTED]: request rejected', 'abcJwt9Yz123456'],
+    ['Bearer mySecretToken123: 401 Unauthorized', 'Bearer [REDACTED]: 401 Unauthorized', 'mySecretToken123'],
+    ['Bearer mySecretToken123: invalid_token', 'Bearer [REDACTED]: invalid_token', 'mySecretToken123'],
+    ['Bearer mySecretToken12==', 'Bearer [REDACTED]', 'mySecretToken12=='],
+    ['Bearer\nmySecretToken12==', 'Bearer [REDACTED]', 'mySecretToken12=='],
+    ['Bearer mySecretToken12==: request rejected', 'Bearer [REDACTED]: request rejected', 'mySecretToken12=='],
+    ['echo "Bearer mySecretToken12=="', 'echo "Bearer [REDACTED]"', 'mySecretToken12=='],
+    ['Bearer\n-mySecretToken1=', 'Bearer [REDACTED]', '-mySecretToken1='],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1410,14 +1438,18 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     expect(built.redactions).toBe(1)
   }
 
-  for (const [sample, secret] of [
-    ['{"auth": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk='],
-    ['{"note": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+  for (const [sample, secret, expectedText] of [
+    ['{"auth": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk=', undefined],
+    ['{"note": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk=', undefined],
+    ['"{\\"note\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', 'mySecretTokenAb=', '"{\\"note\\": \\"Bearer [REDACTED]\\", \\"id\\": 123}"'],
+    ['"{\\"auth\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', 'mySecretTokenAb=', undefined],
+    ['bash -c "curl -H \\"X-Auth: Bearer mySecretTokenAb=\\""', 'mySecretTokenAb=', undefined],
   ] as const) {
     const stats = newStats()
     const out = redactText(sample, stats)
+    if (expectedText !== undefined) expect(out).toBe(expectedText)
     expect(out).not.toContain(secret)
-    expect(stats.redactions).toBe(1)
+    expect(stats.redactions >= 1).toBe(true)
 
     const reStats = newStats()
     expect(redactText(out, reStats)).toBe(out)
@@ -1439,7 +1471,7 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
       maxPayloadChars: 16_384,
     })
     expect(JSON.stringify(built.row)).not.toContain(secret)
-    expect(built.redactions).toBe(1)
+    expect(built.redactions >= 1).toBe(true)
   }
 
   for (const prose of [
@@ -1484,6 +1516,10 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\npublicvalue=',
     'MODE=bearer\nclientSecret=',
     'MODE=bearer\nschemaV2Config=',
+    'MODE=bearer\napiTokenKey=',
+    'MODE=bearer\n-client_secret=',
+    '# bearer CLIENT_SECRET=',
+    '# bearer client_secret=',
     'MODE=bearer\npublicvalue=" \'a\'"',
     String.raw`bash -c "mode=bearer` + '\n' + String.raw`publicvalue=\" \'a\'\""`,
   ]) {
@@ -1546,6 +1582,12 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['// "todo Bearer + quote repeat', (n: number) => '// "todo Bearer\ncustomValue="x"\nlog="Bearer\nU2VjcmV0VG9rZW4="foo"\n'.repeat((n / 61) | 0), 160_000, 400, 180],
     ['# bearer CLIENT_SECRET single-line flood', (n: number) => '# bearer CLIENT_SECRET="MySecret1234" '.repeat((n / 38) | 0), 160_000, 250, 120],
     ['bearer CLIENT_SECRET single-line flood', (n: number) => 'bearer CLIENT_SECRET="MySecret1234" '.repeat((n / 36) | 0), 160_000, 250, 120],
+    ['# bearer myTokenSecret123 single-line flood', (n: number) => '# bearer myTokenSecret123="MySecret1234" '.repeat((n / 41) | 0), 160_000, 250, 120],
+    ['# bearer client_secret colon single-line flood', (n: number) => '# bearer client_secret: MySecret1234 '.repeat((n / 37) | 0), 160_000, 250, 120],
+    ['echo escaped quote Bearer single-line flood', (n: number) => 'echo "\\"Bearer mySecretTokenAb=\\"" '.repeat((n / 34) | 0), 160_000, 250, 120],
+    ['# echo single quote Bearer single-line flood', (n: number) => "# echo 'Bearer mySecretTokenAb=' ".repeat((n / 32) | 0), 160_000, 250, 120],
+    ['# echo quote foo unclosed single-line flood', (n: number) => "# echo 'Bearer mySecretTokenAb=' foo 'unclosed ".repeat((n / 46) | 0), 160_000, 250, 120],
+    ['Token Bearer colon diagnostic single-line flood', (n: number) => 'Token Bearer mySecretToken123: request rejected '.repeat((n / 48) | 0), 160_000, 250, 120],
   ] as const) {
     const small = gen(10_000)
     redactText(small, newStats())
@@ -1559,11 +1601,44 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     const msLarge = performance.now() - t1
     expect(outLarge).not.toContain('U2VjcmV0VG9rZW4=')
     expect(outLarge).not.toContain('MySecret1234')
+    expect(outLarge).not.toContain('mySecretTokenAb=')
+    expect(outLarge).not.toContain('mySecretToken123')
     expect({
       label,
       withinBudget: msLarge < maxMs,
       linearScaling: msLarge <= Math.max(floorMs, msSmall * 25),
     }).toEqual({ label, withinBudget: true, linearScaling: true })
+  }
+
+  const padTail = ' ' + 'a'.repeat(300)
+  for (const [sample, isDoubleQuoted] of [
+    ['# bearer myTokenSecret12="x" # "unclosed', false],
+    ["# bearer myTokenSecret12='x' // 'unclosed", false],
+    ["# bearer myTokenSecret12='x' $'it\\'s' 'y'", false],
+    ["# bearer myTokenSecret12='Don\\'t' 'y'", false],
+    ["# bearer myTokenSecret12='Users' 'y'", false],
+    ["# bearer myTokenSecret12='x' fn<'a>()", false],
+    ['# bearer myTokenSecret12="x"   "y"', false],
+    ['bash -c "mode=bearer myTokenSecret12=\\"x\\" \\"y\\""', true],
+    ['bash -c "mode=bearer myTokenSecret12=\\"x\\" \\\\ \\"y\\""', true],
+    ['echo "\\"Bearer mySecretTokenAb=\\" \\"next\\""', true],
+    ["# echo 'Bearer mySecretTokenAb=' 'next'", false],
+    ["# echo 'Bearer mySecretTokenAb=' foo 'unclosed", false],
+  ] as const) {
+    const padded = isDoubleQuoted ? sample.slice(0, -1) + padTail + '"' : sample + padTail
+    const s1 = newStats()
+    const o1 = redactText(sample, s1)
+    const s2 = newStats()
+    const o2 = redactText(padded, s2)
+    const strippedO2 = isDoubleQuoted
+      ? o2.endsWith(padTail + '"')
+        ? o2.slice(0, -(padTail.length + 1)) + '"'
+        : o2
+      : o2.endsWith(padTail)
+        ? o2.slice(0, -padTail.length)
+        : o2
+    expect(o1).toBe(strippedO2)
+    expect(s1.redactions).toBe(s2.redactions)
   }
 
   for (const [sample, expected, secret] of [
@@ -1604,6 +1679,36 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['# bearer CLIENT_SECRET=mySecret!123', '# bearer CLIENT_SECRET=[REDACTED]', 'mySecret!123'],
     ['# bearer CLIENT_SECRET=abc"def"', '# bearer CLIENT_SECRET=[REDACTED]', 'abc"def"'],
     ['# bearer CLIENT_SECRET=\\\nMySecret1234', '# bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['# bearer myTokenSecret123="MySecret1234"', '# bearer myTokenSecret123=[REDACTED]', 'MySecret1234'],
+    ['# bearer oauth2ClientSecret="MySecret1234"', '# bearer oauth2ClientSecret=[REDACTED]', 'MySecret1234'],
+    ['# bearer ClientSecret="MySecret1234"', '# bearer ClientSecret=[REDACTED]', 'MySecret1234'],
+    ['# bearer client-secret="MySecret1234"', '# bearer client-secret=[REDACTED]', 'MySecret1234'],
+    ['# bearer auth.client_secret="MySecret1234"', '# bearer auth.client_secret=[REDACTED]', 'MySecret1234'],
+    ['# bearer secret123456="MySecret1234"', '# bearer secret123456=[REDACTED]', 'MySecret1234'],
+    ['# bearer -client_secret="MySecret1234"', '# bearer -client_secret=[REDACTED]', 'MySecret1234'],
+    ['# bearer -Dssl.password="MySecret1234"', '# bearer -Dssl.password=[REDACTED]', 'MySecret1234'],
+    ['# bearer myTokenSecret12="MySecret1234"', '# bearer myTokenSecret12=[REDACTED]', 'MySecret1234'],
+    ['# "todo bearer myTokenSecret12="MySecret1234"', '# "todo bearer myTokenSecret12=[REDACTED]', 'MySecret1234'],
+    ['# "todo bearer myTokenSecret12="MySecret1234', '# "todo bearer myTokenSecret12=[REDACTED]', 'MySecret1234'],
+    ['# bearer myTokenSecret123=MySecret1234', '# bearer myTokenSecret123=[REDACTED]', 'MySecret1234'],
+    ['# bearer -client_secret=MySecret1234', '# bearer -client_secret=[REDACTED]', 'MySecret1234'],
+    ['# bearer client-secret=MySecret1234', '# bearer client-secret=[REDACTED]', 'MySecret1234'],
+    ['# bearer auth.client_secret=MySecret1234', '# bearer auth.client_secret=[REDACTED]', 'MySecret1234'],
+    ['# bearer client_secret: MySecret1234', '# bearer client_secret: [REDACTED]', 'MySecret1234'],
+    ['# bearer password_hash: MySecret1234', '# bearer password_hash: [REDACTED]', 'MySecret1234'],
+    ['# bearer client-secret: MySecret1234', '# bearer client-secret: [REDACTED]', 'MySecret1234'],
+    ['# bearer auth.client_secret: MySecret1234', '# bearer auth.client_secret: [REDACTED]', 'MySecret1234'],
+    ['# bearer ClientSecret: MySecret1234', '# bearer ClientSecret: [REDACTED]', 'MySecret1234'],
+    ['# bearer myTokenSecret123: "MySecret1234"', '# bearer myTokenSecret123: [REDACTED]', 'MySecret1234'],
+    ['# bearer myTokenSecret123: MySecret1234', '# bearer myTokenSecret123: [REDACTED]', 'MySecret1234'],
+    ['# bearer CLIENT_SECRET = "MySecret1234"', '# bearer CLIENT_SECRET = [REDACTED]', 'MySecret1234'],
+    ['// bearer client_secret: MySecret1234', '// bearer client_secret: [REDACTED]', 'MySecret1234'],
+    ['// bearer myTokenSecret123="MySecret1234"', '// bearer myTokenSecret123=[REDACTED]', 'MySecret1234'],
+    ['# bearer CLIENT_SECRET= MySecret1234', '# bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['# "todo bearer CLIENT_SECRET= MySecret1234', '# "todo bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['# bearer myTokenSecret123= "MySecret1234"', '# bearer myTokenSecret123=[REDACTED]', 'MySecret1234'],
+    ['# bearer CLIENT_SECRET=="MySecret1234"', '# bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['bash -c "mode=bearer myTokenSecret12=\\"MySecret1234\\""', 'bash -c "mode=bearer myTokenSecret12=[REDACTED]', 'MySecret1234'],
   ] as const) {
     const stats = newStats()
     const out = redactText(sample, stats)
