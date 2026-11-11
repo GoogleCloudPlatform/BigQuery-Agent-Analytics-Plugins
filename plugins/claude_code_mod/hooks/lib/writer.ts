@@ -1667,19 +1667,12 @@ export class Writer {
   // nothing in the way (no notice, backoff, failure, replay, dead-letter
   // write or recovery due), the rows still queued wait for that answer, then
   // go in one request, with a token already at hand: no token command runs.
-  // What it does not land in time is spilled before the budget ends. With
-  // `replaySpills` too, once every row has landed, this table's spill and
-  // retry files are replayed with what is left of the budget (see
-  // replayAtExit).
-  //
-  // The background writer's exit flush (`spillForExit`): waits up to half of
-  // `budgetMs` for any in-flight batches, then (if healthy and a token is
-  // already in hand) runs one bounded send — or, when `this.exitWait` caught
-  // a table-not-found answer during that wait, makes the table first and
-  // sends that batch once more — and spills everything else to disk. With
-  // `replaySpills` too, once every row has landed, this table's spill and
-  // retry files are replayed with what is left of the budget (see
-  // replayAtExit).
+  // What it does not land in time is spilled before the budget ends. A
+  // table-not-found answer to that batch of this writer's, during that wait,
+  // brings its rows back to that one request, which then makes the table first
+  // and is sent once (sendAtExit). With `replaySpills` too, once every row
+  // has landed, this table's spill and retry files are replayed with what is
+  // left of the budget (see replayAtExit).
   //
   // Otherwise it starts no request: the rows still queued go at once to a
   // spill file the next session sends, or in a dry run to the dry-run files,

@@ -926,6 +926,7 @@ test('the same run whose end-of-turn request lands during the exit wait creates 
   const { ending } = await exitWithTurnBatchOut($, world)
   await answerDuringExit(world, OK_INSERT, ending)
   expect(requestsOf(world)).toEqual(['POST insertAll', 'POST insertAll'])
+  expect(world.sentRows().length).toBe(4)
   expect(new Set(world.sentRows().map(r => r.event_id)).size).toBe(4)
   expect(deadLetterRows(world)).toEqual([])
   expect(world.stderr).toEqual([])
