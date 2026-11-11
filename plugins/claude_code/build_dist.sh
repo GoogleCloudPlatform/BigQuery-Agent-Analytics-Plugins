@@ -179,7 +179,7 @@ fetch_sdk_tags() {
   if ! tag_refs="$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags "$remote_url" 'refs/tags/tracing-v*' 2>/dev/null)"; then
     return 1
   fi
-  git init -q "$dest_dir"
+  git init -q "$dest_dir" || return 1
   if [[ -n "$tag_refs" ]]; then
     if ! GIT_TERMINAL_PROMPT=0 git -C "$dest_dir" fetch -q --depth=1 "$remote_url" 'refs/tags/tracing-v*:refs/tags/tracing-v*' >/dev/null 2>&1; then
       return 1

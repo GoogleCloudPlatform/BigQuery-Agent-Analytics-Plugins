@@ -1544,3 +1544,200 @@ test('a token that runs out during the exit wait: no create without one, the bat
   expect(spillRowCount(files)).toBe(1)
   expect(writer.problem?.missing).toBe('table')
 })
+
+test('spillForExit ignores a 1 ms Io.now tick before raceUntil when waiting on in-flight batches (sendQueued: true)', { options: OPTIONS }, async () => {
+  const clock = probeClock()
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/exit-clock-tick-flights' }, {})
+  const files = new Map<string, string>()
+  let releaseFetch = (): void => undefined
+  let fetchCalled = false
+  let tickOnNextNow = false
+  let nowCallsAfterArmed = 0
+  const baseIo = makeProbeIo(
+    clock,
+    async () => {
+      fetchCalled = true
+      return new Promise(resolve => {
+        releaseFetch = () => resolve(OK_INSERT)
+      })
+    },
+    async () => ({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }),
+  )
+  const io: Io = {
+    ...baseIo,
+    now: () => {
+      if (!tickOnNextNow) return clock.now()
+      nowCallsAfterArmed += 1
+      return nowCallsAfterArmed === 1 ? clock.now() : clock.now() + 1
+    },
+    writeFile: async (p, text) => {
+      files.set(p, text)
+    },
+  }
+  const writer = new Writer(io, () => config, () => 'exit-clock-tick-flights')
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: '1'.repeat(32), agent: 'coding-agent', sessionId: 'exit-clock-tick-flights', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+  writer.requestFlush(0)
+  for (let i = 0; i < 20 && !fetchCalled; i += 1) await clock.advance(0)
+  expect(fetchCalled).toBe(true)
+
+  tickOnNextNow = true
+  let ended = false
+  let result: { spilled: number } | undefined
+  const ending = writer.spillForExit(800, { sendQueued: true }).then(v => {
+    ended = true
+    result = v
+    return v
+  })
+  await clock.advance(399)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(ended).toBe(false)
+  await clock.advance(1)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(ended).toBe(true)
+  await ending
+  expect(result).toEqual({ spilled: 1 })
+  expect(spillRowCount(files)).toBe(1)
+  releaseFetch()
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(clock.pending()).toBe(0)
+})
+
+test('spillForExit ignores a 1 ms Io.now tick before raceUntil when spilling queued rows with no in-flight batch (sendQueued: false)', { options: OPTIONS }, async () => {
+  const clock = probeClock()
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/exit-clock-tick-spill' }, {})
+  let releaseWrite = (): void => undefined
+  let writeStarted = false
+  let tickOnNextNow = false
+  let nowCallsAfterArmed = 0
+  const io: Io = {
+    ...makeProbeIo(
+      clock,
+      async () => OK_INSERT,
+      async () => ({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }),
+    ),
+    now: () => {
+      if (!tickOnNextNow) return clock.now()
+      nowCallsAfterArmed += 1
+      return nowCallsAfterArmed === 1 ? clock.now() : clock.now() + 1
+    },
+    writeFile: async () => {
+      writeStarted = true
+      await new Promise<void>(resolve => {
+        releaseWrite = resolve
+      })
+    },
+  }
+  const writer = new Writer(io, () => config, () => 'exit-clock-tick-spill')
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: '2'.repeat(32), agent: 'coding-agent', sessionId: 'exit-clock-tick-spill', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+
+  tickOnNextNow = true
+  let ended = false
+  let result: { spilled: number } | undefined
+  const ending = writer.spillForExit(800, { sendQueued: false }).then(v => {
+    ended = true
+    result = v
+    return v
+  })
+  await clock.advance(799)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(writeStarted).toBe(true)
+  expect(ended).toBe(false)
+  await clock.advance(1)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(ended).toBe(true)
+  await ending
+  expect(result).toEqual({ spilled: 1 })
+  expect(clock.pending()).toBe(0)
+  releaseWrite()
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+})
+
+test('spillForExit subtracts elapsed flight-wait time from pending-write raceUntil budget when sendQueued is false', { options: OPTIONS }, async () => {
+  const clock = probeClock()
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/exit-flight-elapsed' }, {})
+  let fetchCalled = false
+  let releaseWrite = (): void => undefined
+  let writeStarted = false
+  const io: Io = {
+    ...makeProbeIo(
+      clock,
+      async () => {
+        fetchCalled = true
+        return new Promise(resolve => {
+          clock.after(100, () => resolve(OK_INSERT))
+        })
+      },
+      async () => ({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }),
+    ),
+    writeFile: async () => {
+      writeStarted = true
+      await new Promise<void>(resolve => {
+        releaseWrite = resolve
+      })
+    },
+  }
+  const writer = new Writer(io, () => config, () => 'exit-flight-elapsed')
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: '3'.repeat(32), agent: 'coding-agent', sessionId: 'exit-flight-elapsed', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+  writer.requestFlush(0)
+  for (let i = 0; i < 20 && !fetchCalled; i += 1) await clock.advance(0)
+  expect(fetchCalled).toBe(true)
+
+  // Queue a second row after the first batch is in flight so park() starts a hanging spill write.
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: '4'.repeat(32), agent: 'coding-agent', sessionId: 'exit-flight-elapsed', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+
+  let ended = false
+  let result: { spilled: number } | undefined
+  const ending = writer.spillForExit(800, { sendQueued: false }).then(v => {
+    ended = true
+    result = v
+    return v
+  })
+  await clock.advance(100)
+  expect(writeStarted).toBe(true)
+  expect(ended).toBe(false)
+  await clock.advance(699)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(ended).toBe(false)
+  await clock.advance(1)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(ended).toBe(true)
+  await ending
+  expect(result).toEqual({ spilled: 1 })
+  expect(clock.pending()).toBe(0)
+  releaseWrite()
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+})
+
+test('probeDestination ignores a 1 ms Io.now tick before computing attempt 0 token timeout', { options: OPTIONS }, async () => {
+  const clock = probeClock()
+  let tickOnNextNow = false
+  let nowCallsAfterArmed = 0
+  let releaseToken = (): void => undefined
+  const io: Io = {
+    ...makeProbeIo(
+      clock,
+      async () => TABLE_FOUND,
+      async () => new Promise(resolve => {
+        releaseToken = () => resolve({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' })
+      }),
+    ),
+    now: () => {
+      if (!tickOnNextNow) return clock.now()
+      nowCallsAfterArmed += 1
+      return nowCallsAfterArmed === 1 ? clock.now() : clock.now() + 1
+    },
+  }
+  const writer = new Writer(io, () => PROBE_CONFIG, () => 'probe-clock-tick')
+  tickOnNextNow = true
+  let result: string | null | undefined
+  void writer.probeDestination(3000, true, 8000).then(v => {
+    result = v
+  })
+  await clock.advance(4999)
+  expect(result).toBeUndefined()
+  await clock.advance(1)
+  expect(result).toBe('no token within 5000 ms')
+  expect(writer.snapshot().lastError?.message).toBe('destination check: no token within 5000 ms')
+  expect(clock.pending()).toBe(0)
+  releaseToken()
+})

@@ -778,7 +778,7 @@ export class Writer {
       // attempt 0 (and on unbounded checks when > reqBudgetMs remains), and at
       // least 500 ms on bounded post-401 retries so a fresh-token retry still
       // proceeds when 500 ms .. reqBudgetMs of the deadline remains.
-      const remainingBeforeToken = deadline - this.io.now()
+      const remainingBeforeToken = attempt === 0 ? totalBudgetMs : deadline - this.io.now()
       const reserveMs = attempt === 0 || (budgetMs === undefined && remainingBeforeToken > reqBudgetMs)
         ? reqBudgetMs
         : Math.min(reqBudgetMs, 500)
@@ -1729,7 +1729,8 @@ export class Writer {
     const flights = flightWriters.flatMap(writer => (writer.inFlight !== null ? [writer.inFlight] : []))
     const wait: { notFound: HttpAnswer | null } = { notFound: null }
     if (marks !== null) this.exitWait = wait
-    if (flights.length > 0 && budgetMs > 0) await this.raceUntil(Promise.all(flights), start + Math.floor(budgetMs / 2))
+    const waitedFlights = flights.length > 0 && budgetMs > 0
+    if (waitedFlights) await this.raceUntil(Promise.all(flights), start + Math.floor(budgetMs / 2), start)
     this.exitWait = null
     // What no answer took: the rows still out, and those an answer asked
     // for again. Rows an answer refused, or parks after their retries, are
@@ -1752,7 +1753,7 @@ export class Writer {
     }
     const pending = [...writes, ...this.persisting]
     if (pending.length > 0) {
-      if (marks === null) await this.raceUntil(Promise.all(pending), until)
+      if (marks === null) await this.raceUntil(Promise.all(pending), until, waitedFlights ? this.io.now() : start)
       else await Promise.race([Promise.all(pending).catch(() => undefined), marks.end.at])
     }
     for (const timer of timers) timer.cancel()
@@ -1969,8 +1970,8 @@ export class Writer {
     }
   }
 
-  private raceUntil(work: Promise<unknown>, until: number): Promise<unknown> {
-    const wait = until - this.io.now()
+  private raceUntil(work: Promise<unknown>, until: number, now = this.io.now()): Promise<unknown> {
+    const wait = until - now
     if (wait <= 0) return Promise.resolve()
     let timer: Timer | null = null
     const timeout = new Promise<void>(resolve => {

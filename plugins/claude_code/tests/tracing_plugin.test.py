@@ -33,6 +33,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -3837,6 +3838,51 @@ class TestBuildDist39(unittest.TestCase):
         )
         self.assertNotEqual(res_local_tag.returncode, 0)
         self.assertIn("not newer than existing tag tracing-v9.9.9", res_local_tag.stdout)
+
+    def test_sdk_tag_discovery_git_init_failure_fails_closed(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bqaa_39_git_init_fail_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        env = self._clean_git_env()
+
+        empty_sdk = tmp / "empty_sdk.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-q", str(empty_sdk)],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+
+        plugins_repo = tmp / "plugins_repo"
+        check_script = self._init_plugins_repo(plugins_repo, env)
+        subprocess.run(
+            ["git", "-C", str(plugins_repo), "remote", "add", "sdk", empty_sdk.as_uri()],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        wrapper_bin = tmp / "wrapper_bin"
+        wrapper_bin.mkdir(parents=True, exist_ok=True)
+        git_wrapper = wrapper_bin / "git"
+        git_wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"${1:-}\" == \"init\" ]]; then\n"
+            "  exit 1\n"
+            "fi\n"
+            f"exec {shlex.quote(real_git)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        os.chmod(git_wrapper, 0o755)
+
+        wrapper_env = dict(env, PATH=f"{wrapper_bin}{os.pathsep}{env.get('PATH', '')}")
+        res = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=wrapper_env, timeout=30,
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn(
+            "not ok - failed to fetch tracing-v release tags from SDK remote",
+            res.stdout,
+        )
+        self.assertNotIn("ok - no tracing-v release tags exist yet", res.stdout)
 
 
 if __name__ == "__main__":
