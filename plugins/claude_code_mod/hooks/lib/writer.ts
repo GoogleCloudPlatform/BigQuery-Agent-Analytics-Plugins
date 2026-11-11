@@ -1501,7 +1501,9 @@ export class Writer {
   }
 
   // Whether a table-not-found answer (`message`, not a dataset's) may be met
-  // by making the table: this writer's one try.
+  // by making the table: `createTable` latches `createAttempted` only on
+  // terminal statuses (2xx/409/400/403/404), leaving transient 5xx/429/network
+  // failures retriable on a later attempt.
   private mayCreateTable(c: Config, message: string): boolean {
     return c.autoCreateTable && !this.createAttempted && !isDatasetMissing(message)
   }

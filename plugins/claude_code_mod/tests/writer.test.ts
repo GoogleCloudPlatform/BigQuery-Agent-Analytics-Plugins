@@ -1900,6 +1900,41 @@ test('backfill auto-creates missing table once after transient 503 createTable e
   expect(world2.files.get(spillPath)).toBe('')
 })
 
+test('foreground send retries createTable after transient 503 and latches once created without duplicating rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  world.replies = [TABLE_MISSING, UNAVAILABLE]
+  const writer = ownWriter(world)
+  writer.enqueue(ownRow('a'.repeat(32)), 0)
+  await writer.flush()
+  expect(world.fetches.map(f => `${f.method} ${f.url.split('/').pop()?.split('?')[0]}`)).toEqual(['POST insertAll', 'POST tables'])
+  expect(world.acceptedRows()).toEqual([])
+
+  await world.clock.advance(5_000)
+  world.replies = [TABLE_MISSING, { status: 200, text: '{"kind":"bigquery#table"}' }, OK_INSERT]
+  await writer.flush()
+  expect(world.fetches.map(f => `${f.method} ${f.url.split('/').pop()?.split('?')[0]}`)).toEqual([
+    'POST insertAll',
+    'POST tables',
+    'POST insertAll',
+    'POST tables',
+    'POST insertAll',
+  ])
+  expect(world.acceptedRows().map(r => r.event_id)).toEqual(['a'.repeat(32)])
+
+  // Once createTable succeeds (200), a later 404 does not trigger another POST tables.
+  world.replies = [TABLE_MISSING]
+  writer.enqueue(ownRow('b'.repeat(32)), 0)
+  await writer.flush()
+  expect(world.fetches.map(f => `${f.method} ${f.url.split('/').pop()?.split('?')[0]}`)).toEqual([
+    'POST insertAll',
+    'POST tables',
+    'POST insertAll',
+    'POST tables',
+    'POST insertAll',
+    'POST insertAll',
+  ])
+})
+
 test('relocated deadLetterDir preserves legacy child files via basename matching while still dropping retired competing-writer duplicates', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
   const oldPartition = `/old/dead-letter/${TABLE_REF}`

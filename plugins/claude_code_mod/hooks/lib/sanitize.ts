@@ -522,8 +522,8 @@ const isLikelyBasicCredentialToken = (token: string): boolean => {
   return false
 }
 
-const ALL_CAPS_SNAKE_KEY_RE = /^[A-Z][A-Z0-9_]*_[A-Z0-9_]*$/
-const LOWER_SNAKE_KEY_RE = /^[a-z][a-z0-9_]*_[a-z0-9_]*$/
+const ALL_CAPS_SNAKE_KEY_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]*)+$/
+const LOWER_SNAKE_KEY_RE = /^[a-z][a-z0-9]*(?:_[a-z0-9]*)+$/
 const PYTHON_SINGLE_PREFIX_RE = /(?:^|[^A-Za-z0-9_])(?:[rbfu]|rf|fr|rb|br)$/i
 const RUST_LIFETIME_PREFIX_CHARS = new Set(['<', '&', ',', '+', ':'])
 const RUST_LIFETIME_TAIL_RE = /^'(?:[a-z_][a-z0-9_]*|static)(?=$|[\s,>:;)\]+])/
@@ -775,14 +775,14 @@ function buildEscapedLineTable(text: string, lineStart: number, lineStop: number
 const AUTH_SCHEME_RE = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=-]{4,})/gi
 const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t\u00a0]*[:=]\s*(?:\\*["'])?$/i
 const CAMEL_CASE_KEY_RE = /^[a-z]+(?:[A-Z][a-z]+)+$/
-const CAMEL_CASE_VERSION_KEY_RE = /^[a-z]+[0-9]*(?:[A-Z][a-z0-9]+)*[A-Z][a-z]+$/
+const CAMEL_CASE_VERSION_KEY_RE = /^(?:[a-z]{2,}[0-9]{0,3}|v[0-9]{1,2})(?:V[0-9]{1,2}|[A-Z][a-z]{2,}[0-9]{0,2})*[A-Z][a-z]{2,}$/
 const UPPER_WORD_KEY_RE = /^[A-Z]{2,}$/
 const LOWER_DOTTED_KEY_RE = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z_]*)+$/
 const LOWER_KEBAB_KEY_RE = /^[a-z]+(?:-[a-z]+)+$/
 const DOUBLE_DASH_LOWER_FLAG_RE = /^--[a-z][a-z0-9_-]*$/
-const SINGLE_DASH_SNAKE_OR_LOWER_FLAG_RE = /^-(?:[a-z][a-z0-9_]*_[a-z0-9_]*|[a-z]+)$/
+const SINGLE_DASH_SNAKE_OR_LOWER_FLAG_RE = /^-(?:[a-z][a-z0-9]*(?:_[a-z0-9]*)+|[a-z]+)$/
 const LOWER_WORD_KEY_RE = /^[a-z]+$/
-const STRUCTURED_CONFIG_KEY_RE = /^(?:[A-Z][A-Z0-9_]*_[A-Z0-9_]*|[a-z]+(?:[_.-][a-z]+)+|[A-Z][a-z]+(?:[A-Z][a-z]+)+)$/
+const STRUCTURED_CONFIG_KEY_RE = /^(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]*)+|[a-z]+(?:[_.-][a-z]+)+|[A-Z][a-z]+(?:[A-Z][a-z]+)+)$/
 const DIAGNOSTIC_SINGLE_WORD_RE =
   /^(?:unauthorized|forbidden|expired|rejected|denied|failed|invalid|missing|revoked|malformed|unauthenticated|unavailable|blocked|disabled|error|invalid_token|invalid_request|invalid_grant|access_denied|unauthorized_client|insufficient_scope|server_error)(?=$|[\s.,;:!?)\]}'"])/i
 const DIAGNOSTIC_PROSE_RE = /^(?:[A-Za-z]{2,}(?:[ \t]+[A-Za-z]{2,})+|(?:HTTP(?:\/[\d.]+)?[ \t]+)?(?:4\d\d|5\d\d)(?:[ \t]+[A-Za-z]+)*)(?=$|[\s.,;:!?)\]}'"])/
@@ -813,6 +813,8 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
   AUTH_SCHEME_RE.lastIndex = 0
   let out = ''
   let copied = 0
+  let lastKeptMatchEnd = 0
+  let prevKeptMatchEnd = 0
   let quotePos = 0
   let activeQuote = ''
   let ansiSingle = false
@@ -1265,25 +1267,35 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
           ? trailingDots.slice(0, 32)
           : trailingDots + after.slice(0, 32 - trailingDots.length)
     const effectiveMatchEnd = trailingDots === '' ? matchEnd : m.index + scheme.length + space.length + coreToken.length
+    const keepAndRewind = (): void => {
+      if (effectiveMatchEnd > lastKeptMatchEnd) {
+        prevKeptMatchEnd = lastKeptMatchEnd
+        lastKeptMatchEnd = effectiveMatchEnd
+      }
+      rewind()
+    }
     if (!inHeader && !basicB64) {
       const rawKeyPart = eqIdx > 0 ? coreToken.slice(0, eqIdx) : ''
+      const keyWithinCap = rawKeyPart.length <= 100
       const isPlainAssignKey = eqIdx > 0 && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(rawKeyPart)
       const isDashPrefixed = eqIdx > 0 && !isPlainAssignKey && rawKeyPart.charCodeAt(0) === 45
       const flagStripped = isDashPrefixed ? (rawKeyPart.charCodeAt(1) === 45 ? rawKeyPart.slice(2) : rawKeyPart.slice(1)) : ''
       const isDoubleFlag = isDashPrefixed && rawKeyPart.charCodeAt(1) === 45
       const isConfigFlagShape =
         isDashPrefixed &&
+        keyWithinCap &&
         (isDoubleFlag ? DOUBLE_DASH_LOWER_FLAG_RE.test(rawKeyPart) : SINGLE_DASH_SNAKE_OR_LOWER_FLAG_RE.test(rawKeyPart))
       const isFlagAssignKey =
         isDashPrefixed &&
         flagStripped !== '' &&
         /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(flagStripped) &&
-        (isConfigFlagShape || isSensitiveKey(flagStripped))
+        (isConfigFlagShape || (flagStripped.length <= 100 && isSensitiveKey(flagStripped)))
       const isAssignKey = isPlainAssignKey || isFlagAssignKey
       const assignKey = isFlagAssignKey ? flagStripped : rawKeyPart
-      const isLowerWordKey = isPlainAssignKey && LOWER_WORD_KEY_RE.test(rawKeyPart)
+      const isLowerWordKey = isPlainAssignKey && keyWithinCap && LOWER_WORD_KEY_RE.test(rawKeyPart)
       const isEmptyAssignIdentifier =
         isAssignKey &&
+        keyWithinCap &&
         !isLowerWordKey &&
         ((isFlagAssignKey && isDoubleFlag) ||
           ALL_CAPS_SNAKE_KEY_RE.test(assignKey) ||
@@ -1300,7 +1312,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
           /^[ \t\u00a0]*[:=]/.test(effectiveAfter) &&
           (!isBase64PaddedToken(coreToken) || isEmptyAssignIdentifier || isLowerWordKey || isConfigFlagShape)
         ) {
-          rewind()
+          keepAndRewind()
           continue
         }
         if (isAssignKey) {
@@ -1312,7 +1324,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                 ? !opensEscapedFast(effectiveMatchEnd, effectiveAfter[1] as string)
                 : /^\\[nrt]/.test(effectiveAfter))
             if (!isBase64PaddedToken(coreToken) || isEmptyAssignIdentifier || coreToken[eqIdx + 1] === '~' || !safeAfter) {
-              rewind()
+              keepAndRewind()
               continue
             }
           } else {
@@ -1320,17 +1332,21 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             const assignRhs = hasAssignRhsAt(effectiveMatchEnd, effectiveAfter, qState, coreToken, isLowerWordKey)
             if (endsWithDoubleEq || isLowerWordKey) {
               if ((isLowerWordKey && (effectiveAfter === '' || /^[\s#]/.test(effectiveAfter))) || assignRhs) {
-                rewind()
+                keepAndRewind()
                 continue
               }
             } else if (assignRhs) {
-              rewind()
+              keepAndRewind()
               continue
             } else {
-              const unredactedBeforeStart = Math.max(copied, m.index - 40)
+              const keptFloor = lastKeptMatchEnd <= m.index ? lastKeptMatchEnd : prevKeptMatchEnd
+              const unredactedBeforeStart = Math.max(copied, keptFloor, m.index - 40)
               const unredactedBefore =
                 m.index <= unredactedBeforeStart ? '' : text.slice(unredactedBeforeStart, m.index)
-              const precededByEq = /(?:^|[^=!<>])=[ \t\u00a0]*$/.test(unredactedBefore)
+              const eqMatch = /=[ \t\u00a0]*$/.exec(unredactedBefore)
+              const eqAbsIdx = eqMatch === null ? -1 : unredactedBeforeStart + eqMatch.index
+              const precededByEq =
+                eqAbsIdx !== -1 && (eqAbsIdx === 0 || !/[=!<>]/.test(text[eqAbsIdx - 1] as string))
               const closedByEnclosingQuote =
                 isBase64PaddedToken(coreToken) &&
                 !precededByEq &&
@@ -1360,12 +1376,13 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                   (precededByEqOrInComment || !isBase64PaddedToken(coreToken)) &&
                   (isEmptyAssignIdentifier ||
                     isConfigFlagShape ||
-                    CAMEL_CASE_VERSION_KEY_RE.test(rawKeyPart) ||
-                    (UPPER_WORD_KEY_RE.test(rawKeyPart) && precededByEqOrInComment) ||
-                    LOWER_DOTTED_KEY_RE.test(rawKeyPart) ||
-                    LOWER_KEBAB_KEY_RE.test(rawKeyPart))
+                    (keyWithinCap &&
+                      (CAMEL_CASE_VERSION_KEY_RE.test(rawKeyPart) ||
+                        (UPPER_WORD_KEY_RE.test(rawKeyPart) && precededByEqOrInComment) ||
+                        LOWER_DOTTED_KEY_RE.test(rawKeyPart) ||
+                        LOWER_KEBAB_KEY_RE.test(rawKeyPart))))
                 ) {
-                  rewind()
+                  keepAndRewind()
                   continue
                 }
               }
@@ -1383,7 +1400,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
           const spacedEq = /^[ \t\u00a0]+=(?!=)[ \t\u00a0]*\S/.test(afterLine)
           const colonMatch = /^[ \t\u00a0]*:(?!:)[ \t\u00a0]*(\S[^\r\n]*)/.exec(afterLine)
           if (spacedEq || (colonMatch !== null && !isDiagnosticColonRhs(colonMatch[1] as string, keyCand))) {
-            rewind()
+            keepAndRewind()
             continue
           }
         }
@@ -1414,34 +1431,34 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             (qState.inComment || qState.activeQuote === '') &&
             (effectiveAfter === '' || /^[\s#]/.test(effectiveAfter))
           if (singleAssignRhs || spaceBeforeQuoteRhs || emptyNonPaddedEnv) {
-            rewind()
+            keepAndRewind()
             continue
           }
         } else if (!isBase64PaddedToken(coreToken)) {
-          rewind()
+          keepAndRewind()
           continue
         }
       }
     }
     if (!isBasic) {
       if (coreToken.length < 12) {
-        rewind()
+        keepAndRewind()
         continue
       }
       if (!inHeader && PASCAL_CASE_WORD_RE.test(coreToken)) {
         const hasProseFollow = (hasNewline || space.includes('\u00a0')) && /^[ \t\u00a0]+[a-z]{2,}\b/.test(effectiveAfter)
         if (hasProseFollow || (space.includes('\u00a0') && isDocumentationPascalPhrase(coreToken))) {
-          rewind()
+          keepAndRewind()
           continue
         }
       }
     } else {
       if (hasNewline ? !inHeader && !basicB64 : !inHeader && !isLikelyBasicCredentialToken(coreToken)) {
-        rewind()
+        keepAndRewind()
         continue
       }
       if (inHeader && coreToken.length < 4) {
-        rewind()
+        keepAndRewind()
         continue
       }
     }

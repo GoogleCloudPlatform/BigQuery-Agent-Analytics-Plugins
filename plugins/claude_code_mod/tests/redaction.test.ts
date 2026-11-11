@@ -1458,6 +1458,21 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer\n-cfg_flg_ab=', 'Bearer [REDACTED]', '-cfg_flg_ab='],
     ['foo=\nBearer\nlB79GsW66LvIcKaTzjh=', 'foo=\nBearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
     ['x == Bearer\nlB79GsW66LvIcKaTzjh=', 'x == Bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
+    ['Bearer\nschemaV2Config= Bearer\nlB79GsW66LvIcKaTzjh=', 'Bearer\nschemaV2Config= Bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
+    ['Bearer\nschemaV2Config= Bearer\nWORK_DIR_XY=', 'Bearer\nschemaV2Config= Bearer [REDACTED]', 'WORK_DIR_XY='],
+    ['Bearer\nschemaV2Config= Bearer\ncacheV2Mode=', 'Bearer\nschemaV2Config= Bearer [REDACTED]', 'cacheV2Mode='],
+    ['Bearer abc= Bearer\nWORK_DIR_XY=', 'Bearer abc= Bearer [REDACTED]', 'WORK_DIR_XY='],
+    ['MODE=bearer\nlB79GsW66LvIcKaTzjh=', 'MODE=bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
+    ['MODE=bearer\np2112MrvcRo=', 'MODE=bearer [REDACTED]', 'p2112MrvcRo='],
+    ['MODE=bearer\nabV2GsLvIcKaTzjh=', 'MODE=bearer [REDACTED]', 'abV2GsLvIcKaTzjh='],
+    ['x !=' + ' '.repeat(39) + 'Bearer\nWORK_DIR_XY=', 'x !=' + ' '.repeat(39) + 'Bearer [REDACTED]', 'WORK_DIR_XY='],
+    ['x ==' + ' '.repeat(39) + 'Bearer\nWORK_DIR_XY=', 'x ==' + ' '.repeat(39) + 'Bearer [REDACTED]', 'WORK_DIR_XY='],
+    ['x <=' + ' '.repeat(39) + 'Bearer\nWORK_DIR_XY=', 'x <=' + ' '.repeat(39) + 'Bearer [REDACTED]', 'WORK_DIR_XY='],
+    ['x >=' + ' '.repeat(39) + 'Bearer\nWORK_DIR_XY=', 'x >=' + ' '.repeat(39) + 'Bearer [REDACTED]', 'WORK_DIR_XY='],
+    ['Bearer A' + '_'.repeat(100) + 'a=', 'Bearer [REDACTED]', '_'.repeat(100) + 'a='],
+    ['bearer a' + '_'.repeat(100) + 'A=', 'bearer [REDACTED]', '_'.repeat(100) + 'A='],
+    ['Bearer -a' + '_'.repeat(100) + 'A=', 'Bearer [REDACTED]', '_'.repeat(100) + 'A='],
+    ['Bearer\n' + 'A_'.repeat(55) + 'A=', 'Bearer [REDACTED]', 'A_'.repeat(55) + 'A='],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1604,6 +1619,10 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'Bearer\n--config-file=',
     'Bearer\nCURRENT_WORK_DIR=',
     'Bearer\npublic_work_dirs=',
+    'MODE=bearer\noauth2ClientKey=',
+    'MODE=bearer\noauth2ClientSecret=',
+    'MODE=bearer\nschemaV2Config=\nMODE=bearer\ncacheV2Mode=',
+    'x :=' + ' '.repeat(39) + 'Bearer\nWORK_DIR_XY=',
   ]) {
     const stats = newStats()
     expect(redactText(prose, stats)).toBe(prose)
@@ -1705,6 +1724,35 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
       label,
       withinBudget: msLarge < maxMs,
       linearScaling: msLarge <= Math.max(floorMs, msSmall * 25),
+    }).toEqual({ label, withinBudget: true, linearScaling: true })
+  }
+
+  for (const [label, gen, expectedScheme] of [
+    ['Bearer ALL_CAPS_SNAKE single long non-match', (n: number) => 'Bearer A' + '_'.repeat(n) + 'a=', 'Bearer'],
+    ['bearer lower_snake single long non-match', (n: number) => 'bearer a' + '_'.repeat(n) + 'A=', 'bearer'],
+    ['Bearer single-dash snake single long non-match', (n: number) => 'Bearer -a' + '_'.repeat(n) + 'A=', 'Bearer'],
+    ['Bearer single-dash sensitive key single long token', (n: number) => 'Bearer -a' + '_'.repeat(n) + 'key=', 'Bearer'],
+    ['Bearer cross-line camel single long non-match', (n: number) => 'Bearer\na' + 'Bc'.repeat(n >> 1) + '1=', 'Bearer'],
+    ['Bearer cross-line dotted single long non-match', (n: number) => 'Bearer\n' + 'ab.'.repeat((n / 3) | 0) + '1=', 'Bearer'],
+    ['Bearer cross-line kebab single long non-match', (n: number) => 'Bearer\n' + 'ab-'.repeat((n / 3) | 0) + '1=', 'Bearer'],
+    ['Bearer cross-line ALL_CAPS_SNAKE over cap', (n: number) => 'Bearer\nA' + '_'.repeat(n) + 'A=', 'Bearer'],
+  ] as const) {
+    const small = gen(10_000)
+    redactText(small, newStats())
+    const t0 = performance.now()
+    redactText(small, newStats())
+    const msSmall = Math.max(1, performance.now() - t0)
+    const large = gen(160_000)
+    const statsLarge = newStats()
+    const t1 = performance.now()
+    const outLarge = redactText(large, statsLarge)
+    const msLarge = performance.now() - t1
+    expect(outLarge).toBe(`${expectedScheme} [REDACTED]`)
+    expect(statsLarge.redactions).toBe(1)
+    expect({
+      label,
+      withinBudget: msLarge < 100,
+      linearScaling: msLarge <= Math.max(40, msSmall * 25),
     }).toEqual({ label, withinBudget: true, linearScaling: true })
   }
 
