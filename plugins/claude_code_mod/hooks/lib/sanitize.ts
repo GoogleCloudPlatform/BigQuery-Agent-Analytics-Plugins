@@ -522,6 +522,66 @@ const isLikelyBasicCredentialToken = (token: string): boolean => {
   return false
 }
 
+const isBase64PaddedToken = (token: string): boolean => {
+  let cleanEnd = token.length
+  while (cleanEnd > 0) {
+    const ch = token.charCodeAt(cleanEnd - 1)
+    if (ch === 46 || ch === 95 || ch === 126 || ch === 45) cleanEnd -= 1
+    else break
+  }
+  if (cleanEnd < 12 || cleanEnd % 4 !== 0) return false
+  let pad = 0
+  while (pad < 2 && cleanEnd - pad > 0 && token.charCodeAt(cleanEnd - 1 - pad) === 61) pad += 1
+  if (pad === 0) return false
+  for (let i = 0; i < cleanEnd - pad; i += 1) {
+    const c = token.charCodeAt(i)
+    const ok =
+      (c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      (c >= 48 && c <= 57) ||
+      c === 43 ||
+      c === 47 ||
+      c === 95 ||
+      c === 45
+    if (!ok) return false
+  }
+  return true
+}
+
+const opensQuotedAssignmentValue = (text: string, quoteIdx: number, q: string): boolean => {
+  const nl = text.indexOf('\n', quoteIdx + 1)
+  const cr = text.indexOf('\r', quoteIdx + 1)
+  const lineStop =
+    nl === -1 ? (cr === -1 ? text.length : cr) : cr === -1 ? nl : Math.min(nl, cr)
+  if (q === '`' && text[quoteIdx + 1] === '`') return false
+  let count = 1
+  let i = quoteIdx + 1
+  while (i < lineStop) {
+    const ch = text[i] as string
+    if (q !== "'" && ch === '\\') {
+      const next = text[i + 1]
+      if (next === '\\' || next === q) {
+        i += 2
+        continue
+      }
+    }
+    if (ch === q) {
+      if (q === "'") {
+        const prev = text[i - 1] ?? ''
+        const next = text[i + 1] ?? ''
+        if (count % 2 === 0 && /[A-Za-z0-9]/.test(prev) && /[A-Za-z]/.test(next)) {
+          i += 1
+          continue
+        }
+      }
+      count += 1
+    }
+    i += 1
+  }
+  if (count >= 2) return count % 2 === 0
+  return quoteIdx + 1 < lineStop && !/^[\s.,;:!?)}\]'"`]/.test(text[quoteIdx + 1] as string)
+}
+
 const AUTH_SCHEME_RE = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=-]{4,})/gi
 const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t\u00a0]*[:=]\s*(?:\\*["'])?$/i
 
@@ -530,6 +590,55 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
   AUTH_SCHEME_RE.lastIndex = 0
   let out = ''
   let copied = 0
+  let quotePos = 0
+  let activeQuote = ''
+  const quoteAt = (target: number): string => {
+    while (quotePos < target) {
+      const ch = text[quotePos] as string
+      if (activeQuote !== '') {
+        if (activeQuote !== "'" && ch === '\\') {
+          const next = text[quotePos + 1]
+          if (next === '\\' || next === activeQuote) {
+            quotePos += 2
+            continue
+          }
+        }
+        if (ch === activeQuote) activeQuote = ''
+        quotePos += 1
+        continue
+      }
+      if (ch === '\\') {
+        const next = text[quotePos + 1]
+        if (next === '\\' || next === '"' || next === "'" || next === '`') {
+          quotePos += 2
+          continue
+        }
+        quotePos += 1
+        continue
+      }
+      if (ch === '"') {
+        activeQuote = '"'
+        quotePos += 1
+        continue
+      }
+      if (ch === "'") {
+        const prev = quotePos > 0 ? (text[quotePos - 1] as string) : ''
+        const next = text[quotePos + 1] ?? ''
+        if (!(/[A-Za-z0-9]/.test(prev) && /[A-Za-z]/.test(next))) activeQuote = "'"
+        quotePos += 1
+        continue
+      }
+      if (ch === '`') {
+        let runLen = 1
+        while (quotePos + runLen < target && text[quotePos + runLen] === '`') runLen += 1
+        if (runLen === 1) activeQuote = '`'
+        quotePos += runLen
+        continue
+      }
+      quotePos += 1
+    }
+    return activeQuote
+  }
   for (let m = AUTH_SCHEME_RE.exec(text); m !== null; m = AUTH_SCHEME_RE.exec(text)) {
     const scheme = m[1] as string
     const space = m[2] as string
@@ -542,17 +651,38 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const inHeader = AUTH_HEADER_PREFIX.test(before)
     const hasNewline = /[\r\n]/.test(space)
     const after = text.slice(matchEnd, matchEnd + 32)
-    if (!inHeader && hasNewline) {
-      if (
-        /^[ \t\u00a0]*[:=]/.test(after) ||
-        /^[A-Za-z_][A-Za-z0-9_.-]*=[^=]/.test(token) ||
-        (/^[A-Za-z_][A-Za-z0-9_.-]*=$/.test(token) && /^['"$`]/.test(after))
-      ) {
+    const isBasic = scheme.toLowerCase() === 'basic'
+    const basicB64 = isBasic && isBase64Credential(token)
+    if (!inHeader && hasNewline && !basicB64) {
+      if (/^[ \t\u00a0]*[:=]/.test(after) && !isBase64PaddedToken(token)) {
         rewind()
         continue
       }
+      const eqIdx = token.indexOf('=')
+      if (eqIdx > 0 && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(token.slice(0, eqIdx))) {
+        if (eqIdx < token.length - 1) {
+          if (token[eqIdx + 1] !== '=' && /[^._~-]/.test(token.slice(eqIdx + 1))) {
+            rewind()
+            continue
+          }
+        } else if (after[0] === '$') {
+          if (/^\$(?:[A-Za-z_({'"$])/.test(after)) {
+            rewind()
+            continue
+          }
+        } else if (
+          /^\[REDACTED(?::[a-z-]+)?\](?:$|[\s,;:|)&'"`\].!?])/.test(after) &&
+          (!isBase64PaddedToken(token) || isSensitiveKey(token.slice(0, eqIdx)))
+        ) {
+          rewind()
+          continue
+        } else if ((after[0] === '"' || after[0] === "'" || after[0] === '`') && quoteAt(m.index) !== after[0] && opensQuotedAssignmentValue(text, matchEnd, after[0])) {
+          rewind()
+          continue
+        }
+      }
     }
-    if (scheme.toLowerCase() === 'bearer') {
+    if (!isBasic) {
       if (token.length < 12) {
         rewind()
         continue
@@ -565,7 +695,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
         }
       }
     } else {
-      if (hasNewline ? !inHeader && !isBase64Credential(token) : !inHeader && !isLikelyBasicCredentialToken(token)) {
+      if (hasNewline ? !inHeader && !basicB64 : !inHeader && !isLikelyBasicCredentialToken(token)) {
         rewind()
         continue
       }

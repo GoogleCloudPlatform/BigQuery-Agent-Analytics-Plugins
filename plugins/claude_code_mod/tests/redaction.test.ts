@@ -1323,7 +1323,35 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Authorization: Basic\ndXNlcjpwYXNz', 'Authorization: [REDACTED]', 'dXNlcjpwYXNz'],
     ['Authorization: Basic\ncmV2aWV3ZXI6Zml4dHVyZQ==: request rejected', 'Authorization: [REDACTED]', 'cmV2aWV3ZXI6Zml4dHVyZQ=='],
     ['Basic\ndXNlcjpwYXNz', 'Basic [REDACTED]', 'dXNlcjpwYXNz'],
+    ['Basic\ndXNlcjpwYXNz: request rejected', 'Basic [REDACTED]: request rejected', 'dXNlcjpwYXNz'],
+    ['Basic\nYWI6Y2Q=.', 'Basic [REDACTED]', 'YWI6Y2Q='],
+    ['Basic\nYWI6Y2Q=: request rejected', 'Basic [REDACTED]: request rejected', 'YWI6Y2Q='],
+    ['"Basic\nYWI6Y2Q="', '"Basic [REDACTED]"', 'YWI6Y2Q='],
     ['Basic\ncmV2aWV3ZXI6Zml4dHVyZQ==.', 'Basic [REDACTED]', 'cmV2aWV3ZXI6Zml4dHVyZQ=='],
+    ['Basic\ncmV2aWV3ZXI6Zml4dHVyZTE=.', 'Basic [REDACTED]', 'cmV2aWV3ZXI6Zml4dHVyZTE='],
+    ['"Basic\ncmV2aWV3ZXI6Zml4dHVyZTE="', '"Basic [REDACTED]"', 'cmV2aWV3ZXI6Zml4dHVyZTE='],
+    ['`Basic\ncmV2aWV3ZXI6Zml4dHVyZTE=`', '`Basic [REDACTED]`', 'cmV2aWV3ZXI6Zml4dHVyZTE='],
+    ["'Basic\ncmV2aWV3ZXI6Zml4dHVyZTE='", "'Basic [REDACTED]'", 'cmV2aWV3ZXI6Zml4dHVyZTE='],
+    ['"Basic\ncmV2aWV3ZXI6Zml4dHVyZTE=."', '"Basic [REDACTED]"', 'cmV2aWV3ZXI6Zml4dHVyZTE='],
+    ['Authorization: "Basic\ncmV2aWV3ZXI6Zml4dHVyZTE="', 'Authorization: [REDACTED]', 'cmV2aWV3ZXI6Zml4dHVyZTE='],
+    ['Authorization: "Basic\ncmV2aWV3ZXI6Zml4dHVyZTE=."', 'Authorization: [REDACTED]', 'cmV2aWV3ZXI6Zml4dHVyZTE='],
+    ['Basic\ncmV2aWV3ZXI6Zml4dHVyZQ==: request rejected', 'Basic [REDACTED]: request rejected', 'cmV2aWV3ZXI6Zml4dHVyZQ=='],
+    ['Basic\ncmV2aWV3ZXI6Zml4dHVyZTE=: request rejected', 'Basic [REDACTED]: request rejected', 'cmV2aWV3ZXI6Zml4dHVyZTE='],
+    ['Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=.', 'Bearer [REDACTED]', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=-', 'Bearer [REDACTED]', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=$', 'Bearer [REDACTED]$', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['"Bearer\ncmV2aWV3Rml4dHVyZU9ubHk="', '"Bearer [REDACTED]"', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['`Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=`', '`Bearer [REDACTED]`', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ["'Bearer\ncmV2aWV3Rml4dHVyZU9ubHk='", "'Bearer [REDACTED]'", 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['\'"Bearer\ncmV2aWV3Rml4dHVyZU9ubHk="\'', '\'"Bearer [REDACTED]"\'', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['"Use \'Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=\' and \'other\'"', '"Use \'Bearer [REDACTED]\' and \'other\'"', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['echo "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=" "next\nline"', 'echo "Bearer [REDACTED]" "next\nline"', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['Bearer\ncmV2aWV3Rml4dHVyZU9ubHk="', 'Bearer [REDACTED]"', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['Authorization: "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk="', 'Authorization: [REDACTED]', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['Authorization: "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=."', 'Authorization: [REDACTED]', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=: request rejected', 'Bearer [REDACTED]: request rejected', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['Bearer\ncmV2aWV3Rml4dHVyZQ==: request rejected', 'Bearer [REDACTED]: request rejected', 'cmV2aWV3Rml4dHVyZQ=='],
+    ['log: {"note": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'log: {"note": "Bearer [REDACTED]", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk='],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1357,6 +1385,38 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     expect(built.redactions).toBe(1)
   }
 
+  for (const [sample, secret] of [
+    ['{"auth": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['{"note": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+  ] as const) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).not.toContain(secret)
+    expect(stats.redactions).toBe(1)
+
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
+
+    const built = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: sample },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    expect(JSON.stringify(built.row)).not.toContain(secret)
+    expect(built.redactions).toBe(1)
+  }
+
   for (const prose of [
     'Basic\nconfiguration guide',
     'Bearer\u00a0ConfigurationWord',
@@ -1364,6 +1424,9 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'Bearer\u00a0Configuration details follow',
     'Authentication scheme: Bearer\nConfiguration details follow',
     'Bearer\nConfiguration details follow',
+    'MODE=bearer\nEMPTY_VAR=""',
+    "MODE=bearer\nEMPTY_VAR=''",
+    'MODE=bearer\nPUBLIC_NAME="hello"',
   ]) {
     const stats = newStats()
     expect(redactText(prose, stats)).toBe(prose)
@@ -1410,16 +1473,46 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     }).toEqual({ label, under100ms: true, linearScaling: true })
   }
 
-  for (const [sample, expected] of [
-    [`scheme: bearer\nclient_secret: ${CANARY}`, 'scheme: bearer\nclient_secret: [REDACTED]'],
-    [`scheme: bearer\npassword_hash: ${CANARY}`, 'scheme: bearer\npassword_hash: [REDACTED]'],
-    [`MODE=bearer\nCLIENT_SECRET="${CANARY}"`, 'MODE=bearer\nCLIENT_SECRET=[REDACTED]'],
+  for (const [label, gen, largeSize, maxMs, floorMs] of [
+    ['"Bearer\\n a12=" repeat', (n: number) => '"Bearer\naaaaaaaaaaa="'.repeat((n / 22) | 0), 160_000, 150, 80],
+    ['Bearer\\n a12=" repeat', (n: number) => 'Bearer\naaaaaaaaaaa="'.repeat((n / 21) | 0), 160_000, 150, 80],
+    ['"Bearer\\n" + a= pairs', (n: number) => '"Bearer\n' + 'a='.repeat(((n - 8) / 2) | 0), 80_000, 250, 120],
+  ] as const) {
+    const small = gen(10_000)
+    redactText(small, newStats())
+    const t0 = performance.now()
+    redactText(small, newStats())
+    const msSmall = Math.max(1, performance.now() - t0)
+    const large = gen(largeSize)
+    redactText(large.slice(0, 100), newStats())
+    const t1 = performance.now()
+    redactText(large, newStats())
+    const msLarge = performance.now() - t1
+    expect({
+      label,
+      withinBudget: msLarge < maxMs,
+      linearScaling: msLarge <= Math.max(floorMs, msSmall * 25),
+    }).toEqual({ label, withinBudget: true, linearScaling: true })
+  }
+
+  for (const [sample, expected, secret] of [
+    [`scheme: bearer\nclient_secret: ${CANARY}`, 'scheme: bearer\nclient_secret: [REDACTED]', CANARY],
+    [`scheme: bearer\npassword_hash: ${CANARY}`, 'scheme: bearer\npassword_hash: [REDACTED]', CANARY],
+    [`MODE=bearer\nCLIENT_SECRET="${CANARY}"`, 'MODE=bearer\nCLIENT_SECRET=[REDACTED]', CANARY],
+    [`Don't use bearer\nCLIENT_SECRET='${CANARY}'`, "Don't use bearer\nCLIENT_SECRET=[REDACTED]", CANARY],
+    [`MODE=bearer\nCLIENT_SECRET=${CANARY}`, 'MODE=bearer\nCLIENT_SECRET=[REDACTED]', CANARY],
+    ['MODE=bearer\nCLIENT_SECRET=$MY_TOKEN_VAR', 'MODE=bearer\nCLIENT_SECRET=[REDACTED]', '$MY_TOKEN_VAR'],
+    ['MODE=bearer\nCLIENT_SECRET=${MY_TOKEN_VAR}', 'MODE=bearer\nCLIENT_SECRET=[REDACTED]', '${MY_TOKEN_VAR}'],
   ] as const) {
     const stats = newStats()
     const out = redactText(sample, stats)
-    expect(out).not.toContain(CANARY)
+    expect(out).not.toContain(secret)
     expect(out).toBe(expected)
     expect(stats.redactions).toBe(1)
+
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
 
     const built = buildRow({
       eventType: 'TOOL_COMPLETED',
@@ -1437,7 +1530,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
       maxPayloadChars: 16_384,
     })
     const serialized = JSON.stringify(built.row)
-    expect(serialized).not.toContain(CANARY)
+    expect(serialized).not.toContain(secret)
+    expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(expected)
     expect(built.redactions).toBe(1)
   }
 })
