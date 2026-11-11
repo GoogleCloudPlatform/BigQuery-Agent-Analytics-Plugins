@@ -1405,6 +1405,43 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer mySecretToken12==: request rejected', 'Bearer [REDACTED]: request rejected', 'mySecretToken12=='],
     ['echo "Bearer mySecretToken12=="', 'echo "Bearer [REDACTED]"', 'mySecretToken12=='],
     ['Bearer\n-mySecretToken1=', 'Bearer [REDACTED]', '-mySecretToken1='],
+    ['x=`echo \\`a\\` Bearer\nmySecretTokenAb=`', 'x=`echo \\`a\\` Bearer [REDACTED]`', 'mySecretTokenAb='],
+    ['x=`echo \\`a\\` Bearer mySecretTokenAb=`', 'x=`echo \\`a\\` Bearer [REDACTED]`', 'mySecretTokenAb='],
+    ['# x=`echo \\`a\\` Bearer mySecretTokenAb=`', '# x=`echo \\`a\\` Bearer [REDACTED]`', 'mySecretTokenAb='],
+    ['# x=`echo \\`a\\` Bearer mySecretTokenAb=` `unclosed', '# x=`echo \\`a\\` Bearer [REDACTED]` `unclosed', 'mySecretTokenAb='],
+    ['sh -c \'echo "\\"Bearer\nmySecretTokenAb=\\""\'', 'sh -c \'echo "\\"Bearer [REDACTED]\\""\'', 'mySecretTokenAb='],
+    ['sh -c \'echo "\\"Bearer mySecretTokenAb=\\""\'', 'sh -c \'echo "\\"Bearer [REDACTED]\\""\'', 'mySecretTokenAb='],
+    ['x="echo `echo \\`a\\` Bearer\nmySecretTokenAb=`"', 'x="echo `echo \\`a\\` Bearer [REDACTED]`"', 'mySecretTokenAb='],
+    ['x="echo `echo \\`a\\` Bearer mySecretToken=`"', 'x="echo `echo \\`a\\` Bearer [REDACTED]`"', 'mySecretToken='],
+    ['sh -c \'echo "\\"unclosed"; echo "Bearer\nmySecretTokenAb="\'', 'sh -c \'echo "\\"unclosed"; echo "Bearer [REDACTED]"\'', 'mySecretTokenAb='],
+    ['sh -c \'echo "\\"unclosed"; echo "Bearer mySecretToken=" "unclosed\'', 'sh -c \'echo "\\"unclosed"; echo "Bearer [REDACTED]" "unclosed\'', 'mySecretToken='],
+    ['sh -c \'echo "foo\\\' Bearer\nmySecretTokenAb=\'', 'sh -c \'echo "foo\\\' Bearer [REDACTED]\'', 'mySecretTokenAb='],
+    ['sh -c \'echo "foo\\\' && echo "Bearer\nmySecretTokenAb="\'', 'sh -c \'echo "foo\\\' && echo "Bearer [REDACTED]"\'', 'mySecretTokenAb='],
+    ['sh -c \'echo "\\"Bearer mySecretToken=\\"" \\"unclosed\'', 'sh -c \'echo "\\"Bearer [REDACTED]\\"" \\"unclosed\'', 'mySecretToken='],
+    ['# echo "\\"Bearer mySecretToken=\\"" \\"unclosed', '# echo "\\"Bearer [REDACTED]\\"" \\"unclosed', 'mySecretToken='],
+    ['# echo "\\"Bearer mySecretTokenAb=\\"" \\"unclosed', '# echo "\\"Bearer [REDACTED]\\"" \\"unclosed', 'mySecretTokenAb='],
+    ['# echo "\\"Bearer mySecretTokenAb=\\""', '# echo "\\"Bearer [REDACTED]\\""', 'mySecretTokenAb='],
+    ['# echo "\\"unclosed"; echo "Bearer mySecretToken=" "unclosed', '# echo "\\"unclosed"; echo "Bearer [REDACTED]" "unclosed', 'mySecretToken='],
+    ['x="echo \\` Bearer\nmySecretTokenAb="', 'x="echo \\` Bearer [REDACTED]"', 'mySecretTokenAb='],
+    ['Bearer MySecretToken123=.', 'Bearer [REDACTED]', 'MySecretToken123'],
+    ['Bearer MySecretToken123=...', 'Bearer [REDACTED]', 'MySecretToken123'],
+    ['Bearer MySecretToken123=.\n', 'Bearer [REDACTED]\n', 'MySecretToken123'],
+    ['Bearer MySecretToken123=. Next sentence.', 'Bearer [REDACTED] Next sentence.', 'MySecretToken123'],
+    ['Bearer\nMySecretToken123=.', 'Bearer [REDACTED]', 'MySecretToken123'],
+    ['Basic MySecretToken123=.', 'Basic [REDACTED]', 'MySecretToken123'],
+    ['Bearer tokenValue12345==.', 'Bearer [REDACTED]', 'tokenValue12345'],
+    ['Bearer\ntokenValue12345==.', 'Bearer [REDACTED]', 'tokenValue12345'],
+    ['Bearer\nmySecretTokenAb=.', 'Bearer [REDACTED]', 'mySecretTokenAb='],
+    ['Bearer\nmySecretTokenAb=\'', 'Bearer [REDACTED]\'', 'mySecretTokenAb='],
+    ['Bearer\nreviewFixtureOnly9472=', 'Bearer [REDACTED]', 'reviewFixtureOnly9472='],
+    [`Bearer\n${['ya29', 'a0AfH6SMBxyz123='].join('.')}`, 'Bearer [REDACTED]', ['ya29', 'a0AfH6SMBxyz123='].join('.')],
+    ['Bearer\ntok-1234567890ab=', 'Bearer [REDACTED]', 'tok-1234567890ab='],
+    ['Bearer\nxoxbTOKENvalue123=', 'Bearer [REDACTED]', 'xoxbTOKENvalue123='],
+    ['Bearer\nAbCdEfGhIjKlMnOp=', 'Bearer [REDACTED]', 'AbCdEfGhIjKlMnOp='],
+    ['Bearer\nAbcdefghijkl=', 'Bearer [REDACTED]', 'Abcdefghijkl='],
+    ['Bearer\ndXNlcjpwYXNz=', 'Bearer [REDACTED]', 'dXNlcjpwYXNz='],
+    ['Bearer\nENVIRONMENT=', 'Bearer [REDACTED]', 'ENVIRONMENT='],
+    ['Bearer\nschemaV2Config123=', 'Bearer [REDACTED]', 'schemaV2Config123='],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1522,6 +1559,17 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     '# bearer client_secret=',
     'MODE=bearer\npublicvalue=" \'a\'"',
     String.raw`bash -c "mode=bearer` + '\n' + String.raw`publicvalue=\" \'a\'\""`,
+    'MODE=bearer\nENVIRONMENT=',
+    'MODE=bearer\nserver.endpoint=',
+    'MODE=bearer\ncustom-header=',
+    'MODE=bearer\n--config-file=',
+    'MODE=bearer\n--config-file1=',
+    'MODE=bearer\n-verbose=',
+    'MODE=bearer\nWORK_DIR=.',
+    'MODE=bearer\npublic_dir=.',
+    'MODE=bearer\nCURRENT_WORK_DIR=.',
+    'MODE=bearer\npublic_work_dir=.',
+    'MODE=bearer\nschemaV2Config=.',
   ]) {
     const stats = newStats()
     expect(redactText(prose, stats)).toBe(prose)
@@ -1551,6 +1599,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Basic\\n dots', (n: number) => 'Basic\n' + '.'.repeat(n) + 'x'],
     ['Basic\\n Bearer.', (n: number) => 'Basic\n' + 'Bearer.'.repeat((n / 7) | 0)],
     ['Bearer\\u00a0 Pascal', (n: number) => 'Bearer\u00a0' + 'Aa'.repeat((n / 2) | 0) + 'Z'],
+    ['Bearer\\n WORK_DIR= dots', (n: number) => 'MODE=bearer\nWORK_DIR=' + '.'.repeat(n)],
+    ['Bearer\\n MySecretToken123= dots', (n: number) => 'Bearer\nMySecretToken123=' + '.'.repeat(n)],
   ] as const) {
     const small = gen(10_000)
     redactText(small, newStats())
@@ -1588,6 +1638,13 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['# echo single quote Bearer single-line flood', (n: number) => "# echo 'Bearer mySecretTokenAb=' ".repeat((n / 32) | 0), 160_000, 250, 120],
     ['# echo quote foo unclosed single-line flood', (n: number) => "# echo 'Bearer mySecretTokenAb=' foo 'unclosed ".repeat((n / 46) | 0), 160_000, 250, 120],
     ['Token Bearer colon diagnostic single-line flood', (n: number) => 'Token Bearer mySecretToken123: request rejected '.repeat((n / 48) | 0), 160_000, 250, 120],
+    ['escaped backtick Bearer flood', (n: number) => 'x=`echo \\`a\\` Bearer mySecretTokenAb=` '.repeat((n / 40) | 0), 160_000, 250, 120],
+    ['sh -c innerQuote escaped Bearer flood', (n: number) => 'sh -c \'echo "\\"Bearer mySecretToken=\\"" \\"unclosed\' '.repeat((n / 52) | 0), 160_000, 250, 120],
+    ['comment escaped quote Bearer flood', (n: number) => '# echo "\\"Bearer mySecretToken=\\"" \\"unclosed '.repeat((n / 46) | 0), 160_000, 250, 120],
+    ['Bearer trailing-dot padding flood', (n: number) => 'Bearer\nMySecretToken123=. '.repeat((n / 26) | 0), 160_000, 250, 120],
+    ['Bearer double-eq trailing-dot flood', (n: number) => 'Bearer\ntokenValue12345==. '.repeat((n / 26) | 0), 160_000, 250, 120],
+    ['Bearer cross-line non-assignment token flood', (n: number) => 'Bearer\nreviewFixtureOnly9472= '.repeat((n / 30) | 0), 160_000, 250, 120],
+    ['Bearer cross-line base64 non-assignment flood', (n: number) => 'Bearer\ndXNlcjpwYXNz= '.repeat((n / 21) | 0), 160_000, 250, 120],
   ] as const) {
     const small = gen(10_000)
     redactText(small, newStats())
@@ -1603,6 +1660,11 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     expect(outLarge).not.toContain('MySecret1234')
     expect(outLarge).not.toContain('mySecretTokenAb=')
     expect(outLarge).not.toContain('mySecretToken123')
+    expect(outLarge).not.toContain('mySecretToken=')
+    expect(outLarge).not.toContain('MySecretToken123')
+    expect(outLarge).not.toContain('tokenValue12345')
+    expect(outLarge).not.toContain('reviewFixtureOnly9472=')
+    expect(outLarge).not.toContain('dXNlcjpwYXNz=')
     expect({
       label,
       withinBudget: msLarge < maxMs,
@@ -1624,6 +1686,14 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['echo "\\"Bearer mySecretTokenAb=\\" \\"next\\""', true],
     ["# echo 'Bearer mySecretTokenAb=' 'next'", false],
     ["# echo 'Bearer mySecretTokenAb=' foo 'unclosed", false],
+    ['sh -c \'echo "\\"Bearer mySecretToken=\\"" \\"unclosed\'', false],
+    ['# echo "\\"Bearer mySecretToken=\\"" \\"unclosed', false],
+    ['x=`echo \\`a\\` Bearer mySecretTokenAb=`', false],
+    ['# x=`echo \\`a\\` Bearer mySecretTokenAb=` `unclosed', false],
+    ['sh -c \'echo "\\"unclosed"; echo "Bearer mySecretToken=" "unclosed\'', false],
+    ['x="echo `echo \\`a\\` Bearer mySecretToken=`"', true],
+    ['Bearer MySecretToken123=.', false],
+    ['Bearer tokenValue12345==.', false],
   ] as const) {
     const padded = isDoubleQuoted ? sample.slice(0, -1) + padTail + '"' : sample + padTail
     const s1 = newStats()

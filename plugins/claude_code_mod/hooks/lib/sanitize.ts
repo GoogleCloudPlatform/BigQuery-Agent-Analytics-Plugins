@@ -775,6 +775,12 @@ function buildEscapedLineTable(text: string, lineStart: number, lineStop: number
 const AUTH_SCHEME_RE = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=-]{4,})/gi
 const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t\u00a0]*[:=]\s*(?:\\*["'])?$/i
 const CAMEL_CASE_KEY_RE = /^[a-z]+(?:[A-Z][a-z]+)+$/
+const CAMEL_CASE_VERSION_KEY_RE = /^[a-z]+[0-9]*(?:[A-Z][a-z0-9]+)*[A-Z][a-z]+$/
+const UPPER_WORD_KEY_RE = /^[A-Z]{2,}$/
+const LOWER_DOTTED_KEY_RE = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z_]*)+$/
+const LOWER_KEBAB_KEY_RE = /^[a-z]+(?:-[a-z]+)+$/
+const DOUBLE_DASH_LOWER_FLAG_RE = /^--[a-z][a-z0-9_-]*$/
+const SINGLE_DASH_SNAKE_OR_LOWER_FLAG_RE = /^-(?:[a-z][a-z0-9_]*_[a-z0-9_]*|[a-z]+)$/
 const LOWER_WORD_KEY_RE = /^[a-z]+$/
 const STRUCTURED_CONFIG_KEY_RE = /^(?:[A-Z][A-Z0-9_]*_[A-Z0-9_]*|[a-z]+(?:[_.-][a-z]+)+|[A-Z][a-z]+(?:[A-Z][a-z]+)+)$/
 const DIAGNOSTIC_SINGLE_WORD_RE =
@@ -917,12 +923,12 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
         const next = text[quotePos + 1]
         if (commentQuote !== '') {
           if ((commentQuote !== "'" || commentAnsiSingle) && ch === '\\') {
-            if (next === '\\' || next === commentQuote) {
+            if (next === '"' || next === "'") {
+              commentEscapedQuote = toggleEscapedQuote(commentEscapedQuote, next)
               quotePos += 2
               continue
             }
-            if (next === '"' || next === "'") {
-              commentEscapedQuote = toggleEscapedQuote(commentEscapedQuote, next)
+            if (next === '\\' || next === commentQuote || next === '`' || next === '$') {
               quotePos += 2
               continue
             }
@@ -955,23 +961,31 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
         if (ch === '$' && next === "'") {
           commentQuote = "'"
           commentAnsiSingle = true
+          commentEscapedQuote = ''
           quotePos += 2
           continue
         }
         if (ch === '"') {
           commentQuote = '"'
+          commentEscapedQuote = ''
           quotePos += 1
           continue
         }
         if (ch === "'") {
-          if (!isNonQuoteSingleQuote(text, quotePos)) commentQuote = "'"
+          if (!isNonQuoteSingleQuote(text, quotePos)) {
+            commentQuote = "'"
+            commentEscapedQuote = ''
+          }
           quotePos += 1
           continue
         }
         if (ch === '`') {
           let runLen = 1
           while (quotePos + runLen < target && text[quotePos + runLen] === '`') runLen += 1
-          if (runLen === 1) commentQuote = '`'
+          if (runLen === 1) {
+            commentQuote = '`'
+            commentEscapedQuote = ''
+          }
           quotePos += runLen
           continue
         }
@@ -982,12 +996,12 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
         const next = text[quotePos + 1]
         if (innerQuote !== '') {
           if ((innerQuote !== "'" || innerAnsiSingle) && ch === '\\') {
-            if (next === '\\' || next === innerQuote) {
+            if ((next === '"' || next === "'") && !(activeQuote === "'" && !ansiSingle && next === "'")) {
+              activeEscapedQuote = toggleEscapedQuote(activeEscapedQuote, next)
               quotePos += 2
               continue
             }
-            if ((next === '"' || next === "'") && next !== innerQuote) {
-              activeEscapedQuote = toggleEscapedQuote(activeEscapedQuote, next)
+            if ((next === '\\' || next === innerQuote || next === '`' || next === '$') && !(activeQuote === "'" && !ansiSingle && next === "'")) {
               quotePos += 2
               continue
             }
@@ -1008,6 +1022,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
           if (ch === innerQuote) {
             innerQuote = ''
             innerAnsiSingle = false
+            activeEscapedQuote = ''
             quotePos += 1
             continue
           }
@@ -1015,12 +1030,12 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
           continue
         }
         if ((activeQuote !== "'" || ansiSingle) && ch === '\\') {
-          if (next === '\\') {
+          if (next === '"' || next === "'") {
+            activeEscapedQuote = toggleEscapedQuote(activeEscapedQuote, next)
             quotePos += 2
             continue
           }
-          if (next === '"' || next === "'") {
-            activeEscapedQuote = toggleEscapedQuote(activeEscapedQuote, next)
+          if (next === '\\' || next === activeQuote || next === '`' || next === '$') {
             quotePos += 2
             continue
           }
@@ -1189,6 +1204,26 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     }
     return opensEscapedFast(quoteIdx, q)
   }
+  const hasAssignRhsAt = (
+    rhsIdx: number,
+    rhsText: string,
+    qState: QuoteContext,
+    coreToken: string,
+    isLowerWordKey: boolean,
+  ): boolean => {
+    if (rhsText === '') return false
+    const c0 = rhsText.charCodeAt(0)
+    if (c0 === 36) return ASSIGN_RHS_VAR_RE.test(rhsText)
+    if (c0 === 91) return ASSIGN_RHS_REDACTED_RE.test(rhsText) || ASSIGN_RHS_PUNCT_RE.test(rhsText)
+    if (c0 === 34 || c0 === 39 || c0 === 96) {
+      return isOpeningUnescapedQuote(rhsIdx, rhsText[0] as string, qState, coreToken, isLowerWordKey)
+    }
+    if (c0 === 92) {
+      const c1 = rhsText.charCodeAt(1)
+      if (c1 === 34 || c1 === 39) return isOpeningEscapedQuote(rhsIdx, rhsText[1] as string, qState, coreToken, isLowerWordKey)
+    }
+    return ASSIGN_RHS_PUNCT_RE.test(rhsText)
+  }
   for (let m = AUTH_SCHEME_RE.exec(text); m !== null; m = AUTH_SCHEME_RE.exec(text)) {
     const scheme = m[1] as string
     const space = m[2] as string
@@ -1197,91 +1232,137 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const rewind = (): void => {
       AUTH_SCHEME_RE.lastIndex = Math.max(m.index + scheme.length, matchEnd - 6)
     }
-    const before = text.slice(Math.max(0, m.index - 40), m.index)
-    const inHeader = AUTH_HEADER_PREFIX.test(before)
-    const hasNewline = /[\r\n]/.test(space)
+    const before = m.index === 0 ? '' : text.slice(Math.max(0, m.index - 40), m.index)
+    const inHeader =
+      before.length >= 14 && (before.includes('z') || before.includes('Z')) && AUTH_HEADER_PREFIX.test(before)
+    const hasNewline = space.length === 1 ? space.charCodeAt(0) === 10 || space.charCodeAt(0) === 13 : space.includes('\n') || space.includes('\r')
     const after = text.slice(matchEnd, matchEnd + 32)
-    const isBasic = scheme.toLowerCase() === 'basic'
+    const isBasic = scheme.length === 5 && (scheme === 'Basic' || scheme === 'basic' || scheme.toLowerCase() === 'basic')
     const basicB64 = isBasic && isBase64Credential(token)
+    const eqIdx = token.indexOf('=')
+    let coreToken = token
+    let trailingDots = ''
+    if (eqIdx > 0 && token.charCodeAt(token.length - 1) === 46) {
+      const eqCount = token[eqIdx + 1] === '=' ? 2 : 1
+      if (eqIdx + eqCount < token.length) {
+        let allDots = true
+        for (let d = eqIdx + eqCount; d < token.length; d += 1) {
+          if (token.charCodeAt(d) !== 46) {
+            allDots = false
+            break
+          }
+        }
+        if (allDots) {
+          coreToken = token.slice(0, eqIdx + eqCount)
+          trailingDots = token.slice(eqIdx + eqCount)
+        }
+      }
+    }
+    const effectiveAfter =
+      trailingDots === ''
+        ? after
+        : trailingDots.length >= 32
+          ? trailingDots.slice(0, 32)
+          : trailingDots + after.slice(0, 32 - trailingDots.length)
+    const effectiveMatchEnd = trailingDots === '' ? matchEnd : m.index + scheme.length + space.length + coreToken.length
     if (!inHeader && !basicB64) {
-      const eqIdx = token.indexOf('=')
-      const rawKeyPart = eqIdx > 0 ? token.slice(0, eqIdx) : ''
+      const rawKeyPart = eqIdx > 0 ? coreToken.slice(0, eqIdx) : ''
       const isPlainAssignKey = eqIdx > 0 && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(rawKeyPart)
-      const flagStripped = rawKeyPart.startsWith('--') ? rawKeyPart.slice(2) : rawKeyPart.startsWith('-') ? rawKeyPart.slice(1) : ''
-      const isDoubleFlag = rawKeyPart.startsWith('--')
+      const isDashPrefixed = eqIdx > 0 && !isPlainAssignKey && rawKeyPart.charCodeAt(0) === 45
+      const flagStripped = isDashPrefixed ? (rawKeyPart.charCodeAt(1) === 45 ? rawKeyPart.slice(2) : rawKeyPart.slice(1)) : ''
+      const isDoubleFlag = isDashPrefixed && rawKeyPart.charCodeAt(1) === 45
+      const isConfigFlagShape =
+        isDashPrefixed &&
+        (isDoubleFlag ? DOUBLE_DASH_LOWER_FLAG_RE.test(rawKeyPart) : SINGLE_DASH_SNAKE_OR_LOWER_FLAG_RE.test(rawKeyPart))
       const isFlagAssignKey =
-        !isPlainAssignKey &&
+        isDashPrefixed &&
         flagStripped !== '' &&
         /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(flagStripped) &&
-        isSensitiveKey(flagStripped)
+        (isConfigFlagShape || isSensitiveKey(flagStripped))
       const isAssignKey = isPlainAssignKey || isFlagAssignKey
       const assignKey = isFlagAssignKey ? flagStripped : rawKeyPart
-      const isLowerWordKey = isAssignKey && LOWER_WORD_KEY_RE.test(assignKey)
+      const isLowerWordKey = isPlainAssignKey && LOWER_WORD_KEY_RE.test(rawKeyPart)
       const isEmptyAssignIdentifier =
         isAssignKey &&
+        !isLowerWordKey &&
         ((isFlagAssignKey && isDoubleFlag) ||
           ALL_CAPS_SNAKE_KEY_RE.test(assignKey) ||
           LOWER_SNAKE_KEY_RE.test(assignKey) ||
           CAMEL_CASE_KEY_RE.test(assignKey))
-      const endsWithEq = isAssignKey && eqIdx === token.length - 1
-      const endsWithDoubleEq = isAssignKey && eqIdx === token.length - 2 && token[eqIdx + 1] === '='
+      const endsWithEq = isAssignKey && eqIdx === coreToken.length - 1
+      const endsWithDoubleEq = isAssignKey && eqIdx === coreToken.length - 2 && coreToken[eqIdx + 1] === '='
       const isEqPaddedEnd = endsWithEq || endsWithDoubleEq
 
       if (hasNewline) {
-        if (/^[ \t\u00a0]*[:=]/.test(after) && (!isBase64PaddedToken(token) || isEmptyAssignIdentifier || isLowerWordKey)) {
+        const ac0 = effectiveAfter.charCodeAt(0)
+        if (
+          (ac0 === 58 || ac0 === 61 || ac0 === 32 || ac0 === 9 || ac0 === 160) &&
+          /^[ \t\u00a0]*[:=]/.test(effectiveAfter) &&
+          (!isBase64PaddedToken(coreToken) || isEmptyAssignIdentifier || isLowerWordKey || isConfigFlagShape)
+        ) {
           rewind()
           continue
         }
         if (isAssignKey) {
           if (!isEqPaddedEnd) {
             const safeAfter =
-              after === '' ||
-              /^(?:[\s),;}\]"'`]|[:.!?](?:$|[\s'")\]},;])|\$(?:$|[\s),;}\]"'`]))/.test(after) ||
-              ((after.startsWith('\\"') || after.startsWith("\\'"))
-                ? !opensEscapedFast(matchEnd, after[1] as string)
-                : /^\\[nrt]/.test(after))
-            if (!isBase64PaddedToken(token) || isEmptyAssignIdentifier || token[eqIdx + 1] === '~' || !safeAfter) {
+              effectiveAfter === '' ||
+              /^(?:[\s),;}\]"'`]|[:.!?](?:$|[\s'")\]},;])|\$(?:$|[\s),;}\]"'`]))/.test(effectiveAfter) ||
+              ((effectiveAfter.startsWith('\\"') || effectiveAfter.startsWith("\\'"))
+                ? !opensEscapedFast(effectiveMatchEnd, effectiveAfter[1] as string)
+                : /^\\[nrt]/.test(effectiveAfter))
+            if (!isBase64PaddedToken(coreToken) || isEmptyAssignIdentifier || coreToken[eqIdx + 1] === '~' || !safeAfter) {
               rewind()
               continue
             }
           } else {
             const qState = quoteAt(m.index)
-            const hasAssignRhsInAfter = (): boolean =>
-              ASSIGN_RHS_VAR_RE.test(after) ||
-              ASSIGN_RHS_REDACTED_RE.test(after) ||
-              ((after[0] === '"' || after[0] === "'" || after[0] === '`') &&
-                isOpeningUnescapedQuote(matchEnd, after[0], qState, token, isLowerWordKey)) ||
-              (after.startsWith('\\"') || after.startsWith("\\'")
-                ? isOpeningEscapedQuote(matchEnd, after[1] as string, qState, token, isLowerWordKey)
-                : ASSIGN_RHS_PUNCT_RE.test(after))
-            if (endsWithDoubleEq) {
-              if (hasAssignRhsInAfter()) {
+            const assignRhs = hasAssignRhsAt(effectiveMatchEnd, effectiveAfter, qState, coreToken, isLowerWordKey)
+            if (endsWithDoubleEq || isLowerWordKey) {
+              if ((isLowerWordKey && (effectiveAfter === '' || /^[\s#]/.test(effectiveAfter))) || assignRhs) {
                 rewind()
                 continue
               }
+            } else if (assignRhs) {
+              rewind()
+              continue
             } else {
               const closedByEnclosingQuote =
-                isBase64PaddedToken(token) &&
-                !isLowerWordKey &&
+                isBase64PaddedToken(coreToken) &&
                 !/=\s*$/.test(before) &&
-                !hasAssignRhsInAfter() &&
-                ((!qState.inComment && qState.activeQuote !== '' && after[0] === qState.activeQuote) ||
+                ((!qState.inComment && qState.activeQuote !== '' && effectiveAfter[0] === qState.activeQuote) ||
                   (!qState.inComment &&
                     qState.innerQuote !== '' &&
-                    after[0] === qState.innerQuote &&
-                    isDelimOrSpaceAfterQuote(after[1])) ||
+                    effectiveAfter[0] === qState.innerQuote &&
+                    isDelimOrSpaceAfterQuote(effectiveAfter[1])) ||
                   ((qState.inComment ? qState.commentEscapedQuote : qState.activeEscapedQuote) !== '' &&
-                    after.startsWith('\\' + (qState.inComment ? qState.commentEscapedQuote : qState.activeEscapedQuote)) &&
-                    (isDelimOrSpaceAfterQuote(after[2]) ||
-                      (!qState.inComment && qState.activeQuote === '' && after[2] === '\\'))))
-              if (
-                (isEmptyAssignIdentifier && !closedByEnclosingQuote) ||
-                (isLowerWordKey && (after === '' || /^[\s#]/.test(after))) ||
-                (!isBase64PaddedToken(token) && !isSensitiveKey(assignKey)) ||
-                hasAssignRhsInAfter()
-              ) {
-                rewind()
-                continue
+                    effectiveAfter.startsWith('\\' + (qState.inComment ? qState.commentEscapedQuote : qState.activeEscapedQuote)) &&
+                    (isDelimOrSpaceAfterQuote(effectiveAfter[2]) ||
+                      (!qState.inComment && qState.activeQuote === '' && effectiveAfter[2] === '\\'))))
+              if (!closedByEnclosingQuote) {
+                const precededByEqOrInComment = /=\s*$/.test(before) || qState.inComment
+                const isEmptyTailForAssign =
+                  effectiveAfter === '' ||
+                  /^[\s#;)|&]/.test(effectiveAfter) ||
+                  ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`') &&
+                    effectiveAfter[1] === effectiveAfter[0] &&
+                    isDelimOrSpaceAfterQuote(effectiveAfter[2])) ||
+                  (trailingDots !== '' && (!isBase64PaddedToken(coreToken) || precededByEqOrInComment)) ||
+                  (precededByEqOrInComment &&
+                    (effectiveAfter[0] === '"' || effectiveAfter[0] === "'") &&
+                    isDelimOrSpaceAfterQuote(effectiveAfter[1]))
+                if (
+                  isEmptyTailForAssign &&
+                  (isEmptyAssignIdentifier ||
+                    isConfigFlagShape ||
+                    CAMEL_CASE_VERSION_KEY_RE.test(rawKeyPart) ||
+                    (UPPER_WORD_KEY_RE.test(rawKeyPart) && precededByEqOrInComment) ||
+                    LOWER_DOTTED_KEY_RE.test(rawKeyPart) ||
+                    LOWER_KEBAB_KEY_RE.test(rawKeyPart))
+                ) {
+                  rewind()
+                  continue
+                }
               }
             }
           }
@@ -1304,64 +1385,57 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
       } else if (isAssignKey && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
         if (isEqPaddedEnd) {
           const qState = quoteAt(m.index)
-          const singleAssignRhs =
-            ASSIGN_RHS_VAR_RE.test(after) ||
-            ASSIGN_RHS_REDACTED_RE.test(after) ||
-            ((after[0] === '"' || after[0] === "'" || after[0] === '`') &&
-              isOpeningUnescapedQuote(matchEnd, after[0], qState, token, isLowerWordKey)) ||
-            (after.startsWith('\\"') || after.startsWith("\\'")
-              ? isOpeningEscapedQuote(matchEnd, after[1] as string, qState, token, isLowerWordKey)
-              : ASSIGN_RHS_PUNCT_RE.test(after))
+          const singleAssignRhs = hasAssignRhsAt(effectiveMatchEnd, effectiveAfter, qState, coreToken, isLowerWordKey)
           const spaceBeforeQuoteRhs =
-            !isBase64PaddedToken(token) &&
-            /^[ \t]+["'$\\]/.test(after) &&
+            !isBase64PaddedToken(coreToken) &&
+            /^[ \t]+["'$\\]/.test(effectiveAfter) &&
             (() => {
               let sp = 1
-              while (sp < after.length && (after[sp] === ' ' || after[sp] === '\t')) sp += 1
-              const qIdx = matchEnd + sp
+              while (sp < effectiveAfter.length && (effectiveAfter[sp] === ' ' || effectiveAfter[sp] === '\t')) sp += 1
+              const qIdx = effectiveMatchEnd + sp
               const ch = text[qIdx]
               if (ch === '"' || ch === "'" || ch === '`') {
-                return isOpeningUnescapedQuote(qIdx, ch, qState, token, isLowerWordKey)
+                return isOpeningUnescapedQuote(qIdx, ch, qState, coreToken, isLowerWordKey)
               }
               if (ch === '\\' && (text[qIdx + 1] === '"' || text[qIdx + 1] === "'")) {
-                return isOpeningEscapedQuote(qIdx, text[qIdx + 1] as string, qState, token, isLowerWordKey)
+                return isOpeningEscapedQuote(qIdx, text[qIdx + 1] as string, qState, coreToken, isLowerWordKey)
               }
-              return /^\$(?:[A-Za-z_({'"$])/.test(after.slice(sp))
+              return /^\$(?:[A-Za-z_({'"$])/.test(effectiveAfter.slice(sp))
             })()
           const emptyNonPaddedEnv =
             !endsWithDoubleEq &&
-            !isBase64PaddedToken(token) &&
+            !isBase64PaddedToken(coreToken) &&
             isEmptyAssignIdentifier &&
             (qState.inComment || qState.activeQuote === '') &&
-            (after === '' || /^[\s#]/.test(after))
+            (effectiveAfter === '' || /^[\s#]/.test(effectiveAfter))
           if (singleAssignRhs || spaceBeforeQuoteRhs || emptyNonPaddedEnv) {
             rewind()
             continue
           }
-        } else if (!isBase64PaddedToken(token)) {
+        } else if (!isBase64PaddedToken(coreToken)) {
           rewind()
           continue
         }
       }
     }
     if (!isBasic) {
-      if (token.length < 12) {
+      if (coreToken.length < 12) {
         rewind()
         continue
       }
-      if (!inHeader && PASCAL_CASE_WORD_RE.test(token)) {
-        const hasProseFollow = (hasNewline || space.includes('\u00a0')) && /^[ \t\u00a0]+[a-z]{2,}\b/.test(after)
-        if (hasProseFollow || (space.includes('\u00a0') && isDocumentationPascalPhrase(token))) {
+      if (!inHeader && PASCAL_CASE_WORD_RE.test(coreToken)) {
+        const hasProseFollow = (hasNewline || space.includes('\u00a0')) && /^[ \t\u00a0]+[a-z]{2,}\b/.test(effectiveAfter)
+        if (hasProseFollow || (space.includes('\u00a0') && isDocumentationPascalPhrase(coreToken))) {
           rewind()
           continue
         }
       }
     } else {
-      if (hasNewline ? !inHeader && !basicB64 : !inHeader && !isLikelyBasicCredentialToken(token)) {
+      if (hasNewline ? !inHeader && !basicB64 : !inHeader && !isLikelyBasicCredentialToken(coreToken)) {
         rewind()
         continue
       }
-      if (inHeader && token.length < 4) {
+      if (inHeader && coreToken.length < 4) {
         rewind()
         continue
       }
