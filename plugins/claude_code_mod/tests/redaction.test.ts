@@ -1304,7 +1304,9 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     [`Authorization: Bearer\n\n${token}`, 'Authorization: [REDACTED]', token],
     [`Authorization: Bearer\r\n ${token}`, 'Authorization: [REDACTED]', token],
     [`Authorization: Bearer\r\n \r\n ${token}`, 'Authorization: [REDACTED]', token],
+    [`Authorization: Bearer\n${token}: request rejected`, 'Authorization: [REDACTED]', token],
     [`Bearer\u00a0${token}`, 'Bearer [REDACTED]', token],
+    ['Bearer\u00a0ReviewFixtureOnly', 'Bearer [REDACTED]', 'ReviewFixtureOnly'],
     [`Bearer\n${token}`, 'Bearer [REDACTED]', token],
     ['Bearer\nabcdefghijklmnop', 'Bearer [REDACTED]', 'abcdefghijklmnop'],
     ['Bearer\r\n abcdefghijklmnop', 'Bearer [REDACTED]', 'abcdefghijklmnop'],
@@ -1313,8 +1315,15 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer\r\n reviewFixtureOnly', 'Bearer [REDACTED]', 'reviewFixtureOnly'],
     ['Bearer\nReviewFixtureOnly', 'Bearer [REDACTED]', 'ReviewFixtureOnly'],
     ['Bearer\r\n ReviewFixtureOnly', 'Bearer [REDACTED]', 'ReviewFixtureOnly'],
+    [`Scheme: Bearer\nBearer ${token}`, 'Scheme: Bearer\nBearer [REDACTED]', token],
+    ['Authorization:\nBearer\nReviewFixtureOnly more', 'Authorization:\nBearer [REDACTED] more', 'ReviewFixtureOnly'],
+    ['Proxy-Authorization:\nBearer\nReviewFixtureOnly more', 'Proxy-Authorization:\nBearer [REDACTED] more', 'ReviewFixtureOnly'],
+    ['Authorization: Bearer\u00a0ConfigurationWord', 'Authorization: [REDACTED]', 'ConfigurationWord'],
+    [`Basic\nBearer ${token}`, 'Basic\nBearer [REDACTED]', token],
     ['Authorization: Basic\ndXNlcjpwYXNz', 'Authorization: [REDACTED]', 'dXNlcjpwYXNz'],
+    ['Authorization: Basic\ncmV2aWV3ZXI6Zml4dHVyZQ==: request rejected', 'Authorization: [REDACTED]', 'cmV2aWV3ZXI6Zml4dHVyZQ=='],
     ['Basic\ndXNlcjpwYXNz', 'Basic [REDACTED]', 'dXNlcjpwYXNz'],
+    ['Basic\ncmV2aWV3ZXI6Zml4dHVyZQ==.', 'Basic [REDACTED]', 'cmV2aWV3ZXI6Zml4dHVyZQ=='],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1322,6 +1331,10 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     expect(out).toBe(expected)
     expect(out).not.toContain(secret)
     expect(stats.redactions).toBe(1)
+
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
 
     const built = buildRow({
       eventType: 'TOOL_COMPLETED',
@@ -1340,13 +1353,15 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     })
     const serialized = JSON.stringify(built.row)
     expect(serialized).not.toContain(secret)
-    expect(serialized).toContain(expected)
+    expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(expected)
     expect(built.redactions).toBe(1)
   }
 
   for (const prose of [
     'Basic\nconfiguration guide',
     'Bearer\u00a0ConfigurationWord',
+    'Bearer\u00a0AuthenticationGuide',
+    'Bearer\u00a0Configuration details follow',
     'Authentication scheme: Bearer\nConfiguration details follow',
     'Bearer\nConfiguration details follow',
   ]) {
@@ -1371,6 +1386,28 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     })
     expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(prose)
     expect(built.redactions).toBe(0)
+  }
+
+  for (const [label, gen] of [
+    ['Bearer\\n repeat', (n: number) => 'Bearer\n'.repeat((n / 7) | 0)],
+    ['Basic\\n dots', (n: number) => 'Basic\n' + '.'.repeat(n) + 'x'],
+    ['Basic\\n Bearer.', (n: number) => 'Basic\n' + 'Bearer.'.repeat((n / 7) | 0)],
+    ['Bearer\\u00a0 Pascal', (n: number) => 'Bearer\u00a0' + 'Aa'.repeat((n / 2) | 0) + 'Z'],
+  ] as const) {
+    const small = gen(10_000)
+    redactText(small, newStats())
+    const t0 = performance.now()
+    redactText(small, newStats())
+    const ms10 = Math.max(0.1, performance.now() - t0)
+    const large = gen(80_000)
+    const t1 = performance.now()
+    redactText(large, newStats())
+    const ms80 = performance.now() - t1
+    expect({
+      label,
+      under100ms: ms80 < 100,
+      linearScaling: ms80 <= Math.max(25, ms10 * 20),
+    }).toEqual({ label, under100ms: true, linearScaling: true })
   }
 
   for (const [sample, expected] of [

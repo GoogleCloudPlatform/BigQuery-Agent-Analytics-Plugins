@@ -1538,10 +1538,154 @@ class TestTranscriptAndHooks38(unittest.TestCase):
         self.assertEqual(tool_rows[0]["status"], "ERROR")
         self.assertEqual(tool_rows[0]["error_message"], "Non-zero exit status")
 
-        stop_rows = [r for r in rows if r["event_type"] == "LLM_RESPONSE"]
+        stop_rows = [r for r in rows if r["event_type"] == "LLM_ERROR"]
         self.assertEqual(len(stop_rows), 1)
         self.assertEqual(stop_rows[0]["status"], "ERROR")
         self.assertEqual(stop_rows[0]["error_message"], "rate_limit_error")
+        self.assertEqual(
+            [r for r in rows if r["event_type"] == "LLM_RESPONSE"],
+            [],
+            f"StopFailure must emit LLM_ERROR, not LLM_RESPONSE: {rows}",
+        )
+
+    def test_stop_failure_emits_llm_error_and_preserves_fields(self):
+        from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter
+        from bigquery_agent_analytics_tracing.config import (
+            BQAA_EVENT_TYPES,
+            BQAAConfig,
+        )
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        self.assertIn("LLM_ERROR", BQAA_EVENT_TYPES)
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_stopfail_llm_err_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        direct_log = os.path.join(tmp_root, "direct.log")
+        direct_cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            agent_name="test-agent",
+            user_id="test-user",
+            dry_run=True,
+            log_file=direct_log,
+            state_dir=os.path.join(tmp_root, "direct_state"),
+            spool_dir=os.path.join(tmp_root, "direct_spool"),
+        )
+        direct_logger = BigQueryAgentAnalyticsLogger(direct_cfg)
+        emitted = direct_logger.log_llm_error(
+            response="partial output before limit",
+            session_id="sess-direct",
+            invocation_id="inv-direct",
+            trace_id="trace-direct",
+            span_id="span-direct",
+            parent_span_id="parent-direct",
+            model="test-model",
+            usage_metadata={"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
+            total_ms=42,
+            error_message="synthetic_rate_limit",
+            attributes={"custom_flag": True},
+        )
+        self.assertEqual(emitted["event_type"], "LLM_ERROR")
+        self.assertEqual(emitted["status"], "ERROR")
+        self.assertEqual(emitted["error_message"], "synthetic_rate_limit")
+        self.assertEqual(emitted["content"], {"response": "partial output before limit"})
+        self.assertEqual(emitted["trace_id"], "trace-direct")
+        self.assertEqual(emitted["invocation_id"], "inv-direct")
+        self.assertEqual(emitted["span_id"], "span-direct")
+        self.assertEqual(emitted["parent_span_id"], "parent-direct")
+        self.assertEqual(emitted["attributes"]["model"], "test-model")
+        self.assertEqual(emitted["attributes"]["usage_metadata"]["total_tokens"], 15)
+        self.assertTrue(emitted["attributes"]["custom_flag"])
+
+        # Adapter UserPromptSubmit -> StopFailure end-to-end.
+        hook_log = os.path.join(tmp_root, "hook_stopfail.log")
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            agent_name="stopfail-agent",
+            user_id="stopfail-user",
+            dry_run=True,
+            log_file=hook_log,
+            state_dir=os.path.join(tmp_root, "state"),
+            spool_dir=os.path.join(tmp_root, "spool"),
+        )
+        adapter = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg))
+        transcript = Path(tmp_root) / "transcript.jsonl"
+        transcript.write_text("", encoding="utf-8")
+
+        from unittest import mock
+        with mock.patch.dict(
+            os.environ,
+            {"BQAA_AGENT_NAME": "stopfail-agent", "BQAA_USER_ID": "stopfail-user"},
+        ):
+            adapter.process("SessionStart", {"session_id": "sf-turn-1", "cwd": tmp_root})
+            adapter.process("UserPromptSubmit", {
+                "session_id": "sf-turn-1",
+                "prompt": "trigger rate limit",
+                "invocation_id": "inv-sf-1",
+                "transcript_path": str(transcript),
+            })
+            transcript.write_text(
+                json.dumps({
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg_sf_1",
+                        "model": "test-model-sf",
+                        "usage": {"input_tokens": 17, "output_tokens": 9},
+                        "content": [{"type": "text", "text": "transcript partial"}],
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            adapter.process("StopFailure", {
+                "session_id": "sf-turn-1",
+                "error": "synthetic_rate_limit",
+                "error_type": "rate_limit",
+                "reason": "quota_exceeded",
+                "last_assistant_message": "partial reply",
+                "transcript_path": str(transcript),
+            })
+            adapter.process("SessionEnd", {
+                "session_id": "sf-turn-1",
+                "transcript_path": str(transcript),
+            })
+
+        rows = []
+        for line in Path(hook_log).read_text(encoding="utf-8").splitlines():
+            idx = line.find("DRY_RUN ")
+            if idx != -1:
+                rows.append(json.loads(line[idx + len("DRY_RUN "):]))
+
+        req_rows = [r for r in rows if r["event_type"] == "LLM_REQUEST"]
+        err_rows = [r for r in rows if r["event_type"] == "LLM_ERROR"]
+        resp_rows = [r for r in rows if r["event_type"] == "LLM_RESPONSE"]
+
+        self.assertEqual(len(req_rows), 1)
+        self.assertEqual(len(err_rows), 1, f"expected 1 LLM_ERROR row, got {rows}")
+        self.assertEqual(resp_rows, [], f"expected 0 LLM_RESPONSE rows, got {resp_rows}")
+
+        err = err_rows[0]
+        req = req_rows[0]
+        self.assertEqual(err["status"], "ERROR")
+        self.assertEqual(err["error_message"], "synthetic_rate_limit")
+        self.assertEqual(err["session_id"], "sf-turn-1")
+        self.assertEqual(err["trace_id"], req["trace_id"])
+        self.assertEqual(err["invocation_id"], req["invocation_id"])
+        self.assertEqual(err["invocation_id"], "inv-sf-1")
+        self.assertEqual(err["span_id"], req["span_id"])
+        self.assertEqual(err["agent"], "stopfail-agent")
+        self.assertEqual(err["user_id"], "stopfail-user")
+        self.assertEqual(json.loads(err["content"]), {"response": "partial reply"})
+        err_attrs = json.loads(err["attributes"])
+        self.assertEqual(err_attrs["model"], "test-model-sf")
+        self.assertEqual(
+            err_attrs["usage_metadata"],
+            {"prompt_tokens": 17, "completion_tokens": 9, "total_tokens": 26},
+        )
+        self.assertTrue(err_attrs["stop_failure"])
+        self.assertEqual(err_attrs["hook_event_name"], "StopFailure")
+        self.assertEqual(err_attrs["error_type"], "rate_limit")
+        self.assertEqual(err_attrs["reason"], "quota_exceeded")
 
     def test_multiturn_session_end_flushes_turn2_without_usage_after_turn1_stop(self):
         from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter
@@ -2707,6 +2851,331 @@ class TestRound3Fixes(unittest.TestCase):
         self.assertLess(elapsed, 1.0)
         log_text = (Path(tmp_root) / "drain.log").read_text(encoding="utf-8")
         self.assertIn("DRAINER skipped", log_text)
+
+    def test_drain_retry_meta_write_failure_preserves_backoff_and_expiry(self):
+        import errno
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_p2_retry_enospc_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        def _cleanup_drain_globals():
+            prefix = f"{Path(spool_dir)}{os.sep}"
+            for cache in (drain._in_memory_retry_meta,):
+                for key in list(cache):
+                    if key.startswith(prefix):
+                        del cache[key]
+            for s in (drain._skipped_paths,):
+                for key in list(s):
+                    if key.startswith(prefix):
+                        s.discard(key)
+            for key in list(drain._reported_skips):
+                if prefix in key:
+                    drain._reported_skips.discard(key)
+
+        self.addCleanup(_cleanup_drain_globals)
+
+        def _write_envelope(name: str, marker: str) -> Path:
+            path = Path(spool_dir) / name
+            path.write_text(
+                json.dumps({
+                    "config": {
+                        "project_id": "p",
+                        "dataset": "d",
+                        "table": "agent_events",
+                    },
+                    "row": {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "event_type": "LLM_REQUEST",
+                        "content": {"marker": marker},
+                        "attributes": {},
+                        "latency_ms": {},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            return path
+
+        fail_env = _write_envelope("event-001-fail.json", "fail-always")
+        attempts = {"fail": 0}
+        delivered = []
+
+        def _insert(table_id, rows):
+            del table_id
+            outcomes = []
+            for idx, row in enumerate(rows):
+                if row["content"]["marker"] == "fail-always":
+                    attempts["fail"] += 1
+                    outcomes.append({
+                        "index": idx,
+                        "errors": [{"reason": "backendError", "message": "transient 503"}],
+                    })
+                else:
+                    delivered.append(row["content"]["marker"])
+            return outcomes
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+
+        log_path = Path(spool_dir) / "drain.log"
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=str(log_path),
+            dry_run=False,
+            drain_retry_backoff_seconds=None,
+            drain_max_retry_age_seconds=12.0,
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.03,
+        )
+        now = {"t": 1000.0}
+
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(
+                 drain,
+                 "_write_retry_meta",
+                 side_effect=OSError(errno.ENOSPC, "No space left on device"),
+             ):
+            resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved1, 0)
+            self.assertEqual(attempts["fail"], 1)
+            self.assertTrue(fail_env.is_file())
+            self.assertFalse((Path(spool_dir) / "event-001-fail.json.retry").exists())
+
+            mem_key = str(fail_env)
+            self.assertIn(mem_key, drain._in_memory_retry_meta)
+            self.assertEqual(drain._in_memory_retry_meta[mem_key]["first_failed_at"], 1000.0)
+            self.assertEqual(drain._in_memory_retry_meta[mem_key]["attempts"], 1)
+            self.assertEqual(drain._in_memory_retry_meta[mem_key]["next_retry_at"], 1005.0)
+
+            wait1 = drain._next_deferred_wait_seconds(cfg)
+            self.assertIsNotNone(wait1)
+            self.assertAlmostEqual(wait1, 5.0, places=3)
+
+            # During backoff window: healthy sibling drains while fail stays deferred.
+            now["t"] = 1002.0
+            healthy_env = _write_envelope("event-002-healthy.json", "healthy-1")
+            resolved2 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved2, 1)
+            self.assertEqual(delivered, ["healthy-1"])
+            self.assertFalse(healthy_env.exists())
+            self.assertEqual(attempts["fail"], 1)
+
+            # Backoff elapsed: second attempt preserves first_failed_at=1000.0.
+            now["t"] = 1005.0
+            resolved3 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved3, 0)
+            self.assertEqual(attempts["fail"], 2)
+            self.assertEqual(drain._in_memory_retry_meta[mem_key]["first_failed_at"], 1000.0)
+            self.assertEqual(drain._in_memory_retry_meta[mem_key]["attempts"], 2)
+            self.assertEqual(drain._in_memory_retry_meta[mem_key]["next_retry_at"], 1015.0)
+            wait2 = drain._next_deferred_wait_seconds(cfg)
+            self.assertIsNotNone(wait2)
+            self.assertAlmostEqual(wait2, 7.0, places=3)
+
+            # Max retry age elapsed: expires and quarantines instead of resetting first_failed_at.
+            now["t"] = 1012.0
+            resolved4 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved4, 1)
+            self.assertEqual(attempts["fail"], 2)
+            self.assertFalse(fail_env.exists())
+            self.assertNotIn(mem_key, drain._in_memory_retry_meta)
+            self.assertTrue(
+                (Path(spool_dir) / "dead-letter" / "event-001-fail.write-failed.json").is_file()
+            )
+
+        log_text = log_path.read_text(encoding="utf-8")
+        self.assertEqual(log_text.count("DRAINER retry_meta_write_failed"), 1, log_text)
+        self.assertIn("DRAINER retry_expired file=event-001-fail.json", log_text)
+
+        # Full _run loop check with real time: nonzero backoff sleeps and eventual expiry.
+        run_fail_env = _write_envelope("event-003-run.json", "fail-always")
+        attempts["fail"] = 0
+        sleeps = []
+        orig_sleep = asyncio.sleep
+
+        async def _tracking_sleep(delay):
+            sleeps.append(delay)
+            await orig_sleep(delay)
+
+        cfg_run = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=str(log_path),
+            dry_run=False,
+            drain_retry_backoff_seconds=0.12,
+            drain_max_retry_age_seconds=0.20,
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.03,
+        )
+        with mock.patch.object(
+            drain,
+            "_write_retry_meta",
+            side_effect=OSError(errno.ENOSPC, "No space left on device"),
+        ), mock.patch.object(drain.asyncio, "sleep", side_effect=_tracking_sleep):
+            asyncio.run(asyncio.wait_for(drain._run(cfg_run), timeout=3.0))
+
+        self.assertTrue(sleeps, "expected _run to sleep during retry backoff")
+        self.assertTrue(
+            all(delay > 0.0 for delay in sleeps),
+            f"expected strictly positive backoff/poll sleeps, got {sleeps}",
+        )
+        self.assertLessEqual(attempts["fail"], 3)
+        self.assertFalse(run_fail_env.exists())
+        self.assertTrue(
+            (Path(spool_dir) / "dead-letter" / "event-003-run.write-failed.json").is_file()
+        )
+
+    def test_drain_quarantine_oserror_skips_expired_without_spinning_and_drains_healthy(self):
+        import errno
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing._utils import PrivateDir
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_p2_quar_enospc_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        def _cleanup_drain_globals():
+            prefix = f"{Path(spool_dir)}{os.sep}"
+            for key in list(drain._in_memory_retry_meta):
+                if key.startswith(prefix):
+                    del drain._in_memory_retry_meta[key]
+            for key in list(drain._skipped_paths):
+                if key.startswith(prefix):
+                    drain._skipped_paths.discard(key)
+            for key in list(drain._reported_skips):
+                if prefix in key:
+                    drain._reported_skips.discard(key)
+
+        self.addCleanup(_cleanup_drain_globals)
+
+        def _write_envelope(name: str, marker: str) -> Path:
+            path = Path(spool_dir) / name
+            path.write_text(
+                json.dumps({
+                    "config": {
+                        "project_id": "p",
+                        "dataset": "d",
+                        "table": "agent_events",
+                    },
+                    "row": {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "event_type": "LLM_REQUEST",
+                        "content": {"marker": marker},
+                        "attributes": {},
+                        "latency_ms": {},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            return path
+
+        expired_env = _write_envelope("event-001-expired.json", "expired-bad")
+        healthy_env = _write_envelope("event-002-healthy.json", "healthy-ok")
+
+        delivered = []
+        fail_attempts = {"n": 0}
+
+        def _insert(table_id, rows):
+            del table_id
+            for row in rows:
+                marker = row["content"]["marker"]
+                if marker == "expired-bad":
+                    fail_attempts["n"] += 1
+                else:
+                    delivered.append(marker)
+            return []
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+
+        log_path = Path(spool_dir) / "drain.log"
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=str(log_path),
+            dry_run=False,
+            drain_retry_backoff_seconds=0.1,
+            drain_max_retry_age_seconds=0.05,
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+        )
+
+        # Simulate combined full-disk condition: .retry sidecar write fails with ENOSPC,
+        # retry age elapses, and dead-letter subdir creation also fails with ENOSPC.
+        orig_subdir = PrivateDir.subdir
+
+        def _failing_dead_letter(self_dir, sub_name):
+            if sub_name == "dead-letter":
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return orig_subdir(self_dir, sub_name)
+
+        now = {"t": 2000.0}
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(
+                 drain,
+                 "_write_retry_meta",
+                 side_effect=OSError(errno.ENOSPC, "No space left on device"),
+             ), \
+             mock.patch.object(PrivateDir, "subdir", _failing_dead_letter):
+            # Seed failure state as if prior pass failed .retry write under ENOSPC.
+            with drain.ensure_private_dir(spool_dir) as spool_priv:
+                drain._store_in_memory_retry_meta(
+                    spool_priv,
+                    "event-001-expired.json",
+                    {
+                        "first_failed_at": 1900.0,
+                        "attempts": 2,
+                        "next_retry_at": 1910.0,
+                        "last_error": "prior ENOSPC deferral",
+                    },
+                )
+
+            sleeps = []
+            orig_sleep = asyncio.sleep
+
+            async def _tracking_sleep(delay):
+                sleeps.append(delay)
+                await orig_sleep(delay)
+
+            with mock.patch.object(drain.asyncio, "sleep", side_effect=_tracking_sleep):
+                asyncio.run(asyncio.wait_for(drain._run(cfg), timeout=2.0))
+
+        self.assertEqual(fail_attempts["n"], 0, "expired file must not retry BQ send")
+        self.assertEqual(delivered, ["healthy-ok"])
+        self.assertFalse(healthy_env.exists())
+        self.assertTrue(expired_env.is_file(), "un-quarantinable file must stay in spool")
+        self.assertFalse((Path(spool_dir) / "dead-letter").exists())
+        self.assertIn(str(expired_env), drain._skipped_paths)
+        self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
+        self.assertTrue(all(d > 0.0 for d in sleeps), f"unexpected zero sleep: {sleeps}")
+
+        log_text = log_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            log_text.count("DRAINER retry_expiry_quarantine_failed"),
+            1,
+            log_text,
+        )
+        self.assertIn("DRAINER retry_expired file=event-001-expired.json", log_text)
+        self.assertNotIn("Traceback", log_text)
+        self.assertNotIn("DRAINER fatal", log_text)
 
     def test_legacy_010_mid_turn_state_and_spool_migration_single_delivery(self):
         from bigquery_agent_analytics_tracing import drain

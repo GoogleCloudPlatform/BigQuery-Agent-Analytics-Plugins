@@ -306,9 +306,10 @@ class BigQueryAgentAnalyticsLogger:
         attributes=attributes,
     )
 
-  def log_llm_response(
+  def _log_llm_outcome(
       self,
       *,
+      event_type: str,
       response: str,
       session_id: str,
       invocation_id: str,
@@ -337,7 +338,7 @@ class BigQueryAgentAnalyticsLogger:
     if attributes:
       attrs.update(attributes)
     return self.log_event(
-        event_type="LLM_RESPONSE",
+        event_type=event_type,
         agent=agent,
         user_id=user_id,
         session_id=session_id,
@@ -351,6 +352,82 @@ class BigQueryAgentAnalyticsLogger:
         latency_ms={"total_ms": total_ms} if total_ms is not None else {},
         status=status,
         error_message=error_message,
+        is_truncated=is_truncated,
+    )
+
+  def log_llm_response(
+      self,
+      *,
+      response: str,
+      session_id: str,
+      invocation_id: str,
+      trace_id: str,
+      span_id: str,
+      parent_span_id: str | None = None,
+      agent: str | None = None,
+      user_id: str | None = None,
+      model: str | None = None,
+      usage_metadata: dict[str, int] | None = None,
+      total_ms: int | None = None,
+      status: str = "OK",
+      error_message: str | None = None,
+      attributes: dict[str, Any] | None = None,
+      is_truncated: bool = False,
+  ) -> dict[str, Any]:
+    return self._log_llm_outcome(
+        event_type="LLM_RESPONSE",
+        response=response,
+        session_id=session_id,
+        invocation_id=invocation_id,
+        trace_id=trace_id,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
+        agent=agent,
+        user_id=user_id,
+        model=model,
+        usage_metadata=usage_metadata,
+        total_ms=total_ms,
+        status=status,
+        error_message=error_message,
+        attributes=attributes,
+        is_truncated=is_truncated,
+    )
+
+  def log_llm_error(
+      self,
+      *,
+      response: str = "",
+      session_id: str,
+      invocation_id: str,
+      trace_id: str,
+      span_id: str,
+      parent_span_id: str | None = None,
+      agent: str | None = None,
+      user_id: str | None = None,
+      model: str | None = None,
+      usage_metadata: dict[str, int] | None = None,
+      total_ms: int | None = None,
+      status: str = "ERROR",
+      error_message: str | None = None,
+      attributes: dict[str, Any] | None = None,
+      is_truncated: bool = False,
+  ) -> dict[str, Any]:
+    return self._log_llm_outcome(
+        event_type="LLM_ERROR",
+        response=response,
+        session_id=session_id,
+        invocation_id=invocation_id,
+        trace_id=trace_id,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
+        agent=agent,
+        user_id=user_id,
+        model=model,
+        usage_metadata=usage_metadata,
+        total_ms=total_ms,
+        status=status,
+        error_message=error_message,
+        attributes=attributes,
         is_truncated=is_truncated,
     )
 

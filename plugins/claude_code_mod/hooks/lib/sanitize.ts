@@ -481,9 +481,39 @@ function decodeBase64PrintableColon(token: string): boolean {
 }
 
 const PASCAL_CASE_WORD_RE = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/
+const PASCAL_COMPONENT_RE = /[A-Z][a-z]+/g
+const PROSE_PASCAL_WORDS = new Set([
+  'configuration', 'word', 'words', 'authentication', 'authorization',
+  'documentation', 'description', 'specification', 'implementation',
+  'troubleshooting', 'information', 'overview', 'example', 'examples',
+  'details', 'section', 'format', 'scheme', 'header', 'headers',
+  'guide', 'reference', 'summary', 'introduction', 'quickstart',
+  'migration', 'options', 'settings', 'usage', 'notes',
+])
+
+const isDocumentationPascalPhrase = (token: string): boolean => {
+  PASCAL_COMPONENT_RE.lastIndex = 0
+  let count = 0
+  for (let m = PASCAL_COMPONENT_RE.exec(token); m !== null; m = PASCAL_COMPONENT_RE.exec(token)) {
+    if (!PROSE_PASCAL_WORDS.has(m[0].toLowerCase())) return false
+    count += 1
+  }
+  return count > 0
+}
+
+const isBase64Credential = (token: string): boolean => {
+  if (decodeBase64PrintableColon(token)) return true
+  let cleanEnd = token.length
+  while (cleanEnd > 0) {
+    const ch = token.charCodeAt(cleanEnd - 1)
+    if (ch === 46 || ch === 95 || ch === 126 || ch === 45) cleanEnd -= 1
+    else break
+  }
+  return cleanEnd >= 4 && cleanEnd < token.length && decodeBase64PrintableColon(token.slice(0, cleanEnd))
+}
 
 const isLikelyBasicCredentialToken = (token: string): boolean => {
-  if (decodeBase64PrintableColon(token)) return true
+  if (isBase64Credential(token)) return true
   if (token.length < 12) return false
   if (/[0-9+/=_.-]/.test(token)) return true
   if (/[a-z]/.test(token) && /[A-Z]/.test(token)) {
@@ -493,7 +523,7 @@ const isLikelyBasicCredentialToken = (token: string): boolean => {
 }
 
 const AUTH_SCHEME_RE = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=-]{4,})/gi
-const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t\u00a0]*[:=][ \t\u00a0]*(?:\r?\n[ \t\u00a0]+)?(?:\\*["'])?$/i
+const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t\u00a0]*[:=]\s*(?:\\*["'])?$/i
 
 function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
   if (!/bearer|basic/i.test(text)) return text
@@ -505,29 +535,44 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const space = m[2] as string
     const token = m[3] as string
     const matchEnd = m.index + m[0].length
+    const rewind = (): void => {
+      AUTH_SCHEME_RE.lastIndex = Math.max(m.index + scheme.length, matchEnd - 6)
+    }
     const before = text.slice(Math.max(0, m.index - 40), m.index)
     const inHeader = AUTH_HEADER_PREFIX.test(before)
     const hasNewline = /[\r\n]/.test(space)
     const after = text.slice(matchEnd, matchEnd + 32)
-    if (hasNewline) {
+    if (!inHeader && hasNewline) {
       if (
         /^[ \t\u00a0]*[:=]/.test(after) ||
         /^[A-Za-z_][A-Za-z0-9_.-]*=[^=]/.test(token) ||
         (/^[A-Za-z_][A-Za-z0-9_.-]*=$/.test(token) && /^['"$`]/.test(after))
       ) {
+        rewind()
         continue
       }
     }
     if (scheme.toLowerCase() === 'bearer') {
-      if (token.length < 12) continue
-      if (!inHeader && PASCAL_CASE_WORD_RE.test(token)) {
-        if (space.includes('\u00a0') || (hasNewline && /^[ \t\u00a0]+[a-z]{2,}\b/.test(after))) continue
-      }
-    } else {
-      if (hasNewline ? !inHeader && !decodeBase64PrintableColon(token) : !inHeader && !isLikelyBasicCredentialToken(token)) {
+      if (token.length < 12) {
+        rewind()
         continue
       }
-      if (inHeader && token.length < 4) continue
+      if (!inHeader && PASCAL_CASE_WORD_RE.test(token)) {
+        const hasProseFollow = (hasNewline || space.includes('\u00a0')) && /^[ \t\u00a0]+[a-z]{2,}\b/.test(after)
+        if (hasProseFollow || (space.includes('\u00a0') && isDocumentationPascalPhrase(token))) {
+          rewind()
+          continue
+        }
+      }
+    } else {
+      if (hasNewline ? !inHeader && !isBase64Credential(token) : !inHeader && !isLikelyBasicCredentialToken(token)) {
+        rewind()
+        continue
+      }
+      if (inHeader && token.length < 4) {
+        rewind()
+        continue
+      }
     }
     out += text.slice(copied, m.index) + scheme + ' ' + MARKER
     stats.redactions += 1
@@ -1521,9 +1566,10 @@ function redactNamedValues(text: string, stats: SanitizeStats): string {
       continue
     }
     // An auth scheme whose token a pattern already redacted (and counted),
-    // quoted or not (`"Bearer [REDACTED]"` in JSON, escaped in a log line).
+    // quoted or not (`"Bearer [REDACTED]"` in JSON, escaped in a log line),
+    // including any trailing sentence/diagnostic punctuation.
     const alreadyRedactedScheme =
-      /^\\?['"]?(?:Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|Bot)\s+\[REDACTED(?::[a-z-]+)?\]\\?['"]?$/i.test(text.slice(start, valueEnd).trim())
+      /^\\?['"]?(?:Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|Bot)\s+\[REDACTED(?::[a-z-]+)?\](?:\\?['"]|[:,.!?])?$/i.test(text.slice(start, valueEnd).trim())
     noteCut(text, start, valueEnd, end, stats)
     out += text.slice(copied, start) + MARKER + close
     copied = end

@@ -1061,7 +1061,7 @@ class ClaudeHookBQAAAdapter:
       attrs["error_type"] = payload.get("error_type")
     if payload.get("reason"):
       attrs["reason"] = payload.get("reason")
-    self.logger.log_llm_response(
+    self.logger.log_llm_error(
         response=output,
         session_id=state.get("session_id"),
         invocation_id=inv_id,

@@ -36,6 +36,7 @@ BQAA_EVENT_TYPES = frozenset(
     {
         "LLM_REQUEST",
         "LLM_RESPONSE",
+        "LLM_ERROR",
         "TOOL_STARTING",
         "TOOL_COMPLETED",
         "HITL_CREDENTIAL_REQUEST",
