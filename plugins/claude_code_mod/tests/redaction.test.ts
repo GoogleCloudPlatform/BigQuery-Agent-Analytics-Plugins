@@ -1442,6 +1442,22 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer\ndXNlcjpwYXNz=', 'Bearer [REDACTED]', 'dXNlcjpwYXNz='],
     ['Bearer\nENVIRONMENT=', 'Bearer [REDACTED]', 'ENVIRONMENT='],
     ['Bearer\nschemaV2Config123=', 'Bearer [REDACTED]', 'schemaV2Config123='],
+    ['Bearer\nlB79GsW66LvIcKaTzjh=', 'Bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
+    ['Bearer\np2112MrvcRo=', 'Bearer [REDACTED]', 'p2112MrvcRo='],
+    ['Bearer\np2112MrvcRo= # trailing comment', 'Bearer [REDACTED] # trailing comment', 'p2112MrvcRo='],
+    ['Bearer\nmySecretTokenAb=', 'Bearer [REDACTED]', 'mySecretTokenAb='],
+    ['Bearer\nqWertyUiopAsdfg=', 'Bearer [REDACTED]', 'qWertyUiopAsdfg='],
+    ['Bearer\nschemaV2Configx=', 'Bearer [REDACTED]', 'schemaV2Configx='],
+    ['Bearer\ncustom-headerxx=', 'Bearer [REDACTED]', 'custom-headerxx='],
+    ['Bearer\nWORK_DIR_XY=', 'Bearer [REDACTED]', 'WORK_DIR_XY='],
+    ['Bearer\nWORK_DIR_XYZ_AB=', 'Bearer [REDACTED]', 'WORK_DIR_XYZ_AB='],
+    ['Bearer\nwork_dir_xy=', 'Bearer [REDACTED]', 'work_dir_xy='],
+    ['Bearer\nwork_dir_xyz_ab=', 'Bearer [REDACTED]', 'work_dir_xyz_ab='],
+    ['Bearer\n--config-fx=', 'Bearer [REDACTED]', '--config-fx='],
+    ['Bearer\n--config-fix-ab=', 'Bearer [REDACTED]', '--config-fix-ab='],
+    ['Bearer\n-cfg_flg_ab=', 'Bearer [REDACTED]', '-cfg_flg_ab='],
+    ['foo=\nBearer\nlB79GsW66LvIcKaTzjh=', 'foo=\nBearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
+    ['x == Bearer\nlB79GsW66LvIcKaTzjh=', 'x == Bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1481,6 +1497,7 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['"{\\"note\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', 'mySecretTokenAb=', '"{\\"note\\": \\"Bearer [REDACTED]\\", \\"id\\": 123}"'],
     ['"{\\"auth\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', 'mySecretTokenAb=', undefined],
     ['bash -c "curl -H \\"X-Auth: Bearer mySecretTokenAb=\\""', 'mySecretTokenAb=', undefined],
+    ['Bearer\nlB79GsW66LvIcKaTzjh= Bearer\np2112MrvcRo=', 'p2112MrvcRo=', 'Bearer [REDACTED] Bearer [REDACTED]'],
   ] as const) {
     const stats = newStats()
     const out = redactText(sample, stats)
@@ -1570,6 +1587,23 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\nCURRENT_WORK_DIR=.',
     'MODE=bearer\npublic_work_dir=.',
     'MODE=bearer\nschemaV2Config=.',
+    'MODE=bearer\nschemaV2Configx=',
+    'MODE=bearer\ncacheV2Mode=',
+    'MODE=bearer\ncustom-headerxx=',
+    'MODE=bearer\nWORK_DIR_XY=',
+    'MODE=bearer\nWORK_DIR_XYZ=',
+    'MODE=bearer\nwork_dir_xy=',
+    'MODE=bearer\nwork_dir_xyz=',
+    'MODE=bearer\n--config-fx=',
+    'MODE=bearer\n--config-fix=',
+    'MODE=bearer\n-cfg_flg_ab=',
+    'scheme_mode = bearer\nschemaV2Configx=',
+    'type=bearer\nserver.endpointx=',
+    '# bearer\nschemaV2Configx=',
+    '# bearer\ncustom-headerxx=',
+    'Bearer\n--config-file=',
+    'Bearer\nCURRENT_WORK_DIR=',
+    'Bearer\npublic_work_dirs=',
   ]) {
     const stats = newStats()
     expect(redactText(prose, stats)).toBe(prose)
@@ -1645,6 +1679,7 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer double-eq trailing-dot flood', (n: number) => 'Bearer\ntokenValue12345==. '.repeat((n / 26) | 0), 160_000, 250, 120],
     ['Bearer cross-line non-assignment token flood', (n: number) => 'Bearer\nreviewFixtureOnly9472= '.repeat((n / 30) | 0), 160_000, 250, 120],
     ['Bearer cross-line base64 non-assignment flood', (n: number) => 'Bearer\ndXNlcjpwYXNz= '.repeat((n / 21) | 0), 160_000, 250, 120],
+    ['Bearer cross-line base64 camel-version flood', (n: number) => 'Bearer\nlB79GsW66LvIcKaTzjh= '.repeat((n / 28) | 0), 160_000, 250, 120],
   ] as const) {
     const small = gen(10_000)
     redactText(small, newStats())
@@ -1665,6 +1700,7 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     expect(outLarge).not.toContain('tokenValue12345')
     expect(outLarge).not.toContain('reviewFixtureOnly9472=')
     expect(outLarge).not.toContain('dXNlcjpwYXNz=')
+    expect(outLarge).not.toContain('lB79GsW66LvIcKaTzjh=')
     expect({
       label,
       withinBudget: msLarge < maxMs,

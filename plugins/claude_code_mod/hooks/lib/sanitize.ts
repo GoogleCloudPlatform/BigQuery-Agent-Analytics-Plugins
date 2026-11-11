@@ -1327,9 +1327,13 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               rewind()
               continue
             } else {
+              const unredactedBeforeStart = Math.max(copied, m.index - 40)
+              const unredactedBefore =
+                m.index <= unredactedBeforeStart ? '' : text.slice(unredactedBeforeStart, m.index)
+              const precededByEq = /(?:^|[^=!<>])=[ \t\u00a0]*$/.test(unredactedBefore)
               const closedByEnclosingQuote =
                 isBase64PaddedToken(coreToken) &&
-                !/=\s*$/.test(before) &&
+                !precededByEq &&
                 ((!qState.inComment && qState.activeQuote !== '' && effectiveAfter[0] === qState.activeQuote) ||
                   (!qState.inComment &&
                     qState.innerQuote !== '' &&
@@ -1340,7 +1344,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                     (isDelimOrSpaceAfterQuote(effectiveAfter[2]) ||
                       (!qState.inComment && qState.activeQuote === '' && effectiveAfter[2] === '\\'))))
               if (!closedByEnclosingQuote) {
-                const precededByEqOrInComment = /=\s*$/.test(before) || qState.inComment
+                const precededByEqOrInComment = precededByEq || qState.inComment
                 const isEmptyTailForAssign =
                   effectiveAfter === '' ||
                   /^[\s#;)|&]/.test(effectiveAfter) ||
@@ -1353,6 +1357,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                     isDelimOrSpaceAfterQuote(effectiveAfter[1]))
                 if (
                   isEmptyTailForAssign &&
+                  (precededByEqOrInComment || !isBase64PaddedToken(coreToken)) &&
                   (isEmptyAssignIdentifier ||
                     isConfigFlagShape ||
                     CAMEL_CASE_VERSION_KEY_RE.test(rawKeyPart) ||
