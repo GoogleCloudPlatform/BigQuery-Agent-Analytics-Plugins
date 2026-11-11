@@ -480,18 +480,20 @@ function decodeBase64PrintableColon(token: string): boolean {
   return hasColon && hasNonColon
 }
 
+const PASCAL_CASE_WORD_RE = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/
+
 const isLikelyBasicCredentialToken = (token: string): boolean => {
   if (decodeBase64PrintableColon(token)) return true
   if (token.length < 12) return false
   if (/[0-9+/=_.-]/.test(token)) return true
   if (/[a-z]/.test(token) && /[A-Z]/.test(token)) {
-    return !/^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/.test(token)
+    return !PASCAL_CASE_WORD_RE.test(token)
   }
   return false
 }
 
-const AUTH_SCHEME_RE = /\b(Bearer|Basic)([ \t]+|[ \t]*\r?\n[ \t]*)([A-Za-z0-9._~+/=-]{4,})/gi
-const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t]*[:=][ \t]*(?:\\*["'])?$/i
+const AUTH_SCHEME_RE = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=-]{4,})/gi
+const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t\u00a0]*[:=][ \t\u00a0]*(?:\r?\n[ \t\u00a0]+)?(?:\\*["'])?$/i
 
 function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
   if (!/bearer|basic/i.test(text)) return text
@@ -505,10 +507,11 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const matchEnd = m.index + m[0].length
     const before = text.slice(Math.max(0, m.index - 40), m.index)
     const inHeader = AUTH_HEADER_PREFIX.test(before)
-    if (space.includes('\n')) {
-      const after = text.slice(matchEnd, matchEnd + 16)
+    const hasNewline = /[\r\n]/.test(space)
+    const after = text.slice(matchEnd, matchEnd + 32)
+    if (hasNewline) {
       if (
-        /^[ \t]*[:=]/.test(after) ||
+        /^[ \t\u00a0]*[:=]/.test(after) ||
         /^[A-Za-z_][A-Za-z0-9_.-]*=[^=]/.test(token) ||
         (/^[A-Za-z_][A-Za-z0-9_.-]*=$/.test(token) && /^['"$`]/.test(after))
       ) {
@@ -517,12 +520,12 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     }
     if (scheme.toLowerCase() === 'bearer') {
       if (token.length < 12) continue
-      if (space.includes('\n') && !inHeader && !isLikelyBasicCredentialToken(token)) continue
+      if (!inHeader && PASCAL_CASE_WORD_RE.test(token)) {
+        if (space.includes('\u00a0') || (hasNewline && /^[ \t\u00a0]+[a-z]{2,}\b/.test(after))) continue
+      }
     } else {
-      if (space.includes('\n')) {
-        if (!inHeader && !decodeBase64PrintableColon(token)) continue
-      } else {
-        if (!inHeader && !isLikelyBasicCredentialToken(token)) continue
+      if (hasNewline ? !inHeader && !decodeBase64PrintableColon(token) : !inHeader && !isLikelyBasicCredentialToken(token)) {
+        continue
       }
       if (inHeader && token.length < 4) continue
     }
@@ -2766,8 +2769,10 @@ function isMarkerLike(raw: string): boolean {
   return trimmed === '' || WHOLE_OR_TICKED_MARKER.test(trimmed)
 }
 
-function splitLinesPreserveEol(text: string): { line: string; eol: string }[] {
-  const rows: { line: string; eol: string }[] = []
+type LineRow = { line: string; eol: string }
+
+function splitLinesPreserveEol(text: string): LineRow[] {
+  const rows: LineRow[] = []
   let start = 0
   for (let i = 0; i < text.length; i += 1) {
     if (text.charCodeAt(i) === 10) {
@@ -2799,18 +2804,20 @@ const K8S_VALUE_LINE = /^([ \t]+)value[ \t]*:[ \t]*(.*)$/
 function redactK8sAndYamlBlocks(text: string, stats: SanitizeStats): string {
   if (!text.includes(':') || (!text.includes('|') && !text.includes('>') && !text.includes('name:'))) return text
   const rows = splitLinesPreserveEol(text)
+  const out: LineRow[] = []
   let changed = false
   let i = 0
   while (i < rows.length) {
-    const line = rows[i]!.line
+    const row = rows[i]!
+    const line = row.line
     // 1. Kubernetes / GitHub Actions env `- name: <SENSITIVE>\n  value: <VAL>`
     const nm = K8S_NAME_LINE.exec(line)
     if (nm !== null && i + 1 < rows.length) {
       const keyName = (nm[2] ?? nm[3] ?? nm[4] ?? '').trim()
       if (keyName !== '' && isSensitiveKey(keyName)) {
         const prefixLen = (nm[1] as string).length
-        const nextLine = rows[i + 1]!.line
-        const vm = K8S_VALUE_LINE.exec(nextLine)
+        const nextRow = rows[i + 1]!
+        const vm = K8S_VALUE_LINE.exec(nextRow.line)
         if (vm !== null && (vm[1] as string).length >= prefixLen) {
           const valRaw = (vm[2] as string).trim()
           if (/^(?:[|>][+-]?\d*|\d*[|>][+-]?)(?:[ \t]*(?:#.*)?)?$/.test(valRaw)) {
@@ -2823,15 +2830,14 @@ function redactK8sAndYamlBlocks(text: string, stats: SanitizeStats): string {
               else break
             }
             if (lastBody !== -1) {
-              rows[i + 1]!.line = `${vm[1]}value: ${MARKER}`
-              rows.splice(i + 2, lastBody - (i + 1))
+              out.push(row, { line: `${vm[1]}value: ${MARKER}`, eol: nextRow.eol })
               stats.redactions += 1
               changed = true
-              i += 2
+              i = lastBody + 1
               continue
             }
           } else if (valRaw !== '' && !isMarkerLike(valRaw) && !valRaw.startsWith('#')) {
-            rows[i + 1]!.line = `${vm[1]}value: ${MARKER}`
+            out.push(row, { line: `${vm[1]}value: ${MARKER}`, eol: nextRow.eol })
             stats.redactions += 1
             changed = true
             i += 2
@@ -2857,19 +2863,19 @@ function redactK8sAndYamlBlocks(text: string, stats: SanitizeStats): string {
           else break
         }
         if (lastBody !== -1) {
-          rows[i]!.line = `${lead}${ym[2]}: ${MARKER}`
-          rows.splice(i + 1, lastBody - i)
+          out.push({ line: `${lead}${ym[2]}: ${MARKER}`, eol: row.eol })
           stats.redactions += 1
           changed = true
-          i += 1
+          i = lastBody + 1
           continue
         }
       }
     }
+    out.push(row)
     i += 1
   }
   if (!changed) return text
-  return rows.map(r => r.line + r.eol).join('')
+  return out.map(r => r.line + r.eol).join('')
 }
 
 const MD_WRAP_CLOSED = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_`])([A-Za-z_][A-Za-z0-9_.\t -]{0,80})\2([ \t]*(?:\([^)\n]{1,40}\))?[ \t]*[:=][ \t]*)(.+)$/
@@ -3939,17 +3945,18 @@ function findBalancedProseJsonSpans(text: string): JsonCandidateSpan[] {
   return spans
 }
 
+const PROSE_JSON_SUFFIX_RE = /q(\d+)z/g
+
 function proseJsonTokenSuffix(text: string): number {
   if (!text.includes('pjspan')) return 1
-  let maxSeen = 0
-  const re = /q(\d{1,15})z/g
+  const used = new Set<string>()
+  PROSE_JSON_SUFFIX_RE.lastIndex = 0
   let m: RegExpExecArray | null
-  while ((m = re.exec(text)) !== null) {
-    const n = Number(m[1])
-    if (n > maxSeen) maxSeen = n
+  while ((m = PROSE_JSON_SUFFIX_RE.exec(text)) !== null) {
+    used.add(m[1] as string)
   }
-  let suffix = maxSeen + 1
-  while (text.includes(`q${suffix}z`)) suffix += 1
+  let suffix = 1
+  while (used.has(String(suffix))) suffix += 1
   return suffix
 }
 

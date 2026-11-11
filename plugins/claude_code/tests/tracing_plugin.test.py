@@ -3530,6 +3530,314 @@ class TestBuildDist39(unittest.TestCase):
         self.assertNotEqual(dist_mono_fail.returncode, 0)
         self.assertIn("not newer than existing dist tag tracing-dist-v9.9.9", dist_mono_fail.stdout)
 
+    def _clean_git_env(self) -> dict[str, str]:
+        env = dict(
+            os.environ,
+            PYTHONDONTWRITEBYTECODE="1",
+            GIT_AUTHOR_NAME="Test",
+            GIT_AUTHOR_EMAIL="test@example.com",
+            GIT_COMMITTER_NAME="Test",
+            GIT_COMMITTER_EMAIL="test@example.com",
+        )
+        for var in ("BQAA_SDK_REPO", "BQAA_OFFLINE", "CI", "GITHUB_REF_NAME"):
+            env.pop(var, None)
+        return env
+
+    def _init_plugins_repo(self, target_dir: Path, env: dict[str, str]) -> Path:
+        for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
+            dst = target_dir / item
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                REPO_ROOT / item,
+                dst,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+        for cmd in (
+            ("init", "-q"),
+            ("add", "-A"),
+            ("commit", "-q", "-m", "plugins initial"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(target_dir), *cmd],
+                capture_output=True, text=True, env=env, check=True, timeout=30,
+            )
+        return target_dir / "plugins/claude_code/build_dist.sh"
+
+    def test_sdk_tag_discovery_reachable_empty_repo_passes(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bqaa_39_empty_sdk_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        env = self._clean_git_env()
+
+        empty_sdk = tmp / "empty_sdk.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-q", str(empty_sdk)],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+
+        # 1. Configured 'sdk' remote pointing to reachable empty file:// repo exits 0.
+        plugins_a = tmp / "plugins_a"
+        check_a = self._init_plugins_repo(plugins_a, env)
+        subprocess.run(
+            ["git", "-C", str(plugins_a), "remote", "add", "sdk", empty_sdk.as_uri()],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+        res_a = subprocess.run(
+            ["bash", str(check_a), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(res_a.returncode, 0, f"{res_a.stdout}\n{res_a.stderr}")
+        self.assertIn("ok - no tracing-v release tags exist yet", res_a.stdout)
+
+        # 2. Origin-derived file:// SDK repo that exists and is empty exits 0.
+        pair_dir = tmp / "pair"
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        derived_empty_sdk = pair_dir / "BigQuery-Agent-Analytics-SDK"
+        subprocess.run(
+            ["git", "init", "-q", str(derived_empty_sdk)],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+        isolated = tmp / "isolated"
+        plugins_b = isolated / "checkout"
+        check_b = self._init_plugins_repo(plugins_b, env)
+        origin_uri = (pair_dir / "BigQuery-Agent-Analytics-Plugins").as_uri()
+        subprocess.run(
+            ["git", "-C", str(plugins_b), "remote", "add", "origin", origin_uri],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+        res_b = subprocess.run(
+            ["bash", str(check_b), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(res_b.returncode, 0, f"{res_b.stdout}\n{res_b.stderr}")
+        self.assertIn("ok - no tracing-v release tags exist yet", res_b.stdout)
+
+        # 3. Explicit --sdk-repo file:// pointing to reachable empty repo exits 0.
+        res_c = subprocess.run(
+            ["bash", str(check_a), "--check", "--sdk-repo", empty_sdk.as_uri()],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(res_c.returncode, 0, f"{res_c.stdout}\n{res_c.stderr}")
+        self.assertIn("ok - no tracing-v release tags exist yet", res_c.stdout)
+
+        # 4. Reachable file:// SDK repo WITH a higher tracing-v* tag still fetches and enforces it.
+        tagged_sdk = tmp / "tagged_sdk"
+        tagged_sdk.mkdir(parents=True, exist_ok=True)
+        (tagged_sdk / "README.md").write_text("sdk\n", encoding="utf-8")
+        for cmd in (
+            ("init", "-q"),
+            ("add", "-A"),
+            ("commit", "-q", "-m", "sdk release"),
+            ("tag", "tracing-v9.9.9"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(tagged_sdk), *cmd],
+                capture_output=True, text=True, env=env, check=True, timeout=30,
+            )
+        res_d = subprocess.run(
+            ["bash", str(check_a), "--check", "--sdk-repo", tagged_sdk.as_uri()],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(res_d.returncode, 0)
+        self.assertIn("not newer than existing tag tracing-v9.9.9", res_d.stdout)
+
+    def test_sdk_tag_discovery_unreachable_fails_closed(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bqaa_39_unreach_sdk_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        env = self._clean_git_env()
+
+        missing_uri = (tmp / "does-not-exist-sdk").as_uri()
+
+        # 1. Unreachable file:// configured 'sdk' remote must fail closed.
+        plugins_remote_uri = tmp / "plugins_remote_uri"
+        check_remote_uri = self._init_plugins_repo(plugins_remote_uri, env)
+        subprocess.run(
+            ["git", "-C", str(plugins_remote_uri), "remote", "add", "sdk", missing_uri],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+        res_remote_uri = subprocess.run(
+            ["bash", str(check_remote_uri), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(res_remote_uri.returncode, 0)
+        self.assertIn(
+            "not ok - failed to fetch tracing-v release tags from SDK remote",
+            res_remote_uri.stdout,
+        )
+        self.assertNotIn("ok - no tracing-v release tags exist yet", res_remote_uri.stdout)
+
+        # 2. Non-repo local path configured as 'sdk' remote must fail closed.
+        non_repo = tmp / "not_a_git_repo"
+        non_repo.mkdir(parents=True, exist_ok=True)
+        plugins_remote_path = tmp / "plugins_remote_path"
+        check_remote_path = self._init_plugins_repo(plugins_remote_path, env)
+        subprocess.run(
+            ["git", "-C", str(plugins_remote_path), "remote", "add", "sdk", str(non_repo)],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+        res_remote_path = subprocess.run(
+            ["bash", str(check_remote_path), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(res_remote_path.returncode, 0)
+        self.assertIn(
+            "not ok - failed to fetch tracing-v release tags from SDK remote",
+            res_remote_path.stdout,
+        )
+        self.assertNotIn("ok - no tracing-v release tags exist yet", res_remote_path.stdout)
+
+        # 3. Unreachable origin-derived file://, local path, and closed localhost HTTPS URLs fail closed.
+        origin_cases = [
+            ("file_uri", (tmp / "missing_pair" / "BigQuery-Agent-Analytics-Plugins").as_uri()),
+            ("local_path", str(tmp / "missing_pair" / "BigQuery-Agent-Analytics-Plugins")),
+            ("closed_https", "https://127.0.0.1:1/org/BigQuery-Agent-Analytics-Plugins.git"),
+        ]
+        for label, origin_val in origin_cases:
+            with self.subTest(origin=label):
+                plugins_orig = tmp / f"plugins_orig_{label}"
+                check_orig = self._init_plugins_repo(plugins_orig, env)
+                subprocess.run(
+                    ["git", "-C", str(plugins_orig), "remote", "add", "origin", origin_val],
+                    capture_output=True, text=True, env=env, check=True, timeout=30,
+                )
+                res_orig = subprocess.run(
+                    ["bash", str(check_orig), "--check"],
+                    capture_output=True, text=True, env=env, timeout=30,
+                )
+                self.assertNotEqual(res_orig.returncode, 0, f"{res_orig.stdout}\n{res_orig.stderr}")
+                self.assertIn(
+                    "not ok - failed to fetch tracing-v release tags from derived SDK repository",
+                    res_orig.stdout,
+                )
+                self.assertNotIn("ok - no tracing-v release tags exist yet", res_orig.stdout)
+
+        # 4. Unreachable explicit --sdk-repo file:// URL fails closed.
+        res_explicit = subprocess.run(
+            ["bash", str(check_remote_uri), "--check", "--sdk-repo", missing_uri],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(res_explicit.returncode, 0)
+        self.assertIn(f"not ok - BQAA_SDK_REPO={missing_uri} is not a git repository", res_explicit.stdout)
+        self.assertNotIn("ok - no tracing-v release tags exist yet", res_explicit.stdout)
+
+    def test_sdk_tag_discovery_shallow_repos_fail_closed(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bqaa_39_shallow_sdk_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        env = self._clean_git_env()
+
+        upstream_sdk = tmp / "upstream_sdk"
+        upstream_sdk.mkdir(parents=True, exist_ok=True)
+        for idx in (1, 2):
+            (upstream_sdk / "file.txt").write_text(f"v{idx}\n", encoding="utf-8")
+            if idx == 1:
+                subprocess.run(
+                    ["git", "-C", str(upstream_sdk), "init", "-q"],
+                    capture_output=True, text=True, env=env, check=True, timeout=30,
+                )
+            for cmd in (("add", "-A"), ("commit", "-q", "-m", f"commit {idx}")):
+                subprocess.run(
+                    ["git", "-C", str(upstream_sdk), *cmd],
+                    capture_output=True, text=True, env=env, check=True, timeout=30,
+                )
+
+        # 1. Shallow sibling BigQuery-Agent-Analytics-SDK fails closed.
+        sib_root = tmp / "sibling_case"
+        sib_root.mkdir(parents=True, exist_ok=True)
+        shallow_sib = sib_root / "BigQuery-Agent-Analytics-SDK"
+        subprocess.run(
+            ["git", "clone", "-q", "--depth=1", upstream_sdk.as_uri(), str(shallow_sib)],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+        plugins_sib = sib_root / "BigQuery-Agent-Analytics-Plugins"
+        check_sib = self._init_plugins_repo(plugins_sib, env)
+        res_sib = subprocess.run(
+            ["bash", str(check_sib), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(res_sib.returncode, 0)
+        self.assertIn("is shallow", res_sib.stdout)
+        self.assertNotIn("ok - no tracing-v release tags exist yet", res_sib.stdout)
+
+        # 2. Shallow configured 'sdk' remote (local path) fails closed.
+        plugins_remote = tmp / "plugins_shallow_remote"
+        check_remote = self._init_plugins_repo(plugins_remote, env)
+        subprocess.run(
+            ["git", "-C", str(plugins_remote), "remote", "add", "sdk", str(shallow_sib)],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+        res_remote = subprocess.run(
+            ["bash", str(check_remote), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(res_remote.returncode, 0)
+        self.assertIn("not ok - SDK repository at remote sdk is shallow", res_remote.stdout)
+        self.assertNotIn("ok - no tracing-v release tags exist yet", res_remote.stdout)
+
+        # 3. Shallow origin-derived local SDK path fails closed.
+        plugins_orig = tmp / "plugins_shallow_origin"
+        check_orig = self._init_plugins_repo(plugins_orig, env)
+        subprocess.run(
+            [
+                "git", "-C", str(plugins_orig), "remote", "add", "origin",
+                str(sib_root / "BigQuery-Agent-Analytics-Plugins"),
+            ],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+        res_orig = subprocess.run(
+            ["bash", str(check_orig), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(res_orig.returncode, 0)
+        self.assertIn("is shallow", res_orig.stdout)
+        self.assertNotIn("ok - no tracing-v release tags exist yet", res_orig.stdout)
+
+    def test_sdk_tag_discovery_offline_override(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bqaa_39_offline_sdk_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        env = self._clean_git_env()
+
+        plugins_repo = tmp / "plugins_offline"
+        check_script = self._init_plugins_repo(plugins_repo, env)
+        missing_uri = (tmp / "missing-sdk").as_uri()
+        subprocess.run(
+            ["git", "-C", str(plugins_repo), "remote", "add", "sdk", missing_uri],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+
+        # 1. BQAA_OFFLINE=1 without CI=true skips remote SDK discovery cleanly.
+        for ci_val in (None, ""):
+            offline_env = dict(env, BQAA_OFFLINE="1")
+            if ci_val is not None:
+                offline_env["CI"] = ci_val
+            res_offline = subprocess.run(
+                ["bash", str(check_script), "--check"],
+                capture_output=True, text=True, env=offline_env, timeout=30,
+            )
+            self.assertEqual(res_offline.returncode, 0, f"{res_offline.stdout}\n{res_offline.stderr}")
+            self.assertIn("ok - skipping SDK tag discovery (BQAA_OFFLINE=1)", res_offline.stdout)
+            self.assertNotIn("ok - no tracing-v release tags exist yet", res_offline.stdout)
+
+        # 2. BQAA_OFFLINE=1 with CI=true must fail closed.
+        ci_offline_env = dict(env, BQAA_OFFLINE="1", CI="true")
+        res_ci_offline = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=ci_offline_env, timeout=30,
+        )
+        self.assertNotEqual(res_ci_offline.returncode, 0)
+        self.assertIn("not ok - BQAA_OFFLINE=1 is not permitted when CI=true", res_ci_offline.stdout)
+        self.assertNotIn("ok - no tracing-v release tags exist yet", res_ci_offline.stdout)
+
+        # 3. Even with BQAA_OFFLINE=1 (non-CI), local tracing-v* tags are still enforced.
+        subprocess.run(
+            ["git", "-C", str(plugins_repo), "tag", "tracing-v9.9.9"],
+            capture_output=True, text=True, env=env, check=True, timeout=30,
+        )
+        res_local_tag = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=dict(env, BQAA_OFFLINE="1"), timeout=30,
+        )
+        self.assertNotEqual(res_local_tag.returncode, 0)
+        self.assertIn("not newer than existing tag tracing-v9.9.9", res_local_tag.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

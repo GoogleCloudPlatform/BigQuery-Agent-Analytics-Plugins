@@ -34,7 +34,9 @@
 #   - if git checkout is full (fails on shallow clones so release tags are
 #     never skipped), discovers tracing-v* release tags from BQAA_SDK_REPO /
 #     --sdk-repo, remote 'sdk', sibling BigQuery-Agent-Analytics-SDK, or
-#     derived SDK origin remote, and checks local tracing-v* / tracing-dist-v*:
+#     derived SDK origin remote (failing closed if discovery fails or a target
+#     SDK repo is shallow; BQAA_OFFLINE=1 skips remote SDK discovery outside
+#     CI=true), and checks local tracing-v* / tracing-dist-v*:
 #     * if tracing-v<dist_version> exists (in SDK or this repo), dist/ must
 #       have zero diff against that release's built snapshot (reconstructed
 #       from plugins/claude_code + producers/src on SDK tags, or committed dist);
@@ -168,6 +170,22 @@ PY
 
 is_git_url() {
   [[ "$1" =~ ^(https?|ssh|git|file|rpc):// ]] || [[ "$1" == git@* ]]
+}
+
+fetch_sdk_tags() {
+  local remote_url="$1"
+  local dest_dir="$2"
+  local tag_refs=""
+  if ! tag_refs="$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags "$remote_url" 'refs/tags/tracing-v*' 2>/dev/null)"; then
+    return 1
+  fi
+  git init -q "$dest_dir"
+  if [[ -n "$tag_refs" ]]; then
+    if ! GIT_TERMINAL_PROMPT=0 git -C "$dest_dir" fetch -q --depth=1 "$remote_url" 'refs/tags/tracing-v*:refs/tags/tracing-v*' >/dev/null 2>&1; then
+      return 1
+    fi
+  fi
+  return 0
 }
 
 git_sdk() {
@@ -402,6 +420,8 @@ if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     sdk_repo=""
     sdk_candidate=""
     sdk_explicit=0
+    sdk_discovery_failed=0
+    sdk_discovery_skipped=0
     if [[ "$sdk_repo_arg_set" -eq 1 ]]; then
       sdk_candidate="$sdk_repo_arg"
       sdk_explicit=1
@@ -410,43 +430,63 @@ if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
       sdk_explicit=1
     fi
 
-    if [[ "$sdk_explicit" -eq 1 ]]; then
+    if [[ "${BQAA_OFFLINE:-0}" == "1" && "${CI:-}" == "true" ]]; then
+      echo "not ok - BQAA_OFFLINE=1 is not permitted when CI=true"
+      status=1
+      sdk_discovery_failed=1
+    elif [[ "$sdk_explicit" -eq 1 ]]; then
       if [[ -z "$sdk_candidate" ]]; then
         echo "not ok - BQAA_SDK_REPO= is not a git repository"
         status=1
+        sdk_discovery_failed=1
       elif is_git_url "$sdk_candidate"; then
-        git init -q "$work/sdk_override"
-        if GIT_TERMINAL_PROMPT=0 git -C "$work/sdk_override" fetch -q --depth=1 "$sdk_candidate" 'refs/tags/tracing-v*:refs/tags/tracing-v*' >/dev/null 2>&1; then
+        if fetch_sdk_tags "$sdk_candidate" "$work/sdk_override"; then
           sdk_repo="$work/sdk_override"
         else
           echo "not ok - BQAA_SDK_REPO=$sdk_candidate is not a git repository"
           status=1
+          sdk_discovery_failed=1
         fi
       elif is_git_repo_root "$sdk_candidate"; then
         if [[ "$(git_sdk "$sdk_candidate" rev-parse --is-shallow-repository 2>/dev/null || echo true)" == true ]]; then
           echo "not ok - SDK repository is shallow"
           status=1
+          sdk_discovery_failed=1
         else
           sdk_repo="$sdk_candidate"
         fi
       else
         echo "not ok - BQAA_SDK_REPO=$sdk_candidate is not a git repository"
         status=1
+        sdk_discovery_failed=1
       fi
+    elif [[ "${BQAA_OFFLINE:-0}" == "1" ]]; then
+      echo "ok - skipping SDK tag discovery (BQAA_OFFLINE=1)"
+      sdk_discovery_skipped=1
     else
       sdk_remote_url="$(git -C "$repo" remote get-url sdk 2>/dev/null || true)"
       if [[ -n "$sdk_remote_url" ]]; then
-        if ! is_git_url "$sdk_remote_url" && is_git_repo_root "$sdk_remote_url"; then
-          if [[ "$(git_sdk "$sdk_remote_url" rev-parse --is-shallow-repository 2>/dev/null || echo true)" == true ]]; then
-            echo "not ok - SDK repository at remote sdk is shallow"
-            status=1
+        if ! is_git_url "$sdk_remote_url"; then
+          if is_git_repo_root "$sdk_remote_url"; then
+            if [[ "$(git_sdk "$sdk_remote_url" rev-parse --is-shallow-repository 2>/dev/null || echo true)" == true ]]; then
+              echo "not ok - SDK repository at remote sdk is shallow"
+              status=1
+              sdk_discovery_failed=1
+            else
+              sdk_repo="$sdk_remote_url"
+            fi
           else
-            sdk_repo="$sdk_remote_url"
+            echo "not ok - failed to fetch tracing-v release tags from SDK remote ($sdk_remote_url)"
+            status=1
+            sdk_discovery_failed=1
           fi
         else
-          git init -q "$work/sdk_remote"
-          if GIT_TERMINAL_PROMPT=0 git -C "$work/sdk_remote" fetch -q --depth=1 "$sdk_remote_url" 'refs/tags/tracing-v*:refs/tags/tracing-v*' >/dev/null 2>&1; then
+          if fetch_sdk_tags "$sdk_remote_url" "$work/sdk_remote"; then
             sdk_repo="$work/sdk_remote"
+          else
+            echo "not ok - failed to fetch tracing-v release tags from SDK remote ($sdk_remote_url)"
+            status=1
+            sdk_discovery_failed=1
           fi
         fi
       else
@@ -470,18 +510,40 @@ if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
           fi
         fi
         if [[ -n "$sibling_sdk" ]] && is_git_repo_root "$sibling_sdk"; then
-          if [[ "$(git_sdk "$sibling_sdk" rev-parse --is-shallow-repository 2>/dev/null || echo true)" != true ]]; then
+          if [[ "$(git_sdk "$sibling_sdk" rev-parse --is-shallow-repository 2>/dev/null || echo true)" == true ]]; then
+            echo "not ok - SDK repository at $sibling_sdk is shallow"
+            status=1
+            sdk_discovery_failed=1
+          else
             sdk_repo="$sibling_sdk"
           fi
         fi
-        if [[ -z "$sdk_repo" && -z "$(git -C "$repo" tag -l 'tracing-v*')" ]]; then
+        if [[ "$sdk_discovery_failed" -eq 0 && "$sdk_discovery_skipped" -eq 0 && -z "$sdk_repo" && -z "$(git -C "$repo" tag -l 'tracing-v*')" ]]; then
           origin_url="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
           if [[ "$origin_url" == *BigQuery-Agent-Analytics-Plugins* ]]; then
             sdk_url="${origin_url%BigQuery-Agent-Analytics-Plugins*}BigQuery-Agent-Analytics-SDK${origin_url##*BigQuery-Agent-Analytics-Plugins}"
-            git init -q "$work/sdk_remote"
-            GIT_TERMINAL_PROMPT=0 git -C "$work/sdk_remote" fetch -q --depth=1 "$sdk_url" 'refs/tags/tracing-v*:refs/tags/tracing-v*' >/dev/null 2>&1 || true
-            if [[ -n "$(git -C "$work/sdk_remote" tag -l 'tracing-v*')" ]]; then
-              sdk_repo="$work/sdk_remote"
+            if ! is_git_url "$sdk_url"; then
+              if is_git_repo_root "$sdk_url"; then
+                if [[ "$(git_sdk "$sdk_url" rev-parse --is-shallow-repository 2>/dev/null || echo true)" == true ]]; then
+                  echo "not ok - SDK repository at $sdk_url is shallow"
+                  status=1
+                  sdk_discovery_failed=1
+                else
+                  sdk_repo="$sdk_url"
+                fi
+              else
+                echo "not ok - failed to fetch tracing-v release tags from derived SDK repository ($sdk_url)"
+                status=1
+                sdk_discovery_failed=1
+              fi
+            else
+              if fetch_sdk_tags "$sdk_url" "$work/sdk_remote"; then
+                sdk_repo="$work/sdk_remote"
+              else
+                echo "not ok - failed to fetch tracing-v release tags from derived SDK repository ($sdk_url)"
+                status=1
+                sdk_discovery_failed=1
+              fi
             fi
           fi
         fi
@@ -517,7 +579,7 @@ if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
       fi
       if [[ -n "$all_tracing_tags" ]]; then
         check_monotonic_tags "$dist_version" "$all_tracing_tags" "tracing-v" "tag" || status=1
-      else
+      elif [[ "$sdk_discovery_failed" -eq 0 && "$sdk_discovery_skipped" -eq 0 ]]; then
         echo "ok - no tracing-v release tags exist yet"
       fi
     fi

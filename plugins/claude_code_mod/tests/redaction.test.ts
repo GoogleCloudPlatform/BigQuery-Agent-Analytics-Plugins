@@ -1163,28 +1163,166 @@ test('prose JSON placeholder suffix avoids collisions across 12-, 13-, 15-, and 
   }
 })
 
-test('cross-line Bearer and Basic credentials redact while multi-line Basic prose and NBSP stay untouched', () => {
-  const token = 'reviewFixtureOnly9472'
-  const redactCases = [
-    [`Authorization: Bearer\n${token}`, 'Authorization: [REDACTED]'],
-    [`Authorization: Bearer\r\n ${token}`, 'Authorization: [REDACTED]'],
-    [`Bearer\n${token}`, 'Bearer [REDACTED]'],
-    ['Authorization: Basic\ndXNlcjpwYXNz', 'Authorization: [REDACTED]'],
-    ['Basic\ndXNlcjpwYXNz', 'Basic [REDACTED]'],
+test('prose JSON placeholder suffix stays linear at the 15-to-16-digit boundary with 26,000 consecutive collisions', () => {
+  const secret = ['boundary', 'linear', 'secret', '010'].join('-')
+  const makeSample = (count: number): string => {
+    const tokens = Array.from({ length: count }, (_, i) => `q${1_000_000_000_000_000 + i}z`).join(' ')
+    return `pjspan q999999999999999z ${tokens} {"secret":"${secret}","nested":{"ok":1}}`
+  }
+  const makeRowInput = (payload: string) => ({
+    eventType: 'TOOL_COMPLETED',
+    timestampMs: 0,
+    eventId: 'e1',
+    agent: 'a',
+    sessionId: 's',
+    invocationId: 'i',
+    userId: 'u',
+    traceId: 't',
+    spanId: 'p',
+    parentSpanId: null,
+    content: { result: payload },
+    attributes: {},
+    maxPayloadChars: 500_000,
+  })
+
+  const small = makeSample(2_000)
+  redactText(small, newStats())
+  buildRow(makeRowInput(small))
+
+  const tWarm0 = performance.now()
+  redactText(small, newStats())
+  const redactSmallMs = Math.max(1, performance.now() - tWarm0)
+  const tWarm1 = performance.now()
+  buildRow(makeRowInput(small))
+  const buildSmallMs = Math.max(1, performance.now() - tWarm1)
+
+  const sample = makeSample(26_000)
+  const t0 = performance.now()
+  const stats = newStats()
+  const out = redactText(sample, stats)
+  const redactMs = performance.now() - t0
+
+  expect(redactMs).toBeLessThan(500)
+  expect(redactMs <= Math.max(120, redactSmallMs * 25)).toBe(true)
+  expect(out).not.toContain(secret)
+  expect(out).toContain('pjspan q999999999999999z')
+  expect(out).toContain('q1000000000000000z')
+  expect(out).toContain('q1000000000025999z')
+  expect(out).toContain('{"secret":"[REDACTED]","nested":{"ok":1}}')
+  expect(stats.truncated).toBe(false)
+  expect(stats.redactions).toBeGreaterThanOrEqual(1)
+
+  const t1 = performance.now()
+  const built = buildRow(makeRowInput(sample))
+  const buildMs = performance.now() - t1
+
+  expect(buildMs).toBeLessThan(500)
+  expect(buildMs <= Math.max(120, buildSmallMs * 25)).toBe(true)
+  const serialized = JSON.stringify(built.row)
+  expect(serialized).not.toContain(secret)
+  expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toContain('{"secret":"[REDACTED]","nested":{"ok":1}}')
+  expect(built.row.is_truncated).toBe(false)
+  expect(built.redactions).toBeGreaterThanOrEqual(1)
+})
+
+test('repeated short YAML and Kubernetes block scalars scale linearly without quadratic row shifts', () => {
+  const makeRowInput = (payload: string) => ({
+    eventType: 'TOOL_COMPLETED',
+    timestampMs: 0,
+    eventId: 'e1',
+    agent: 'a',
+    sessionId: 's',
+    invocationId: 'i',
+    userId: 'u',
+    traceId: 't',
+    spanId: 'p',
+    parentSpanId: null,
+    content: { result: payload },
+    attributes: {},
+    maxPayloadChars: 500_000,
+  })
+
+  const shapes = [
+    {
+      name: 'yaml',
+      secret: 'yamlBlkSec9',
+      unit: 'password: |\n  yamlBlkSec9\n',
+      redactedUnit: 'password: [REDACTED]\n',
+      expectTruncated: false,
+      minBuiltRedactions: 16_000,
+    },
+    {
+      name: 'k8s',
+      secret: 'k8sBlkSec9',
+      unit: '- name: DB_KEY\n  value: |\n    k8sBlkSec9\n',
+      redactedUnit: '- name: DB_KEY\n  value: [REDACTED]\n',
+      expectTruncated: true,
+      minBuiltRedactions: 12_000,
+    },
   ] as const
-  for (const [sample, expected] of redactCases) {
+
+  for (const shape of shapes) {
+    const small = shape.unit.repeat(2_000)
+    redactText(small, newStats())
+    buildRow(makeRowInput(small))
+
+    const tWarm0 = performance.now()
+    redactText(small, newStats())
+    const redactSmallMs = Math.max(1, performance.now() - tWarm0)
+    const tWarm1 = performance.now()
+    buildRow(makeRowInput(small))
+    const buildSmallMs = Math.max(1, performance.now() - tWarm1)
+
+    const sample = shape.unit.repeat(16_000)
+    const t0 = performance.now()
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    const redactMs = performance.now() - t0
+
+    expect(redactMs).toBeLessThan(500)
+    expect(redactMs <= Math.max(120, redactSmallMs * 20)).toBe(true)
+    expect(out).not.toContain(shape.secret)
+    expect(out === shape.redactedUnit.repeat(16_000)).toBe(true)
+    expect(stats.redactions).toBe(16_000)
+
+    const t1 = performance.now()
+    const built = buildRow(makeRowInput(sample))
+    const buildMs = performance.now() - t1
+
+    expect(buildMs).toBeLessThan(500)
+    expect(buildMs <= Math.max(120, buildSmallMs * 20)).toBe(true)
+    expect(JSON.stringify(built.row)).not.toContain(shape.secret)
+    expect(built.row.is_truncated).toBe(shape.expectTruncated)
+    expect(built.redactions).toBeGreaterThanOrEqual(shape.minBuiltRedactions)
+  }
+})
+
+test('cross-line and NBSP Bearer and Basic credentials redact while multi-line prose stays untouched', () => {
+  const token = 'reviewFixtureOnly9472'
+  const redactCases: readonly (readonly [string, string, string])[] = [
+    [`Authorization: Bearer\n${token}`, 'Authorization: [REDACTED]', token],
+    [`Authorization: Bearer\n\n${token}`, 'Authorization: [REDACTED]', token],
+    [`Authorization: Bearer\r\n ${token}`, 'Authorization: [REDACTED]', token],
+    [`Authorization: Bearer\r\n \r\n ${token}`, 'Authorization: [REDACTED]', token],
+    [`Bearer\u00a0${token}`, 'Bearer [REDACTED]', token],
+    [`Bearer\n${token}`, 'Bearer [REDACTED]', token],
+    ['Bearer\nabcdefghijklmnop', 'Bearer [REDACTED]', 'abcdefghijklmnop'],
+    ['Bearer\r\n abcdefghijklmnop', 'Bearer [REDACTED]', 'abcdefghijklmnop'],
+    ['Bearer\nreviewfixtureonly', 'Bearer [REDACTED]', 'reviewfixtureonly'],
+    ['Bearer\nreviewFixtureOnly', 'Bearer [REDACTED]', 'reviewFixtureOnly'],
+    ['Bearer\r\n reviewFixtureOnly', 'Bearer [REDACTED]', 'reviewFixtureOnly'],
+    ['Bearer\nReviewFixtureOnly', 'Bearer [REDACTED]', 'ReviewFixtureOnly'],
+    ['Bearer\r\n ReviewFixtureOnly', 'Bearer [REDACTED]', 'ReviewFixtureOnly'],
+    ['Authorization: Basic\ndXNlcjpwYXNz', 'Authorization: [REDACTED]', 'dXNlcjpwYXNz'],
+    ['Basic\ndXNlcjpwYXNz', 'Basic [REDACTED]', 'dXNlcjpwYXNz'],
+  ]
+  for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
     const out = redactText(sample, stats)
     expect(out).toBe(expected)
-    expect(out).not.toContain(token)
-    expect(out).not.toContain('dXNlcjpwYXNz')
+    expect(out).not.toContain(secret)
     expect(stats.redactions).toBe(1)
-  }
 
-  for (const rowSample of [
-    `Authorization: Bearer\n${token}`,
-    `Authorization: Bearer\r\n ${token}`,
-  ]) {
     const built = buildRow({
       eventType: 'TOOL_COMPLETED',
       timestampMs: 0,
@@ -1196,13 +1334,13 @@ test('cross-line Bearer and Basic credentials redact while multi-line Basic pros
       traceId: 't',
       spanId: 'p',
       parentSpanId: null,
-      content: { result: rowSample },
+      content: { result: sample },
       attributes: {},
       maxPayloadChars: 16_384,
     })
     const serialized = JSON.stringify(built.row)
-    expect(serialized).not.toContain(token)
-    expect(serialized).toContain('Authorization: [REDACTED]')
+    expect(serialized).not.toContain(secret)
+    expect(serialized).toContain(expected)
     expect(built.redactions).toBe(1)
   }
 
@@ -1210,10 +1348,29 @@ test('cross-line Bearer and Basic credentials redact while multi-line Basic pros
     'Basic\nconfiguration guide',
     'Bearer\u00a0ConfigurationWord',
     'Authentication scheme: Bearer\nConfiguration details follow',
+    'Bearer\nConfiguration details follow',
   ]) {
     const stats = newStats()
     expect(redactText(prose, stats)).toBe(prose)
     expect(stats.redactions).toBe(0)
+
+    const built = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: prose },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(prose)
+    expect(built.redactions).toBe(0)
   }
 
   for (const [sample, expected] of [
