@@ -642,7 +642,12 @@ const opensQuotedAssignmentValue = (text: string, quoteIdx: number, q: string): 
     }
     i += 1
   }
-  if (count >= 2) return count % 2 === 0
+  if (count >= 2) {
+    if (count % 2 !== 0) return false
+    const m2 = /^[ \t]+(["'`])[^\s"'`,;)}\]]/.exec(text.slice(quoteIdx + 1, lineStop))
+    if (count === 2 && m2 && m2[1] === q) return false
+    return true
+  }
   return quoteIdx + 1 < lineStop && !/^[\s.,;:!?)}\]'"`]/.test(text[quoteIdx + 1] as string)
 }
 
@@ -668,7 +673,8 @@ const opensEscapedQuotedAssignmentValue = (text: string, quoteIdx: number, q: st
   }
   if (count >= 2) {
     if (count % 2 !== 0) return false
-    if (count === 2 && /^\s+\\["'][^\s"'`,;)}\]]/.test(text.slice(quoteIdx + 2, lineStop))) return false
+    const m2 = /^[ \t]+\\(["'])[^\s"'`,;)}\]]/.exec(text.slice(quoteIdx + 2, lineStop))
+    if (count === 2 && m2 && m2[1] === q) return false
     return true
   }
   return quoteIdx + 2 < lineStop && !/^[\s.,;:!?)}\]'"`]/.test(text[quoteIdx + 2] as string)
@@ -676,6 +682,11 @@ const opensEscapedQuotedAssignmentValue = (text: string, quoteIdx: number, q: st
 
 const AUTH_SCHEME_RE = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=-]{4,})/gi
 const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t\u00a0]*[:=]\s*(?:\\*["'])?$/i
+const CAMEL_CASE_KEY_RE = /^[a-z]+(?:[A-Z][a-z]+)+$/
+const LOWER_WORD_KEY_RE = /^[a-z]+$/
+const ASSIGN_RHS_VAR_RE = /^\$(?:[A-Za-z_({'"$])/
+const ASSIGN_RHS_REDACTED_RE = /^\[REDACTED(?::[a-z-]+)?\](?:$|[\s,;:|)&'"`\].!?])/
+const ASSIGN_RHS_PUNCT_RE = /^(?:[@#%^*({[]|[!?:&](?!$|[\s'")\]},;!?])|\\(?:\\|\$|[^nrt"'\\]))/
 
 function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
   if (!/bearer|basic/i.test(text)) return text
@@ -714,20 +725,12 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
       }
       if (isHashCommentStart(text, quotePos)) {
         const lb = nextLineBreakAfter(quotePos + 1)
-        if (lb !== -1 && lb < target) {
-          quotePos = text[lb] === '\r' && text[lb + 1] === '\n' ? lb + 2 : lb + 1
-          continue
-        }
-        quotePos += 1
+        quotePos = lb === -1 ? text.length : text[lb] === '\r' && text[lb + 1] === '\n' ? lb + 2 : lb + 1
         continue
       }
       if (isSlashCommentStart(text, quotePos)) {
         const lb = nextLineBreakAfter(quotePos + 2)
-        if (lb !== -1 && lb < target) {
-          quotePos = text[lb] === '\r' && text[lb + 1] === '\n' ? lb + 2 : lb + 1
-          continue
-        }
-        quotePos += 2
+        quotePos = lb === -1 ? text.length : text[lb] === '\r' && text[lb + 1] === '\n' ? lb + 2 : lb + 1
         continue
       }
       if (ch === '\\') {
@@ -783,7 +786,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const after = text.slice(matchEnd, matchEnd + 32)
     const isBasic = scheme.toLowerCase() === 'basic'
     const basicB64 = isBasic && isBase64Credential(token)
-    if (!inHeader && hasNewline && !basicB64) {
+    if (!inHeader && !basicB64) {
       const eqIdx = token.indexOf('=')
       const rawKeyPart = eqIdx > 0 ? token.slice(0, eqIdx) : ''
       const isPlainAssignKey = eqIdx > 0 && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(rawKeyPart)
@@ -795,60 +798,66 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
         isSensitiveKey(rawKeyPart.slice(2))
       const isAssignKey = isPlainAssignKey || isFlagAssignKey
       const assignKey = isFlagAssignKey ? rawKeyPart.slice(2) : rawKeyPart
-      const isEnvOrSensitiveAssign =
+      const isLowerWordKey = isAssignKey && LOWER_WORD_KEY_RE.test(assignKey)
+      const isEmptyAssignIdentifier =
         isAssignKey &&
-        (isFlagAssignKey || isSensitiveKey(assignKey) || ALL_CAPS_SNAKE_KEY_RE.test(assignKey))
+        (isFlagAssignKey ||
+          ALL_CAPS_SNAKE_KEY_RE.test(assignKey) ||
+          LOWER_SNAKE_KEY_RE.test(assignKey) ||
+          CAMEL_CASE_KEY_RE.test(assignKey))
 
-      if (/^[ \t\u00a0]*[:=]/.test(after) && (!isBase64PaddedToken(token) || isEnvOrSensitiveAssign)) {
-        rewind()
-        continue
-      }
-      if (isAssignKey) {
-        if (eqIdx < token.length - 1) {
-          const safeAfter =
-            after === '' ||
-            /^(?:[\s),;}\]"'`]|[:.!?](?:$|[\s'")\]},;])|\$(?:$|[\s),;}\]"'`]))/.test(after) ||
-            ((after.startsWith('\\"') || after.startsWith("\\'"))
-              ? !opensEscapedQuotedAssignmentValue(text, matchEnd, after[1] as string)
-              : /^\\[nrt]/.test(after))
-          if (
-            !isBase64PaddedToken(token) ||
-            isEnvOrSensitiveAssign ||
-            token[eqIdx + 1] === '~' ||
-            !safeAfter
-          ) {
+      if (hasNewline) {
+        if (/^[ \t\u00a0]*[:=]/.test(after) && (!isBase64PaddedToken(token) || isEmptyAssignIdentifier || isLowerWordKey)) {
+          rewind()
+          continue
+        }
+        if (isAssignKey) {
+          if (eqIdx < token.length - 1) {
+            const safeAfter =
+              after === '' ||
+              /^(?:[\s),;}\]"'`]|[:.!?](?:$|[\s'")\]},;])|\$(?:$|[\s),;}\]"'`]))/.test(after) ||
+              ((after.startsWith('\\"') || after.startsWith("\\'"))
+                ? !opensEscapedQuotedAssignmentValue(text, matchEnd, after[1] as string)
+                : /^\\[nrt]/.test(after))
+            if (!isBase64PaddedToken(token) || isEmptyAssignIdentifier || token[eqIdx + 1] === '~' || !safeAfter) {
+              rewind()
+              continue
+            }
+          } else {
+            const hasAssignRhsInAfter = (): boolean =>
+              ASSIGN_RHS_VAR_RE.test(after) ||
+              ASSIGN_RHS_REDACTED_RE.test(after) ||
+              ((after[0] === '"' || after[0] === "'" || after[0] === '`') &&
+                quoteAt(m.index) !== after[0] &&
+                opensQuotedAssignmentValue(text, matchEnd, after[0])) ||
+              (after.startsWith('\\"') || after.startsWith("\\'")
+                ? opensEscapedQuotedAssignmentValue(text, matchEnd, after[1] as string)
+                : ASSIGN_RHS_PUNCT_RE.test(after))
+            if (
+              isEmptyAssignIdentifier ||
+              (isLowerWordKey && (after === '' || /^[\s#]/.test(after))) ||
+              (!isBase64PaddedToken(token) && !isSensitiveKey(assignKey)) ||
+              hasAssignRhsInAfter()
+            ) {
+              rewind()
+              continue
+            }
+          }
+        }
+      } else if (isAssignKey && (isEmptyAssignIdentifier || isLowerWordKey) && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
+        if (eqIdx === token.length - 1) {
+          const singleAssignRhs =
+            ASSIGN_RHS_VAR_RE.test(after) ||
+            ASSIGN_RHS_REDACTED_RE.test(after) ||
+            ((after[0] === '"' || after[0] === "'" || after[0] === '`') && quoteAt(m.index) !== after[0]) ||
+            after.startsWith('\\"') ||
+            after.startsWith("\\'") ||
+            ASSIGN_RHS_PUNCT_RE.test(after)
+          if (singleAssignRhs) {
             rewind()
             continue
           }
-        } else if (
-          !isBase64PaddedToken(token) ||
-          isEnvOrSensitiveAssign ||
-          (LOWER_SNAKE_KEY_RE.test(assignKey) && (after === '' || /^[\s#]/.test(after)))
-        ) {
-          rewind()
-          continue
-        } else if (after[0] === '$') {
-          if (/^\$(?:[A-Za-z_({'"$])/.test(after)) {
-            rewind()
-            continue
-          }
-        } else if (/^\[REDACTED(?::[a-z-]+)?\](?:$|[\s,;:|)&'"`\].!?])/.test(after)) {
-          rewind()
-          continue
-        } else if (
-          (after[0] === '"' || after[0] === "'" || after[0] === '`') &&
-          quoteAt(m.index) !== after[0] &&
-          opensQuotedAssignmentValue(text, matchEnd, after[0])
-        ) {
-          rewind()
-          continue
-        } else if (
-          after.startsWith('\\"') || after.startsWith("\\'")
-            ? opensEscapedQuotedAssignmentValue(text, matchEnd, after[1] as string)
-            : /^[@#%^*({[]/.test(after) ||
-              /^[!?:&](?!$|[\s'")\]},;!?])/.test(after) ||
-              /^\\(?:\\|\$|[^nrt"'\\])/.test(after)
-        ) {
+        } else if (!isBase64PaddedToken(token)) {
           rewind()
           continue
         }
