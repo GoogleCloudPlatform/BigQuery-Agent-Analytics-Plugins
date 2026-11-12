@@ -1528,6 +1528,32 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['MODE=bearer\nconfiguration: details', 'MODE=bearer [REDACTED]: details', 'configuration'],
     ['Bearer\nreview_fixture_only:', 'Bearer [REDACTED]:', 'review_fixture_only'],
     ['x :: Bearer\nschemaV2Config: foo', 'x :: Bearer [REDACTED]: foo', 'schemaV2Config'],
+    ['Bearer\nabcdefghijklmg==', 'Bearer [REDACTED]', 'abcdefghijklmg=='],
+    ['Bearer\nabcdefghijklmg=', 'Bearer [REDACTED]', 'abcdefghijklmg='],
+    ['Bearer\nabcdefghijklmno=', 'Bearer [REDACTED]', 'abcdefghijklmno='],
+    ['Basic\nabcdefghijklmg==', 'Basic [REDACTED]', 'abcdefghijklmg=='],
+    ['Basic\nabcdefghijklmg=', 'Basic [REDACTED]', 'abcdefghijklmg='],
+    ['Basic\nabcdefghijklmno=', 'Basic [REDACTED]', 'abcdefghijklmno='],
+    ['Bearer\nabcdefghijklmg==\n', 'Bearer [REDACTED]\n', 'abcdefghijklmg=='],
+    ['Bearer\nabcdefghijklmg==  # trailing', 'Bearer [REDACTED]  # trailing', 'abcdefghijklmg=='],
+    ['MODE=bearer\nabcdefghijklmg==', 'MODE=bearer [REDACTED]', 'abcdefghijklmg=='],
+    ['MODE=basic\nabcdefghijklmg==', 'MODE=basic [REDACTED]', 'abcdefghijklmg=='],
+    ['Bearer\n  abcdefghijklmg==', 'Bearer [REDACTED]', 'abcdefghijklmg=='],
+    ['Bearer\r\n  abcdefghijklmg==', 'Bearer [REDACTED]', 'abcdefghijklmg=='],
+    ['Bearer\nabcdefghijklmg==.', 'Bearer [REDACTED]', 'abcdefghijklmg=='],
+    ['Bearer\nabcdefghijklmno=.', 'Bearer [REDACTED]', 'abcdefghijklmno='],
+    ['Bearer\nabcdefghijklmg==" and "', 'Bearer [REDACTED]" and "', 'abcdefghijklmg=='],
+    ['Bearer\nabcdefghijklmno=" and "', 'Bearer [REDACTED]" and "', 'abcdefghijklmno='],
+    ['Bearer\nabcdefghijklmg==\\" and \\"', 'Bearer [REDACTED]\\" and \\"', 'abcdefghijklmg=='],
+    ['Bearer\nabcdefghijklmno=\\" and \\"', 'Bearer [REDACTED]\\" and \\"', 'abcdefghijklmno='],
+    ['Bearer\nabcdefghijklmg==&foo=1', 'Bearer [REDACTED]&foo=1', 'abcdefghijklmg=='],
+    ['Bearer\nabcdefghijklmg==#frag', 'Bearer [REDACTED]#frag', 'abcdefghijklmg=='],
+    ['Bearer\nabcdefghijklmg==:8080', 'Bearer [REDACTED]:8080', 'abcdefghijklmg=='],
+    ['Bearer\nabcdefghijklmno=&foo=1', 'Bearer [REDACTED]&foo=1', 'abcdefghijklmno='],
+    ['scheme: bearer\nabcdefghijklmg==', 'scheme: bearer [REDACTED]', 'abcdefghijklmg=='],
+    ['scheme: bearer\nabcdefghijklmg=', 'scheme: bearer [REDACTED]', 'abcdefghijklmg='],
+    ['Basic\ncmV2aWV3Rml4dHVyZU9ubHk=', 'Basic [REDACTED]', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['Basic\nmySecretToken12==', 'Basic [REDACTED]', 'mySecretToken12=='],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1701,6 +1727,15 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'x_z12345: Bearer\nReviewFixtureOnly more',
     'Authorization:\n""\nBearer\nConfiguration details follow',
     'Authentication: ' + ' '.repeat(60) + 'Bearer\nConfiguration details follow',
+    'MODE=bearer\nusername=',
+    'MODE=bearer\nclient_secret=',
+    'MODE=bearer\ntoken=',
+    'MODE=basic\nusername=',
+    '# bearer\npublicvalue=',
+    'Bearer\nusername=',
+    'Bearer\ntoken=',
+    'Bearer\nfoo== "bar"',
+    'MODE=bearer\nfoo=="bar"',
   ]) {
     const stats = newStats()
     expect(redactText(prose, stats)).toBe(prose)
@@ -1792,6 +1827,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer CLIENT_SECRET= 160k empty space flood', (n: number) => 'Bearer CLIENT_SECRET=' + ' '.repeat(n), 160_000, 150, 80],
     ['Bearer cross-line CLIENT_SECRET 160k colon space flood', (n: number) => 'Bearer\nCLIENT_SECRET: ' + ' '.repeat(n) + 'invalid hunter2', 160_000, 150, 80],
     ['Bearer cross-line CLIENT_SECRET repeated colon space flood', (n: number) => ('Bearer\nCLIENT_SECRET: ' + ' '.repeat(200) + 'invalid hunter2\n').repeat((n / 238) | 0), 160_000, 250, 120],
+    ['Bearer cross-line lowercase padded == flood', (n: number) => 'Bearer\nabcdefghijklmg== '.repeat((n / 24) | 0), 160_000, 250, 120],
+    ['Basic cross-line lowercase padded == flood', (n: number) => 'Basic\nabcdefghijklmg== '.repeat((n / 23) | 0), 160_000, 250, 120],
   ] as const) {
     const small = gen(10_000)
     redactText(small, newStats())
@@ -1804,6 +1841,7 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     const outLarge = redactText(large, newStats())
     const msLarge = performance.now() - t1
     expect(outLarge).not.toContain('U2VjcmV0VG9rZW4=')
+    expect(outLarge).not.toContain('abcdefghijklmg==')
     expect(outLarge).not.toContain('MySecret1234')
     expect(outLarge).not.toContain('mySecretTokenAb=')
     expect(outLarge).not.toContain('mySecretToken123')

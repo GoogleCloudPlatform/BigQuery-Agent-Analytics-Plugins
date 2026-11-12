@@ -1359,12 +1359,12 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     q: string,
     qState: QuoteContext,
     token: string,
-    isLowerWordKey: boolean,
+    allowPaddedLowerQuoteRhs: boolean,
   ): boolean => {
     const outerQuote = qState.inComment ? '' : qState.activeQuote
     if (outerQuote === q) return false
     const nextAfter = text[quoteIdx + 1]
-    if (isBase64PaddedToken(token) && !isLowerWordKey && isDelimOrSpaceAfterQuote(nextAfter)) return false
+    if (isBase64PaddedToken(token) && !allowPaddedLowerQuoteRhs && isDelimOrSpaceAfterQuote(nextAfter)) return false
     const openSameOrInner = qState.inComment ? qState.commentQuote : qState.innerQuote
     if (openSameOrInner === q && isDelimOrSpaceAfterQuote(nextAfter)) return false
     return opensUnescapedFast(quoteIdx, q)
@@ -1374,10 +1374,10 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     q: string,
     qState: QuoteContext,
     token: string,
-    isLowerWordKey: boolean,
+    allowPaddedLowerQuoteRhs: boolean,
   ): boolean => {
     const nextAfter = text[quoteIdx + 2]
-    if (isBase64PaddedToken(token) && !isLowerWordKey && isDelimOrSpaceAfterQuote(nextAfter)) return false
+    if (isBase64PaddedToken(token) && !allowPaddedLowerQuoteRhs && isDelimOrSpaceAfterQuote(nextAfter)) return false
     const openEsc = qState.inComment ? qState.commentEscapedQuote : qState.activeEscapedQuote
     if (openEsc === q) {
       const outer = qState.inComment ? '' : qState.activeQuote
@@ -1390,20 +1390,21 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     rhsText: string,
     qState: QuoteContext,
     coreToken: string,
-    isLowerWordKey: boolean,
+    allowPaddedLowerQuoteRhs: boolean,
+    allowPunctRhs: boolean,
   ): boolean => {
     if (rhsText === '') return false
     const c0 = rhsText.charCodeAt(0)
     if (c0 === 36) return ASSIGN_RHS_VAR_RE.test(rhsText)
-    if (c0 === 91) return ASSIGN_RHS_REDACTED_RE.test(rhsText) || ASSIGN_RHS_PUNCT_RE.test(rhsText)
+    if (c0 === 91) return ASSIGN_RHS_REDACTED_RE.test(rhsText) || (allowPunctRhs && ASSIGN_RHS_PUNCT_RE.test(rhsText))
     if (c0 === 34 || c0 === 39 || c0 === 96) {
-      return isOpeningUnescapedQuote(rhsIdx, rhsText[0] as string, qState, coreToken, isLowerWordKey)
+      return isOpeningUnescapedQuote(rhsIdx, rhsText[0] as string, qState, coreToken, allowPaddedLowerQuoteRhs)
     }
     if (c0 === 92) {
       const c1 = rhsText.charCodeAt(1)
-      if (c1 === 34 || c1 === 39) return isOpeningEscapedQuote(rhsIdx, rhsText[1] as string, qState, coreToken, isLowerWordKey)
+      if (c1 === 34 || c1 === 39) return isOpeningEscapedQuote(rhsIdx, rhsText[1] as string, qState, coreToken, allowPaddedLowerQuoteRhs)
     }
-    return ASSIGN_RHS_PUNCT_RE.test(rhsText)
+    return allowPunctRhs && ASSIGN_RHS_PUNCT_RE.test(rhsText)
   }
   const assignPrefixContext = (matchIndex: number): { precededByEq: boolean; precededByColon: boolean } => {
     const keptFloor = lastKeptMatchEnd <= matchIndex ? lastKeptMatchEnd : prevKeptMatchEnd
@@ -1525,6 +1526,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
         }
       }
     }
+    let isPaddedBasicCandidate = false
     if (!inHeader && !basicB64 && eqIdx > 0) {
       const rawKeyPart = coreToken.slice(0, eqIdx)
       const keyWithinCap = rawKeyPart.length <= 100
@@ -1555,6 +1557,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
       const endsWithEq = isAssignKey && eqIdx === coreToken.length - 1
       const endsWithDoubleEq = isAssignKey && eqIdx === coreToken.length - 2 && coreToken[eqIdx + 1] === '='
       const isEqPaddedEnd = endsWithEq || endsWithDoubleEq
+      isPaddedBasicCandidate = isEqPaddedEnd && coreToken.length >= 12
 
       if (hasNewline) {
         if (isAssignKey) {
@@ -1571,17 +1574,26 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             }
           } else {
             const qState = quoteAt(m.index)
-            const assignRhs = hasAssignRhsAt(effectiveMatchEnd, effectiveAfter, qState, coreToken, isLowerWordKey)
-            if (endsWithDoubleEq || isLowerWordKey) {
-              if ((isLowerWordKey && (effectiveAfter === '' || /^[\s#]/.test(effectiveAfter))) || assignRhs) {
-                keepAndRewind()
-                continue
-              }
-            } else if (assignRhs) {
+            const { precededByEq } = assignPrefixContext(m.index)
+            const precededByEqOrInComment = precededByEq || qState.inComment
+            const isSensAssign = assignKey.length <= 100 && isSensitiveKey(assignKey)
+            const allowPaddedLowerQuoteRhs =
+              isLowerWordKey && !endsWithDoubleEq && (precededByEqOrInComment || isSensAssign)
+            const allowPunctRhs =
+              (!endsWithDoubleEq && precededByEqOrInComment) || (isEmptyAssignIdentifier && isSensAssign)
+            const assignRhs = hasAssignRhsAt(
+              effectiveMatchEnd,
+              effectiveAfter,
+              qState,
+              coreToken,
+              allowPaddedLowerQuoteRhs,
+              allowPunctRhs,
+            )
+            if (assignRhs) {
               keepAndRewind()
               continue
-            } else {
-              const { precededByEq } = assignPrefixContext(m.index)
+            }
+            if (!endsWithDoubleEq) {
               const closedByEnclosingQuote =
                 isBase64PaddedToken(coreToken) &&
                 !precededByEq &&
@@ -1595,7 +1607,6 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                     (isDelimOrSpaceAfterQuote(effectiveAfter[2]) ||
                       (!qState.inComment && qState.activeQuote === '' && effectiveAfter[2] === '\\'))))
               if (!closedByEnclosingQuote) {
-                const precededByEqOrInComment = precededByEq || qState.inComment
                 const isEmptyTailForAssign =
                   effectiveAfter === '' ||
                   /^[\s#;)|&]/.test(effectiveAfter) ||
@@ -1613,7 +1624,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                     isConfigFlagShape ||
                     (keyWithinCap &&
                       (CAMEL_CASE_VERSION_KEY_RE.test(rawKeyPart) ||
-                        (UPPER_WORD_KEY_RE.test(rawKeyPart) && precededByEqOrInComment) ||
+                        ((UPPER_WORD_KEY_RE.test(rawKeyPart) || isLowerWordKey) && precededByEqOrInComment) ||
                         LOWER_DOTTED_KEY_RE.test(rawKeyPart) ||
                         LOWER_KEBAB_KEY_RE.test(rawKeyPart))))
                 ) {
@@ -1627,7 +1638,14 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
       } else if (isAssignKey && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
         if (isEqPaddedEnd) {
           const qState = quoteAt(m.index)
-          const singleAssignRhs = hasAssignRhsAt(effectiveMatchEnd, effectiveAfter, qState, coreToken, isLowerWordKey)
+          const singleAssignRhs = hasAssignRhsAt(
+            effectiveMatchEnd,
+            effectiveAfter,
+            qState,
+            coreToken,
+            isLowerWordKey && !endsWithDoubleEq,
+            !endsWithDoubleEq || (isEmptyAssignIdentifier && isSensitiveKey(assignKey)),
+          )
           const eqLineStop = lineStopFor(effectiveMatchEnd)
           let spEnd = effectiveMatchEnd
           while (spEnd < eqLineStop) {
@@ -1642,10 +1660,10 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             (() => {
               const ch = text[spEnd]
               if (ch === '"' || ch === "'" || ch === '`') {
-                return isOpeningUnescapedQuote(spEnd, ch, qState, coreToken, isLowerWordKey)
+                return isOpeningUnescapedQuote(spEnd, ch, qState, coreToken, isLowerWordKey && !endsWithDoubleEq)
               }
               if (ch === '\\' && (text[spEnd + 1] === '"' || text[spEnd + 1] === "'")) {
-                return isOpeningEscapedQuote(spEnd, text[spEnd + 1] as string, qState, coreToken, isLowerWordKey)
+                return isOpeningEscapedQuote(spEnd, text[spEnd + 1] as string, qState, coreToken, isLowerWordKey && !endsWithDoubleEq)
               }
               if (ch === '$') {
                 return ASSIGN_RHS_VAR_RE.test(text.slice(spEnd, Math.min(eqLineStop, spEnd + 2)))
@@ -1680,7 +1698,11 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
         }
       }
     } else {
-      if (hasNewline ? !inHeader && !basicB64 : !inHeader && !isLikelyBasicCredentialToken(coreToken)) {
+      if (
+        hasNewline
+          ? !inHeader && !basicB64 && !isBase64PaddedToken(coreToken) && !isPaddedBasicCandidate
+          : !inHeader && !isLikelyBasicCredentialToken(coreToken)
+      ) {
         keepAndRewind()
         continue
       }
