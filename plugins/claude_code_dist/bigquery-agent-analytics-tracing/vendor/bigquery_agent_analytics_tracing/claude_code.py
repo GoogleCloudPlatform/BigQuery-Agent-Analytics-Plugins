@@ -34,7 +34,7 @@ import stat
 import sys
 import time
 import traceback
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from ._utils import deterministic_span
 from ._utils import ensure_private_dir
@@ -407,9 +407,13 @@ class StateStore:
   def set(self, key: str, value: Any) -> None:
     self.update({key: value})
 
-  def update(self, values: dict[str, Any]) -> None:
+  def update(
+      self, values: dict[str, Any], *, delete: Iterable[str] = ()
+  ) -> None:
     with self._session_store.transaction() as state:
       state.update(values)
+      for key in delete:
+        state.pop(key, None)
       self._cache = dict(state)
 
   def delete(self, *keys: str) -> None:
@@ -849,14 +853,14 @@ class ClaudeHookBQAAAdapter:
             "last_stop_text": None,
             "last_stop_usage": None,
             "last_stop_model": None,
-        }
-    )
-    state.delete(
-        "last_stop_failed",
-        "last_stop_failed_trace_id",
-        "last_stop_error_message",
-        "last_stop_error_type",
-        "last_stop_reason",
+        },
+        delete=(
+            "last_stop_failed",
+            "last_stop_failed_trace_id",
+            "last_stop_error_message",
+            "last_stop_error_type",
+            "last_stop_reason",
+        ),
     )
     self.logger.log_llm_request(
         prompt=prompt,
@@ -1030,21 +1034,21 @@ class ClaudeHookBQAAAdapter:
             "last_response_captured": was_captured,
             "last_response_captured_trace_id": trace_id if was_captured else None,
             "last_stop_model": effective_model,
-        }
-    )
-    state.delete(
-        "current_trace_id",
-        "current_span_id",
-        "current_invocation_id",
-        "current_prompt",
-        "current_start_ms",
-        "transcript_path",
-        "transcript_start_line",
-        "last_stop_failed",
-        "last_stop_failed_trace_id",
-        "last_stop_error_message",
-        "last_stop_error_type",
-        "last_stop_reason",
+        },
+        delete=(
+            "current_trace_id",
+            "current_span_id",
+            "current_invocation_id",
+            "current_prompt",
+            "current_start_ms",
+            "transcript_path",
+            "transcript_start_line",
+            "last_stop_failed",
+            "last_stop_failed_trace_id",
+            "last_stop_error_message",
+            "last_stop_error_type",
+            "last_stop_reason",
+        ),
     )
 
   def _stop_failure(self, payload: dict[str, Any], state: StateStore) -> None:
@@ -1138,7 +1142,6 @@ class ClaudeHookBQAAAdapter:
       state_updates["last_stop_error_type"] = payload.get("error_type")
     if payload.get("reason"):
       state_updates["last_stop_reason"] = payload.get("reason")
-    state.update(state_updates)
     delete_keys = [
         "current_trace_id",
         "current_span_id",
@@ -1152,7 +1155,7 @@ class ClaudeHookBQAAAdapter:
       delete_keys.append("last_stop_error_type")
     if not payload.get("reason"):
       delete_keys.append("last_stop_reason")
-    state.delete(*delete_keys)
+    state.update(state_updates, delete=delete_keys)
 
   def _subagent_stop(self, payload: dict[str, Any], state: StateStore) -> None:
     if not state.get("current_trace_id"):

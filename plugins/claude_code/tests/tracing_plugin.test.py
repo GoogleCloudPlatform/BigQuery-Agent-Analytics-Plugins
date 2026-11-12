@@ -2012,6 +2012,85 @@ class TestTranscriptAndHooks38(unittest.TestCase):
             {"prompt_tokens": 15, "completion_tokens": 9, "total_tokens": 24},
         )
 
+    def test_stop_failure_and_turn_transition_commit_state_atomically(self):
+        import contextlib
+        from unittest import mock
+        from bigquery_agent_analytics_tracing.claude_code import (
+            ClaudeHookBQAAAdapter,
+            _LockedJSONStore,
+        )
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_atomic_state_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        state_dir = os.path.join(tmp_root, "state")
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=True,
+            log_file=os.path.join(tmp_root, "atomic.log"),
+            state_dir=state_dir,
+            spool_dir=os.path.join(tmp_root, "spool"),
+        )
+        adapter = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg))
+        transcript = Path(tmp_root) / "t_atomic.jsonl"
+        transcript.write_text("", encoding="utf-8")
+
+        snapshots: list[dict] = []
+        orig_transaction = _LockedJSONStore.transaction
+
+        @contextlib.contextmanager
+        def _recording_transaction(store_self):
+            with orig_transaction(store_self) as state:
+                yield state
+                snapshots.append(dict(state))
+
+        sid = "atomic-sf-1"
+        with mock.patch.object(_LockedJSONStore, "transaction", _recording_transaction):
+            adapter.process("SessionStart", {"session_id": sid, "cwd": tmp_root})
+            adapter.process("UserPromptSubmit", {
+                "session_id": sid,
+                "prompt": "turn 1 fails",
+                "transcript_path": str(transcript),
+            })
+            before_sf = len(snapshots)
+            adapter.process("StopFailure", {
+                "session_id": sid,
+                "error": "rate_limit",
+                "error_type": "429",
+                "reason": "quota",
+                "transcript_path": str(transcript),
+            })
+            after_sf = len(snapshots)
+            adapter.process("UserPromptSubmit", {
+                "session_id": sid,
+                "prompt": "turn 2 starts",
+                "transcript_path": str(transcript),
+            })
+            after_ups2 = len(snapshots)
+            adapter.process("Stop", {
+                "session_id": sid,
+                "transcript_path": str(transcript),
+            })
+
+        # StateStore.__init__ reads once via transaction(); StopFailure itself must perform
+        # a single atomic write transaction (2 total transactions), with zero torn commits.
+        self.assertEqual(
+            after_sf - before_sf,
+            2,
+            f"StopFailure must perform 1 read + 1 atomic write, saw {snapshots[before_sf:after_sf]}",
+        )
+        for snap in snapshots:
+            self.assertFalse(
+                snap.get("last_stop_failed") and snap.get("current_trace_id"),
+                f"intermediate torn state committed with both last_stop_failed and current_trace_id: {snap}",
+            )
+        self.assertIsNone(snapshots[after_sf - 1].get("current_trace_id"))
+        self.assertTrue(snapshots[after_sf - 1].get("last_stop_failed"))
+        self.assertIsNone(snapshots[after_ups2 - 1].get("last_stop_failed"))
+        self.assertIsNotNone(snapshots[after_ups2 - 1].get("current_trace_id"))
+
     def test_multiturn_session_end_flushes_turn2_without_usage_after_turn1_stop(self):
         from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter
         from bigquery_agent_analytics_tracing.config import BQAAConfig
@@ -3193,13 +3272,14 @@ class TestRound3Fixes(unittest.TestCase):
                 for key in list(cache):
                     if key.startswith(prefix):
                         del cache[key]
-            for s in (drain._skipped_paths,):
+            for s in (drain._skipped_paths, drain._retry_skipped_paths):
                 for key in list(s):
                     if key.startswith(prefix):
                         s.discard(key)
-            for key in list(drain._reported_skips):
-                if prefix in key:
-                    drain._reported_skips.discard(key)
+            for s in (drain._reported_skips, drain._diagnostic_logs, drain._reported_saturation_logs):
+                for key in list(s):
+                    if prefix in key:
+                        s.discard(key)
 
         self.addCleanup(_cleanup_drain_globals)
 
@@ -3381,9 +3461,13 @@ class TestRound3Fixes(unittest.TestCase):
             for key in list(drain._skipped_paths):
                 if key.startswith(prefix):
                     drain._skipped_paths.discard(key)
-            for key in list(drain._reported_skips):
-                if prefix in key:
-                    drain._reported_skips.discard(key)
+            for key in list(drain._retry_skipped_paths):
+                if key.startswith(prefix):
+                    drain._retry_skipped_paths.discard(key)
+            for s in (drain._reported_skips, drain._diagnostic_logs, drain._reported_saturation_logs):
+                for key in list(s):
+                    if prefix in key:
+                        s.discard(key)
 
         self.addCleanup(_cleanup_drain_globals)
 
@@ -3515,9 +3599,12 @@ class TestRound3Fixes(unittest.TestCase):
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
             drain._skipped_paths.clear()
+            drain._retry_skipped_paths.clear()
             drain._retry_meta_saturated.clear()
             drain._skip_cap_saturated.clear()
             drain._reported_skips.clear()
+            drain._diagnostic_logs.clear()
+            drain._reported_saturation_logs.clear()
 
         self.addCleanup(_cleanup_drain_globals)
         _cleanup_drain_globals()
@@ -3604,12 +3691,13 @@ class TestRound3Fixes(unittest.TestCase):
             )
             # Existing tracked entries (fail1, fail2) are NOT evicted and caps are respected.
             self.assertEqual(len(drain._in_memory_retry_meta), 2)
-            self.assertEqual(len(drain._skipped_paths), 2)
+            self.assertEqual(drain._skipped_paths, set())
+            self.assertEqual(len(drain._retry_skipped_paths), 2)
             self.assertEqual(drain._retry_meta_saturated, set())
             self.assertIn(str(fail1), drain._in_memory_retry_meta)
             self.assertIn(str(fail2), drain._in_memory_retry_meta)
-            self.assertIn(str(fail3), drain._skipped_paths)
-            self.assertIn(str(fail_legacy), drain._skipped_paths)
+            self.assertIn(str(fail3), drain._retry_skipped_paths)
+            self.assertIn(str(fail_legacy), drain._retry_skipped_paths)
             for tracked in (str(fail1), str(fail2)):
                 self.assertEqual(drain._in_memory_retry_meta[tracked]["first_failed_at"], 1000.0)
                 self.assertEqual(drain._in_memory_retry_meta[tracked]["attempts"], 1)
@@ -3668,7 +3756,8 @@ class TestRound3Fixes(unittest.TestCase):
             )
             self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
             self.assertEqual(len(drain._in_memory_retry_meta), 2)
-            self.assertEqual(len(drain._skipped_paths), 2)
+            self.assertEqual(drain._skipped_paths, set())
+            self.assertEqual(len(drain._retry_skipped_paths), 2)
             self.assertLessEqual(len(drain._reported_skips), 4)
 
             # Critical P2 check: stale .retry sidecar on overflow envelope must NOT
@@ -3703,30 +3792,40 @@ class TestRound3Fixes(unittest.TestCase):
                 self.assertEqual(drain._in_memory_retry_meta[tracked]["attempts"], 2)
                 self.assertEqual(drain._in_memory_retry_meta[tracked]["next_retry_at"], 1015.0)
 
-            # Expiry elapsed (t=1012.0): tracked fail-1 and fail-2 expire and quarantine.
+            # Expiry elapsed (t=1012.0): tracked fail-1 and fail-2 expire and quarantine,
+            # freeing in-memory slots mid-pass so parked overflow (including expired fail-stale)
+            # immediately un-parks: fail-stale quarantines (total resolved=3), while fail-3 and
+            # fail-over take the two free in-memory slots and fail-legacy parks (1/2).
             now["t"] = 1012.0
             resolved4 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
-            self.assertEqual(resolved4, 2)
+            self.assertEqual(resolved4, 3)
             self.assertFalse(fail1.exists())
             self.assertFalse(fail2.exists())
+            self.assertFalse(fail_stale.exists())
             self.assertTrue((Path(spool_dir) / "dead-letter" / "event-001-fail.write-failed.json").is_file())
             self.assertTrue((Path(spool_dir) / "dead-letter" / "event-002-fail.write-failed.json").is_file())
-            self.assertEqual(drain._in_memory_retry_meta, {})
-            self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
+            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-005-stale-fail.write-failed.json").is_file())
+            self.assertEqual(set(drain._in_memory_retry_meta), {str(fail3), str(fail_over)})
+            self.assertEqual(drain._retry_skipped_paths, {str(fail_legacy)})
+            self.assertEqual(drain._retry_meta_saturated, set())
 
-        # Disk recovery check: once _write_retry_meta succeeds again (or a new _run starts),
-        # saturation clears, healthy envelopes drain, and expired stale-sidecar files quarantine.
+        # Disk recovery check: once _write_retry_meta succeeds again without any manual
+        # _skipped_paths clearing, healthy envelopes drain immediately and parked retry
+        # envelopes write .retry sidecars once due.
         healthy_recovered = _write_envelope("event-008-healthy.json", "healthy-after-recovery")
         with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
              mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]):
-            drain._skipped_paths.clear()
             resolved_rec = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
-            self.assertEqual(resolved_rec, 2)
+            self.assertEqual(resolved_rec, 1)
             self.assertIn("healthy-after-recovery", delivered)
             self.assertFalse(healthy_recovered.exists())
-            self.assertFalse(fail_stale.exists())
-            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-005-stale-fail.write-failed.json").is_file())
+            now["t"] = 1017.0
+            self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
+            self.assertEqual(drain._retry_skipped_paths, set())
             self.assertTrue((Path(spool_dir) / "event-003-fail.json.retry").is_file())
+            now["t"] = 1018.0
+            self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
+            self.assertTrue((Path(spool_dir) / "event-legacy-004-fail.json.retry").is_file())
             self.assertEqual(drain._retry_meta_saturated, set())
 
         log_text = log_path.read_text(encoding="utf-8")
@@ -3737,6 +3836,8 @@ class TestRound3Fixes(unittest.TestCase):
 
         # Edge case: cap=0 must not crash or spin when retry sidecar writes fail.
         _cleanup_drain_globals()
+        for sidecar in Path(spool_dir).glob("*.retry"):
+            sidecar.unlink()
         now["t"] = 1018.0
         with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 0), \
              mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
@@ -3748,7 +3849,8 @@ class TestRound3Fixes(unittest.TestCase):
             resolved_zero = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
             self.assertEqual(resolved_zero, 0)
             self.assertEqual(drain._in_memory_retry_meta, {})
-            self.assertLessEqual(len(drain._skipped_paths), 1)
+            self.assertEqual(drain._skipped_paths, set())
+            self.assertLessEqual(len(drain._retry_skipped_paths), 1)
             self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
             self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
 
@@ -3764,9 +3866,12 @@ class TestRound3Fixes(unittest.TestCase):
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
             drain._skipped_paths.clear()
+            drain._retry_skipped_paths.clear()
             drain._retry_meta_saturated.clear()
             drain._skip_cap_saturated.clear()
             drain._reported_skips.clear()
+            drain._diagnostic_logs.clear()
+            drain._reported_saturation_logs.clear()
 
         self.addCleanup(_cleanup_drain_globals)
         _cleanup_drain_globals()
@@ -3902,7 +4007,8 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
 
         # Quarantine-failure paths (missing-config, partial permanent, whole-batch permanent)
-        # must pop _in_memory_retry_meta even when _quarantine returns False without OSError.
+        # must retain quarantine_pending=True in _in_memory_retry_meta when _skipped_paths
+        # is full (never re-sending to BigQuery) and recover once dead-letter is writable.
         cfg_missing = BQAAConfig(
             project_id="",
             dataset="",
@@ -3931,8 +4037,9 @@ class TestRound3Fixes(unittest.TestCase):
                 _cleanup_drain_globals()
                 for stale in Path(spool_dir).glob("event-*"):
                     stale.unlink()
-                # Pre-fill _skipped_paths (2) and saturate retry_meta so p_perm is only
-                # protected from endless retries if _in_memory_retry_meta is popped on quarantine failure.
+                dead_dir = Path(spool_dir) / "dead-letter"
+                if dead_dir.exists():
+                    shutil.rmtree(dead_dir, ignore_errors=True)
                 s1 = _write_healthy("event-001-skip.json", "s1")
                 s1.write_text("{bad", encoding="utf-8")
                 s2 = _write_healthy("event-002-skip.json", "s2")
@@ -3945,29 +4052,38 @@ class TestRound3Fixes(unittest.TestCase):
                 now_t = time.time()
                 with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
                      mock.patch.object(drain, "_quarantine", return_value=False):
+                    # Realistically fill _skipped_paths (2/2) via failing quarantine on s1, s2;
+                    # do NOT seed fake _retry_meta_saturated.
                     drain._skipped_paths.update({str(s1), str(s2)})
-                    drain._retry_meta_saturated.add(str(Path(spool_dir)))
                     drain._in_memory_retry_meta[str(p_perm)] = {
                         "first_failed_at": now_t,
                         "attempts": 1,
                         "next_retry_at": 0.0,
                         "last_error": "prior transient",
                     }
-                    if label == "permanent_partial":
-                        drain._in_memory_retry_meta[str(Path(spool_dir) / "event-011-ok.json")] = {
-                            "first_failed_at": now_t,
-                            "attempts": 1,
-                            "next_retry_at": 0.0,
-                            "last_error": "prior transient",
-                        }
                     asyncio.run(drain._drain_once(sub_cfg, use_storage_api=False))
-                    self.assertNotIn(str(p_perm), drain._in_memory_retry_meta)
+                    self.assertIn(str(p_perm), drain._in_memory_retry_meta)
+                    self.assertIs(
+                        drain._in_memory_retry_meta[str(p_perm)].get("quarantine_pending"),
+                        True,
+                    )
                     self.assertIsNone(drain._next_deferred_wait_seconds(sub_cfg))
                     calls_after_first = insert_calls["n"]
                     if label != "missing_config":
                         self.assertGreater(calls_after_first, 0)
-                    asyncio.run(drain._drain_once(sub_cfg, use_storage_api=False))
+                    # Subsequent poll while quarantine still fails must NEVER re-call BigQuery.
+                    resolved_again = asyncio.run(drain._drain_once(sub_cfg, use_storage_api=False))
+                    self.assertEqual(resolved_again, 0)
                     self.assertEqual(insert_calls["n"], calls_after_first)
+                    self.assertIsNone(drain._next_deferred_wait_seconds(sub_cfg))
+
+                # Once dead-letter recovers, quarantine_pending resolves cleanly without BigQuery call.
+                with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2):
+                    resolved_recover = asyncio.run(drain._drain_once(sub_cfg, use_storage_api=False))
+                    self.assertEqual(resolved_recover, 1)
+                    self.assertEqual(insert_calls["n"], calls_after_first)
+                    self.assertNotIn(str(p_perm), drain._in_memory_retry_meta)
+                    self.assertFalse(p_perm.exists())
 
     def test_drain_in_process_disk_recovery_clears_saturation_without_clearing_skipped_paths(self):
         import errno
@@ -3982,9 +4098,12 @@ class TestRound3Fixes(unittest.TestCase):
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
             drain._skipped_paths.clear()
+            drain._retry_skipped_paths.clear()
             drain._retry_meta_saturated.clear()
             drain._skip_cap_saturated.clear()
             drain._reported_skips.clear()
+            drain._diagnostic_logs.clear()
+            drain._reported_saturation_logs.clear()
 
         self.addCleanup(_cleanup_drain_globals)
         _cleanup_drain_globals()
@@ -4011,6 +4130,9 @@ class TestRound3Fixes(unittest.TestCase):
             os.chmod(path, 0o600)
             return path
 
+        junk = Path(spool_dir) / "event-000-corrupt.json"
+        junk.write_text("{corrupt-json", encoding="utf-8")
+        os.chmod(junk, 0o600)
         fail1 = _write_envelope("event-001-fail.json", "fail-1")
         fail2 = _write_envelope("event-002-fail.json", "fail-2")
         fail3 = _write_envelope("event-003-fail.json", "fail-3")
@@ -4044,7 +4166,7 @@ class TestRound3Fixes(unittest.TestCase):
             log_file=str(Path(spool_dir) / "drain.log"),
             dry_run=False,
             drain_retry_backoff_seconds=None,
-            drain_max_retry_age_seconds=12.0,
+            drain_max_retry_age_seconds=20.0,
             drain_idle_seconds=0.06,
             drain_poll_seconds=0.02,
         )
@@ -4052,33 +4174,44 @@ class TestRound3Fixes(unittest.TestCase):
 
         with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
              mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]):
+            orig_quarantine = drain._quarantine
+
+            def _fail_corrupt_quarantine(spool, name, reason, **kwargs):
+                if name == junk.name:
+                    return False
+                return orig_quarantine(spool, name, reason, **kwargs)
+
             with mock.patch.object(
+                drain, "_quarantine", side_effect=_fail_corrupt_quarantine
+            ), mock.patch.object(
                 drain,
                 "_write_retry_meta",
                 side_effect=OSError(errno.ENOSPC, "No space left on device"),
             ):
-                # Fill _in_memory_retry_meta (fail1, fail2) and _skipped_paths (fail3, fail4).
+                # Fill non-retry _skipped_paths (junk), _in_memory_retry_meta (fail1, fail2),
+                # and _retry_skipped_paths (fail3, fail4).
                 self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
+                self.assertEqual(drain._skipped_paths, {str(junk)})
                 self.assertEqual(len(drain._in_memory_retry_meta), 2)
-                self.assertEqual(len(drain._skipped_paths), 2)
+                self.assertEqual(drain._retry_skipped_paths, {str(fail3), str(fail4)})
 
                 # Overflow envelope fail5 triggers _retry_meta_saturated under ENOSPC.
                 now["t"] = 1001.0
-                _write_envelope("event-005-fail.json", "fail-5")
+                fail5 = _write_envelope("event-005-fail.json", "fail-5")
                 self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
                 self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
 
-                # Healthy file written while saturated stays deferred until saturation clears.
+                # Healthy file written while saturated waits for recovery.
                 now["t"] = 1002.0
                 healthy_while_sat = _write_envelope("event-006-healthy.json", "healthy-while-sat")
                 self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
                 self.assertTrue(healthy_while_sat.exists())
                 self.assertEqual(delivered, [])
 
-            # Disk recovers BEFORE tracked expiry (now=1005.0 < 1012.0). Keep _skipped_paths
-            # intact at cap=2 so only sidecar write success clears _retry_meta_saturated.
+            # Disk recovers BEFORE tracked expiry (now=1005.0 < 1020.0): sidecar write
+            # clears _retry_meta_saturated and releases _retry_skipped_paths, while
+            # keeping non-retry _skipped_paths ({junk}) intact!
             now["t"] = 1005.0
-            self.assertEqual(len(drain._skipped_paths), 2)
             self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
             self.assertEqual(
                 drain._retry_meta_saturated,
@@ -4086,19 +4219,28 @@ class TestRound3Fixes(unittest.TestCase):
                 "successful tracked sidecar write must clear saturation in-process",
             )
             self.assertEqual(
+                drain._retry_skipped_paths,
+                set(),
+                "_retry_skipped_paths must release in-process so parked retries get another turn",
+            )
+            self.assertEqual(
                 drain._skipped_paths,
-                {str(fail3), str(fail4)},
-                "_skipped_paths must remain intact across in-process recovery",
+                {str(junk)},
+                "non-retry _skipped_paths must remain intact across in-process recovery",
             )
             self.assertTrue((Path(spool_dir) / "event-001-fail.json.retry").is_file())
             self.assertTrue((Path(spool_dir) / "event-002-fail.json.retry").is_file())
 
-            # Next pass drains the healthy file written while saturated.
+            # Next pass drains healthy_while_sat AND writes sidecars for previously parked fail3..fail5.
             now["t"] = 1006.0
             resolved_healthy = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
             self.assertEqual(resolved_healthy, 1)
             self.assertEqual(delivered, ["healthy-while-sat"])
             self.assertFalse(healthy_while_sat.exists())
+            self.assertTrue((Path(spool_dir) / "event-003-fail.json.retry").is_file())
+            self.assertTrue((Path(spool_dir) / "event-004-fail.json.retry").is_file())
+            self.assertTrue((Path(spool_dir) / "event-005-fail.json.retry").is_file())
+            self.assertEqual(drain._skipped_paths, {str(junk)})
 
     def test_drain_run_sleep_floor_zero_wait_due_and_saturated_idle_exit(self):
         import errno
@@ -4113,9 +4255,12 @@ class TestRound3Fixes(unittest.TestCase):
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
             drain._skipped_paths.clear()
+            drain._retry_skipped_paths.clear()
             drain._retry_meta_saturated.clear()
             drain._skip_cap_saturated.clear()
             drain._reported_skips.clear()
+            drain._diagnostic_logs.clear()
+            drain._reported_saturation_logs.clear()
 
         self.addCleanup(_cleanup_drain_globals)
         _cleanup_drain_globals()
@@ -4142,6 +4287,7 @@ class TestRound3Fixes(unittest.TestCase):
             os.chmod(path, 0o600)
             return path
 
+        now = {"t": 1000.0}
         state = {"mode": "fail_once", "calls": 0}
         delivered: list[str] = []
 
@@ -4149,6 +4295,15 @@ class TestRound3Fixes(unittest.TestCase):
             del table_id
             state["calls"] += 1
             if state["mode"] == "fail_once" and state["calls"] == 1:
+                return [
+                    {
+                        "index": idx,
+                        "errors": [{"reason": "backendError", "message": "transient 503"}],
+                    }
+                    for idx in range(len(rows))
+                ]
+            if state["mode"] == "fail_and_advance":
+                now["t"] += 0.06
                 return [
                     {
                         "index": idx,
@@ -4169,8 +4324,7 @@ class TestRound3Fixes(unittest.TestCase):
 
         _install_fake_bigquery(self, insert_fn=_insert)
 
-        # 1. With drain_retry_backoff_seconds=0.0, _next_deferred_wait_seconds returns 0.0;
-        #    _run must clamp sleep to drain_poll_seconds and never pass 0 to asyncio.sleep.
+        # 1a. Deterministic fake clock with backoff=0.0: wait_due==0.0 must clamp to poll.
         env1 = _write_envelope("event-001-floor.json", "floor-ok")
         cfg_floor = BQAAConfig(
             project_id="p",
@@ -4183,42 +4337,91 @@ class TestRound3Fixes(unittest.TestCase):
             dry_run=False,
             drain_retry_backoff_seconds=0.0,
             drain_max_retry_age_seconds=86400.0,
-            drain_idle_seconds=0.06,
-            drain_poll_seconds=0.02,
+            drain_idle_seconds=0.6,
+            drain_poll_seconds=0.2,
         )
         orig_wait_fn = drain._next_deferred_wait_seconds
-        wait_dues: list[float | None] = []
+        wait_dues1: list[float | None] = []
+        sleeps1: list[float] = []
 
-        def _spy_wait(c):
+        def _spy_wait_1(c):
             res = orig_wait_fn(c)
-            wait_dues.append(res)
+            wait_dues1.append(res)
             return res
 
-        sleeps1: list[float] = []
-        orig_sleep = asyncio.sleep
-
-        async def _track_sleep_1(delay):
+        async def _fake_sleep_1(delay):
             sleeps1.append(delay)
-            await orig_sleep(delay)
+            now["t"] += delay
 
-        with mock.patch.object(drain, "_next_deferred_wait_seconds", side_effect=_spy_wait), \
-             mock.patch.object(drain.asyncio, "sleep", side_effect=_track_sleep_1):
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(drain, "_next_deferred_wait_seconds", side_effect=_spy_wait_1), \
+             mock.patch.object(drain.asyncio, "sleep", side_effect=_fake_sleep_1):
             asyncio.run(asyncio.wait_for(drain._run(cfg_floor), timeout=2.0))
 
-        self.assertIn(0.0, wait_dues, f"expected wait_due == 0.0 to be observed, got {wait_dues}")
+        self.assertIn(0.0, wait_dues1, f"expected wait_due == 0.0, got {wait_dues1}")
         self.assertTrue(sleeps1)
-        self.assertTrue(
-            all(d > 0.0 and d == cfg_floor.drain_poll_seconds for d in sleeps1),
-            f"expected positive clamped sleep floor {cfg_floor.drain_poll_seconds}, got {sleeps1}",
-        )
+        self.assertTrue(all(d == cfg_floor.drain_poll_seconds for d in sleeps1), sleeps1)
         self.assertEqual(delivered, ["floor-ok"])
         self.assertFalse(env1.exists())
 
-        # 2. When only skipped and saturated entries remain in spool, _run exits cleanly
-        #    after drain_idle_seconds without hanging or passing 0 to asyncio.sleep.
+        # 1b. Deterministic mutant killer for positive backoff (>0) hitting wait_due==0.0:
+        #     event-001 fails at t=2000.0 (due=2000.25); pass 2 at t=2000.20 skips event-001,
+        #     runs event-002 whose simulated RPC latency advances clock past 2000.25 so
+        #     _next_deferred_wait_seconds deterministically sees wait_due == 0.0 with backoff > 0!
         _cleanup_drain_globals()
+        delivered.clear()
+        now["t"] = 2000.0
+        state["calls"] = 0
+        state["mode"] = "fail_and_advance"
+        _write_envelope("event-001-late.json", "late-1")
+        cfg_pos = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=str(Path(spool_dir) / "drain.log"),
+            dry_run=False,
+            drain_retry_backoff_seconds=0.25,
+            drain_max_retry_age_seconds=5.0,
+            drain_idle_seconds=0.6,
+            drain_poll_seconds=0.2,
+        )
+        wait_dues_pos: list[float | None] = []
+        sleeps_pos: list[float] = []
+        probe_written = {"done": False}
+
+        def _spy_wait_pos(c):
+            res = orig_wait_fn(c)
+            wait_dues_pos.append(res)
+            return res
+
+        async def _fake_sleep_pos(delay):
+            sleeps_pos.append(delay)
+            now["t"] += delay
+            if not probe_written["done"]:
+                probe_written["done"] = True
+                _write_envelope("event-002-probe.json", "probe-2")
+            else:
+                state["mode"] = "ok"
+
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(drain, "_next_deferred_wait_seconds", side_effect=_spy_wait_pos), \
+             mock.patch.object(drain.asyncio, "sleep", side_effect=_fake_sleep_pos):
+            asyncio.run(asyncio.wait_for(drain._run(cfg_pos), timeout=2.0))
+
+        self.assertIn(0.0, wait_dues_pos, f"expected wait_due==0.0 under positive backoff, got {wait_dues_pos}")
+        self.assertEqual(sleeps_pos[1], cfg_pos.drain_poll_seconds, sleeps_pos)
+        self.assertTrue(all(d > 0.0 for d in sleeps_pos), sleeps_pos)
+        self.assertEqual(sorted(delivered), ["late-1", "probe-2"])
+
+        # 2. Deterministic fake-clock idle exit when skipped, quarantine_pending, and
+        #    retry-saturated entries fill all bounded structures simultaneously.
+        _cleanup_drain_globals()
+        now["t"] = 3000.0
         state["mode"] = "fail_always"
-        for idx in range(1, 6):
+        for idx in range(1, 9):
             _write_envelope(f"event-00{idx}-sat.json", f"sat-{idx}")
         cfg_sat = BQAAConfig(
             project_id="p",
@@ -4236,24 +4439,617 @@ class TestRound3Fixes(unittest.TestCase):
         )
         sleeps2: list[float] = []
 
-        async def _track_sleep_2(delay):
+        async def _fake_sleep_2(delay):
             sleeps2.append(delay)
-            await orig_sleep(delay)
+            now["t"] += delay
 
         with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
+             mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
              mock.patch.object(
                  drain,
                  "_write_retry_meta",
                  side_effect=OSError(errno.ENOSPC, "No space left on device"),
              ), \
              mock.patch.object(drain, "_quarantine", return_value=False), \
-             mock.patch.object(drain.asyncio, "sleep", side_effect=_track_sleep_2):
+             mock.patch.object(drain.asyncio, "sleep", side_effect=_fake_sleep_2):
             asyncio.run(asyncio.wait_for(drain._run(cfg_sat), timeout=2.0))
 
         self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
+        self.assertEqual(len(drain._skipped_paths), 2)
+        self.assertEqual(len(drain._retry_skipped_paths), 2)
+        self.assertEqual(len(drain._in_memory_retry_meta), 2)
+        self.assertTrue(
+            all(v.get("quarantine_pending") for v in drain._in_memory_retry_meta.values()),
+            drain._in_memory_retry_meta,
+        )
         self.assertTrue(sleeps2)
         self.assertTrue(all(d > 0.0 for d in sleeps2), sleeps2)
         self.assertGreaterEqual(sum(sleeps2), cfg_sat.drain_idle_seconds - 1e-9)
+
+    def test_drain_bigquery_recovery_while_saturated_and_cap_zero_delivery_release(self):
+        import errno
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_bq_rec_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        def _cleanup_drain_globals():
+            drain._in_memory_retry_meta.clear()
+            drain._skipped_paths.clear()
+            drain._retry_skipped_paths.clear()
+            drain._retry_meta_saturated.clear()
+            drain._skip_cap_saturated.clear()
+            drain._reported_skips.clear()
+            drain._diagnostic_logs.clear()
+            drain._reported_saturation_logs.clear()
+
+        self.addCleanup(_cleanup_drain_globals)
+        _cleanup_drain_globals()
+
+        def _write_envelope(name: str, marker: str) -> Path:
+            path = Path(spool_dir) / name
+            path.write_text(
+                json.dumps({
+                    "config": {
+                        "project_id": "p",
+                        "dataset": "d",
+                        "table": "agent_events",
+                    },
+                    "row": {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "event_type": "LLM_REQUEST",
+                        "content": {"marker": marker},
+                        "attributes": {},
+                        "latency_ms": {},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            return path
+
+        delivered: list[str] = []
+        bq_down = {"active": True, "fail_prefix": "fail-"}
+
+        def _insert(table_id, rows):
+            del table_id
+            outcomes = []
+            for idx, row in enumerate(rows):
+                marker = row["content"]["marker"]
+                if bq_down["active"] and marker.startswith(bq_down["fail_prefix"]):
+                    outcomes.append({
+                        "index": idx,
+                        "errors": [{"reason": "backendError", "message": "transient 503"}],
+                    })
+                else:
+                    delivered.append(marker)
+            return outcomes
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=str(Path(spool_dir) / "drain.log"),
+            dry_run=False,
+            drain_retry_backoff_seconds=None,
+            drain_max_retry_age_seconds=60.0,
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+        )
+        now = {"t": 1000.0}
+
+        for idx in range(1, 5):
+            _write_envelope(f"event-00{idx}-fail.json", f"fail-{idx}")
+
+        with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
+             mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(
+                 drain,
+                 "_write_retry_meta",
+                 side_effect=OSError(errno.ENOSPC, "No space left on device"),
+             ):
+            self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
+            now["t"] = 1001.0
+            _write_envelope("event-005-fail.json", "fail-5")
+            self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
+            self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
+            self.assertEqual(len(drain._retry_skipped_paths), 2)
+
+            healthy_h = _write_envelope("event-006-healthy.json", "healthy-H")
+
+            # BigQuery recovers even while disk sidecar writes STILL fail with ENOSPC:
+            # fail-1 and fail-2 deliver, freeing _in_memory_retry_meta and releasing saturation.
+            bq_down["active"] = False
+            now["t"] = 1005.0
+            resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved1, 2)
+            self.assertEqual(drain._in_memory_retry_meta, {})
+            self.assertEqual(drain._retry_meta_saturated, set())
+            self.assertEqual(drain._retry_skipped_paths, set())
+
+            # Next pass drains parked fail-3..fail-5 AND healthy-H completely!
+            now["t"] = 1006.0
+            resolved2 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved2, 4)
+            self.assertFalse(healthy_h.exists())
+            self.assertEqual(
+                sorted(delivered),
+                ["fail-1", "fail-2", "fail-3", "fail-4", "fail-5", "healthy-H"],
+            )
+
+        # Edge case cap=0: delivery/quarantine resolving in a batch clears retry saturation.
+        _cleanup_drain_globals()
+        delivered.clear()
+        bq_down["active"] = True
+        with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 0), \
+             mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(
+                 drain,
+                 "_write_retry_meta",
+                 side_effect=OSError(errno.ENOSPC, "No space left on device"),
+             ):
+            # idx=0 saturates (fail-1, fail-2), idx=2 succeeds (ok-after-sat) in the same batch!
+            _write_envelope("event-101-fail.json", "fail-cap0-1")
+            _write_envelope("event-102-fail.json", "fail-cap0-2")
+            _write_envelope("event-103-ok.json", "ok-after-cap0-sat")
+            resolved_cap0 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved_cap0, 1)
+            self.assertEqual(delivered, ["ok-after-cap0-sat"])
+            self.assertEqual(drain._retry_meta_saturated, set())
+            self.assertEqual(drain._retry_skipped_paths, set())
+
+    def test_drain_skip_cap_saturated_keeps_valid_deferred_sidecar_wait_in_run_and_dedupes_logs(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_skip_sat_wait_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        def _cleanup_drain_globals():
+            drain._in_memory_retry_meta.clear()
+            drain._skipped_paths.clear()
+            drain._retry_skipped_paths.clear()
+            drain._retry_meta_saturated.clear()
+            drain._skip_cap_saturated.clear()
+            drain._reported_skips.clear()
+            drain._diagnostic_logs.clear()
+            drain._reported_saturation_logs.clear()
+
+        self.addCleanup(_cleanup_drain_globals)
+        _cleanup_drain_globals()
+
+        # 3 unquarantinable envelopes (mismatch/corrupt): exceed cap=2 -> _skip_cap_saturated,
+        # plus check destination_mismatch diagnostic log deduplication across repeated polls.
+        mismatch_names: set[str] = set()
+        for idx in (1, 2, 3):
+            name = f"event-00{idx}-mismatch.json"
+            mismatch_names.add(name)
+            p = Path(spool_dir) / name
+            p.write_text(
+                json.dumps({
+                    "config": {"project_id": "other-proj", "dataset": "d", "table": "t"},
+                    "row": {"event_type": "LLM_REQUEST"},
+                }),
+                encoding="utf-8",
+            )
+            os.chmod(p, 0o600)
+
+        valid_deferred = Path(spool_dir) / "event-900-deferred.json"
+        valid_deferred.write_text(
+            json.dumps({
+                "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                "row": {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "event_type": "LLM_REQUEST",
+                    "content": {"marker": "deferred-900"},
+                    "attributes": {},
+                    "latency_ms": {},
+                },
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(valid_deferred, 0o600)
+
+        log_path = Path(spool_dir) / "drain.log"
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=str(log_path),
+            dry_run=False,
+            drain_retry_backoff_seconds=0.5,
+            drain_max_retry_age_seconds=10.0,
+            drain_idle_seconds=0.1,
+            drain_poll_seconds=0.04,
+        )
+
+        now = {"t": 1000.0}
+        calls = {"n": 0}
+        delivered: list[str] = []
+
+        def _insert(table_id, rows):
+            del table_id
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [
+                    {
+                        "index": idx,
+                        "errors": [{"reason": "backendError", "message": "transient 503"}],
+                    }
+                    for idx in range(len(rows))
+                ]
+            delivered.extend(row["content"]["marker"] for row in rows)
+            return []
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+        orig_quarantine = drain._quarantine
+
+        def _selective_quarantine(spool, name, reason, **kwargs):
+            if name in mismatch_names:
+                return False
+            return orig_quarantine(spool, name, reason, **kwargs)
+
+        sleeps: list[float] = []
+
+        async def _fake_sleep(delay):
+            sleeps.append(delay)
+            now["t"] += delay
+
+        # First run _run end-to-end under fake clock: event-900 fails once at t=1000.0 with
+        # backoff 0.5s (> drain_idle_seconds 0.1s) while _skip_cap_saturated is active.
+        # _run must NOT exit after 0.1s idle; it must wait out 0.5s, deliver event-900, then exit!
+        with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
+             mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(drain, "_quarantine", side_effect=_selective_quarantine), \
+             mock.patch.object(drain.asyncio, "sleep", side_effect=_fake_sleep):
+            asyncio.run(asyncio.wait_for(drain._run(cfg), timeout=2.0))
+
+        self.assertEqual(delivered, ["deferred-900"])
+        self.assertFalse(valid_deferred.exists())
+        self.assertEqual(drain._skip_cap_saturated, {str(Path(spool_dir))})
+        self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
+        self.assertGreaterEqual(now["t"], 1000.5)
+
+        log_text = log_path.read_text(encoding="utf-8")
+        # Overflowed event-003-mismatch.json ran across >10 polls but must log mismatch only ONCE.
+        self.assertEqual(
+            log_text.count("DRAINER destination_mismatch file=event-003-mismatch.json"),
+            1,
+            log_text,
+        )
+
+        # Also test mutant killer: when _skip_cap_saturated is ALREADY set, quarantining a
+        # newly arrived corrupt file succeeds and must count resolved == 1.
+        corrupt_resolvable = Path(spool_dir) / "event-901-corrupt-ok.json"
+        corrupt_resolvable.write_text("{bad", encoding="utf-8")
+        os.chmod(corrupt_resolvable, 0o600)
+        with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
+             mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(drain, "_quarantine", side_effect=_selective_quarantine):
+            resolved_corrupt = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+        self.assertEqual(resolved_corrupt, 1)
+        self.assertFalse(corrupt_resolvable.exists())
+
+    def test_drain_quarantine_pending_preserves_expiry_and_dedupes_expired_logs(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_qpending_exp_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        def _cleanup_drain_globals():
+            drain._in_memory_retry_meta.clear()
+            drain._skipped_paths.clear()
+            drain._retry_skipped_paths.clear()
+            drain._retry_meta_saturated.clear()
+            drain._skip_cap_saturated.clear()
+            drain._reported_skips.clear()
+            drain._diagnostic_logs.clear()
+            drain._reported_saturation_logs.clear()
+
+        self.addCleanup(_cleanup_drain_globals)
+        _cleanup_drain_globals()
+
+        for idx in (1, 2, 3):
+            c = Path(spool_dir) / f"event-00{idx}-junk.json"
+            c.write_text("{bad", encoding="utf-8")
+            os.chmod(c, 0o600)
+
+        held_env = Path(spool_dir) / "event-009-held.json"
+        held_env.write_text(
+            json.dumps({
+                "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                "row": {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "event_type": "LLM_REQUEST",
+                    "content": {"marker": "held-9"},
+                    "attributes": {},
+                    "latency_ms": {},
+                },
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(held_env, 0o600)
+
+        exp_env = Path(spool_dir) / "event-010-expired.json"
+        exp_env.write_text(
+            json.dumps({
+                "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                "row": {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "event_type": "LLM_REQUEST",
+                    "content": {"marker": "expired-10"},
+                    "attributes": {},
+                    "latency_ms": {},
+                },
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(exp_env, 0o600)
+
+        exp_over_env = Path(spool_dir) / "event-011-expired-overflow.json"
+        exp_over_env.write_text(
+            json.dumps({
+                "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                "row": {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "event_type": "LLM_REQUEST",
+                    "content": {"marker": "expired-11"},
+                    "attributes": {},
+                    "latency_ms": {},
+                },
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(exp_over_env, 0o600)
+        exp_over_sidecar = Path(spool_dir) / "event-011-expired-overflow.json.retry"
+        exp_over_sidecar.write_text(
+            json.dumps({
+                "first_failed_at": 1000.0,
+                "attempts": 1,
+                "next_retry_at": 1005.0,
+                "last_error": "prior 503",
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(exp_over_sidecar, 0o600)
+
+        insert_calls = {"n": 0}
+
+        def _insert(table_id, rows):
+            del table_id, rows
+            insert_calls["n"] += 1
+            return []
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+
+        log_path = Path(spool_dir) / "drain.log"
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=str(log_path),
+            dry_run=False,
+            drain_retry_backoff_seconds=None,
+            drain_max_retry_age_seconds=10.0,
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+        )
+        now = {"t": 1020.0}
+
+        import errno as _errno
+        orig_subdir = drain.PrivateDir.subdir
+
+        def _deny_dead_letter(self_dir, name):
+            if name == "dead-letter":
+                raise OSError(_errno.EACCES, "Permission denied")
+            return orig_subdir(self_dir, name)
+
+        with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
+             mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(drain.PrivateDir, "subdir", _deny_dead_letter):
+            with drain.ensure_private_dir(spool_dir) as spool_priv:
+                drain._store_in_memory_retry_meta(
+                    spool_priv,
+                    "event-009-held.json",
+                    {
+                        "first_failed_at": 1000.0,
+                        "attempts": 2,
+                        "next_retry_at": 1005.0,
+                        "quarantine_pending": True,
+                        "quarantine_reason": "write-failed",
+                    },
+                )
+                drain._store_in_memory_retry_meta(
+                    spool_priv,
+                    "event-010-expired.json",
+                    {
+                        "first_failed_at": 1000.0,
+                        "attempts": 2,
+                        "next_retry_at": 1005.0,
+                        "last_error": "prior ENOSPC",
+                    },
+                )
+            for _ in range(4):
+                self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
+                self.assertEqual(len(drain._in_memory_retry_meta), 2)
+                self.assertIn(str(exp_env), drain._in_memory_retry_meta)
+                self.assertIs(drain._in_memory_retry_meta[str(exp_env)].get("quarantine_pending"), True)
+                self.assertEqual(drain._in_memory_retry_meta[str(exp_env)]["first_failed_at"], 1000.0)
+                self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
+            self.assertEqual(insert_calls["n"], 0, "expired quarantine_pending/overflow must never re-call BigQuery")
+
+        # Only after dead-letter recovers (real _quarantine), exp_env and exp_over_env move cleanly.
+        orig_quarantine = drain._quarantine
+        def _only_exp_recovers(spool, name, reason, **kwargs):
+            if name not in (exp_env.name, exp_over_env.name):
+                return False
+            return orig_quarantine(spool, name, reason, **kwargs)
+
+        with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
+             mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(drain, "_quarantine", side_effect=_only_exp_recovers):
+            self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 2)
+            self.assertEqual(insert_calls["n"], 0)
+            self.assertFalse(exp_env.exists())
+            self.assertFalse(exp_over_env.exists())
+            self.assertNotIn(str(exp_env), drain._in_memory_retry_meta)
+            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-010-expired.write-failed.json").is_file())
+            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-011-expired-overflow.write-failed.json").is_file())
+
+        log_text = log_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            log_text.count("DRAINER retry_expired file=event-010-expired.json"),
+            1,
+            log_text,
+        )
+        self.assertEqual(
+            log_text.count("DRAINER retry_expired file=event-011-expired-overflow.json"),
+            1,
+            log_text,
+        )
+        self.assertEqual(
+            log_text.count("DRAINER retry_expiry_quarantine_failed file=event-011-expired-overflow.json"),
+            1,
+            log_text,
+        )
+
+    def test_drain_read_retry_meta_prefers_fresher_in_memory_over_stale_sidecar(self):
+        import errno
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_stale_sidecar_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        def _cleanup_drain_globals():
+            drain._in_memory_retry_meta.clear()
+            drain._skipped_paths.clear()
+            drain._retry_skipped_paths.clear()
+            drain._retry_meta_saturated.clear()
+            drain._skip_cap_saturated.clear()
+            drain._reported_skips.clear()
+            drain._diagnostic_logs.clear()
+            drain._reported_saturation_logs.clear()
+
+        self.addCleanup(_cleanup_drain_globals)
+        _cleanup_drain_globals()
+
+        env_path = Path(spool_dir) / "event-001-stale.json"
+        env_path.write_text(
+            json.dumps({
+                "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                "row": {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "event_type": "LLM_REQUEST",
+                    "content": {"marker": "stale-sidecar"},
+                    "attributes": {},
+                    "latency_ms": {},
+                },
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(env_path, 0o600)
+        sidecar_path = Path(spool_dir) / "event-001-stale.json.retry"
+        sidecar_path.write_text(
+            json.dumps({
+                "first_failed_at": 995.0,
+                "attempts": 1,
+                "next_retry_at": 1000.0,
+                "last_error": "prior transient before ENOSPC",
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(sidecar_path, 0o600)
+
+        calls = {"n": 0, "fail": True}
+        delivered: list[str] = []
+
+        def _insert(table_id, rows):
+            del table_id
+            calls["n"] += 1
+            if calls["fail"]:
+                return [
+                    {
+                        "index": idx,
+                        "errors": [{"reason": "backendError", "message": "transient 503"}],
+                    }
+                    for idx in range(len(rows))
+                ]
+            delivered.extend(row["content"]["marker"] for row in rows)
+            return []
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=str(Path(spool_dir) / "drain.log"),
+            dry_run=False,
+            drain_retry_backoff_seconds=None,
+            drain_max_retry_age_seconds=60.0,
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+        )
+        now = {"t": 1003.0}
+
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(
+                 drain,
+                 "_write_retry_meta",
+                 side_effect=OSError(errno.ENOSPC, "No space left on device"),
+             ):
+            # Pass 1 at t=1003.0: sidecar is due (1000.0 <= 1003.0), fails BigQuery,
+            # _write_retry_meta fails ENOSPC leaving stale disk sidecar attempts=1 untouched,
+            # while in-memory records attempts=2 and next_retry_at=1013.0 (backoff=10s).
+            self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
+            self.assertEqual(calls["n"], 1)
+
+            with drain.ensure_private_dir(spool_dir) as spool_priv:
+                effective = drain._read_retry_meta(spool_priv, "event-001-stale.json")
+            self.assertIsNotNone(effective)
+            self.assertEqual(effective["attempts"], 2)
+            self.assertEqual(effective["next_retry_at"], 1013.0)
+
+            # Advance time inside the backoff window (t=1008.0 < 1013.0): stale disk sidecar
+            # still says next_retry_at=1000.0, so _drain_once MUST defer and NOT re-send!
+            now["t"] = 1008.0
+            calls["fail"] = False
+            self.assertAlmostEqual(drain._next_deferred_wait_seconds(cfg), 5.0, places=3)
+            self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
+            self.assertEqual(calls["n"], 1, "stale .retry sidecar must never bypass fresher in-memory backoff")
+
+            # Advance past next_retry_at=1013.0: delivers cleanly and removes envelope + stale sidecar.
+            now["t"] = 1013.0
+            self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 1)
+            self.assertEqual(calls["n"], 2)
+            self.assertEqual(delivered, ["stale-sidecar"])
+            self.assertFalse(env_path.exists())
+            self.assertFalse(sidecar_path.exists())
 
     def test_legacy_010_mid_turn_state_and_spool_migration_single_delivery(self):
         from bigquery_agent_analytics_tracing import drain

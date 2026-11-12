@@ -1554,6 +1554,17 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['scheme: bearer\nabcdefghijklmg=', 'scheme: bearer [REDACTED]', 'abcdefghijklmg='],
     ['Basic\ncmV2aWV3Rml4dHVyZU9ubHk=', 'Basic [REDACTED]', 'cmV2aWV3Rml4dHVyZU9ubHk='],
     ['Basic\nmySecretToken12==', 'Basic [REDACTED]', 'mySecretToken12=='],
+    ['# Bearer\nabcdefghijklmg=', '# Bearer [REDACTED]', 'abcdefghijklmg='],
+    ['# Bearer\nabcdefghijklmno=', '# Bearer [REDACTED]', 'abcdefghijklmno='],
+    ['# Bearer\nABCDEFGHIJKLMNO=', '# Bearer [REDACTED]', 'ABCDEFGHIJKLMNO='],
+    ['# bearer\nschemaV2Configx=', '# bearer [REDACTED]', 'schemaV2Configx='],
+    ['# bearer\ncustom-headerxx=', '# bearer [REDACTED]', 'custom-headerxx='],
+    ['# bearer\npublicvalue=', '# bearer [REDACTED]', 'publicvalue='],
+    ['MODE=bearer\nabcdefghijklmno=', 'MODE=bearer [REDACTED]', 'abcdefghijklmno='],
+    ['MODE=bearer\nABCDEFGHIJKLMNO=', 'MODE=bearer [REDACTED]', 'ABCDEFGHIJKLMNO='],
+    ['MODE=bearer\npublicvalue=', 'MODE=bearer [REDACTED]', 'publicvalue='],
+    ['MODE=bearer\nENVIRONMENT=', 'MODE=bearer [REDACTED]', 'ENVIRONMENT='],
+    ['Authorization:\n`Bearer\nReviewFixtureOnly more`', 'Authorization:\n`Bearer [REDACTED] more`', 'ReviewFixtureOnly'],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1587,27 +1598,48 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     expect(built.redactions).toBe(1)
   }
 
-  for (const [sample, secret, expectedText] of [
+  const multiExpectCases: readonly (readonly [string, string, string | undefined] | readonly [string, string, string | undefined, string | undefined])[] = [
     ['{"auth": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk=', undefined],
     ['{"note": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk=', undefined],
-    ['"{\\"note\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', 'mySecretTokenAb=', '"{\\"note\\": \\"Bearer [REDACTED]\\", \\"id\\": 123}"'],
+    [
+      '"{\\"note\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"',
+      'mySecretTokenAb=',
+      '"{\\"note\\": \\"Bearer [REDACTED]\\", \\"id\\": 123}"',
+      '"{\\"note\\":\\"[REDACTED]\\",\\"id\\":\\"[REDACTED]\\"}"',
+    ],
     ['"{\\"auth\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', 'mySecretTokenAb=', undefined],
     ['"Authorization": "\n' + ' '.repeat(60) + 'Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', '"Authorization": [REDACTED]'],
     ['\\"Authorization\\": \\"' + ' '.repeat(60) + 'Bearer\nReviewFixtureOnly more\\"', 'ReviewFixtureOnly', '\\"Authorization\\": [REDACTED]'],
     ['Authorization = "Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'Authorization = [REDACTED]'],
     ["'Authorization': 'Bearer\nReviewFixtureOnly more'", 'ReviewFixtureOnly', "'Authorization': [REDACTED]"],
-    ["'Authorization' => 'Bearer\nReviewFixtureOnly more'", 'ReviewFixtureOnly', undefined],
-    ['authorization := "Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', undefined],
+    ["'Authorization' => 'Bearer\nReviewFixtureOnly more'", 'ReviewFixtureOnly', "'Authorization' =[REDACTED]"],
+    ['authorization := "Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization :[REDACTED]'],
     // Comparison/scope operators (`==`, `::`) are not explicit auth headers, so
     // the KV pass redacts the `authorization` operand while `Bearer` keeps header neutrality.
-    ['authorization== Bearer\nReviewFixtureOnly more', 'Bearer', undefined],
-    ['authorization:: Bearer\nReviewFixtureOnly more', 'Bearer', undefined],
+    ['authorization== Bearer\nReviewFixtureOnly more', 'Bearer', 'authorization=[REDACTED]\nReviewFixtureOnly more'],
+    ['authorization:: Bearer\nReviewFixtureOnly more', 'Bearer', 'authorization:[REDACTED]\nReviewFixtureOnly more'],
     ['bash -c "curl -H \\"X-Auth: Bearer mySecretTokenAb=\\""', 'mySecretTokenAb=', undefined],
     ['Bearer\nlB79GsW66LvIcKaTzjh= Bearer\np2112MrvcRo=', 'p2112MrvcRo=', 'Bearer [REDACTED] Bearer [REDACTED]'],
-  ] as const) {
+    ['AUTH_MODE := bearer\nCLIENT_SECRET := hunter2', 'hunter2', 'AUTH_MODE :[REDACTED]'],
+    ['AUTH_MODE := bearer\nGITHUB_TOKEN := hunter2', 'hunter2', 'AUTH_MODE :[REDACTED]'],
+    ['AUTH_MODE ::= bearer\nCLIENT_SECRET ::= hunter2', 'hunter2', 'AUTH_MODE :[REDACTED]'],
+    ['MODE := bearer\nCLIENT_SECRET := "hunter2"', 'hunter2', 'MODE := bearer\nCLIENT_SECRET :[REDACTED]'],
+    ['MODE ::= bearer\nCLIENT_SECRET ::= "hunter2"', 'hunter2', 'MODE ::= bearer\nCLIENT_SECRET :[REDACTED]'],
+    ['authorization: bearer\nclient_secret: "Hunter2Secret!"', 'Hunter2Secret!', 'authorization: [REDACTED]'],
+    ['authorization: basic\nclient_secret: "Hunter2Secret!"', 'Hunter2Secret!', 'authorization: [REDACTED]'],
+    ['AUTHORIZATION=bearer\nCLIENT_SECRET="Hunter2Secret!"', 'Hunter2Secret!', 'AUTHORIZATION=[REDACTED]'],
+    ['PROXY_AUTHORIZATION=bearer\nCLIENT_SECRET="Hunter2Secret!"', 'Hunter2Secret!', 'PROXY_AUTHORIZATION=[REDACTED]'],
+    ['AUTHORIZATION=bearer CLIENT_SECRET="Hunter2Secret!" ./app', 'Hunter2Secret!', 'AUTHORIZATION=[REDACTED]'],
+    ['Authorization: Bearer client_secret="Hunter2Secret!"', 'Hunter2Secret!', 'Authorization: [REDACTED]'],
+    ['Authorization: `Bearer\nReviewFixtureOnly more`', 'ReviewFixtureOnly', 'Authorization: [REDACTED]'],
+  ]
+  for (const [sample, secret, expectedText, expectedRowResult] of multiExpectCases) {
     const stats = newStats()
     const out = redactText(sample, stats)
     if (expectedText !== undefined) expect(out).toBe(expectedText)
+    if (sample.startsWith('authorization== ') || sample.startsWith('authorization:: ')) {
+      expect(out).toContain('ReviewFixtureOnly more')
+    }
     expect(out).not.toContain(secret)
     expect(stats.redactions >= 1).toBe(true)
 
@@ -1631,6 +1663,10 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
       maxPayloadChars: 16_384,
     })
     expect(JSON.stringify(built.row)).not.toContain(secret)
+    const rowExpected = expectedRowResult ?? expectedText
+    if (rowExpected !== undefined) {
+      expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(rowExpected)
+    }
     expect(built.redactions >= 1).toBe(true)
   }
 
@@ -1673,7 +1709,7 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     "MODE=bearer\npublicvalue='hello' && fn<'a>()",
     "# 'todo: check bearer\npublicvalue='hello'",
     '// "todo: check bearer\npublicvalue="hello"',
-    'MODE=bearer\npublicvalue=',
+    'MODE=bearer\npublic_value=',
     'MODE=bearer\nclientSecret=',
     'MODE=bearer\nschemaV2Config=',
     'MODE=bearer\napiTokenKey=',
@@ -1681,7 +1717,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\n-client_secret:',
     'MODE=bearer\npublicvalue=" \'a\'"',
     String.raw`bash -c "mode=bearer` + '\n' + String.raw`publicvalue=\" \'a\'\""`,
-    'MODE=bearer\nENVIRONMENT=',
+    'MODE=bearer\nAPP_ENV=',
+    'MODE=bearer\nENV=',
     'MODE=bearer\nserver.endpoint=',
     'MODE=bearer\ncustom-header=',
     'MODE=bearer\n--config-file=',
@@ -1704,8 +1741,9 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\n-cfg_flg_ab=',
     'scheme_mode = bearer\nschemaV2Configx=',
     'type=bearer\nserver.endpointx=',
-    '# bearer\nschemaV2Configx=',
-    '# bearer\ncustom-headerxx=',
+    '# bearer token=',
+    '# bearer\n# schemaV2Configx=',
+    '# bearer\n# custom-headerxx=',
     'Bearer\n--config-file=',
     'Bearer\nCURRENT_WORK_DIR=',
     'Bearer\npublic_work_dirs=',
@@ -1731,7 +1769,10 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\nclient_secret=',
     'MODE=bearer\ntoken=',
     'MODE=basic\nusername=',
-    '# bearer\npublicvalue=',
+    '// bearer api_key=',
+    '# bearer\n# publicvalue=',
+    'MODE=' + ' '.repeat(50) + 'bearer\nusername=',
+    'MODE=\u2003' + ' '.repeat(50) + 'bearer\nusername=',
     'Bearer\nusername=',
     'Bearer\ntoken=',
     'Bearer\nfoo== "bar"',
@@ -1829,6 +1870,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer cross-line CLIENT_SECRET repeated colon space flood', (n: number) => ('Bearer\nCLIENT_SECRET: ' + ' '.repeat(200) + 'invalid hunter2\n').repeat((n / 238) | 0), 160_000, 250, 120],
     ['Bearer cross-line lowercase padded == flood', (n: number) => 'Bearer\nabcdefghijklmg== '.repeat((n / 24) | 0), 160_000, 250, 120],
     ['Basic cross-line lowercase padded == flood', (n: number) => 'Basic\nabcdefghijklmg== '.repeat((n / 23) | 0), 160_000, 250, 120],
+    ['Bearer CLIENT_SECRET quoted colon single-line flood', (n: number) => 'Bearer CLIENT_SECRET: "x" '.repeat((n / 26) | 0), 160_000, 250, 120],
+    ['Bearer CLIENT_SECRET spaced eq single-line flood', (n: number) => 'Bearer CLIENT_SECRET= x '.repeat((n / 24) | 0), 160_000, 250, 120],
   ] as const) {
     const small = gen(10_000)
     redactText(small, newStats())
@@ -2041,12 +2084,16 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['# bearer client_secret: Winter Is Coming', '# bearer [REDACTED]: [REDACTED]', 'Winter Is Coming'],
     ['# bearer myTokenSecret123: foo', '# bearer [REDACTED]: [REDACTED]', 'foo'],
     ['# bearer myTokenSecret123= MySecret1234', '# bearer myTokenSecret123=[REDACTED]', 'MySecret1234'],
-    ['Bearer CLIENT_SECRET= MySecret1234', 'Bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
-    ['Bearer CLIENT_SECRET=\u00a0MySecret1234', 'Bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
-    ['Bearer CLIENT_SECRET=' + ' '.repeat(40) + 'MySecret1234', 'Bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
-    ['Bearer CLIENT_SECRET=' + '\u00a0'.repeat(40) + 'MySecret1234', 'Bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
-    ['Bearer CLIENT_SECRET=\u00a0"MySecret1234"', 'Bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
-    ['Bearer CLIENT_SECRET=' + ' '.repeat(40) + '"MySecret1234"', 'Bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['MODE=bearer CLIENT_SECRET= MySecret1234', 'MODE=bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['# bearer CLIENT_SECRET= MySecret1234', '# bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['MODE=bearer CLIENT_SECRET=\u00a0MySecret1234', 'MODE=bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['MODE=bearer CLIENT_SECRET=\u2003MySecret1234', 'MODE=bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['MODE=bearer CLIENT_SECRET=' + ' '.repeat(40) + 'MySecret1234', 'MODE=bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['MODE=bearer CLIENT_SECRET=' + '\u00a0'.repeat(40) + 'MySecret1234', 'MODE=bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['MODE=bearer CLIENT_SECRET=\u00a0"MySecret1234"', 'MODE=bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['MODE=bearer CLIENT_SECRET=' + ' '.repeat(40) + '"MySecret1234"', 'MODE=bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['MODE=bearer CLIENT_SECRET: "MySecret1234"', 'MODE=bearer CLIENT_SECRET: [REDACTED]', 'MySecret1234'],
+    ['# bearer CLIENT_SECRET: "MySecret1234"', '# bearer CLIENT_SECRET: [REDACTED]', 'MySecret1234'],
     ['MODE=bearer\n--client-secret: "mySecret1234"', 'MODE=bearer\n--client-secret: [REDACTED]', 'mySecret1234'],
     ['MODE=bearer\n-client_secret = mySecret1234', 'MODE=bearer [REDACTED] = [REDACTED]', 'mySecret1234'],
     [`MODE=bearer\nCLIENT_SECRET = ${CANARY}`, 'MODE=bearer [REDACTED] = [REDACTED]', CANARY],
@@ -2141,6 +2188,32 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer --client-secret: mySecret1234', 'Bearer [REDACTED]: [REDACTED]', ['--client-secret', 'mySecret1234']],
     [`scheme: bearer\nclient_secret: ${CANARY}`, 'scheme: bearer [REDACTED]: [REDACTED]', ['client_secret', CANARY]],
     [`MODE=bearer\nCLIENT_SECRET: ${CANARY}`, 'MODE=bearer [REDACTED]: [REDACTED]', ['CLIENT_SECRET', CANARY]],
+    ['Bearer CLIENT_SECRET= MySecret1234', 'Bearer [REDACTED]= [REDACTED]', ['CLIENT_SECRET', 'MySecret1234']],
+    ['Bearer CLIENT_SECRET=\u00a0MySecret1234', 'Bearer [REDACTED]=\u00a0[REDACTED]', ['CLIENT_SECRET', 'MySecret1234']],
+    ['Bearer CLIENT_SECRET=\u2003MySecret1234', 'Bearer [REDACTED]=\u2003[REDACTED]', ['CLIENT_SECRET', 'MySecret1234']],
+    ['Bearer CLIENT_SECRET=' + ' '.repeat(40) + 'MySecret1234', 'Bearer [REDACTED]=' + ' '.repeat(40) + '[REDACTED]', ['CLIENT_SECRET', 'MySecret1234']],
+    ['Bearer CLIENT_SECRET=\u00a0"MySecret1234"', 'Bearer [REDACTED]=\u00a0[REDACTED]', ['CLIENT_SECRET', 'MySecret1234']],
+    ['Bearer secret_token_12345= unauthorized', 'Bearer [REDACTED]= [REDACTED]', ['secret_token_12345', 'unauthorized']],
+    ['[Bearer secret_token_12345= unauthorized]', '[Bearer [REDACTED]= [REDACTED]]', ['secret_token_12345', 'unauthorized']],
+    ['[Bearer secret_token_12345= "a]b"]', '[Bearer [REDACTED]= [REDACTED]]', ['secret_token_12345', 'a]b']],
+    ['[Bearer secret_token_12345= ]', '[Bearer [REDACTED] ]', ['secret_token_12345']],
+    ['Rejected Bearer my_access_token_99: "invalid scope"', 'Rejected Bearer [REDACTED]: [REDACTED]', ['my_access_token_99', 'invalid scope']],
+    ['log="Bearer secret_token_value: "', 'log="Bearer [REDACTED]: "', ['secret_token_value']],
+    ["msg='Bearer secret_token_value:'", "msg='Bearer [REDACTED]:'", ['secret_token_value']],
+    ['"Bearer secret_token_12345: $"', '"Bearer [REDACTED]: [REDACTED]"', ['secret_token_12345']],
+    ['Bearer secret_token_value: $5 refund', 'Bearer [REDACTED]: [REDACTED]', ['secret_token_value', 'refund']],
+    ['Bearer CLIENT_SECRET := hunter2', 'Bearer [REDACTED] := [REDACTED]', ['CLIENT_SECRET', 'hunter2']],
+    ['Bearer CLIENT_SECRET ::= hunter2', 'Bearer [REDACTED] ::= [REDACTED]', ['CLIENT_SECRET', 'hunter2']],
+    ['MODE=bearer\nCLIENT_SECRET\u2003: hunter2', 'MODE=bearer [REDACTED]\u2003: [REDACTED]', ['CLIENT_SECRET', 'hunter2']],
+    ['Authorization:\n    Bearer\nsecret_token_value: "request rejected"', 'Authorization:\n    Bearer [REDACTED]: [REDACTED]', ['secret_token_value', 'request rejected']],
+    ['Authorization:\nBearer secret_token_value = "x"', 'Authorization:\nBearer [REDACTED] = [REDACTED]', ['secret_token_value']],
+    ['Authorization:\nBearer\nsecret_token_value: $REASON', 'Authorization:\nBearer [REDACTED]: [REDACTED]', ['secret_token_value', '$REASON']],
+    ['Authorization:\n  Bearer\nclient_secret="Hunter2Secret!"', 'Authorization:\n  Bearer [REDACTED]', ['client_secret', 'Hunter2Secret!']],
+    ['Authorization:\nBearer\napi_key="Hunter2Secret!"', 'Authorization:\nBearer [REDACTED]', ['api_key', 'Hunter2Secret!']],
+    ['Authorization:\nBearer\napi_key: "Hunter2Secret!"', 'Authorization:\nBearer [REDACTED]: [REDACTED]', ['api_key', 'Hunter2Secret!']],
+    ["('Authorization', 'Bearer client_secret=\"Hunter2Secret!\"')", "('Authorization', 'Bearer [REDACTED]')", ['client_secret', 'Hunter2Secret!']],
+    ["('Authorization', 'Bearer\nclient_secret: \"Hunter2Secret!\"')", "('Authorization', 'Bearer [REDACTED]: [REDACTED]')", ['client_secret', 'Hunter2Secret!']],
+    ['{"message":"Bearer secret_token_value: denied","status":"ok"}', '{"message":"Bearer [REDACTED]: [REDACTED]","status":"ok"}', ['secret_token_value', 'denied']],
   ] as const) {
     const stats = newStats()
     const out = redactText(sample, stats)
@@ -2171,6 +2244,64 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     for (const part of forbidden) expect(serialized).not.toContain(part)
     expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(expected)
     expect(built.redactions).toBe(1)
+  }
+
+  for (const [sample, expected, forbidden, rowResultExpected] of [
+    ['{"error": "Rejected Bearer my_access_token_99: "}', '{"error": "Rejected Bearer [REDACTED]: "}', ['my_access_token_99'], '{"error":"Rejected Bearer [REDACTED]: "}'],
+    ['{"e":"Bearer secret_token_value: denied","next":"ok"}', '{"e":"Bearer [REDACTED]: [REDACTED]","next":"ok"}', ['secret_token_value', 'denied'], '{"e":"[REDACTED]","next":"[REDACTED]"}'],
+  ] as const) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).toBe(expected)
+    for (const part of forbidden) expect(out).not.toContain(part)
+    expect(stats.redactions).toBe(1)
+
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
+
+    const built = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: sample },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    const serialized = JSON.stringify(built.row)
+    for (const part of forbidden) expect(serialized).not.toContain(part)
+    expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(rowResultExpected)
+  }
+
+  for (const [label, gen, expectedSecret] of [
+    ['MODE=bearer CLIENT_SECRET quoted colon single-line flood', (n: number) => 'MODE=bearer CLIENT_SECRET: "x" '.repeat((n / 31) | 0), '"x"'],
+    ['MODE=bearer CLIENT_SECRET spaced eq single-line flood', (n: number) => 'MODE=bearer CLIENT_SECRET= x '.repeat((n / 29) | 0), '= x'],
+    ['MODE= 160k space + bearer\\nusername=', (n: number) => 'MODE=' + ' '.repeat(n) + 'bearer\nusername=', 'NONE_EXPECTED'],
+  ] as const) {
+    const small = gen(10_000)
+    redactText(small, newStats())
+    const t0 = performance.now()
+    redactText(small, newStats())
+    const msSmall = Math.max(1, performance.now() - t0)
+    const large = gen(160_000)
+    redactText(large.slice(0, 100), newStats())
+    const t1 = performance.now()
+    const outLarge = redactText(large, newStats())
+    const msLarge = performance.now() - t1
+    if (expectedSecret === 'NONE_EXPECTED') expect(outLarge).toBe(large)
+    else expect(outLarge).not.toContain(expectedSecret)
+    expect({
+      label,
+      withinBudget: msLarge < 250,
+      linearScaling: msLarge <= Math.max(120, msSmall * 25),
+    }).toEqual({ label, withinBudget: true, linearScaling: true })
   }
 })
 
