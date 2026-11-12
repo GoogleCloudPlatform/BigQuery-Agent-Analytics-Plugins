@@ -1919,12 +1919,8 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     hasCtx: boolean,
     coreToken: string,
     eqIdx: number,
-    isLowerWordKey: boolean,
     tokQState: QuoteContext,
-    isRecognizedConfigKey: boolean,
-    isSensitiveAssignKey: boolean,
   ): boolean => {
-    if (hasCtx && isBase64PaddedToken(coreToken) && !isRecognizedConfigKey && !isSensitiveAssignKey) return false
     const eqLineStop = lineStopFor(curEffectiveMatchEnd)
     let spEnd = curEffectiveMatchEnd
     while (spEnd < eqLineStop && isSameLineWsAt(text, spEnd)) spEnd += 1
@@ -1932,14 +1928,13 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const boundedStop = Math.min(eqLineStop, spEnd + 64)
     const dualHeadStop = computeDualStop(spEnd, boundedStop, tokQState, curHasNewline)
     if (spEnd >= dualHeadStop) return false
-    const allowQuoteRhs = isLowerWordKey || !hasCtx || isRecognizedConfigKey || isSensitiveAssignKey
     const spaceBeforeQuoteRhs = (() => {
       const ch = text[spEnd]
       if (ch === '"' || ch === "'" || ch === '`') {
-        return isOpeningUnescapedQuote(spEnd, ch, tokQState, coreToken, allowQuoteRhs)
+        return isOpeningUnescapedQuote(spEnd, ch, tokQState, coreToken, true)
       }
       if (ch === '\\' && (text[spEnd + 1] === '"' || text[spEnd + 1] === "'")) {
-        return isOpeningEscapedQuote(spEnd, text[spEnd + 1] as string, tokQState, coreToken, allowQuoteRhs)
+        return isOpeningEscapedQuote(spEnd, text[spEnd + 1] as string, tokQState, coreToken, true)
       }
       if (ch === '$') {
         return isValidVarRhsAt(
@@ -1947,7 +1942,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
           text.slice(spEnd, dualHeadStop),
           tokQState,
           coreToken,
-          allowQuoteRhs,
+          true,
         )
       }
       return false
@@ -2247,7 +2242,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                 emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
                 continue
               }
-              if (trySpacedSensitiveEqRhs(false, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey, true)) {
+              if (trySpacedSensitiveEqRhs(false, coreToken, eqIdx, tokQState)) {
                 continue
               }
               if (isEmptyQuotedRhs) {
@@ -2258,7 +2253,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             if (
               hasAssignOrLineCommentCtx &&
               isSensitiveAssignKey &&
-              trySpacedSensitiveEqRhs(true, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey, true)
+              trySpacedSensitiveEqRhs(true, coreToken, eqIdx, tokQState)
             ) {
               continue
             }
@@ -2323,7 +2318,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
             continue
           }
-          if (trySpacedSensitiveEqRhs(hasAssignOrCommentCtx, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey, true)) {
+          if (trySpacedSensitiveEqRhs(hasAssignOrCommentCtx, coreToken, eqIdx, tokQState)) {
             continue
           }
         } else if (!isBase64PaddedToken(coreToken)) {
@@ -4669,6 +4664,7 @@ function stripTrailingParenQualifier(s: string, withSep: boolean): string {
     end -= 1
     while (end > 0 && (s.charCodeAt(end - 1) === 32 || s.charCodeAt(end - 1) === 9)) end -= 1
   }
+  // Cap at 8 consecutive trailing paren groups (each <= 40 inner chars) for O(1) bounded work.
   for (let pass = 0; pass < 8; pass += 1) {
     if (end === 0 || s.charCodeAt(end - 1) !== 41) break
     const closeIdx = end - 1
@@ -4696,7 +4692,7 @@ function stripTrailingParenQualifier(s: string, withSep: boolean): string {
   return end === s.length ? s : s.slice(0, end)
 }
 
-const YAML_BLOCK_HEADER = /^([ \t]*(?:-[ \t]+)?)([A-Za-z0-9_.*"`'-]+(?:[ \t]*\([^\n]{1,40}\))?)[ \t]*:[ \t]*(?:[|>][+-]?\d*|\d*[|>][+-]?)[ \t]*(?:#[^\n]*)?$/
+const YAML_BLOCK_HEADER = /^([ \t]*(?:-[ \t]+)?)([A-Za-z0-9_.*"`'-]+(?:[ \t]*\([^\n]{1,40}?\))?)[ \t]*:[ \t]*(?:[|>][+-]?\d*|\d*[|>][+-]?)[ \t]*(?:#[^\n]*)?$/
 const K8S_NAME_LINE = /^([ \t]*-[ \t]+)name[ \t]*:[ \t]*(?:"([^"\n]+)"|'([^'\n]+)'|([^\s#]+))[ \t]*(?:#.*)?$/
 const K8S_VALUE_LINE = /^([ \t]+)value[ \t]*:[ \t]*(.*)$/
 
@@ -4779,9 +4775,9 @@ function redactK8sAndYamlBlocks(text: string, stats: SanitizeStats): string {
   return out.map(r => r.line + r.eol).join('')
 }
 
-const MD_WRAP_CLOSED = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_`])([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,79}[A-Za-z0-9_.-])?(?:[ \t]*\([^\n]{1,40}\))?)\2([ \t]*(?:\([^\n]{1,40}\)[ \t]*)?[:=][ \t]*)(.+)$/
-const MD_WRAP_AROUND_SEP = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_])([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,79}[A-Za-z0-9_.-])?(?:[ \t]*\([^\n]{1,40}\))?)([:=])\2([ \t]*)(.+)$/
-const MD_PAREN_LABEL = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,59}[A-Za-z0-9_.-])?[ \t]*\([^\n]{1,40}\)[ \t]*[:=][ \t]*)(.+)$/
+const MD_WRAP_CLOSED = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_`])([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,79}[A-Za-z0-9_.-])?(?:[ \t]*\([^\n]{1,40}?\))?)\2([ \t]*(?:\([^\n]{1,40}?\)[ \t]*)?[:=][ \t]*)(.+)$/
+const MD_WRAP_AROUND_SEP = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_])([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,79}[A-Za-z0-9_.-])?(?:[ \t]*\([^\n]{1,40}?\))?)([:=])\2([ \t]*)(.+)$/
+const MD_PAREN_LABEL = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,59}[A-Za-z0-9_.-])?[ \t]*\([^\n]{1,40}?\)[ \t]*[:=][ \t]*)(.+)$/
 const MD_SEPARATOR_ROW = /^\|(?:\s*:?-{2,}:?\s*\|)+\s*$/
 const GENERIC_KEY_COL_HEADERS = new Set([
   'key', 'keys', 'name', 'names', 'field', 'fields', 'setting', 'settings',

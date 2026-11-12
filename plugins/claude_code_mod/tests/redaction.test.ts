@@ -3240,3 +3240,92 @@ test('unspaced delimiter-prefixed quoted RHS on base64-padded sensitive keys red
     expect(s2.redactions).toBe(0)
   }
 })
+
+test('lazy parenthetical qualifiers do not leak secrets across later parens or colons', () => {
+  const cases: readonly [string, string, string][] = [
+    ['**Password** (prod): hunter2 (rotated): see notes', '**Password** (prod): [REDACTED]', 'hunter2'],
+    ['Password (prod): hunter2 (rotated): see notes', 'Password (prod): [REDACTED]', 'hunter2'],
+    ['**Password (prod)**: hunter2 (old)**: x', '**Password (prod)**: [REDACTED]', 'hunter2'],
+    ['**Password (prod):** hunter2 (old):** x', '**Password (prod):** [REDACTED]', 'hunter2'],
+    ['**Password** (prod): k=abc)=y', '**Password** (prod): [REDACTED]', 'abc'],
+    ['Password (a) (b): hunter2 (c): x', 'Password (a) (b): [REDACTED]', 'hunter2'],
+    ['**Password ((a) (b))**: mySecret123', '**Password ((a) (b))**: [REDACTED]', 'mySecret123'],
+    ['**Password** ((a) (b)): mySecret123', '**Password** ((a) (b)): [REDACTED]', 'mySecret123'],
+    ['**Password ((a) (b)):** mySecret123', '**Password ((a) (b)):** [REDACTED]', 'mySecret123'],
+    ['password ((a) (b)): |\n  mySecret123', 'password ((a) (b)): [REDACTED]\n', 'mySecret123'],
+    ['password (prod): | # (note): |\n  hunter2', 'password (prod): [REDACTED]\n', 'hunter2'],
+    ['Password (((a))): mySecret123', 'Password (((a))): [REDACTED]', 'mySecret123'],
+  ]
+  for (const [sample, expected, leakedToken] of cases) {
+    const s1 = newStats()
+    const once = redactText(sample, s1)
+    expect(once).toBe(expected)
+    expect(once).not.toContain(leakedToken)
+    expect(s1.redactions).toBeGreaterThan(0)
+    const s2 = newStats()
+    expect(redactText(once, s2)).toBe(once)
+    expect(s2.redactions).toBe(0)
+  }
+
+  const controls: readonly string[] = [
+    '**Note** (prod): safe (old): x',
+    'Note (prod): safe (old): x',
+    '**Note ((a) (b))**: safe',
+    '**Note (prod)**: safe (old)**: x',
+  ]
+  for (const control of controls) {
+    const s = newStats()
+    expect(redactText(control, s)).toBe(control)
+    expect(s.redactions).toBe(0)
+  }
+
+  const floods: readonly string[] = [
+    `**Password** (${' '.repeat(131_072)}): x`,
+    `**Password** (${'a'.repeat(131_072)}`,
+    `**Note** (${'a'.repeat(131_072)}): safe`,
+    `Password (${'('.repeat(20)}${')'.repeat(20)})${' '.repeat(131_072)}x: secret`,
+  ]
+  for (const probe of floods) {
+    const t0 = performance.now()
+    const s = newStats()
+    const out = redactText(probe, s)
+    const ms = performance.now() - t0
+    expect(ms).toBeLessThan(2000)
+    expect(out).toBe(probe)
+    expect(s.redactions).toBe(0)
+  }
+})
+
+test('same-line, comment-context, and uncontextualized cross-line bearer assignments behave as specified', () => {
+  const redactionCases: readonly [string, string, string][] = [
+    ['MODE=Bearer private_key=".secretVal99"', 'MODE=Bearer private_key=[REDACTED]', 'secretVal99'],
+    ['mode: Bearer private_key=".x"', 'mode: Bearer private_key=[REDACTED]', '.x'],
+    ['auth: Bearer private_key=".x"', 'auth: [REDACTED]', '.x'],
+    ['# Bearer\n# private_key=".secretVal99"', '# Bearer\n# private_key=[REDACTED]', 'secretVal99'],
+    ['# MODE\nBearer\nprivate_key=".secretVal99"', '# MODE\nBearer [REDACTED]=[REDACTED]', 'secretVal99'],
+    ["Users' guide to bearer\npublicvalue='hello'", "Users' guide to bearer [REDACTED]'hello'", 'publicvalue'],
+    ["fn f<'a>() -> bearer\npublicvalue='hello'", "fn f<'a>() -> bearer [REDACTED]'hello'", 'publicvalue'],
+    ["# 'todo: check bearer\npublicvalue='hello'", "# 'todo: check bearer [REDACTED]'hello'", 'publicvalue'],
+    ['// "todo: check bearer\npublicvalue="hello"', '// "todo: check bearer [REDACTED]"hello"', 'publicvalue'],
+  ]
+  for (const [sample, expected, hidden] of redactionCases) {
+    const s1 = newStats()
+    const once = redactText(sample, s1)
+    expect(once).toBe(expected)
+    expect(once).not.toContain(hidden)
+    expect(s1.redactions).toBeGreaterThan(0)
+    const s2 = newStats()
+    expect(redactText(once, s2)).toBe(once)
+    expect(s2.redactions).toBe(0)
+  }
+
+  const controls: readonly string[] = [
+    "MODE=bearer\npublicvalue='hello'",
+    'MODE=bearer\npublicvalue="hello"',
+  ]
+  for (const control of controls) {
+    const s = newStats()
+    expect(redactText(control, s)).toBe(control)
+    expect(s.redactions).toBe(0)
+  }
+})
