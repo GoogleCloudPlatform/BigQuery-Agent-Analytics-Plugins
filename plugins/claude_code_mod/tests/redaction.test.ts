@@ -3034,6 +3034,15 @@ test('RFC 7617 Latin-1 credentials redact across single-line, wrapped, content, 
     ['Basic Omtleeft', 'Omtleeft'],
     ['Basic\nOmtleeft', 'Omtleeft'],
     ['Basic\ncmV2aWV3OnLpdu9ld09ubHkx', 'cmV2aWV3OnLpdu9ld09ubHkx'],
+    // 2-byte RFC 7617 Basic credentials (1-char user or empty user + 1-char password).
+    ['Basic OmI=', 'OmI='],
+    ['Basic\nOmI=', 'OmI='],
+    ['Basic YTo=', 'YTo='],
+    ['Basic\nYTo=', 'YTo='],
+    ['Basic Olg=', 'Olg='],
+    ['Basic\nQjo=', 'Qjo='],
+    ['Basic OqA=', 'OqA='],
+    ['Basic OnA=', 'OnA='],
   ]
   for (const [sample, token] of leaks) {
     const s = newStats()
@@ -3095,11 +3104,44 @@ test('RFC 7617 Latin-1 credentials redact across single-line, wrapped, content, 
     'Basic\noptions guide',
     'Basic\norder of operations',
     'Basic\nobjects overview',
+    // 1-byte decoded ':', colon-only '::', and 3-char unpadded words stay unredacted.
+    'Basic Oi==',
+    'Basic\nOi==',
+    'Basic Ojo=',
+    'Basic OmI',
+    'Basic\nOmI',
+    'Basic the',
+    'Basic\nthe',
   ]
   for (const control of controls) {
     const s = newStats()
     expect(redactText(control, s)).toBe(control)
     expect(s.redactions).toBe(0)
+  }
+
+  // Intentional conservative trade-off: capitalized prose tokens starting with
+  // 'O[g-v]' (such as Output/Okay/Outcome/Overview) decode in Base64 Latin-1 to
+  // printable strings starting with ':' (valid RFC 7617 empty-user credentials),
+  // so they are conservatively redacted while lowercase forms remain preserved.
+  const conservativeCapitalizedProse: readonly [string, string][] = [
+    ['Basic Output', 'Output'],
+    ['Basic\nOutput', 'Output'],
+    ['Basic Okay', 'Okay'],
+    ['Basic\nOkay', 'Okay'],
+    ['Basic Outcome', 'Outcome'],
+    ['Basic\nOutcome', 'Outcome'],
+    ['Basic Overview', 'Overview'],
+    ['Basic\nOverview', 'Overview'],
+  ]
+  for (const [sample, token] of conservativeCapitalizedProse) {
+    const s = newStats()
+    const out = redactText(sample, s)
+    expect(out).toBe('Basic [REDACTED]')
+    expect(out).not.toContain(token)
+    expect(s.redactions).toBe(1)
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
   }
 })
 

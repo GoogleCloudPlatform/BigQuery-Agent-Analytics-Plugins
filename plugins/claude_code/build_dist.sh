@@ -121,8 +121,9 @@ pathlib.Path(sys.argv[2]).write_text(
 PY
 
   # Vendor directly from producers/ when building from an SDK layout, else
-  # use archived vendor/ from src when present, else (when permitted) preserve
-  # vendor/ from existing out dir or committed dist/vendor.
+  # in snapshot mode (allow_dist_vendor=0) use archived vendor/ from src when
+  # present, else (when permitted) preserve vendor/ from existing out dir or
+  # committed dist/vendor.
   local sdk_pkg_src="$src/../../producers/src/bigquery_agent_analytics_tracing"
   if [[ -d "$sdk_pkg_src" ]]; then
     mkdir -p "$tmp_stage/vendor"
@@ -132,7 +133,7 @@ PY
     printf 'Metadata-Version: 2.1\nName: bigquery-agent-analytics-tracing\nVersion: %s\n' \
       "$target_version" > "$dist_info_dir/METADATA"
     chmod 0644 "$dist_info_dir/METADATA"
-  elif [[ -d "$src/vendor" ]]; then
+  elif [[ "$allow_dist_vendor" -eq 0 && -d "$src/vendor" ]]; then
     cp -Rp "$src/vendor" "$tmp_stage/vendor"
   elif [[ "$allow_dist_vendor" -eq 1 && -d "$out/vendor" ]]; then
     cp -Rp "$out/vendor" "$tmp_stage/vendor"
@@ -144,6 +145,15 @@ PY
     return 1
   fi
   strip_bytecode "$tmp_stage"
+  if [[ "$allow_dist_vendor" -eq 0 ]] && ! python3 -B - "$tmp_stage/vendor" <<'PY'
+import os, sys
+sys.exit(0 if any(files for _, _, files in os.walk(sys.argv[1])) else 1)
+PY
+  then
+    rm -rf "$tmp_stage"
+    echo "not ok - release tag snapshot vendor/ contains no usable files after stripping bytecode"
+    return 1
+  fi
 
   rm -rf "$out"
   mkdir -p "$(dirname "$out")"
@@ -399,7 +409,7 @@ verify_tag_snapshot() {
       if ! git_sdk "$tag_repo" archive "$tag_name" plugins/claude_code producers | tar -x -C "$tag_stage"; then
         return 1
       fi
-    elif git_sdk "$tag_repo" ls-tree -r --name-only "$tag_name" -- plugins/claude_code/vendor | grep -q .; then
+    elif [[ -n "$(git_sdk "$tag_repo" ls-tree -r --name-only "$tag_name" -- plugins/claude_code/vendor)" ]]; then
       if ! git_sdk "$tag_repo" archive "$tag_name" plugins/claude_code | tar -x -C "$tag_stage"; then
         return 1
       fi

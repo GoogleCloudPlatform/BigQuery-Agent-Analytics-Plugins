@@ -70,6 +70,13 @@ const commandBudgetMs = (next?: { budget?: { remainingMs?: number } }, elapsedMs
   if (!Number.isFinite(remaining)) return 0
   return Math.max(0, Math.min(BACKFILL_WAIT_MS, remaining - COMMAND_BUDGET_RESERVE_MS - Math.max(0, elapsedMs)))
 }
+const deadLetterBudgetMs = (next?: { budget?: { remainingMs?: number } }, elapsedMs = 0): number => {
+  const remaining = next?.budget?.remainingMs
+  if (remaining === undefined || remaining === Number.POSITIVE_INFINITY) return BACKFILL_WAIT_MS
+  if (!Number.isFinite(remaining) || remaining <= 0) return 0
+  const reserve = Math.min(COMMAND_BUDGET_RESERVE_MS, Math.max(150, Math.floor(remaining / 4)))
+  return Math.max(0, Math.min(BACKFILL_WAIT_MS, remaining - reserve - Math.max(0, elapsedMs)))
+}
 // The host's timer, from session.start's `$`, for work that waits briefly
 // outside any hook (a finished tool call waiting for its decision).
 let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null = null
@@ -1366,10 +1373,12 @@ export const register: Register = (on, registered) => {
     // command hook budget (leaving room for a retry with a fresh token after
     // a 401 when time remains).
     const explicitCheck = (e.args ?? '').trim() === 'check'
-    const budgetMs = commandBudgetMs(next, Date.now() - hookStartedAt)
+    const elapsed = Date.now() - hookStartedAt
+    const probeBudget = commandBudgetMs(next, elapsed)
+    const listBudget = deadLetterBudgetMs(next, elapsed)
     const [destinationCheck, summary] = await Promise.all([
-      !isInteractiveSession || explicitCheck ? current.probeDestination(3000, explicitCheck, budgetMs) : Promise.resolve(null),
-      deadLetterSummary($, budgetMs),
+      !isInteractiveSession || explicitCheck ? current.probeDestination(3000, explicitCheck, probeBudget) : Promise.resolve(null),
+      deadLetterSummary($, listBudget),
     ])
     const snap = current.snapshot()
     const maskTransientSessionStart =
@@ -1418,20 +1427,41 @@ export const register: Register = (on, registered) => {
     // so there (and with `wait`) it waits for the result instead, up to
     // `waitMs` (`BACKFILL_WAIT_MS` capped inside the command hook budget).
     const words = (e.args ?? '').trim().split(/\s+/)
-    const waitMs = Math.min(BACKFILL_WAIT_MS, commandBudgetMs(next, Date.now() - hookStartedAt))
+    const elapsed = Date.now() - hookStartedAt
+    const waitMs = Math.min(BACKFILL_WAIT_MS, commandBudgetMs(next, elapsed))
+    const listBudget = deadLetterBudgetMs(next, elapsed)
     const shouldWait = !isInteractiveSession || words.includes('wait')
     const triggerMode = words.includes('force') ? 'force' : 'command'
     let stopWaiting = (): void => undefined
     const waited = new Promise<null>(resolve => (stopWaiting = () => resolve(null)))
-    const timer = $.clock.after(waitMs, () => stopWaiting())
+    let deadlineExpired = false
+    const timer = shouldWait
+      ? $.clock.after(waitMs, () => {
+          deadlineExpired = true
+          stopWaiting()
+        })
+      : null
+    let waitFloorExpired = false
+    const listCap = shouldWait && waitMs > 0 ? Math.min(listBudget, waitMs) : listBudget
+    const floorTimer =
+      shouldWait && !isInteractiveSession && waitMs >= MIN_NON_INTERACTIVE_BACKFILL_WAIT_MS
+        ? $.clock.after(Math.max(0, waitMs - MIN_NON_INTERACTIVE_BACKFILL_WAIT_MS + 1), () => {
+            waitFloorExpired = true
+          })
+        : null
     try {
-      const summary = await deadLetterSummary($, waitMs)
+      let summary: DeadLetterSummary
+      try {
+        summary = await deadLetterSummary($, listCap)
+      } finally {
+        floorTimer?.cancel()
+      }
       if ('error' in summary) return say(`BigQuery Agent Analytics mod: ${summary.error}`)
       if (summary.files === 0) {
         const elsewhere = summary.elsewhere > 0 ? ` ${summary.elsewhere} file(s) elsewhere in ${config.deadLetterDir} are for other tables or an older layout; they are replayed only under a configuration for their table.` : ''
         return say(`BigQuery Agent Analytics mod: no dead-letter files for ${tableRef(config)} in ${summary.dir}.${elsewhere}`)
       }
-      if (shouldWait && !isInteractiveSession && waitMs < MIN_NON_INTERACTIVE_BACKFILL_WAIT_MS) {
+      if (shouldWait && !isInteractiveSession && (waitMs < MIN_NON_INTERACTIVE_BACKFILL_WAIT_MS || waitFloorExpired)) {
         return say(
           `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} timed out (insufficient command budget) before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
         )
@@ -1444,7 +1474,7 @@ export const register: Register = (on, registered) => {
             internalErrors += 1
           })
       }
-      if (shouldWait && waitMs <= 0) {
+      if (shouldWait && (waitMs <= 0 || deadlineExpired)) {
         logWhenDone()
         return say(
           `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} timed out waiting (insufficient command budget); backfill started in background; /bqaa-status shows progress.`,
@@ -1470,7 +1500,7 @@ export const register: Register = (on, registered) => {
       logWhenDone()
       return say(`BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} still running after ${waitMs / 1000} s; /bqaa-status shows progress.`)
     } finally {
-      timer.cancel()
+      timer?.cancel()
     }
   })
 

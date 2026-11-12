@@ -20,14 +20,16 @@
 // BigQuery finds it, with no /bqaa-backfill. Also: the refused count on the
 // status line counts every row refused since rows last landed.
 
+import type { EngineInterface, OnFunction } from 'claude-code'
 import { type Engine, expect, test } from 'claude-code/testing'
 
 import { type Config, PLUGIN_VERSION, resolveConfig } from '../hooks/lib/config.ts'
 import { packFiles, parseFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
+import { register } from '../hooks/register.ts'
 
-import { ACCESS_TOKEN, COMMAND, DEAD_LETTER_DIR, OK_INSERT, OPTIONS, PARTITION_DIR, SESSION_ID, TABLE_REF, type World, deadLetterFiles, setUp, startSession, utf8Bytes } from './helpers.ts'
+import { ACCESS_TOKEN, COMMAND, DEAD_LETTER_DIR, HOME, OK_INSERT, OPTIONS, PARTITION_DIR, SESSION_ID, TABLE_REF, type World, deadLetterFiles, setUp, startSession, utf8Bytes } from './helpers.ts'
 
 const PLUGIN = 'bigquery-agent-analytics-mod'
 
@@ -2013,10 +2015,10 @@ for (const mode of [
       finishedAt = worldSlow.clock.now()
       return res
     })
-    await worldSlow.clock.advance(300)
+    await worldSlow.clock.advance(1_350)
     const res = await running
     const text = res.text ?? ''
-    expect(finishedAt - t0).toBeLessThanOrEqual(300)
+    expect(finishedAt - t0).toBeLessThanOrEqual(1_350)
     expect(finishedAt - t0).toBeLessThan(1_800)
     expect(text).toContain('dead-letter: timed out listing dead-letter directory')
     if (mode.expectProbe) expect(text).toContain('destination check: no token within')
@@ -2074,3 +2076,238 @@ for (const mode of [
     expect(statusAfter.text ?? '').toContain('dead-letter: 1 file(s)')
   })
 }
+
+test('headless -p /bqaa-backfill skips doomed backfill when post-listing budget drops below 250 ms', { options: OPTIONS }, async ($, on) => {
+  const worldFloor = setUp(on)
+  worldFloor.processDelayMs = 15_000
+  worldFloor.files.set(
+    `${PARTITION_DIR}/spill-20261112T100000000Z-floor-1.jsonl`,
+    packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+  )
+  const listCalls: string[] = []
+  for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+    on('fs.list', { path: dir }, async (_$, e, next) => {
+      listCalls.push(e.path)
+      if (e.path === PARTITION_DIR) await worldFloor.clock.sleep(200)
+      return next(e)
+    })
+  }
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+
+  const running = $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs: 1_800 })
+  await worldFloor.clock.advance(200)
+  const res = await running
+  expect(res.text ?? '').toContain('timed out (insufficient command budget) before this non-interactive run ended')
+  expect(worldFloor.files.has(`${PARTITION_DIR}/spill-20261112T100000000Z-floor-1.jsonl.mark`)).toBe(false)
+  expect(worldFloor.fetches).toEqual([])
+  await worldFloor.clock.advance(200)
+  expect(listCalls).toHaveLength(2)
+  expect(worldFloor.fetches).toEqual([])
+})
+
+test('interactive /bqaa-backfill wait shares one 1800 ms deadline across 100 ms fs.list and hanging backfill', { options: OPTIONS }, async ($, on) => {
+  const worldShared = setUp(on)
+  worldShared.processDelayMs = 15_000
+  worldShared.files.set(
+    `${PARTITION_DIR}/spill-20261112T100000000Z-shared-1.jsonl`,
+    packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+  )
+  for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+    on('fs.list', { path: dir }, async (_$, e, next) => {
+      if (e.path === PARTITION_DIR) await worldShared.clock.sleep(100)
+      return next(e)
+    })
+  }
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+
+  const t0 = worldShared.clock.now()
+  let finishedAt = -1
+  const running = $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: 1_800 }).then(res => {
+    finishedAt = worldShared.clock.now()
+    return res
+  })
+  await worldShared.clock.advance(300)
+  const res = await running
+  expect(finishedAt - t0).toBeLessThanOrEqual(300)
+  expect(res.text ?? '').toContain('still running after')
+  const statusRunning = $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 1_800 })
+  await worldShared.clock.advance(100)
+  const status = await statusRunning
+  expect(status.text ?? '').toContain('backfill: running')
+})
+
+for (const mode of [
+  { label: 'interactive /bqaa-backfill', args: '', expectText: 'backfill started for 1 file(s)' },
+  { label: 'interactive /bqaa-backfill wait', args: 'wait', expectText: 'backfill started in background; /bqaa-status shows progress.' },
+] as const) {
+  test(`${mode.label} succeeds on 10 ms async fs.list at budgetMs=1500 and starts background backfill`, { options: OPTIONS }, async ($, on) => {
+    const worldTight = setUp(on)
+    worldTight.processDelayMs = 15_000
+    worldTight.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-tight-async.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+      on('fs.list', { path: dir }, async (_$, e, next) => {
+        if (e.path === PARTITION_DIR) await worldTight.clock.sleep(10)
+        return next(e)
+      })
+    }
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+
+    const running = $.command.run({ command: 'bqaa-backfill', args: mode.args, ...COMMAND }, { budgetMs: 1_500 })
+    await worldTight.clock.advance(15)
+    const res = await running
+    expect(res.text ?? '').toContain(mode.expectText)
+
+    const statusRunning = $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 1_500 })
+    await worldTight.clock.advance(15)
+    const status = await statusRunning
+    expect(status.text ?? '').toContain('dead-letter: 1 file(s)')
+    expect(status.text ?? '').toContain('backfill: running')
+  })
+}
+
+for (const budgetMs of [-50, 0, 200, 1_500, 1_501, 1_749, 1_800, 2_000, Number.NaN, Number.POSITIVE_INFINITY] as const) {
+  test(`/bqaa-status budget sweep at budgetMs=${String(budgetMs)} under slow fs.list delays never rejects`, { options: OPTIONS }, async ($, on) => {
+    const worldSweep = setUp(on, { BQAA_AUTO_BACKFILL: 'false' })
+    worldSweep.processDelayMs = 15_000
+    worldSweep.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-sweep.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    const delayMs = budgetMs === Number.POSITIVE_INFINITY ? 9_000 : 2_000
+    const listCalls: string[] = []
+    for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+      on('fs.list', { path: dir }, async (_$, e, next) => {
+        listCalls.push(e.path)
+        await worldSweep.clock.sleep(delayMs)
+        return next(e)
+      })
+    }
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+    const nodeProc = (globalThis as {
+      process?: { on?: (ev: string, fn: () => void) => void; off?: (ev: string, fn: () => void) => void }
+    }).process
+
+    let rejections = 0
+    const onUnhandled = (): void => {
+      rejections += 1
+    }
+    nodeProc?.on?.('unhandledRejection', onUnhandled)
+    try {
+      const running = $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs })
+      const maxAdvance = Number.isFinite(budgetMs) ? Math.max(0, budgetMs) : 8_000
+      await worldSweep.clock.advance(maxAdvance)
+      const res = await running
+      expect(res.text ?? '').toContain('dead-letter: timed out')
+      expect(listCalls).toHaveLength(1)
+      await worldSweep.clock.advance(delayMs)
+      expect(listCalls).toHaveLength(1)
+      expect(rejections).toBe(0)
+    } finally {
+      nodeProc?.off?.('unhandledRejection', onUnhandled)
+    }
+  })
+}
+
+test('/bqaa-status and /bqaa-backfill cancel all command timers (0 leaked timers on probeClock)', { options: OPTIONS }, async () => {
+  const clock = probeClock()
+  let sessionStartHandler: ((...args: unknown[]) => Promise<unknown>) | null = null
+  const commandHandlers = new Map<string, (...args: unknown[]) => Promise<unknown>>()
+  const registerSpy = ((eventName: string, arg2: unknown, arg3?: unknown) => {
+    const handler = (typeof arg2 === 'function' ? arg2 : arg3) as (...args: unknown[]) => Promise<unknown>
+    if (eventName === 'session.start') sessionStartHandler = handler
+    if (eventName === 'command.run' && typeof arg2 === 'object' && arg2 !== null && 'command' in arg2) {
+      commandHandlers.set(String((arg2 as { command: string }).command), handler)
+    }
+    return { catch: () => undefined }
+  }) as unknown as OnFunction
+
+  register(registerSpy, { ...OPTIONS, autoBackfill: false, recordHostname: false })
+
+  let commandTimersOnly = false
+  let commandTimerHandles = 0
+  let commandTimersCancelledOrFired = 0
+  const wrapAfter = (ms: number, fn: () => void) => {
+    if (!commandTimersOnly) return { cancel: () => undefined }
+    commandTimerHandles += 1
+    let done = false
+    const inner = clock.after(ms, () => {
+      if (!done) {
+        done = true
+        commandTimersCancelledOrFired += 1
+      }
+      fn()
+    })
+    return {
+      cancel: () => {
+        if (!done) {
+          done = true
+          commandTimersCancelledOrFired += 1
+        }
+        inner.cancel()
+      },
+    }
+  }
+
+  let listDelayMs = 0
+  const envMap: Record<string, string> = { HOME, USER: 'dev' }
+  const stub$: EngineInterface = {
+    plugin: { root: '/plugin' },
+    env: { get: async (name: string) => envMap[name] },
+    store: { get: async () => undefined, set: async () => undefined, delete: async () => undefined, keys: async () => [] },
+    state: { get: async () => ({ value: undefined, version: 0 }), set: async () => ({ version: 1, isSet: true }) },
+    session: { id: async () => SESSION_ID, version: async () => ({ version: '1.0.0' }) },
+    clock: {
+      after: wrapAfter,
+      every: () => ({ cancel: () => undefined }),
+      sleep: (ms: number) => new Promise<void>(resolve => { clock.after(ms, () => resolve()) }),
+    },
+    http: { fetch: async () => ({ status: 200, text: '{}' }) },
+    process: { run: async () => ({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }) },
+    fs: {
+      write: async () => undefined,
+      read: async () => '',
+      exists: async (path: string) => path === DEAD_LETTER_DIR || path === PARTITION_DIR,
+      list: async (path: string) => {
+        if (listDelayMs > 0 && path === PARTITION_DIR) await new Promise<void>(resolve => clock.after(listDelayMs, resolve))
+        return path === PARTITION_DIR ? [{ name: 'spill-20261112T100000000Z-t0.jsonl', kind: 'file', size: 128 }] : []
+      },
+    },
+    ui: {
+      status: () => undefined,
+      log: () => undefined,
+      toast: () => undefined,
+      invalidate: () => undefined,
+      resolve: () => ({ Box: () => ({}), Text: () => ({}), Button: () => ({}) }),
+    },
+    command: { register: async () => undefined },
+  } as unknown as EngineInterface
+
+  await sessionStartHandler!(stub$, { surface: null, isInteractive: false, cwd: '/work/my-repo' }, async () => undefined)
+  expect(clock.pending()).toBe(0)
+
+  commandTimersOnly = true
+
+  // 1. /bqaa-status with 2_000 ms slow fs.list at budgetMs = 1_800 cancels cleanly at 1_350 ms.
+  listDelayMs = 2_000
+  const statusFn = commandHandlers.get('bqaa-status')!
+  const statusRun = statusFn(stub$, { command: 'bqaa-status', args: '', ...COMMAND }, Object.assign(async () => undefined, { budget: { remainingMs: 1_800 } }))
+  await clock.advance(1_350)
+  const statusRes = (await statusRun) as { text?: string }
+  expect(statusRes.text ?? '').toContain('dead-letter: timed out')
+  await clock.advance(2_000)
+  expect(clock.pending()).toBe(0)
+
+  // 2. Headless -p /bqaa-backfill with 200 ms fs.list at budgetMs = 1_800 cancels floorTimer + waited timer + deadLetter timer.
+  listDelayMs = 200
+  const backfillFn = commandHandlers.get('bqaa-backfill')!
+  const backfillRun = backfillFn(stub$, { command: 'bqaa-backfill', args: '', ...COMMAND }, Object.assign(async () => undefined, { budget: { remainingMs: 1_800 } }))
+  await clock.advance(200)
+  const backfillRes = (await backfillRun) as { text?: string }
+  expect(backfillRes.text ?? '').toContain('timed out (insufficient command budget) before this non-interactive run ended')
+  expect(clock.pending()).toBe(0)
+  expect(commandTimerHandles).toBeGreaterThanOrEqual(4)
+  expect(commandTimersCancelledOrFired).toBe(commandTimerHandles)
+})

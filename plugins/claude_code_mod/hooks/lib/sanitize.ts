@@ -454,7 +454,7 @@ function decodeBase64PrintableColon(token: string): boolean {
   let cleanLen = token.length
   while (cleanLen > 0 && token.charCodeAt(cleanLen - 1) === 61) cleanLen -= 1
   const pad = token.length - cleanLen
-  if (pad > 2 || cleanLen < 4 || (pad > 0 && token.length % 4 !== 0) || cleanLen % 4 === 1) return false
+  if (pad > 2 || cleanLen < 3 || (cleanLen === 3 && pad !== 1) || (pad > 0 && token.length % 4 !== 0) || cleanLen % 4 === 1) return false
   const bytes: number[] = []
   let i = 0
   while (i + 4 <= cleanLen) {
@@ -493,7 +493,7 @@ function decodeBase64PrintableColon(token: string): boolean {
     const n = (v0 << 18) | (v1 << 12) | (v2 << 6)
     bytes.push((n >>> 16) & 0xff, (n >>> 8) & 0xff)
   }
-  if (bytes.length < 3) return false
+  if (bytes.length < 2) return false
   return isPrintableUtf8WithColon(bytes) || isPrintableLatin1WithColon(bytes)
 }
 

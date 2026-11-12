@@ -5791,10 +5791,11 @@ class TestBuildDist39(unittest.TestCase):
         for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
             dst = tmp_repo / item
             dst.parent.mkdir(parents=True, exist_ok=True)
+            ignored = ("__pycache__", "*.pyc", "*.pyo", "vendor") if item == "plugins/claude_code" else ("__pycache__", "*.pyc", "*.pyo")
             shutil.copytree(
                 REPO_ROOT / item,
                 dst,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+                ignore=shutil.ignore_patterns(*ignored),
             )
 
         def _git(*args, cwd=tmp_repo):
@@ -5888,10 +5889,11 @@ class TestBuildDist39(unittest.TestCase):
         for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
             dst = plugins_repo / item
             dst.parent.mkdir(parents=True, exist_ok=True)
+            ignored = ("__pycache__", "*.pyc", "*.pyo", "vendor") if item == "plugins/claude_code" else ("__pycache__", "*.pyc", "*.pyo")
             shutil.copytree(
                 REPO_ROOT / item,
                 dst,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+                ignore=shutil.ignore_patterns(*ignored),
             )
         _git("init", "-q", cwd=plugins_repo)
         _git("add", "-A", cwd=plugins_repo)
@@ -5904,7 +5906,7 @@ class TestBuildDist39(unittest.TestCase):
         shutil.copytree(
             REPO_ROOT / "plugins/claude_code",
             sdk_repo / "plugins/claude_code",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "vendor"),
         )
         shutil.copytree(
             VENDOR_DIR,
@@ -5975,10 +5977,11 @@ class TestBuildDist39(unittest.TestCase):
         for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
             dst = isolated_plugins / item
             dst.parent.mkdir(parents=True, exist_ok=True)
+            ignored = ("__pycache__", "*.pyc", "*.pyo", "vendor") if item == "plugins/claude_code" else ("__pycache__", "*.pyc", "*.pyo")
             shutil.copytree(
                 REPO_ROOT / item,
                 dst,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+                ignore=shutil.ignore_patterns(*ignored),
             )
         _git("init", "-q", cwd=isolated_plugins)
         _git("remote", "add", "origin", str(plugins_repo), cwd=isolated_plugins)
@@ -6077,10 +6080,11 @@ class TestBuildDist39(unittest.TestCase):
         for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
             dst = target_dir / item
             dst.parent.mkdir(parents=True, exist_ok=True)
+            ignored = ("__pycache__", "*.pyc", "*.pyo", "vendor") if item == "plugins/claude_code" else ("__pycache__", "*.pyc", "*.pyo")
             shutil.copytree(
                 REPO_ROOT / item,
                 dst,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+                ignore=shutil.ignore_patterns(*ignored),
             )
         for cmd in (
             ("init", "-q"),
@@ -6436,7 +6440,7 @@ class TestBuildDist39(unittest.TestCase):
         shutil.copytree(
             REPO_ROOT / "plugins/claude_code",
             sdk_matching / "plugins/claude_code",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "vendor"),
         )
         shutil.copytree(
             dist_dir / "vendor",
@@ -6480,7 +6484,7 @@ class TestBuildDist39(unittest.TestCase):
         shutil.copytree(
             REPO_ROOT / "plugins/claude_code",
             sdk_missing / "plugins/claude_code",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "vendor"),
         )
         _git("init", "-q", cwd=sdk_missing)
         _git("add", "-A", cwd=sdk_missing)
@@ -6498,12 +6502,12 @@ class TestBuildDist39(unittest.TestCase):
         )
 
         # 4. Source-only tag whose plugins/claude_code/vendor/ holds only bytecode
-        #    detects vendor mismatch after strip_bytecode.
+        #    must fail closed explicitly after strip_bytecode.
         sdk_pyc_only = tmp / "sdk_pyc_only"
         shutil.copytree(
             REPO_ROOT / "plugins/claude_code",
             sdk_pyc_only / "plugins/claude_code",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "vendor"),
         )
         pyc_dir = sdk_pyc_only / "plugins/claude_code/vendor/bigquery_agent_analytics_tracing/__pycache__"
         pyc_dir.mkdir(parents=True, exist_ok=True)
@@ -6518,7 +6522,47 @@ class TestBuildDist39(unittest.TestCase):
             capture_output=True, text=True, env=env, timeout=30,
         )
         self.assertNotEqual(pyc_res.returncode, 0)
-        self.assertIn("differs: vendor/", pyc_res.stdout)
+        self.assertIn(
+            "not ok - release tag snapshot vendor/ contains no usable files after stripping bytecode",
+            pyc_res.stdout,
+        )
+
+    def test_local_untracked_vendor_does_not_shadow_dist_vendor(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bqaa_local_vendor_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        env = self._clean_git_env()
+
+        plugins_repo = tmp / "plugins_repo"
+        check_script = self._init_plugins_repo(plugins_repo, env)
+        dist_dir = plugins_repo / "plugins/claude_code_dist/bigquery-agent-analytics-tracing"
+        dist_drain = dist_dir / "vendor/bigquery_agent_analytics_tracing/drain.py"
+        expected_drain = dist_drain.read_text(encoding="utf-8")
+
+        # Create an untracked, differing local plugins/claude_code/vendor/ in the checkout.
+        local_vendor = plugins_repo / "plugins/claude_code/vendor"
+        shutil.copytree(dist_dir / "vendor", local_vendor)
+        local_drain = local_vendor / "bigquery_agent_analytics_tracing/drain.py"
+        local_drain.write_text(expected_drain + "\n# stale untracked local vendor\n", encoding="utf-8")
+        (local_vendor / "extra_untracked.py").write_text("# should not be copied\n", encoding="utf-8")
+
+        check_res = subprocess.run(
+            ["bash", str(check_script), "--check"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(check_res.returncode, 0, f"{check_res.stdout}\n{check_res.stderr}")
+        self.assertIn("ok - committed dist matches what plugins/claude_code builds", check_res.stdout)
+
+        out_dir = tmp / "built_out"
+        build_res = subprocess.run(
+            ["bash", str(check_script), str(out_dir)],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(build_res.returncode, 0, f"{build_res.stdout}\n{build_res.stderr}")
+        self.assertEqual(
+            (out_dir / "vendor/bigquery_agent_analytics_tracing/drain.py").read_text(encoding="utf-8"),
+            expected_drain,
+        )
+        self.assertFalse((out_dir / "vendor/extra_untracked.py").exists())
 
 
 if __name__ == "__main__":
