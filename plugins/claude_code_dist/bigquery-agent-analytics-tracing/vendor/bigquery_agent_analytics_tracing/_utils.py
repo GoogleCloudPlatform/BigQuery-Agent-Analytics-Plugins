@@ -19,6 +19,7 @@ from anywhere in the package."""
 
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime
 from datetime import timezone
 import errno
@@ -32,7 +33,7 @@ from pathlib import Path
 import stat
 import tempfile
 import time
-from typing import Any, TYPE_CHECKING
+from typing import Any, Iterator, TYPE_CHECKING
 import uuid
 import weakref
 
@@ -670,11 +671,156 @@ def open_existing_private_dir(path: str | os.PathLike[str]) -> PrivateDir:
   return _open_private_dir(directory, directory, None)
 
 
+@contextlib.contextmanager
+def open_destination_spool_dir(
+    base_spool_dir: str | os.PathLike[str],
+    project_id: str,
+    dataset: str,
+    table: str = "agent_events",
+    *,
+    create: bool = True,
+) -> Iterator[PrivateDir]:
+  """Open (optionally creating) the verified per-destination spool subdir."""
+  from .config import destination_partition_id
+
+  root_path = Path(base_spool_dir).expanduser()
+  part = destination_partition_id(project_id, dataset, table)
+  root = (
+      ensure_private_dir(root_path)
+      if create
+      else open_existing_private_dir(root_path)
+  )
+  if not part or root_path.name == part:
+    with root:
+      yield root
+    return
+  with root:
+    if create:
+      sub = root.subdir(part)
+    elif root.fd is None:
+      sub = open_existing_private_dir(root_path / part)
+    else:
+      sub = _open_private_dir(root_path / part, part, root.fd)
+    with sub:
+      yield sub
+
+
+def extract_envelope_config(data: dict[str, Any]) -> dict[str, Any]:
+  """Return destination config dict from a spool envelope."""
+  cfg = data.get("config")
+  if isinstance(cfg, dict) and any(
+      cfg.get(k) for k in ("project_id", "dataset", "table")
+  ):
+    return cfg
+  bqaa = data.get("_bqaa")
+  if isinstance(bqaa, dict) and isinstance(bqaa.get("config"), dict):
+    return bqaa["config"]
+  return cfg if isinstance(cfg, dict) else {}
+
+
+def is_destination_mismatch_for(
+    envelope_cfg: dict[str, Any],
+    project_id: str,
+    dataset: str,
+    table: str = "agent_events",
+) -> bool:
+  """Return True if an envelope embeds a different non-empty destination."""
+  for key, expected in (
+      ("project_id", project_id),
+      ("dataset", dataset),
+      ("table", table),
+  ):
+    raw_val = envelope_cfg.get(key)
+    val = (
+        raw_val.strip()
+        if isinstance(raw_val, str)
+        else (str(raw_val).strip() if raw_val is not None else "")
+    )
+    if not val:
+      continue
+    if val != expected:
+      return True
+  return False
+
+
+def _inspect_single_spool_dir(
+    spool: PrivateDir,
+    dir_path: Path,
+    status: dict[str, Any],
+    latest_mtime: int,
+) -> tuple[list[str], int]:
+  names = spool.names()
+  pending_names = [
+      n for n in names if n.startswith("event-") and n.endswith(".json")
+  ]
+  status["pending_count"] += len(pending_names)
+
+  retry_names = [n for n in names if n.endswith(".retry")]
+  status["deferred_count"] += len(retry_names)
+  for rname in retry_names:
+    try:
+      rinfo = spool.lstat(rname)
+      if not stat.S_ISREG(rinfo.st_mode):
+        continue
+      fd = spool.open(rname, os.O_RDONLY)
+      with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+        meta = safe_json_loads(handle.read(), {})
+      if isinstance(meta, dict):
+        err = str(meta.get("last_error") or "").strip()
+        if err and rinfo.st_mtime_ns >= latest_mtime:
+          latest_mtime = rinfo.st_mtime_ns
+          status["latest_error"] = err
+    except OSError:
+      continue
+
+  if spool.exists("dead-letter"):
+    try:
+      dinfo = spool.lstat("dead-letter")
+      if stat.S_ISDIR(dinfo.st_mode):
+        dead_dir = (
+            open_existing_private_dir(dir_path / "dead-letter")
+            if spool.fd is None
+            else _open_private_dir(
+                dir_path / "dead-letter", "dead-letter", spool.fd
+            )
+        )
+        with dead_dir as dead:
+          for dname in dead.names():
+            if dname == "destination-mismatch":
+              try:
+                minfo = dead.lstat(dname)
+                if stat.S_ISDIR(minfo.st_mode):
+                  mm_dir = (
+                      open_existing_private_dir(
+                          dir_path / "dead-letter" / dname
+                      )
+                      if dead.fd is None
+                      else _open_private_dir(
+                          dir_path / "dead-letter" / dname, dname, dead.fd
+                      )
+                  )
+                  with mm_dir as mm:
+                    mm_files = [
+                        m for m in mm.names() if m.endswith(".json")
+                    ]
+                    status["destination_mismatch_count"] += len(mm_files)
+                    status["dead_letter_count"] += len(mm_files)
+              except OSError:
+                pass
+            elif dname.endswith(".json"):
+              status["dead_letter_count"] += 1
+    except OSError as exc:
+      if not status["error"]:
+        status["error"] = str(exc)
+
+  return names, latest_mtime
+
+
 def inspect_spool_status(spool_dir: str | os.PathLike[str]) -> dict[str, Any]:
   """Read-only summary of pending, deferred, and dead-letter spool counts.
 
-  Never creates directories or modifies spool state; refuses unsafe
-  symlinks/directories and surfaces any inspection error cleanly.
+  Inspects both the root spool directory and all ``dest-*`` destination
+  partitions without creating directories or following unsafe symlinks.
   """
   status: dict[str, Any] = {
       "pending_count": 0,
@@ -691,71 +837,26 @@ def inspect_spool_status(spool_dir: str | os.PathLike[str]) -> dict[str, Any]:
     return status
   try:
     with open_existing_private_dir(base) as spool:
-      names = spool.names()
-      pending_names = [
-          n
-          for n in names
-          if n.startswith("event-") and n.endswith(".json")
-      ]
-      status["pending_count"] = len(pending_names)
-
-      retry_names = [n for n in names if n.endswith(".retry")]
-      status["deferred_count"] = len(retry_names)
       latest_mtime = -1
-      for rname in retry_names:
-        try:
-          rinfo = spool.lstat(rname)
-          if not stat.S_ISREG(rinfo.st_mode):
-            continue
-          fd = spool.open(rname, os.O_RDONLY)
-          with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
-            meta = safe_json_loads(handle.read(), {})
-          if isinstance(meta, dict):
-            err = str(meta.get("last_error") or "").strip()
-            if err and rinfo.st_mtime_ns >= latest_mtime:
-              latest_mtime = rinfo.st_mtime_ns
-              status["latest_error"] = err
-        except OSError:
+      names, latest_mtime = _inspect_single_spool_dir(
+          spool, base, status, latest_mtime
+      )
+      for entry in sorted(names):
+        if not entry.startswith("dest-"):
           continue
-
-      if spool.exists("dead-letter"):
         try:
-          dinfo = spool.lstat("dead-letter")
-          if stat.S_ISDIR(dinfo.st_mode):
-            dead_dir = (
-                open_existing_private_dir(base / "dead-letter")
-                if spool.fd is None
-                else _open_private_dir(
-                    base / "dead-letter", "dead-letter", spool.fd
-                )
+          part_dir = (
+              open_existing_private_dir(base / entry)
+              if spool.fd is None
+              else _open_private_dir(base / entry, entry, spool.fd)
+          )
+          with part_dir as part_spool:
+            _, latest_mtime = _inspect_single_spool_dir(
+                part_spool, base / entry, status, latest_mtime
             )
-            with dead_dir as dead:
-              for dname in dead.names():
-                if dname == "destination-mismatch":
-                  try:
-                    minfo = dead.lstat(dname)
-                    if stat.S_ISDIR(minfo.st_mode):
-                      mm_dir = (
-                          open_existing_private_dir(
-                              base / "dead-letter" / dname
-                          )
-                          if dead.fd is None
-                          else _open_private_dir(
-                              base / "dead-letter" / dname, dname, dead.fd
-                          )
-                      )
-                      with mm_dir as mm:
-                        mm_files = [
-                            m for m in mm.names() if m.endswith(".json")
-                        ]
-                        status["destination_mismatch_count"] = len(mm_files)
-                        status["dead_letter_count"] += len(mm_files)
-                  except OSError:
-                    pass
-                elif dname.endswith(".json"):
-                  status["dead_letter_count"] += 1
-        except OSError as exc:
-          status["error"] = str(exc)
+        except (OSError, RuntimeError) as exc:
+          if not status["error"]:
+            status["error"] = str(exc)
   except (OSError, RuntimeError) as exc:
     status["error"] = str(exc)
   return status
@@ -1048,8 +1149,16 @@ def migrate_legacy_spool(
     spool_dir: str | os.PathLike[str],
     *,
     legacy_spool_dir: str | os.PathLike[str] | None = None,
+    destination: tuple[str, str, str] | None = None,
 ) -> dict[str, Any]:
-  """Safely import owned v0.1.0 spooled envelopes into ``spool_dir`` without duplicates."""
+  """Safely import owned v0.1.0 spooled envelopes into ``spool_dir`` without duplicates.
+
+  When ``destination=(project_id, dataset, table)`` has non-empty
+  ``project_id`` and ``dataset``, only envelopes matching that destination
+  (or carrying no destination fields) are migrated into that destination's
+  partition; envelopes targeting other destinations stay untouched in the
+  legacy spool so their own sessions/drainers can claim them.
+  """
   result: dict[str, Any] = {
       "migrated": 0,
       "unsafe_skipped": 0,
@@ -1057,6 +1166,14 @@ def migrate_legacy_spool(
       "skipped_reasons": {},
       "error": None,
   }
+  dest_proj = dest_ds = dest_tbl = ""
+  if destination is not None:
+    raw_proj, raw_ds, raw_tbl = destination
+    dest_proj = (raw_proj or "").strip()
+    dest_ds = (raw_ds or "").strip()
+    dest_tbl = (raw_tbl or "").strip() or "agent_events"
+  has_dest = bool(dest_proj and dest_ds)
+
   legacy_path = resolve_legacy_spool_dir(
       spool_dir, legacy_spool_dir=legacy_spool_dir
   )
@@ -1079,7 +1196,14 @@ def migrate_legacy_spool(
     if not event_names:
       return result
 
-    with ensure_private_dir(spool_dir) as dst:
+    dst_ctx = (
+        open_destination_spool_dir(
+            spool_dir, dest_proj, dest_ds, dest_tbl, create=True
+        )
+        if has_dest
+        else ensure_private_dir(spool_dir)
+    )
+    with dst_ctx as dst:
       if _same_private_dir(legacy, dst):
         return result
       lock_fd = dst.open(".migrate.lock", os.O_CREAT | os.O_RDWR, 0o600)
@@ -1104,6 +1228,10 @@ def migrate_legacy_spool(
             result["skipped_reasons"][name] = reason
             if len(result["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
               result["unsafe_entries"].append(f"{legacy_path / name}: {reason}")
+            continue
+          if has_dest and is_destination_mismatch_for(
+              extract_envelope_config(parsed), dest_proj, dest_ds, dest_tbl
+          ):
             continue
 
           retry_name = f"{name}.retry"

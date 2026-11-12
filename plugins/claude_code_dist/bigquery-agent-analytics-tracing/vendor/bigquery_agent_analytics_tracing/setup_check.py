@@ -250,7 +250,24 @@ def collect_report(python_bin: str | None = None) -> _SetupReport:
     storage_write_imports = _probe_imports(resolved, _STORAGE_WRITE_IMPORTS)
   spool_dir = os.environ.get("BQAA_SPOOL_DIR", default_spool_dir())
   state_dir = os.environ.get("BQAA_STATE_DIR", default_state_dir())
-  legacy_mig = migrate_legacy_spool(spool_dir)
+  project_id = (
+      os.environ.get("BQAA_PROJECT_ID")
+      or os.environ.get("GCP_PROJECT_ID")
+      or os.environ.get("GOOGLE_CLOUD_PROJECT")
+      or None
+  )
+  dataset = (
+      os.environ.get("BQAA_DATASET") or os.environ.get("BQ_DATASET") or None
+  )
+  table = (
+      os.environ.get("BQAA_TABLE")
+      or os.environ.get("BQ_TABLE")
+      or "agent_events"
+  )
+  destination = (
+      (project_id, dataset, table) if (project_id and dataset) else None
+  )
+  legacy_mig = migrate_legacy_spool(spool_dir, destination=destination)
   spool_status = inspect_spool_status(spool_dir)
   legacy_status = inspect_legacy_backlog(state_dir, spool_dir)
   legacy_error = legacy_status["error"] or legacy_mig.get("error")
@@ -258,15 +275,8 @@ def collect_report(python_bin: str | None = None) -> _SetupReport:
       python_bin=resolved,
       interpreter_error=interpreter_error,
       config_error=_probe_config(),
-      project_id=(
-          os.environ.get("BQAA_PROJECT_ID")
-          or os.environ.get("GCP_PROJECT_ID")
-          or os.environ.get("GOOGLE_CLOUD_PROJECT")
-          or None
-      ),
-      dataset=(
-          os.environ.get("BQAA_DATASET") or os.environ.get("BQ_DATASET") or None
-      ),
+      project_id=project_id,
+      dataset=dataset,
       trace_enabled=(
           os.environ.get("BQAA_TRACE_ENABLED", "true").lower() == "true"
       ),

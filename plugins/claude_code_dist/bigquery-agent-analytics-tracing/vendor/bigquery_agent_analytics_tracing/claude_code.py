@@ -763,7 +763,14 @@ class ClaudeHookBQAAAdapter:
       pass
 
     if self.config.enabled:
-      legacy_mig = migrate_legacy_spool(self.config.spool_dir)
+      destination = (
+          (self.config.project_id, self.config.dataset, self.config.table)
+          if (self.config.project_id and self.config.dataset)
+          else None
+      )
+      legacy_mig = migrate_legacy_spool(
+          self.config.spool_dir, destination=destination
+      )
       if legacy_mig.get("migrated", 0) > 0:
         log_to_file(
             self.config,

@@ -18,8 +18,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import getpass
+import hashlib
+import json
 import math
 import os
+from pathlib import Path
 import tempfile
 from typing import Callable, TypeVar
 
@@ -115,6 +118,33 @@ def legacy_default_state_dir() -> str:
 
 def legacy_default_spool_dir() -> str:
   return os.path.join(legacy_default_state_dir(), "spool")
+
+
+def destination_partition_id(
+    project_id: str, dataset: str, table: str = "agent_events"
+) -> str:
+  """Return a deterministic, collision-free partition dir name for a destination."""
+  if not (project_id or "").strip() or not (dataset or "").strip():
+    return ""
+  payload = json.dumps(
+      [project_id, dataset, table or "agent_events"],
+      separators=(",", ":"),
+  ).encode("utf-8")
+  return f"dest-{hashlib.sha256(payload).hexdigest()[:16]}"
+
+
+def destination_spool_dir(
+    base_spool_dir: str | os.PathLike[str],
+    project_id: str,
+    dataset: str,
+    table: str = "agent_events",
+) -> str:
+  """Return the per-destination partition directory under ``base_spool_dir``."""
+  base = Path(base_spool_dir).expanduser()
+  part = destination_partition_id(project_id, dataset, table)
+  if not part or base.name == part:
+    return str(base)
+  return str(base / part)
 
 
 def _env_bool(name: str, default: bool) -> bool:

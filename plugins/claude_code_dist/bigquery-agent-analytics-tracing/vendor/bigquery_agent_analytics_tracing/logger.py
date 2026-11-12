@@ -35,6 +35,7 @@ from ._utils import ensure_private_dir
 from ._utils import hex_id
 from ._utils import iso_timestamp
 from ._utils import log_to_file
+from ._utils import open_destination_spool_dir
 from ._utils import PYTHON_C_RUN_MODULE
 from ._utils import truncate
 from ._writer_identity import __version__ as WRITER_VERSION
@@ -158,16 +159,55 @@ def _ensure_drainer(config: BQAAConfig) -> None:
     _log_missing_bigquery_once(config)
     return
 
-  with ensure_private_dir(config.spool_dir) as spool:
+  with open_destination_spool_dir(
+      config.spool_dir,
+      config.project_id,
+      config.dataset,
+      config.table,
+      create=True,
+  ) as spool:
     fd = spool.open(".drainer.pid", os.O_CREAT | os.O_RDWR)
   try:
     try:
       fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-      return  # Another drainer is running.
+      return  # Another drainer for this destination is running.
     fcntl.flock(fd, fcntl.LOCK_UN)
   finally:
     os.close(fd)
+
+  child_env = os.environ.copy()
+  child_env["BQAA_PROJECT_ID"] = config.project_id
+  child_env["BQAA_DATASET"] = config.dataset
+  child_env["BQAA_TABLE"] = config.table or "agent_events"
+  child_env["BQAA_SPOOL_DIR"] = config.spool_dir
+  child_env["BQAA_STATE_DIR"] = config.state_dir
+  child_env["BQAA_LOG_FILE"] = config.log_file
+  child_env["BQAA_MAX_LOG_BYTES"] = str(config.max_log_bytes)
+  child_env["BQAA_AUTO_CREATE_TABLE"] = (
+      "true" if config.auto_create_table else "false"
+  )
+  child_env["BQAA_AUTO_CREATE_DATASET"] = (
+      "true" if config.auto_create_dataset else "false"
+  )
+  child_env["BQAA_WRITER_LABEL"] = config.writer_label
+  child_env["BQAA_DRAIN_IDLE_SECONDS"] = str(config.drain_idle_seconds)
+  child_env["BQAA_DRAIN_POLL_SECONDS"] = str(config.drain_poll_seconds)
+  child_env["BQAA_DRAIN_BATCH_SIZE"] = str(config.drain_batch_size)
+  child_env["BQAA_DRAIN_MAX_RETRY_AGE_SECONDS"] = str(
+      config.drain_max_retry_age_seconds
+  )
+  child_env["BQAA_DRY_RUN"] = "true" if config.dry_run else "false"
+  if config.location:
+    child_env["BQAA_LOCATION"] = config.location
+  else:
+    child_env.pop("BQAA_LOCATION", None)
+  if config.drain_retry_backoff_seconds is not None:
+    child_env["BQAA_DRAIN_RETRY_BACKOFF_SECONDS"] = str(
+        config.drain_retry_backoff_seconds
+    )
+  else:
+    child_env.pop("BQAA_DRAIN_RETRY_BACKOFF_SECONDS", None)
 
   python_bin = env_python or sys.executable or "python3"
   try:
@@ -183,7 +223,7 @@ def _ensure_drainer(config: BQAAConfig) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
-        env=os.environ.copy(),
+        env=child_env,
     )
   except OSError as exc:
     log_to_file(config, f"DRAINER_SPAWN_FAIL {exc}")
@@ -524,7 +564,13 @@ class BigQueryAgentAnalyticsLogger:
         "row": bq_row,
     }
     name = f"event-{time.time_ns()}-{os.getpid()}-{uuid.uuid4().hex[:8]}.json"
-    with ensure_private_dir(self.config.spool_dir) as spool:
+    with open_destination_spool_dir(
+        self.config.spool_dir,
+        self.config.project_id,
+        self.config.dataset,
+        self.config.table,
+        create=True,
+    ) as spool:
       fd = spool.open(f"{name}.tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL)
       with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(json.dumps(envelope, sort_keys=True, default=str))

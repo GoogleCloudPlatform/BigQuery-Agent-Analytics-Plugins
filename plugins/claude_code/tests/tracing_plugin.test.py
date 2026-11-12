@@ -2478,7 +2478,9 @@ class TestTranscriptAndHooks38(unittest.TestCase):
     @staticmethod
     def _read_spool_envelopes(spool_dir: str) -> list[dict]:
         envelopes = []
-        for path in sorted(Path(spool_dir).glob("event-*.json")):
+        root = Path(spool_dir)
+        paths = sorted(root.glob("event-*.json")) + sorted(root.glob("dest-*/event-*.json"))
+        for path in paths:
             envelopes.append(json.loads(path.read_text(encoding="utf-8")))
         return envelopes
 
@@ -2550,16 +2552,18 @@ class TestTranscriptAndHooks38(unittest.TestCase):
             # Late transcript usage lands after Stop.
             t_a.write_text(_assistant_150("msg_late_stop_a", "late stop recovered text"), encoding="utf-8")
 
+            from bigquery_agent_analytics_tracing.config import destination_spool_dir
+            part_a = destination_spool_dir(spool_a, "p", "d")
             use_chmod = hasattr(os, "geteuid") and os.geteuid() != 0
             if use_chmod:
-                os.chmod(spool_a, 0o500)
-                self.addCleanup(lambda: os.path.exists(spool_a) and os.chmod(spool_a, 0o700))
+                os.chmod(part_a, 0o500)
+                self.addCleanup(lambda: os.path.exists(part_a) and os.chmod(part_a, 0o700))
                 with self.assertRaises(OSError):
                     adapter_a.process("SessionEnd", {
                         "session_id": "late-fail-stop-a",
                         "transcript_path": str(t_a),
                     })
-                os.chmod(spool_a, 0o700)
+                os.chmod(part_a, 0o700)
             else:
                 orig_spool = logger_a._spool
                 calls = {"n": 0}
@@ -2840,16 +2844,18 @@ class TestTranscriptAndHooks38(unittest.TestCase):
             trace_a = StateStore("late-fail-sf-a", state_a).get("last_trace_id")
             t_a.write_text(_assistant_150("msg_late_sf_a", "late failure recovered text"), encoding="utf-8")
 
+            from bigquery_agent_analytics_tracing.config import destination_spool_dir
+            part_a = destination_spool_dir(spool_a, "p", "d")
             use_chmod = hasattr(os, "geteuid") and os.geteuid() != 0
             if use_chmod:
-                os.chmod(spool_a, 0o500)
-                self.addCleanup(lambda: os.path.exists(spool_a) and os.chmod(spool_a, 0o700))
+                os.chmod(part_a, 0o500)
+                self.addCleanup(lambda: os.path.exists(part_a) and os.chmod(part_a, 0o700))
                 with self.assertRaises(OSError):
                     adapter_a.process("SessionEnd", {
                         "session_id": "late-fail-sf-a",
                         "transcript_path": str(t_a),
                     })
-                os.chmod(spool_a, 0o700)
+                os.chmod(part_a, 0o700)
             else:
                 orig_spool = logger_a._spool
                 calls = {"n": 0}
@@ -3591,7 +3597,8 @@ class TestReliabilityAndSetup46(unittest.TestCase):
             self.assertNotIn("Traceback", log_text)
             skipped_lines = [l for l in log_text.splitlines() if "DRAINER_SKIPPED" in l]
             self.assertLessEqual(len(skipped_lines), 1, log_text)
-            spooled = list(Path(spool_dir).glob("event-*.json"))
+            from bigquery_agent_analytics_tracing.config import destination_spool_dir
+            spooled = list(Path(destination_spool_dir(spool_dir, "p", "d")).glob("event-*.json"))
             self.assertGreaterEqual(len(spooled), 1)
 
     def test_drain_main_without_bigquery_exits_zero_without_traceback(self):
@@ -6032,7 +6039,8 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(report["legacy_migrated"], 1)
             self.assertEqual(report["spool_pending"], 1)
             self.assertEqual(report["legacy_unsafe_count"], 5)
-            self.assertTrue((new_spool / "event-safe.json").is_file())
+            from bigquery_agent_analytics_tracing.config import destination_spool_dir
+            self.assertTrue((Path(destination_spool_dir(new_spool, "p", "d")) / "event-safe.json").is_file())
             self.assertFalse(safe_env.exists())
             self.assertFalse((new_spool / "event-sym.json").exists())
             self.assertFalse((new_spool / "event-hard.json").exists())
@@ -7168,6 +7176,445 @@ class TestBuildDist39(unittest.TestCase):
             _ignore_claude_code_src(str(SRC_DIR / "hooks"), ["vendor", "common.sh", "__pycache__", "b.pyo"]),
             {"__pycache__", "b.pyo"},
         )
+
+
+class TestDestinationPartitionedSpool(unittest.TestCase):
+    """Per-destination spool and drainer lock partitioning."""
+
+    def test_partition_id_collision_resistance_and_idempotence(self):
+        from bigquery_agent_analytics_tracing.config import (
+            destination_partition_id,
+            destination_spool_dir,
+        )
+
+        p_empty = destination_partition_id("", "ds", "tbl")
+        self.assertEqual(p_empty, "")
+        self.assertEqual(destination_partition_id("proj", "", "tbl"), "")
+
+        p1 = destination_partition_id("a.b", "c", "t")
+        p2 = destination_partition_id("a", "b.c", "t")
+        p3 = destination_partition_id("a", "b", "c.t")
+        p4 = destination_partition_id("a", "b", "other_table")
+        self.assertTrue(p1.startswith("dest-"))
+        self.assertEqual(len({p1, p2, p3, p4}), 4)
+        self.assertEqual(
+            destination_partition_id("proj", "ds", ""),
+            destination_partition_id("proj", "ds", "agent_events"),
+        )
+
+        base = "/tmp/example-spool"
+        once = destination_spool_dir(base, "proj", "ds", "tbl")
+        twice = destination_spool_dir(once, "proj", "ds", "tbl")
+        self.assertEqual(once, twice)
+        self.assertEqual(destination_spool_dir(base, "", "ds", "tbl"), base)
+
+    def test_active_drainer_a_retry_backoff_does_not_block_or_quarantine_b(self):
+        import threading
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing import logger as bq_logger
+        from bigquery_agent_analytics_tracing.config import (
+            BQAAConfig,
+            default_spool_dir,
+            destination_spool_dir,
+        )
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_part_repro_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        os.chmod(tmp_root, 0o700)
+
+        a_attempted = threading.Event()
+        a_allow_success = threading.Event()
+        delivered_lock = threading.Lock()
+        delivered: dict[str, list[dict]] = {}
+
+        def _insert(table_id, rows):
+            if table_id == "proj-a.ds_a.agent_events" and not a_allow_success.is_set():
+                a_attempted.set()
+                raise RuntimeError("503 transient failure for destination A")
+            with delivered_lock:
+                delivered.setdefault(table_id, []).extend(rows)
+            return []
+
+        _install_fake_bigquery(
+            self,
+            insert_fn=_insert,
+            get_table_fn=lambda tid: object(),
+        )
+
+        env_backup = os.environ.copy()
+        try:
+            os.environ["TMPDIR"] = tmp_root
+            os.environ.pop("BQAA_SPOOL_DIR", None)
+            os.environ["BQAA_PROJECT_ID"] = "proj-a"
+            os.environ["BQAA_DATASET"] = "ds_a"
+            os.environ["BQAA_TABLE"] = "agent_events"
+            os.environ["BQAA_LOCATION"] = "US"
+            os.environ["BQAA_DRAIN_RETRY_BACKOFF_SECONDS"] = "99.0"
+
+            shared_default_spool = Path(default_spool_dir())
+            cfg_a = BQAAConfig(
+                project_id="proj-a",
+                dataset="ds_a",
+                table="agent_events",
+                auto_create_table=False,
+                spool_dir=str(shared_default_spool),
+                state_dir=os.path.join(tmp_root, "state_a"),
+                log_file=os.path.join(tmp_root, "a.log"),
+                dry_run=False,
+                drain_idle_seconds=0.15,
+                drain_poll_seconds=0.02,
+                drain_retry_backoff_seconds=1.5,
+                drain_max_retry_age_seconds=60.0,
+            )
+            cfg_b = BQAAConfig(
+                project_id="proj-b",
+                dataset="ds_b",
+                table="agent_events",
+                auto_create_table=False,
+                spool_dir=str(shared_default_spool),
+                state_dir=os.path.join(tmp_root, "state_b"),
+                log_file=os.path.join(tmp_root, "b.log"),
+                dry_run=False,
+                drain_idle_seconds=0.15,
+                drain_poll_seconds=0.02,
+                drain_retry_backoff_seconds=0.05,
+                drain_max_retry_age_seconds=60.0,
+            )
+
+            # Spool an A row and start A's drainer; it fails once and enters retry backoff holding A's .drainer.pid.
+            with mock.patch.object(bq_logger, "_ensure_drainer", return_value=None):
+                BigQueryAgentAnalyticsLogger(cfg_a).log_event(
+                    event_type="LLM_REQUEST", content={"session": "A"}
+                )
+
+            errors_a: list[BaseException] = []
+
+            def _run_a():
+                try:
+                    asyncio.run(drain._run(cfg_a))
+                except BaseException as exc:  # pragma: no cover - surfaced below
+                    errors_a.append(exc)
+
+            thread_a = threading.Thread(target=_run_a, daemon=True)
+            thread_a.start()
+            self.assertTrue(a_attempted.wait(timeout=5.0), "drainer A never attempted write")
+
+            # Wait until A's retry sidecar is persisted so A is actively in backoff holding A's lock.
+            part_a = Path(destination_spool_dir(shared_default_spool, "proj-a", "ds_a", "agent_events"))
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not list(part_a.glob("*.retry")):
+                time.sleep(0.01)
+            self.assertTrue(list(part_a.glob("*.retry")), "expected A row in retry backoff")
+
+            # While A holds its lock in backoff, log B through real BigQueryAgentAnalyticsLogger(cfg_b).
+            # _ensure_drainer(cfg_b) must NOT be blocked by A's lock and must pass B's explicit env vars.
+            spawn_calls: list[dict] = []
+            with mock.patch.object(
+                bq_logger.subprocess,
+                "Popen",
+                side_effect=lambda *a, **kw: spawn_calls.append(dict(kw)) or None,
+            ):
+                BigQueryAgentAnalyticsLogger(cfg_b).log_event(
+                    event_type="LLM_REQUEST", content={"session": "B"}
+                )
+
+            self.assertEqual(len(spawn_calls), 1, "B must spawn its own drainer even while A holds lock")
+            child_env = spawn_calls[0]["env"]
+            self.assertEqual(child_env["BQAA_PROJECT_ID"], "proj-b")
+            self.assertEqual(child_env["BQAA_DATASET"], "ds_b")
+            self.assertEqual(child_env["BQAA_TABLE"], "agent_events")
+            self.assertEqual(child_env["BQAA_SPOOL_DIR"], str(shared_default_spool))
+            self.assertEqual(child_env["BQAA_DRAIN_RETRY_BACKOFF_SECONDS"], "0.05")
+            self.assertNotIn("BQAA_LOCATION", child_env)
+
+            # Drainer B runs concurrently with A in backoff, delivers B promptly, and exits cleanly.
+            t0 = time.monotonic()
+            asyncio.run(drain._run(cfg_b))
+            elapsed_b = time.monotonic() - t0
+            self.assertLess(elapsed_b, 1.0, f"drainer B waited on A's backoff ({elapsed_b:.2f}s)")
+
+            with delivered_lock:
+                b_rows = list(delivered.get("proj-b.ds_b.agent_events", []))
+            self.assertEqual(len(b_rows), 1)
+            self.assertEqual(json.loads(b_rows[0]["content"]), {"session": "B"})
+            self.assertEqual(list(shared_default_spool.rglob("*destination-mismatch*")), [])
+            self.assertFalse((shared_default_spool / ".root-drain.lock").exists())
+
+            # Clear A's transient failure and let A finish delivering its row.
+            a_allow_success.set()
+            thread_a.join(timeout=6.0)
+            self.assertFalse(thread_a.is_alive(), "drainer A did not finish after clearing transient error")
+            self.assertEqual(errors_a, [])
+            with delivered_lock:
+                a_rows = list(delivered.get("proj-a.ds_a.agent_events", []))
+            self.assertEqual(len(a_rows), 1)
+            self.assertEqual(json.loads(a_rows[0]["content"]), {"session": "A"})
+            self.assertEqual(list(shared_default_spool.rglob("*destination-mismatch*")), [])
+        finally:
+            a_allow_success.set()
+            os.environ.clear()
+            os.environ.update(env_backup)
+
+    def test_shared_explicit_spool_same_dataset_different_tables_concurrent(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing import logger as bq_logger
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_part_tables_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "shared_spool"
+        delivered: dict[str, list[dict]] = {}
+
+        def _insert(table_id, rows):
+            delivered.setdefault(table_id, []).extend(rows)
+            return []
+
+        _install_fake_bigquery(self, insert_fn=_insert, get_table_fn=lambda tid: object())
+
+        cfg_t1 = BQAAConfig(
+            project_id="proj-shared",
+            dataset="ds_shared",
+            table="events_one",
+            auto_create_table=False,
+            spool_dir=str(spool_dir),
+            state_dir=os.path.join(tmp_root, "state_1"),
+            log_file=os.path.join(tmp_root, "1.log"),
+            drain_idle_seconds=0.05,
+            drain_poll_seconds=0.01,
+        )
+        cfg_t2 = BQAAConfig(
+            project_id="proj-shared",
+            dataset="ds_shared",
+            table="events_two",
+            auto_create_table=False,
+            spool_dir=str(spool_dir),
+            state_dir=os.path.join(tmp_root, "state_2"),
+            log_file=os.path.join(tmp_root, "2.log"),
+            drain_idle_seconds=0.05,
+            drain_poll_seconds=0.01,
+        )
+
+        p1 = Path(destination_spool_dir(spool_dir, "proj-shared", "ds_shared", "events_one"))
+        p2 = Path(destination_spool_dir(spool_dir, "proj-shared", "ds_shared", "events_two"))
+        self.assertNotEqual(p1, p2)
+
+        with mock.patch.object(bq_logger, "_ensure_drainer", return_value=None):
+            BigQueryAgentAnalyticsLogger(cfg_t1).log_event(event_type="LLM_REQUEST", content={"t": 1})
+            BigQueryAgentAnalyticsLogger(cfg_t2).log_event(event_type="LLM_REQUEST", content={"t": 2})
+
+        # Seed a skipped entry in p1 and confirm concurrent drain._run(cfg_t2) does not wipe p1's tracking.
+        p1_skip_key = str(p1 / "event-synthetic.json")
+        drain._skipped_paths.add(p1_skip_key)
+        try:
+            async def _both():
+                await asyncio.gather(drain._run(cfg_t1), drain._run(cfg_t2))
+
+            asyncio.run(_both())
+        finally:
+            drain._skipped_paths.discard(p1_skip_key)
+
+        self.assertEqual(len(delivered.get("proj-shared.ds_shared.events_one", [])), 1)
+        self.assertEqual(len(delivered.get("proj-shared.ds_shared.events_two", [])), 1)
+        self.assertEqual(list(spool_dir.rglob("*destination-mismatch*")), [])
+
+    def test_per_partition_forged_envelope_still_quarantines(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_part_forge_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        delivered: dict[str, list[dict]] = {}
+
+        def _insert(table_id, rows):
+            delivered.setdefault(table_id, []).extend(rows)
+            return []
+
+        _install_fake_bigquery(self, insert_fn=_insert, get_table_fn=lambda tid: object())
+
+        cfg_a = BQAAConfig(
+            project_id="proj-a",
+            dataset="ds_a",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(spool_dir),
+            state_dir=os.path.join(tmp_root, "state"),
+            log_file=os.path.join(tmp_root, "a.log"),
+        )
+        part_a = Path(destination_spool_dir(spool_dir, "proj-a", "ds_a", "agent_events"))
+        part_a.mkdir(parents=True, mode=0o700)
+        os.chmod(spool_dir, 0o700)
+        os.chmod(part_a, 0o700)
+
+        forged = part_a / "event-forged.json"
+        forged.write_text(
+            json.dumps({
+                "config": {
+                    "project_id": "other-proj",
+                    "dataset": "other_ds",
+                    "table": "injected_rows",
+                },
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST"},
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(forged, 0o600)
+
+        resolved = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+        self.assertEqual(resolved, 1)
+        self.assertNotIn("other-proj.other_ds.injected_rows", delivered)
+        self.assertTrue(
+            (part_a / "dead-letter" / "destination-mismatch" / "event-forged.destination-mismatch.json").is_file()
+        )
+
+    def test_inspect_spool_status_aggregates_partitions_and_rejects_symlink(self):
+        from bigquery_agent_analytics_tracing import _utils
+        from bigquery_agent_analytics_tracing.config import destination_spool_dir
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_part_status_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        spool_dir.mkdir(mode=0o700)
+        os.chmod(spool_dir, 0o700)
+
+        part_a = Path(destination_spool_dir(spool_dir, "proj-a", "ds_a", "agent_events"))
+        part_b = Path(destination_spool_dir(spool_dir, "proj-b", "ds_b", "agent_events"))
+        for d in (part_a, part_b):
+            d.mkdir(mode=0o700)
+            os.chmod(d, 0o700)
+
+        # Root pending + partition A pending/retry (older) + partition B dead-letter/retry (newer)
+        (spool_dir / "event-root.json").write_text("{}", encoding="utf-8")
+        (part_a / "event-a1.json").write_text("{}", encoding="utf-8")
+        retry_a = part_a / "event-a1.json.retry"
+        retry_a.write_text(json.dumps({"last_error": "older error A"}), encoding="utf-8")
+        os.utime(retry_a, ns=(1_000_000_000, 1_000_000_000))
+
+        (part_b / "event-b1.json").write_text("{}", encoding="utf-8")
+        retry_b = part_b / "event-b1.json.retry"
+        retry_b.write_text(json.dumps({"last_error": "newest error B"}), encoding="utf-8")
+        os.utime(retry_b, ns=(2_000_000_000, 2_000_000_000))
+
+        dl_b = part_b / "dead-letter"
+        mm_b = dl_b / "destination-mismatch"
+        mm_b.mkdir(parents=True, mode=0o700)
+        os.chmod(dl_b, 0o700)
+        os.chmod(mm_b, 0o700)
+        (dl_b / "event-b2.write-failed.json").write_text("{}", encoding="utf-8")
+        (mm_b / "event-b3.destination-mismatch.json").write_text("{}", encoding="utf-8")
+
+        status = _utils.inspect_spool_status(spool_dir)
+        self.assertIsNone(status["error"])
+        self.assertEqual(status["pending_count"], 3)
+        self.assertEqual(status["deferred_count"], 2)
+        self.assertEqual(status["dead_letter_count"], 2)
+        self.assertEqual(status["destination_mismatch_count"], 1)
+        self.assertEqual(status["latest_error"], "newest error B")
+
+        # Symlinked dest-* directory must be rejected and reported cleanly without creating dirs.
+        outside = Path(tmp_root) / "outside_target"
+        outside.mkdir(mode=0o700)
+        os.symlink(str(outside), str(spool_dir / "dest-evil"))
+        bad_status = _utils.inspect_spool_status(spool_dir)
+        self.assertIsNotNone(bad_status["error"])
+
+    def test_multi_destination_v010_legacy_migration(self):
+        from bigquery_agent_analytics_tracing import _utils, drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_part_legacy_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        legacy_spool = Path(tmp_root) / "legacy" / "spool"
+        legacy_spool.mkdir(parents=True, mode=0o700)
+        os.chmod(legacy_spool.parent, 0o700)
+        os.chmod(legacy_spool, 0o700)
+
+        new_spool = Path(tmp_root) / "new_spool"
+        new_spool.mkdir(mode=0o700)
+        os.chmod(new_spool, 0o700)
+
+        (legacy_spool / "event-a.json").write_text(
+            json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "a"}},
+            }),
+            encoding="utf-8",
+        )
+        (legacy_spool / "event-b.json").write_text(
+            json.dumps({
+                "config": {"project_id": "proj-b", "dataset": "ds_b", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "b"}},
+            }),
+            encoding="utf-8",
+        )
+        (legacy_spool / "event-empty.json").write_text(
+            json.dumps({
+                "config": {},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "empty"}},
+            }),
+            encoding="utf-8",
+        )
+        for p in legacy_spool.glob("event-*.json"):
+            os.chmod(p, 0o600)
+
+        # A migrates A + empty {}, leaving B intact in legacy_spool without unsafe_skipped.
+        mig_a = _utils.migrate_legacy_spool(
+            new_spool,
+            legacy_spool_dir=legacy_spool,
+            destination=("proj-a", "ds_a", "agent_events"),
+        )
+        self.assertIsNone(mig_a["error"])
+        self.assertEqual(mig_a["migrated"], 2)
+        self.assertEqual(mig_a["unsafe_skipped"], 0)
+        self.assertFalse((legacy_spool / "event-a.json").exists())
+        self.assertFalse((legacy_spool / "event-empty.json").exists())
+        self.assertTrue((legacy_spool / "event-b.json").is_file())
+
+        # B migrates B cleanly before A drains, without cross-quarantine.
+        mig_b = _utils.migrate_legacy_spool(
+            new_spool,
+            legacy_spool_dir=legacy_spool,
+            destination=("proj-b", "ds_b", "agent_events"),
+        )
+        self.assertIsNone(mig_b["error"])
+        self.assertEqual(mig_b["migrated"], 1)
+        self.assertEqual(mig_b["unsafe_skipped"], 0)
+        self.assertFalse((legacy_spool / "event-b.json").exists())
+
+        delivered: dict[str, list[dict]] = {}
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda tid, rows: delivered.setdefault(tid, []).extend(rows) or [],
+            get_table_fn=lambda tid: object(),
+        )
+        cfg_a = BQAAConfig(
+            project_id="proj-a",
+            dataset="ds_a",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(new_spool),
+            state_dir=os.path.join(tmp_root, "state_a"),
+            log_file=os.path.join(tmp_root, "a.log"),
+        )
+        cfg_b = BQAAConfig(
+            project_id="proj-b",
+            dataset="ds_b",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(new_spool),
+            state_dir=os.path.join(tmp_root, "state_b"),
+            log_file=os.path.join(tmp_root, "b.log"),
+        )
+        self.assertEqual(asyncio.run(drain._drain_once(cfg_a, use_storage_api=False)), 2)
+        self.assertEqual(asyncio.run(drain._drain_once(cfg_b, use_storage_api=False)), 1)
+        self.assertEqual(len(delivered.get("proj-a.ds_a.agent_events", [])), 2)
+        self.assertEqual(len(delivered.get("proj-b.ds_b.agent_events", [])), 1)
+        self.assertEqual(list(new_spool.rglob("*destination-mismatch*")), [])
 
 
 if __name__ == "__main__":
