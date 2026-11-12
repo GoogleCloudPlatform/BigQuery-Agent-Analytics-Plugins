@@ -675,27 +675,58 @@ class ClaudeHookBQAAAdapter:
     span_id = (
         state.get("current_span_id") or state.get("last_span_id") or hex_id(16)
     )
-    self.logger.log_llm_response(
-        response=text if need_text else "",
-        session_id=state.get("session_id"),
-        invocation_id=inv_id,
-        trace_id=target_trace,
-        span_id=span_id,
-        agent=state.get("agent"),
-        user_id=state.get("user_id"),
-        model=model or str(state.get("last_stop_model") or ""),
-        usage_metadata=usage,
-        attributes={
-            "session_metadata": {
-                "project_name": state.get("project_name"),
-                "source": "claude_code",
-                "trace_number": state.get("trace_count"),
-            },
-            "custom_tags": {"assistant": "claude_code"},
-            "late_transcript_flush": True,
-        },
-        is_truncated=was_truncated if need_text else False,
+    is_failed_stop = (
+        bool(state.get("last_stop_failed"))
+        and state.get("last_stop_failed_trace_id") == target_trace
+        and not state.get("current_trace_id")
     )
+    attrs: dict[str, Any] = {
+        "session_metadata": {
+            "project_name": state.get("project_name"),
+            "source": "claude_code",
+            "trace_number": state.get("trace_count"),
+        },
+        "custom_tags": {"assistant": "claude_code"},
+        "late_transcript_flush": True,
+    }
+    if is_failed_stop:
+      attrs["stop_failure"] = True
+      attrs["hook_event_name"] = "StopFailure"
+      if state.get("last_stop_error_type"):
+        attrs["error_type"] = state.get("last_stop_error_type")
+      if state.get("last_stop_reason"):
+        attrs["reason"] = state.get("last_stop_reason")
+      self.logger.log_llm_error(
+          response=text if need_text else "",
+          session_id=state.get("session_id"),
+          invocation_id=inv_id,
+          trace_id=target_trace,
+          span_id=span_id,
+          agent=state.get("agent"),
+          user_id=state.get("user_id"),
+          model=model or str(state.get("last_stop_model") or ""),
+          usage_metadata=usage,
+          status="ERROR",
+          error_message=str(
+              state.get("last_stop_error_message") or "stop failure"
+          ),
+          attributes=attrs,
+          is_truncated=was_truncated if need_text else False,
+      )
+    else:
+      self.logger.log_llm_response(
+          response=text if need_text else "",
+          session_id=state.get("session_id"),
+          invocation_id=inv_id,
+          trace_id=target_trace,
+          span_id=span_id,
+          agent=state.get("agent"),
+          user_id=state.get("user_id"),
+          model=model or str(state.get("last_stop_model") or ""),
+          usage_metadata=usage,
+          attributes=attrs,
+          is_truncated=was_truncated if need_text else False,
+      )
     if need_text:
       state.update(
           {
@@ -819,6 +850,13 @@ class ClaudeHookBQAAAdapter:
             "last_stop_usage": None,
             "last_stop_model": None,
         }
+    )
+    state.delete(
+        "last_stop_failed",
+        "last_stop_failed_trace_id",
+        "last_stop_error_message",
+        "last_stop_error_type",
+        "last_stop_reason",
     )
     self.logger.log_llm_request(
         prompt=prompt,
@@ -1002,6 +1040,11 @@ class ClaudeHookBQAAAdapter:
         "current_start_ms",
         "transcript_path",
         "transcript_start_line",
+        "last_stop_failed",
+        "last_stop_failed_trace_id",
+        "last_stop_error_message",
+        "last_stop_error_type",
+        "last_stop_reason",
     )
 
   def _stop_failure(self, payload: dict[str, Any], state: StateStore) -> None:
@@ -1077,20 +1120,26 @@ class ClaudeHookBQAAAdapter:
         attributes=attrs,
         is_truncated=was_truncated,
     )
-    state.update(
-        {
-            "last_trace_id": trace_id,
-            "last_span_id": span_id,
-            "last_invocation_id": inv_id,
-            "last_transcript_path": transcript,
-            "transcript_line": next_line,
-            "seen_usage": next_seen,
-            "last_response_captured": was_captured,
-            "last_response_captured_trace_id": trace_id if was_captured else None,
-            "last_stop_model": effective_model,
-        }
-    )
-    state.delete(
+    state_updates: dict[str, Any] = {
+        "last_trace_id": trace_id,
+        "last_span_id": span_id,
+        "last_invocation_id": inv_id,
+        "last_transcript_path": transcript,
+        "transcript_line": next_line,
+        "seen_usage": next_seen,
+        "last_response_captured": was_captured,
+        "last_response_captured_trace_id": trace_id if was_captured else None,
+        "last_stop_model": effective_model,
+        "last_stop_failed": True,
+        "last_stop_failed_trace_id": trace_id,
+        "last_stop_error_message": error_message,
+    }
+    if payload.get("error_type"):
+      state_updates["last_stop_error_type"] = payload.get("error_type")
+    if payload.get("reason"):
+      state_updates["last_stop_reason"] = payload.get("reason")
+    state.update(state_updates)
+    delete_keys = [
         "current_trace_id",
         "current_span_id",
         "current_invocation_id",
@@ -1098,7 +1147,12 @@ class ClaudeHookBQAAAdapter:
         "current_start_ms",
         "transcript_path",
         "transcript_start_line",
-    )
+    ]
+    if not payload.get("error_type"):
+      delete_keys.append("last_stop_error_type")
+    if not payload.get("reason"):
+      delete_keys.append("last_stop_reason")
+    state.delete(*delete_keys)
 
   def _subagent_stop(self, payload: dict[str, Any], state: StateStore) -> None:
     if not state.get("current_trace_id"):

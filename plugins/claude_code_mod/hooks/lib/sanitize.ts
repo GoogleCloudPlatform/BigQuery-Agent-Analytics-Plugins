@@ -773,7 +773,6 @@ function buildEscapedLineTable(text: string, lineStart: number, lineStop: number
 }
 
 const AUTH_SCHEME_RE = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=-]{4,})/gi
-const AUTH_HEADER_PREFIX = /(?:proxy-)?authorization(?:\\*["'])?[ \t\u00a0]*[:=]\s*(?:\\*["'])?$/i
 const CAMEL_CASE_KEY_RE = /^[a-z]+(?:[A-Z][a-z]+)+$/
 const CAMEL_CASE_VERSION_KEY_RE = /^(?:[a-z]{2,}[0-9]{0,3}|v[0-9]{1,2})(?:V[0-9]{1,2}|[A-Z][a-z]{2,}[0-9]{0,2})*[A-Z][a-z]{2,}$/
 const UPPER_WORD_KEY_RE = /^[A-Z]{2,}$/
@@ -790,10 +789,125 @@ const ASSIGN_RHS_VAR_RE = /^\$(?:[A-Za-z_({'"$])/
 const ASSIGN_RHS_REDACTED_RE = /^\[REDACTED(?::[a-z-]+)?\](?:$|[\s,;:|)&'"`\].!?])/
 const ASSIGN_RHS_PUNCT_RE = /^(?:[@#%^*({[]|[!?:&](?!$|[\s'")\]},;!?])|\\(?:\\|\$|[^nrt"'\\]))/
 
+const isHeaderWsAt = (text: string, idx: number): boolean => {
+  const code = text.charCodeAt(idx)
+  return (
+    code === 32 ||
+    code === 9 ||
+    code === 10 ||
+    code === 13 ||
+    code === 160 ||
+    code === 11 ||
+    code === 12 ||
+    (code >= 0x1680 && /\s/.test(text[idx] as string))
+  )
+}
+
+// Walks backward linearly from `idx` across arbitrary header/JSON whitespace
+// and an optional opening quote to detect `(?:proxy-)?authorization[:=]` without
+// fixed-window cutoff or backtracking. Since each matched scheme starts with
+// non-whitespace letters, consecutive matches never re-scan prior whitespace.
+function hasExplicitAuthHeaderBefore(text: string, idx: number): boolean {
+  if (idx < 14) return false
+  let p = idx
+  while (p > 0 && isHeaderWsAt(text, p - 1)) p -= 1
+  if (p > 0 && (text.charCodeAt(p - 1) === 34 || text.charCodeAt(p - 1) === 39)) {
+    p -= 1
+    while (p > 0 && text.charCodeAt(p - 1) === 92) p -= 1
+    while (p > 0 && isHeaderWsAt(text, p - 1)) p -= 1
+  }
+  if (p === 0) return false
+  const sep = text.charCodeAt(p - 1)
+  if (sep !== 58 && sep !== 61) return false
+  if (p >= 2) {
+    const prev = text.charCodeAt(p - 2)
+    if (sep === 61 ? prev === 61 || prev === 33 || prev === 60 || prev === 62 : prev === 58) return false
+  }
+  p -= 1
+  while (p > 0) {
+    const c = text.charCodeAt(p - 1)
+    if (c === 32 || c === 9 || c === 160) p -= 1
+    else break
+  }
+  if (p > 0 && (text.charCodeAt(p - 1) === 34 || text.charCodeAt(p - 1) === 39)) {
+    p -= 1
+    while (p > 0 && text.charCodeAt(p - 1) === 92) p -= 1
+  }
+  if (p < 13) return false
+  const z = text.charCodeAt(p - 6)
+  if (z !== 122 && z !== 90) return false
+  if (text.slice(p - 13, p).toLowerCase() !== 'authorization') return false
+  return p === 13 || !/[A-Za-z0-9]/.test(text[p - 14] as string)
+}
+
 const isDiagnosticColonRhs = (rhs: string, keyName: string): boolean => {
   if (/^(?:["'`\$]|\\["']|\[REDACTED(?::[a-z-]+)?\])/.test(rhs)) return false
   if (DIAGNOSTIC_PROSE_RE.test(rhs) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhs)) return true
   if (!STRUCTURED_CONFIG_KEY_RE.test(keyName) && /^[a-z]{3,}(?=$|[\s.,;:!?)\]}'"])/.test(rhs)) return true
+  return false
+}
+
+const isCrossLineKeyColonOrSpacedEq = (
+  token: string,
+  afterLine: string,
+  precededByEqOrComment: boolean,
+  precededByColon: boolean,
+): boolean => {
+  if (token.length < 12) return false
+  const isPlainKey = token.length <= 100 && /^[A-Za-z_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$/.test(token)
+  const isDoubleFlag = DOUBLE_DASH_LOWER_FLAG_RE.test(token)
+  const isSensSingleFlag =
+    !isPlainKey &&
+    !isDoubleFlag &&
+    token.startsWith('-') &&
+    !token.startsWith('--') &&
+    token.length <= 101 &&
+    /^[A-Za-z_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$/.test(token.slice(1)) &&
+    isSensitiveKey(token.slice(1))
+  const keyCand = isPlainKey ? token : isDoubleFlag ? token.slice(2) : isSensSingleFlag ? token.slice(1) : ''
+  if (keyCand === '') return false
+
+  const precededByAssign = precededByEqOrComment || precededByColon
+  const isConfigKey = STRUCTURED_CONFIG_KEY_RE.test(keyCand)
+    ? !PASCAL_CASE_WORD_RE.test(keyCand) || precededByAssign || isSensitiveKey(keyCand)
+    : isDoubleFlag ||
+      (precededByAssign &&
+        (CAMEL_CASE_KEY_RE.test(keyCand) ||
+          CAMEL_CASE_VERSION_KEY_RE.test(keyCand) ||
+          UPPER_WORD_KEY_RE.test(keyCand) ||
+          LOWER_WORD_KEY_RE.test(keyCand)))
+
+  const colonMatch = isPlainKey ? /^[ \t\u00a0]*:(?![:=])[ \t\u00a0]*([^\r\n]*)/.exec(afterLine) : null
+  if (colonMatch !== null) {
+    const rhs = colonMatch[1] as string
+    if (rhs !== '') {
+      if (/^(?:["'`\$]|\\["']|\[REDACTED(?::[a-z-]+)?\])/.test(rhs)) {
+        return isConfigKey || (isSensitiveKey(keyCand) && precededByAssign)
+      }
+      if (DIAGNOSTIC_PROSE_RE.test(rhs) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhs)) return false
+      if (!isConfigKey && !(isSensitiveKey(keyCand) && precededByAssign)) return false
+      if (
+        !STRUCTURED_CONFIG_KEY_RE.test(keyCand) &&
+        !(precededByAssign && (CAMEL_CASE_KEY_RE.test(keyCand) || CAMEL_CASE_VERSION_KEY_RE.test(keyCand))) &&
+        /^[a-z]{3,}(?=$|[\s.,;:!?)\]}'"])/.test(rhs)
+      ) {
+        return false
+      }
+      return true
+    }
+    return isConfigKey
+  }
+
+  const spacedEqMatch = /^[ \t\u00a0]+=(?!=)[ \t\u00a0]*([^\r\n]*)/.exec(afterLine)
+  if (spacedEqMatch !== null) {
+    const eqRhs = spacedEqMatch[1] as string
+    if (!isConfigKey && !(isSensitiveKey(keyCand) && precededByAssign)) return false
+    if (eqRhs !== '' && !precededByAssign && (DIAGNOSTIC_PROSE_RE.test(eqRhs) || DIAGNOSTIC_SINGLE_WORD_RE.test(eqRhs))) {
+      return false
+    }
+    return true
+  }
+
   return false
 }
 
@@ -1226,6 +1340,25 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     }
     return ASSIGN_RHS_PUNCT_RE.test(rhsText)
   }
+  const assignPrefixContext = (matchIndex: number): { precededByEq: boolean; precededByColon: boolean } => {
+    const keptFloor = lastKeptMatchEnd <= matchIndex ? lastKeptMatchEnd : prevKeptMatchEnd
+    const unredactedBeforeStart = Math.max(copied, keptFloor, matchIndex - 40)
+    const unredactedBefore =
+      matchIndex <= unredactedBeforeStart ? '' : text.slice(unredactedBeforeStart, matchIndex)
+    const assignMatch = /([:=])[ \t\u00a0]*$/.exec(unredactedBefore)
+    if (assignMatch === null) return { precededByEq: false, precededByColon: false }
+    const assignAbsIdx = unredactedBeforeStart + assignMatch.index
+    if (assignMatch[1] === '=') {
+      return {
+        precededByEq: assignAbsIdx === 0 || !/[=!<>]/.test(text[assignAbsIdx - 1] as string),
+        precededByColon: false,
+      }
+    }
+    return {
+      precededByEq: false,
+      precededByColon: assignAbsIdx === 0 || text[assignAbsIdx - 1] !== ':',
+    }
+  }
   for (let m = AUTH_SCHEME_RE.exec(text); m !== null; m = AUTH_SCHEME_RE.exec(text)) {
     const scheme = m[1] as string
     const space = m[2] as string
@@ -1234,9 +1367,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const rewind = (): void => {
       AUTH_SCHEME_RE.lastIndex = Math.max(m.index + scheme.length, matchEnd - 6)
     }
-    const before = m.index === 0 ? '' : text.slice(Math.max(0, m.index - 40), m.index)
-    const inHeader =
-      before.length >= 14 && (before.includes('z') || before.includes('Z')) && AUTH_HEADER_PREFIX.test(before)
+    const inHeader = hasExplicitAuthHeaderBefore(text, m.index)
     const hasNewline = space.length === 1 ? space.charCodeAt(0) === 10 || space.charCodeAt(0) === 13 : space.includes('\n') || space.includes('\r')
     const after = text.slice(matchEnd, matchEnd + 32)
     const isBasic = scheme.length === 5 && (scheme === 'Basic' || scheme === 'basic' || scheme.toLowerCase() === 'basic')
@@ -1308,12 +1439,20 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
       if (hasNewline) {
         const ac0 = effectiveAfter.charCodeAt(0)
         if (
-          (ac0 === 58 || ac0 === 61 || ac0 === 32 || ac0 === 9 || ac0 === 160) &&
-          /^[ \t\u00a0]*[:=]/.test(effectiveAfter) &&
-          (!isBase64PaddedToken(coreToken) || isEmptyAssignIdentifier || isLowerWordKey || isConfigFlagShape)
+          eqIdx === -1 &&
+          !isBasic &&
+          coreToken.length >= 12 &&
+          (ac0 === 58 || ac0 === 61 || ac0 === 32 || ac0 === 9 || ac0 === 160)
         ) {
-          keepAndRewind()
-          continue
+          const afterLine = text.slice(matchEnd, Math.min(text.length, matchEnd + 96))
+          if (/^[ \t\u00a0]+=(?!=)|^[ \t\u00a0]*:(?![:=])/.test(afterLine)) {
+            const qState = quoteAt(m.index)
+            const { precededByEq, precededByColon } = assignPrefixContext(m.index)
+            if (isCrossLineKeyColonOrSpacedEq(coreToken, afterLine, precededByEq || qState.inComment, precededByColon)) {
+              keepAndRewind()
+              continue
+            }
+          }
         }
         if (isAssignKey) {
           if (!isEqPaddedEnd) {
@@ -1339,14 +1478,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               keepAndRewind()
               continue
             } else {
-              const keptFloor = lastKeptMatchEnd <= m.index ? lastKeptMatchEnd : prevKeptMatchEnd
-              const unredactedBeforeStart = Math.max(copied, keptFloor, m.index - 40)
-              const unredactedBefore =
-                m.index <= unredactedBeforeStart ? '' : text.slice(unredactedBeforeStart, m.index)
-              const eqMatch = /=[ \t\u00a0]*$/.exec(unredactedBefore)
-              const eqAbsIdx = eqMatch === null ? -1 : unredactedBeforeStart + eqMatch.index
-              const precededByEq =
-                eqAbsIdx !== -1 && (eqAbsIdx === 0 || !/[=!<>]/.test(text[eqAbsIdx - 1] as string))
+              const { precededByEq } = assignPrefixContext(m.index)
               const closedByEnclosingQuote =
                 isBase64PaddedToken(coreToken) &&
                 !precededByEq &&
@@ -1428,7 +1560,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             !endsWithDoubleEq &&
             !isBase64PaddedToken(coreToken) &&
             isEmptyAssignIdentifier &&
-            (qState.inComment || qState.activeQuote === '') &&
+            qState.inComment &&
             (effectiveAfter === '' || /^[\s#]/.test(effectiveAfter))
           if (singleAssignRhs || spaceBeforeQuoteRhs || emptyNonPaddedEnv) {
             keepAndRewind()

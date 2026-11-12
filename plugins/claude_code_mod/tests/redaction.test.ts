@@ -1473,6 +1473,31 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['bearer a' + '_'.repeat(100) + 'A=', 'bearer [REDACTED]', '_'.repeat(100) + 'A='],
     ['Bearer -a' + '_'.repeat(100) + 'A=', 'Bearer [REDACTED]', '_'.repeat(100) + 'A='],
     ['Bearer\n' + 'A_'.repeat(55) + 'A=', 'Bearer [REDACTED]', 'A_'.repeat(55) + 'A='],
+    ['Bearer\nreviewFixtureOnly9472: request rejected', 'Bearer [REDACTED]: request rejected', 'reviewFixtureOnly9472'],
+    ['Authorization:\n' + ' '.repeat(27) + 'Bearer\nreviewFixtureOnly9472: request rejected', 'Authorization:\n' + ' '.repeat(27) + 'Bearer [REDACTED]: request rejected', 'reviewFixtureOnly9472'],
+    ['Authorization:\n' + ' '.repeat(27) + 'Bearer\nReviewFixtureOnly more', 'Authorization:\n' + ' '.repeat(27) + 'Bearer [REDACTED] more', 'ReviewFixtureOnly'],
+    ['Authorization:\n' + ' '.repeat(120) + 'Bearer\nReviewFixtureOnly more', 'Authorization:\n' + ' '.repeat(120) + 'Bearer [REDACTED] more', 'ReviewFixtureOnly'],
+    ['Authorization:\n   \r\n   ' + ' '.repeat(40) + 'Bearer\nConfiguration details follow', 'Authorization:\n   \r\n   ' + ' '.repeat(40) + 'Bearer [REDACTED] details follow', 'Configuration'],
+    ['Proxy-Authorization:\n\t\t' + ' '.repeat(60) + 'Bearer\nReviewFixtureOnly more', 'Proxy-Authorization:\n\t\t' + ' '.repeat(60) + 'Bearer [REDACTED] more', 'ReviewFixtureOnly'],
+    ['"Authorization":\n' + ' '.repeat(60) + '"Bearer\nReviewFixtureOnly more"', '"Authorization":\n' + ' '.repeat(60) + '"Bearer [REDACTED] more"', 'ReviewFixtureOnly'],
+    ['\\"Authorization\\":\n' + ' '.repeat(60) + '\\"Bearer\nReviewFixtureOnly more\\"', '\\"Authorization\\":\n' + ' '.repeat(60) + '\\"Bearer [REDACTED] more\\"', 'ReviewFixtureOnly'],
+    ['Authorization:\n' + ' '.repeat(60) + 'Basic\nReviewFixtureOnly more', 'Authorization:\n' + ' '.repeat(60) + 'Basic [REDACTED] more', 'ReviewFixtureOnly'],
+    ['Authorization:\n' + ' '.repeat(60) + 'Basic\nshortTok more', 'Authorization:\n' + ' '.repeat(60) + 'Basic [REDACTED] more', 'shortTok'],
+    ['Bearer\nsecretTokenValue99: expired', 'Bearer [REDACTED]: expired', 'secretTokenValue99'],
+    ['Bearer\nabcdefghijklmnop: unauthorized', 'Bearer [REDACTED]: unauthorized', 'abcdefghijklmnop'],
+    ['Bearer\nreview_fixture_9472: failed', 'Bearer [REDACTED]: failed', 'review_fixture_9472'],
+    ['Bearer\nreviewFixtureOnly9472: 123', 'Bearer [REDACTED]: 123', 'reviewFixtureOnly9472'],
+    ['Bearer\nreview_fixture_9472: 123', 'Bearer [REDACTED]: 123', 'review_fixture_9472'],
+    ['Bearer\ntokenValue1234=: request rejected', 'Bearer [REDACTED]: request rejected', 'tokenValue1234='],
+    ['Bearer\nmy_token_12345=: request rejected', 'Bearer [REDACTED]: request rejected', 'my_token_12345='],
+    ['Bearer\nReviewFixtureOnly: request rejected', 'Bearer [REDACTED]: request rejected', 'ReviewFixtureOnly'],
+    ['Basic\ncmV2aWV3ZXI6Zml4dHVyZQ==: failed', 'Basic [REDACTED]: failed', 'cmV2aWV3ZXI6Zml4dHVyZQ=='],
+    ['Bearer secret_token_value=', 'Bearer [REDACTED]', 'secret_token_value='],
+    ['Bearer SECRET_TOKEN_VALUE=', 'Bearer [REDACTED]', 'SECRET_TOKEN_VALUE='],
+    ['Bearer secret_token_value= # comment', 'Bearer [REDACTED] # comment', 'secret_token_value='],
+    ['Bearer my_api_key_1234=', 'Bearer [REDACTED]', 'my_api_key_1234='],
+    ['Bearer secret_token_value: failed', 'Bearer [REDACTED]: failed', 'secret_token_value'],
+    ['Bearer secret_token_value: rejected', 'Bearer [REDACTED]: rejected', 'secret_token_value'],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1511,6 +1536,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['{"note": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk=', undefined],
     ['"{\\"note\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', 'mySecretTokenAb=', '"{\\"note\\": \\"Bearer [REDACTED]\\", \\"id\\": 123}"'],
     ['"{\\"auth\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', 'mySecretTokenAb=', undefined],
+    ['"Authorization": "\n' + ' '.repeat(60) + 'Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', '"Authorization": [REDACTED]'],
+    ['\\"Authorization\\": \\"' + ' '.repeat(60) + 'Bearer\nReviewFixtureOnly more\\"', 'ReviewFixtureOnly', '\\"Authorization\\": [REDACTED]'],
     ['bash -c "curl -H \\"X-Auth: Bearer mySecretTokenAb=\\""', 'mySecretTokenAb=', undefined],
     ['Bearer\nlB79GsW66LvIcKaTzjh= Bearer\np2112MrvcRo=', 'p2112MrvcRo=', 'Bearer [REDACTED] Bearer [REDACTED]'],
   ] as const) {
@@ -1623,6 +1650,15 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\noauth2ClientSecret=',
     'MODE=bearer\nschemaV2Config=\nMODE=bearer\ncacheV2Mode=',
     'x :=' + ' '.repeat(39) + 'Bearer\nWORK_DIR_XY=',
+    'MODE=bearer\nhost = localhost',
+    'MODE=bearer\nschemaV2Config: foo',
+    'MODE=bearer\nendpoint_url: https://api.example.com',
+    'MODE=bearer\nSERVER_ENDPOINT = localhost',
+    'MODE=bearer\nredirectUri: https://example.com',
+    'Bearer\n--config-file = /etc/app.conf',
+    'x == ' + ' '.repeat(60) + 'Bearer\nConfiguration details follow',
+    'Authorization:\n""\nBearer\nConfiguration details follow',
+    'Authentication: ' + ' '.repeat(60) + 'Bearer\nConfiguration details follow',
   ]) {
     const stats = newStats()
     expect(redactText(prose, stats)).toBe(prose)
@@ -1654,6 +1690,9 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer\\u00a0 Pascal', (n: number) => 'Bearer\u00a0' + 'Aa'.repeat((n / 2) | 0) + 'Z'],
     ['Bearer\\n WORK_DIR= dots', (n: number) => 'MODE=bearer\nWORK_DIR=' + '.'.repeat(n)],
     ['Bearer\\n MySecretToken123= dots', (n: number) => 'Bearer\nMySecretToken123=' + '.'.repeat(n)],
+    ['MODE=bearer\\nschemaV2Config colon flood', (n: number) => 'MODE=bearer\nschemaV2Config: foo '.repeat((n / 32) | 0)],
+    ['Authorization + spaces + short Bearer flood', (n: number) => ('Authorization:' + ' '.repeat(500) + 'Bearer ').repeat((n / 521) | 0)],
+    ['Bearer + spaces + non-matching x', (n: number) => 'Bearer\n' + ' '.repeat(n) + 'x'],
   ] as const) {
     const small = gen(10_000)
     redactText(small, newStats())
@@ -1699,6 +1738,10 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer cross-line non-assignment token flood', (n: number) => 'Bearer\nreviewFixtureOnly9472= '.repeat((n / 30) | 0), 160_000, 250, 120],
     ['Bearer cross-line base64 non-assignment flood', (n: number) => 'Bearer\ndXNlcjpwYXNz= '.repeat((n / 21) | 0), 160_000, 250, 120],
     ['Bearer cross-line base64 camel-version flood', (n: number) => 'Bearer\nlB79GsW66LvIcKaTzjh= '.repeat((n / 28) | 0), 160_000, 250, 120],
+    ['Bearer cross-line diagnostic colon flood', (n: number) => 'Bearer\nreviewFixtureOnly9472: request rejected '.repeat((n / 46) | 0), 160_000, 250, 120],
+    ['Bearer single-line empty env flood', (n: number) => 'Bearer secret_token_value= '.repeat((n / 27) | 0), 160_000, 250, 120],
+    ['Authorization 160k whitespace Bearer prose flood', (n: number) => 'Authorization:\n' + ' '.repeat(n) + 'Bearer\nReviewFixtureOnly more', 160_000, 150, 80],
+    ['Authorization 160k backslash quote Bearer flood', (n: number) => 'Authorization:\n' + '\\'.repeat(n) + '"Bearer\nReviewFixtureOnly more', 160_000, 250, 120],
   ] as const) {
     const small = gen(10_000)
     redactText(small, newStats())
@@ -1718,6 +1761,9 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     expect(outLarge).not.toContain('MySecretToken123')
     expect(outLarge).not.toContain('tokenValue12345')
     expect(outLarge).not.toContain('reviewFixtureOnly9472=')
+    expect(outLarge).not.toContain('reviewFixtureOnly9472')
+    expect(outLarge).not.toContain('secret_token_value=')
+    expect(outLarge).not.toContain('ReviewFixtureOnly')
     expect(outLarge).not.toContain('dXNlcjpwYXNz=')
     expect(outLarge).not.toContain('lB79GsW66LvIcKaTzjh=')
     expect({
@@ -1863,6 +1909,9 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['# bearer myTokenSecret123= "MySecret1234"', '# bearer myTokenSecret123=[REDACTED]', 'MySecret1234'],
     ['# bearer CLIENT_SECRET=="MySecret1234"', '# bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
     ['bash -c "mode=bearer myTokenSecret12=\\"MySecret1234\\""', 'bash -c "mode=bearer myTokenSecret12=[REDACTED]', 'MySecret1234'],
+    [`MODE=bearer\nCLIENT_SECRET: ${CANARY}`, 'MODE=bearer\nCLIENT_SECRET: [REDACTED]', CANARY],
+    ['MODE=bearer\nCLIENT_SECRET: foo', 'MODE=bearer\nCLIENT_SECRET: [REDACTED]', 'foo'],
+    [`MODE=bearer\nCLIENT_SECRET = ${CANARY}`, 'MODE=bearer\nCLIENT_SECRET = [REDACTED]', CANARY],
   ] as const) {
     const stats = newStats()
     const out = redactText(sample, stats)

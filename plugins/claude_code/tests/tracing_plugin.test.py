@@ -1687,6 +1687,212 @@ class TestTranscriptAndHooks38(unittest.TestCase):
         self.assertEqual(err_attrs["error_type"], "rate_limit")
         self.assertEqual(err_attrs["reason"], "quota_exceeded")
 
+    def test_stop_failure_late_transcript_flush_emits_llm_error_not_response(self):
+        from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_sf_late_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        def _parse_dry_run_rows(path: str) -> list[dict]:
+            parsed = []
+            for line in Path(path).read_text(encoding="utf-8").splitlines():
+                idx = line.find("DRY_RUN ")
+                if idx != -1:
+                    parsed.append(json.loads(line[idx + len("DRY_RUN "):]))
+            return parsed
+
+        # 1. StopFailure (empty transcript) -> late assistant text+usage -> SessionEnd.
+        log1 = os.path.join(tmp_root, "sf_session_end.log")
+        cfg1 = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            agent_name="sf-agent",
+            user_id="sf-user",
+            dry_run=True,
+            log_file=log1,
+            state_dir=os.path.join(tmp_root, "state1"),
+            spool_dir=os.path.join(tmp_root, "spool1"),
+        )
+        adapter1 = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg1))
+        t1 = Path(tmp_root) / "t1.jsonl"
+        t1.write_text("", encoding="utf-8")
+
+        adapter1.process("SessionStart", {"session_id": "sf-late-1", "cwd": tmp_root})
+        adapter1.process("UserPromptSubmit", {
+            "session_id": "sf-late-1",
+            "prompt": "trigger failure",
+            "invocation_id": "inv-sf-late-1",
+            "transcript_path": str(t1),
+        })
+        adapter1.process("StopFailure", {
+            "session_id": "sf-late-1",
+            "error": "synthetic_rate_limit",
+            "error_type": "rate_limit",
+            "reason": "quota_exceeded",
+            "transcript_path": str(t1),
+        })
+        t1.write_text(
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_late_sf_1",
+                    "model": "test-model-late",
+                    "usage": {"input_tokens": 20, "output_tokens": 8},
+                    "content": [{"type": "text", "text": "partial before failure"}],
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+        adapter1.process("SessionEnd", {
+            "session_id": "sf-late-1",
+            "transcript_path": str(t1),
+        })
+
+        rows1 = _parse_dry_run_rows(log1)
+        req1 = [r for r in rows1 if r["event_type"] == "LLM_REQUEST"]
+        err1 = [r for r in rows1 if r["event_type"] == "LLM_ERROR"]
+        resp1 = [r for r in rows1 if r["event_type"] == "LLM_RESPONSE"]
+        self.assertEqual(len(req1), 1)
+        self.assertEqual(resp1, [], f"failed turn must never emit LLM_RESPONSE: {resp1}")
+        self.assertEqual(len(err1), 2, f"expected initial + late LLM_ERROR rows, got {err1}")
+        for row in err1:
+            self.assertEqual(row["status"], "ERROR")
+            self.assertEqual(row["error_message"], "synthetic_rate_limit")
+            self.assertEqual(row["trace_id"], req1[0]["trace_id"])
+            self.assertEqual(row["invocation_id"], "inv-sf-late-1")
+            self.assertEqual(row["span_id"], req1[0]["span_id"])
+        late_err1 = err1[1]
+        self.assertEqual(
+            json.loads(late_err1["content"]),
+            {"response": "partial before failure"},
+        )
+        late_attrs1 = json.loads(late_err1["attributes"])
+        self.assertTrue(late_attrs1.get("late_transcript_flush"))
+        self.assertTrue(late_attrs1.get("stop_failure"))
+        self.assertEqual(late_attrs1.get("hook_event_name"), "StopFailure")
+        self.assertEqual(late_attrs1.get("error_type"), "rate_limit")
+        self.assertEqual(late_attrs1.get("reason"), "quota_exceeded")
+        self.assertEqual(late_attrs1.get("model"), "test-model-late")
+        self.assertEqual(
+            late_attrs1["usage_metadata"],
+            {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+        )
+
+        # 2. StopFailure (empty transcript) -> late text+usage -> next UserPromptSubmit
+        #    -> normal Stop -> late usage -> SessionEnd.
+        log2 = os.path.join(tmp_root, "sf_next_turn.log")
+        cfg2 = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=True,
+            log_file=log2,
+            state_dir=os.path.join(tmp_root, "state2"),
+            spool_dir=os.path.join(tmp_root, "spool2"),
+        )
+        adapter2 = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg2))
+        t2 = Path(tmp_root) / "t2.jsonl"
+        t2.write_text("", encoding="utf-8")
+
+        adapter2.process("SessionStart", {"session_id": "sf-late-2", "cwd": tmp_root})
+        adapter2.process("UserPromptSubmit", {
+            "session_id": "sf-late-2",
+            "prompt": "turn 1 fails",
+            "invocation_id": "inv-t1-fail",
+            "transcript_path": str(t2),
+        })
+        adapter2.process("StopFailure", {
+            "session_id": "sf-late-2",
+            "error": "backend_overload",
+            "error_type": "overload",
+            "reason": "server_busy",
+            "transcript_path": str(t2),
+        })
+        t1_late_line = json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_t1_fail",
+                "model": "test-model-1",
+                "usage": {"input_tokens": 14, "output_tokens": 6},
+                "content": [{"type": "text", "text": "turn 1 late error text"}],
+            },
+        })
+        t2.write_text(t1_late_line + "\n", encoding="utf-8")
+
+        # Starting Turn 2 flushes Turn 1's late transcript as LLM_ERROR, then clears failure state.
+        adapter2.process("UserPromptSubmit", {
+            "session_id": "sf-late-2",
+            "prompt": "turn 2 succeeds",
+            "invocation_id": "inv-t2-ok",
+            "transcript_path": str(t2),
+        })
+        t2_line_a = json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_t2_ok",
+                "model": "test-model-2",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "content": [{"type": "text", "text": "turn 2 normal reply"}],
+            },
+        })
+        t2.write_text(t1_late_line + "\n" + t2_line_a + "\n", encoding="utf-8")
+        adapter2.process("Stop", {
+            "session_id": "sf-late-2",
+            "transcript_path": str(t2),
+        })
+        # Late usage chunk on Turn 2 after normal Stop must emit LLM_RESPONSE status=OK.
+        t2_line_b = json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_t2_ok",
+                "model": "test-model-2",
+                "usage": {"input_tokens": 10, "output_tokens": 12},
+                "content": [{"type": "text", "text": "turn 2 final chunk"}],
+            },
+        })
+        t2.write_text(
+            t1_late_line + "\n" + t2_line_a + "\n" + t2_line_b + "\n",
+            encoding="utf-8",
+        )
+        adapter2.process("SessionEnd", {
+            "session_id": "sf-late-2",
+            "transcript_path": str(t2),
+        })
+
+        rows2 = _parse_dry_run_rows(log2)
+        reqs2 = [r for r in rows2 if r["event_type"] == "LLM_REQUEST"]
+        errs2 = [r for r in rows2 if r["event_type"] == "LLM_ERROR"]
+        resps2 = [r for r in rows2 if r["event_type"] == "LLM_RESPONSE"]
+        self.assertEqual(len(reqs2), 2)
+        self.assertEqual(len(errs2), 2, f"Turn 1 must emit 2 LLM_ERROR rows: {errs2}")
+        self.assertEqual(len(resps2), 2, f"Turn 2 must emit 2 LLM_RESPONSE rows: {resps2}")
+
+        for err_row in errs2:
+            self.assertEqual(err_row["trace_id"], reqs2[0]["trace_id"])
+            self.assertEqual(err_row["invocation_id"], "inv-t1-fail")
+            self.assertEqual(err_row["span_id"], reqs2[0]["span_id"])
+            self.assertEqual(err_row["status"], "ERROR")
+            self.assertEqual(err_row["error_message"], "backend_overload")
+        self.assertEqual(
+            json.loads(errs2[1]["content"]),
+            {"response": "turn 1 late error text"},
+        )
+        errs2_late_attrs = json.loads(errs2[1]["attributes"])
+        self.assertTrue(errs2_late_attrs.get("late_transcript_flush"))
+        self.assertTrue(errs2_late_attrs.get("stop_failure"))
+
+        for resp_row in resps2:
+            self.assertEqual(resp_row["trace_id"], reqs2[1]["trace_id"])
+            self.assertEqual(resp_row["invocation_id"], "inv-t2-ok")
+            self.assertEqual(resp_row["span_id"], reqs2[1]["span_id"])
+            self.assertEqual(resp_row["status"], "OK")
+            self.assertIsNone(resp_row["error_message"])
+        resps2_late_attrs = json.loads(resps2[1]["attributes"])
+        self.assertTrue(resps2_late_attrs.get("late_transcript_flush"))
+        self.assertFalse(resps2_late_attrs.get("stop_failure", False))
+        self.assertEqual(resps2_late_attrs["usage_metadata"]["completion_tokens"], 7)
+
     def test_multiturn_session_end_flushes_turn2_without_usage_after_turn1_stop(self):
         from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter
         from bigquery_agent_analytics_tracing.config import BQAAConfig
@@ -3176,6 +3382,163 @@ class TestRound3Fixes(unittest.TestCase):
         self.assertIn("DRAINER retry_expired file=event-001-expired.json", log_text)
         self.assertNotIn("Traceback", log_text)
         self.assertNotIn("DRAINER fatal", log_text)
+
+    def test_drain_retry_meta_cap_does_not_evict_or_spin_and_drains_healthy(self):
+        import errno
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_retry_cap_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        def _cleanup_drain_globals():
+            drain._in_memory_retry_meta.clear()
+            drain._skipped_paths.clear()
+            drain._overflow_high_water.clear()
+            drain._reported_skips.clear()
+
+        self.addCleanup(_cleanup_drain_globals)
+        _cleanup_drain_globals()
+
+        def _write_envelope(name: str, marker: str) -> Path:
+            path = Path(spool_dir) / name
+            path.write_text(
+                json.dumps({
+                    "config": {
+                        "project_id": "p",
+                        "dataset": "d",
+                        "table": "agent_events",
+                    },
+                    "row": {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "event_type": "LLM_REQUEST",
+                        "content": {"marker": marker},
+                        "attributes": {},
+                        "latency_ms": {},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            return path
+
+        fail1 = _write_envelope("event-001-fail.json", "fail-1")
+        fail2 = _write_envelope("event-002-fail.json", "fail-2")
+        fail3 = _write_envelope("event-003-fail.json", "fail-3")
+        fail4 = _write_envelope("event-004-fail.json", "fail-4")
+        fail5 = _write_envelope("event-005-fail.json", "fail-5")
+
+        attempts_by_marker: dict[str, int] = {}
+        delivered: list[str] = []
+
+        def _insert(table_id, rows):
+            del table_id
+            outcomes = []
+            for idx, row in enumerate(rows):
+                marker = row["content"]["marker"]
+                if marker.startswith("fail-"):
+                    attempts_by_marker[marker] = attempts_by_marker.get(marker, 0) + 1
+                    outcomes.append({
+                        "index": idx,
+                        "errors": [{"reason": "backendError", "message": "transient 503"}],
+                    })
+                else:
+                    delivered.append(marker)
+            return outcomes
+
+        _install_fake_bigquery(self, insert_fn=_insert)
+
+        log_path = Path(spool_dir) / "drain.log"
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=spool_dir,
+            state_dir=spool_dir,
+            log_file=str(log_path),
+            dry_run=False,
+            drain_retry_backoff_seconds=None,
+            drain_max_retry_age_seconds=12.0,
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+        )
+        now = {"t": 1000.0}
+
+        with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
+             mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(
+                 drain,
+                 "_write_retry_meta",
+                 side_effect=OSError(errno.ENOSPC, "No space left on device"),
+             ):
+            # Pass 1 at t=1000.0: 5 failing envelopes with cap=2.
+            resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved1, 0)
+            self.assertEqual(
+                attempts_by_marker,
+                {"fail-1": 1, "fail-2": 1, "fail-3": 1, "fail-4": 1, "fail-5": 1},
+            )
+            # Existing tracked entries (fail1, fail2) are NOT evicted and cap is respected.
+            self.assertEqual(len(drain._in_memory_retry_meta), 2)
+            self.assertLessEqual(len(drain._skipped_paths), 2)
+            self.assertIn(str(fail1), drain._in_memory_retry_meta)
+            self.assertIn(str(fail2), drain._in_memory_retry_meta)
+            for tracked in (str(fail1), str(fail2)):
+                self.assertEqual(drain._in_memory_retry_meta[tracked]["first_failed_at"], 1000.0)
+                self.assertEqual(drain._in_memory_retry_meta[tracked]["attempts"], 1)
+                self.assertEqual(drain._in_memory_retry_meta[tracked]["next_retry_at"], 1005.0)
+
+            # Wait calculation must NOT return 0.0 (no 0s retry spin on overflow envelopes).
+            wait1 = drain._next_deferred_wait_seconds(cfg)
+            self.assertIsNotNone(wait1)
+            self.assertAlmostEqual(wait1, 5.0, places=3)
+
+            # During backoff window (t=1002.0): healthy envelope drains while overflow
+            # and tracked failing envelopes do NOT retry.
+            now["t"] = 1002.0
+            healthy_env = _write_envelope("event-006-healthy.json", "healthy-ok")
+            resolved2 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved2, 1)
+            self.assertEqual(delivered, ["healthy-ok"])
+            self.assertFalse(healthy_env.exists())
+            self.assertEqual(
+                attempts_by_marker,
+                {"fail-1": 1, "fail-2": 1, "fail-3": 1, "fail-4": 1, "fail-5": 1},
+            )
+
+            # Backoff elapsed (t=1005.0): only tracked fail-1 and fail-2 retry and
+            # preserve first_failed_at=1000.0; overflow envelopes do not spin or evict them.
+            now["t"] = 1005.0
+            resolved3 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved3, 0)
+            self.assertEqual(
+                attempts_by_marker,
+                {"fail-1": 2, "fail-2": 2, "fail-3": 1, "fail-4": 1, "fail-5": 1},
+            )
+            self.assertEqual(len(drain._in_memory_retry_meta), 2)
+            for tracked in (str(fail1), str(fail2)):
+                self.assertEqual(drain._in_memory_retry_meta[tracked]["first_failed_at"], 1000.0)
+                self.assertEqual(drain._in_memory_retry_meta[tracked]["attempts"], 2)
+                self.assertEqual(drain._in_memory_retry_meta[tracked]["next_retry_at"], 1015.0)
+
+            # Expiry elapsed (t=1012.0): tracked fail-1 and fail-2 expire and quarantine.
+            now["t"] = 1012.0
+            resolved4 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved4, 2)
+            self.assertFalse(fail1.exists())
+            self.assertFalse(fail2.exists())
+            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-001-fail.write-failed.json").is_file())
+            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-002-fail.write-failed.json").is_file())
+            self.assertEqual(drain._in_memory_retry_meta, {})
+            self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
+
+        log_text = log_path.read_text(encoding="utf-8")
+        self.assertEqual(log_text.count("DRAINER retry_meta_cap_reached cap=2"), 1, log_text)
+        self.assertIn("DRAINER retry_expired file=event-001-fail.json", log_text)
+        self.assertIn("DRAINER retry_expired file=event-002-fail.json", log_text)
 
     def test_legacy_010_mid_turn_state_and_spool_migration_single_delivery(self):
         from bigquery_agent_analytics_tracing import drain
