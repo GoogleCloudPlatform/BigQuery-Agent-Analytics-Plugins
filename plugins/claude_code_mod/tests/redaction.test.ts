@@ -1458,9 +1458,9 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer\n-cfg_flg_ab=', 'Bearer [REDACTED]', '-cfg_flg_ab='],
     ['foo=\nBearer\nlB79GsW66LvIcKaTzjh=', 'foo=\nBearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
     ['x == Bearer\nlB79GsW66LvIcKaTzjh=', 'x == Bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
-    ['Bearer\nschemaV2Config= Bearer\nlB79GsW66LvIcKaTzjh=', 'Bearer\nschemaV2Config= Bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
-    ['Bearer\nschemaV2Config= Bearer\nWORK_DIR_XY=', 'Bearer\nschemaV2Config= Bearer [REDACTED]', 'WORK_DIR_XY='],
-    ['Bearer\nschemaV2Config= Bearer\ncacheV2Mode=', 'Bearer\nschemaV2Config= Bearer [REDACTED]', 'cacheV2Mode='],
+    ['MODE=bearer\nschemaV2Config= Bearer\nlB79GsW66LvIcKaTzjh=', 'MODE=bearer\nschemaV2Config= Bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
+    ['MODE=bearer\nschemaV2Config= Bearer\nWORK_DIR_XY=', 'MODE=bearer\nschemaV2Config= Bearer [REDACTED]', 'WORK_DIR_XY='],
+    ['MODE=bearer\nschemaV2Config= Bearer\ncacheV2Mode=', 'MODE=bearer\nschemaV2Config= Bearer [REDACTED]', 'cacheV2Mode='],
     ['Bearer abc= Bearer\nWORK_DIR_XY=', 'Bearer abc= Bearer [REDACTED]', 'WORK_DIR_XY='],
     ['MODE=bearer\nlB79GsW66LvIcKaTzjh=', 'MODE=bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh='],
     ['MODE=bearer\np2112MrvcRo=', 'MODE=bearer [REDACTED]', 'p2112MrvcRo='],
@@ -1564,6 +1564,10 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Authorization:\n  Bearer\nAbcd1234xyz', 'Authorization:\n  Bearer [REDACTED]', 'Abcd1234xyz'],
     ['Authorization:\n  Bearer\nAbcd1234xyz more', 'Authorization:\n  Bearer [REDACTED] more', 'Abcd1234xyz'],
     ['Authorization: Bearer Abcd1234xyz', 'Authorization: [REDACTED]', 'Abcd1234xyz'],
+    ['Authorization: Bearer\nAbcd1234', 'Authorization: [REDACTED]', 'Abcd1234'],
+    ['Authorization:\n  Bearer\nAbcd1234', 'Authorization:\n  Bearer [REDACTED]', 'Abcd1234'],
+    ['Authorization: Bearer\nshortTok', 'Authorization: [REDACTED]', 'shortTok'],
+    ['Authorization:\n  Bearer\nshortTok', 'Authorization:\n  Bearer [REDACTED]', 'shortTok'],
     ['Proxy-Authorization:\n  Bearer\nShortTok', 'Proxy-Authorization:\n  Bearer [REDACTED]', 'ShortTok'],
   ]
   for (const [sample, expected, secret] of redactCases) {
@@ -1646,8 +1650,13 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Authorization:\u2028  Bearer\u2028  ReviewFixtureOnly more', 'ReviewFixtureOnly', 'Authorization:\u2028  Bearer [REDACTED] more'],
     // Comparison/scope operators (`==`, `::`) are not explicit auth headers, so
     // the KV pass redacts the `authorization` operand while `Bearer` keeps header neutrality.
-    ['authorization== Bearer\nReviewFixtureOnly more', 'Bearer', 'authorization=[REDACTED]\nReviewFixtureOnly more'],
-    ['authorization:: Bearer\nReviewFixtureOnly more', 'Bearer', 'authorization:[REDACTED]\nReviewFixtureOnly more'],
+    ['authorization== Bearer\nConfiguration details follow', 'Bearer', 'authorization=[REDACTED]\nConfiguration details follow'],
+    ['authorization:: Bearer\nConfiguration details follow', 'Bearer', 'authorization:[REDACTED]\nConfiguration details follow'],
+    ['authorization== Bearer\nReviewFixtureOnly more', 'ReviewFixtureOnly', 'authorization=[REDACTED]'],
+    ['authorization:: Bearer\nReviewFixtureOnly more', 'ReviewFixtureOnly', 'authorization:[REDACTED]'],
+    ['Bearer\nschemaV2Config= Bearer\nlB79GsW66LvIcKaTzjh=', 'schemaV2Config=', 'Bearer [REDACTED] Bearer [REDACTED]'],
+    ['Bearer\nschemaV2Config= Bearer\nWORK_DIR_XY=', 'WORK_DIR_XY=', 'Bearer [REDACTED] Bearer [REDACTED]'],
+    ['Bearer\nschemaV2Config= Bearer\ncacheV2Mode=', 'cacheV2Mode=', 'Bearer [REDACTED] Bearer [REDACTED]'],
     ['bash -c "curl -H \\"X-Auth: Bearer mySecretTokenAb=\\""', 'mySecretTokenAb=', undefined],
     ['Bearer\nlB79GsW66LvIcKaTzjh= Bearer\np2112MrvcRo=', 'p2112MrvcRo=', 'Bearer [REDACTED] Bearer [REDACTED]'],
     ['AUTH_MODE := bearer\nCLIENT_SECRET := hunter2', 'hunter2', 'AUTH_MODE :[REDACTED]'],
@@ -1667,8 +1676,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     const stats = newStats()
     const out = redactText(sample, stats)
     if (expectedText !== undefined) expect(out).toBe(expectedText)
-    if (sample.startsWith('authorization== ') || sample.startsWith('authorization:: ')) {
-      expect(out).toContain('ReviewFixtureOnly more')
+    if (sample.endsWith('Bearer\nConfiguration details follow')) {
+      expect(out).toContain('Configuration details follow')
     }
     expect(out).not.toContain(secret)
     expect(stats.redactions >= 1).toBe(true)
@@ -1775,9 +1784,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     '# bearer token=',
     '# bearer\n# schemaV2Configx=',
     '# bearer\n# custom-headerxx=',
-    'Bearer\n--config-file=',
-    'Bearer\nCURRENT_WORK_DIR=',
-    'Bearer\npublic_work_dirs=',
+    'MODE=bearer\nCURRENT_WORK_DIR=',
+    'MODE=bearer\npublic_work_dirs=',
     'MODE=bearer\noauth2ClientKey=',
     'MODE=bearer\noauth2ClientSecret=',
     'MODE=bearer\nschemaV2Config=\nMODE=bearer\ncacheV2Mode=',
@@ -1791,15 +1799,19 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\nschemaV2Config:',
     'Bearer\n--config-file = /etc/app.conf',
     'x == ' + ' '.repeat(60) + 'Bearer\nConfiguration details follow',
-    'x == ' + ' '.repeat(20) + 'Bearer\nReviewFixtureOnly more',
-    ' '.repeat(20) + 'Bearer\nReviewFixtureOnly more',
-    'x_z12345: Bearer\nReviewFixtureOnly more',
+    'x == ' + ' '.repeat(20) + 'Bearer\nConfiguration details follow',
+    'x == ' + ' '.repeat(20) + 'Bearer\nAbcd1234',
+    ' '.repeat(20) + 'Bearer\nConfiguration details follow',
+    ' '.repeat(20) + 'Bearer\nAbcd1234',
+    'x_z12345: Bearer\nConfiguration details follow',
+    'x_z12345: Bearer\nAbcd1234',
     'Authorization:\n""\nBearer\nConfiguration details follow',
     'Authentication: ' + ' '.repeat(60) + 'Bearer\nConfiguration details follow',
     'MODE=bearer\nusername=',
     'MODE=bearer\nclient_secret=',
     'MODE=bearer\ntoken=',
     'MODE=basic\nusername=',
+    'MODE=basic\nCLIENT_SECRET=',
     '// bearer api_key=',
     '# bearer\n# publicvalue=',
     'MODE=' + ' '.repeat(50) + 'bearer\nusername=',
@@ -1816,13 +1828,20 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\nabcdefghijklmno=',
     'MODE=bearer\nABCDEFGHIJKLMNO=',
     // Comparison/relational operators (`!=`, `<=`, `>=`) are not explicit auth headers
-    // or assignments, so both `authorization` and trailing prose stay untouched.
-    'authorization != Bearer\nReviewFixtureOnly more',
-    'authorization <= Bearer\nReviewFixtureOnly more',
-    'authorization >= Bearer\nReviewFixtureOnly more',
-    'authorization!= Bearer\nReviewFixtureOnly more',
-    'authorization<= Bearer\nReviewFixtureOnly more',
-    'authorization>= Bearer\nReviewFixtureOnly more',
+    // or assignments, so both `authorization` and genuine documentation prose / short
+    // non-header tokens stay untouched.
+    'authorization != Bearer\nConfiguration details follow',
+    'authorization <= Bearer\nConfiguration details follow',
+    'authorization >= Bearer\nConfiguration details follow',
+    'authorization!= Bearer\nConfiguration details follow',
+    'authorization<= Bearer\nConfiguration details follow',
+    'authorization>= Bearer\nConfiguration details follow',
+    'authorization != Bearer\nAbcd1234',
+    'authorization <= Bearer\nshortTok',
+    'authorization >= Bearer\nAbcd1234',
+    'authorization!= Bearer\nshortTok',
+    'authorization<= Bearer\nAbcd1234',
+    'authorization>= Bearer\nshortTok',
     'Authorization:\n  Bearer\nnone',
     'Authorization:\n  Bearer\nnull',
     'Authorization:\n  Bearer\nempty',
@@ -2550,5 +2569,158 @@ test('PuTTY .ppk scanner scales linearly over repeated headers and still redacts
     expect(out).not.toContain(secret)
     expect(out === `${expectedPrefix}[REDACTED:private-key]`).toBe(true)
     expect(stats.redactions).toBe(10_001)
+  }
+})
+
+test('cross-line Bearer/Basic prose and empty-assignment regressions redact in redactText and buildRow content and error_message', () => {
+  const redactFixtures: readonly (readonly [string, string, string])[] = [
+    ['Bearer\nReviewFixtureOnly more', 'Bearer [REDACTED] more', 'ReviewFixtureOnly'],
+    ['Bearer\nReviewFixtureOnly expired', 'Bearer [REDACTED] expired', 'ReviewFixtureOnly'],
+    ['Bearer\nReviewFixtureOnly request rejected', 'Bearer [REDACTED] request rejected', 'ReviewFixtureOnly'],
+    ['Bearer\u00a0ReviewFixtureOnly more', 'Bearer [REDACTED] more', 'ReviewFixtureOnly'],
+    ['Bearer\nConfiguration', 'Bearer [REDACTED]', 'Configuration'],
+    ['Bearer\nsecret_token_value=', 'Bearer [REDACTED]', 'secret_token_value='],
+    ['Bearer\nreview_fixture9472=', 'Bearer [REDACTED]', 'review_fixture9472='],
+    ['Bearer\nreviewFixtureOnly=', 'Bearer [REDACTED]', 'reviewFixtureOnly='],
+    ['Bearer\nsecret_token_value=""', 'Bearer [REDACTED]""', 'secret_token_value='],
+    ["Bearer\nreviewFixtureOnly=''", "Bearer [REDACTED]''", 'reviewFixtureOnly='],
+    ['Bearer\nsecret_token_value=!', 'Bearer [REDACTED]!', 'secret_token_value='],
+    ['Bearer\nsecret_token_value= expired', 'Bearer [REDACTED] expired', 'secret_token_value='],
+    ['Basic\nsecret_token_value=', 'Basic [REDACTED]', 'secret_token_value='],
+    ['Basic\nreview_fixture9472=', 'Basic [REDACTED]', 'review_fixture9472='],
+    ['Basic\nreviewFixtureOnly=', 'Basic [REDACTED]', 'reviewFixtureOnly='],
+    ['# Bearer\nsecret_token_value=', '# Bearer [REDACTED]', 'secret_token_value='],
+    ['error: Bearer\nsecret_token_value=', 'error: Bearer [REDACTED]', 'secret_token_value='],
+    ['error: Bearer\nsecret_token_value:', 'error: Bearer [REDACTED]:', 'secret_token_value'],
+    ['x: Bearer\nsecret_token_value:', 'x: Bearer [REDACTED]:', 'secret_token_value'],
+    ['error: Bearer\nsecret_token_value: "request rejected"', 'error: Bearer [REDACTED]: [REDACTED]', 'secret_token_value'],
+    ['error: Bearer\nreview_fixture_only:', 'error: Bearer [REDACTED]:', 'review_fixture_only'],
+    ['Bearer\nreviewFixtureOnly=...', 'Bearer [REDACTED]', 'reviewFixtureOnly='],
+    ['Bearer\nCURRENT_WORK_DIR=', 'Bearer [REDACTED]', 'CURRENT_WORK_DIR='],
+    ['Bearer\npublic_work_dirs=', 'Bearer [REDACTED]', 'public_work_dirs='],
+    ['Bearer\n--config-file=', 'Bearer [REDACTED]', '--config-file='],
+  ]
+
+  for (const [sample, expected, token] of redactFixtures) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).toBe(expected)
+    expect(out).not.toContain(token)
+    expect(out).toContain('[REDACTED]')
+    expect(stats.redactions).toBeGreaterThan(0)
+
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
+
+    const builtContent = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: sample },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    const serializedContent = builtContent.row.content ?? ''
+    expect(serializedContent).not.toContain(token)
+    expect(serializedContent).toContain('[REDACTED]')
+    expect((JSON.parse(serializedContent) as { result: string }).result).toBe(expected)
+    expect(builtContent.redactions).toBeGreaterThan(0)
+
+    const builtError = buildRow({
+      eventType: 'TOOL_ERROR',
+      timestampMs: 0,
+      eventId: 'e2',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: null,
+      attributes: {},
+      status: 'ERROR',
+      errorMessage: sample,
+      maxPayloadChars: 16_384,
+    })
+    const errOut = builtError.row.error_message ?? ''
+    expect(errOut).toBe(expected)
+    expect(errOut).not.toContain(token)
+    expect(errOut).toContain('[REDACTED]')
+    expect(builtError.redactions).toBeGreaterThan(0)
+  }
+
+  const controlFixtures: readonly string[] = [
+    'MODE=bearer\nCLIENT_SECRET=',
+    'MODE=bearer\npublicvalue=',
+    'MODE=bearer\nENVIRONMENT=',
+    'MODE=bearer\nDB_PASSWORD=',
+    'MODE=bearer\npublic_name=',
+    'MODE=bearer\nEMPTY_VAR=""',
+    "MODE=bearer\nEMPTY_VAR=''",
+    'MODE=bearer\nschemaV2Config=',
+    'MODE=bearer\n--config-file=',
+    'MODE=bearer\nCURRENT_WORK_DIR=',
+    'MODE=bearer\npublic_work_dirs=',
+    'MODE=basic\nusername=',
+    'MODE=basic\nCLIENT_SECRET=',
+    'Bearer\nConfiguration details follow',
+    'Authentication scheme: Bearer\nConfiguration details follow',
+    'Bearer\u00a0ConfigurationWord',
+    'Bearer\u00a0AuthenticationGuide',
+    'Bearer\u00a0Configuration details follow',
+    'Basic\nconfiguration guide',
+  ]
+
+  for (const control of controlFixtures) {
+    const stats = newStats()
+    expect(redactText(control, stats)).toBe(control)
+    expect(stats.redactions).toBe(0)
+
+    const builtContent = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: control },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    expect((JSON.parse(builtContent.row.content ?? '{}') as { result: string }).result).toBe(control)
+    expect(builtContent.redactions).toBe(0)
+
+    const builtError = buildRow({
+      eventType: 'TOOL_ERROR',
+      timestampMs: 0,
+      eventId: 'e2',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: null,
+      attributes: {},
+      status: 'ERROR',
+      errorMessage: control,
+      maxPayloadChars: 16_384,
+    })
+    expect(builtError.row.error_message).toBe(control)
+    expect(builtError.redactions).toBe(0)
   }
 })

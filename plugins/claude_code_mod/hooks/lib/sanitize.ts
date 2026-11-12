@@ -1925,8 +1925,8 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               const dualHeadStop = computeDualStop(sep.rhsStart, boundedStop, tokQState, hasNewline)
               if (sep.rhsStart >= dualHeadStop) {
                 if (!inHeader && hasNewline) {
-                  const { precededByEq, precededByColon } = getPrefix()
-                  if (precededByEq || tokQState.inComment || precededByColon) {
+                  const { precededByEq } = getPrefix()
+                  if (precededByEq || tokQState.inComment) {
                     keepAndRewind()
                     continue
                   }
@@ -1935,7 +1935,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               } else {
                 if (!inHeader) {
                   const { precededByEq, precededByColon } = getPrefix()
-                  const hasAssignOrCommentCtx = precededByEq || precededByColon || tokQState.inComment
+                  const hasAssignOrCommentCtx = precededByEq || tokQState.inComment || (!hasNewline && precededByColon)
                   if (hasAssignOrCommentCtx) {
                     const rhsHead = text.slice(sep.rhsStart, dualHeadStop)
                     if (hasAssignRhsAt(sep.rhsStart, rhsHead, tokQState, coreToken, true, false)) {
@@ -1955,7 +1955,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               }
             } else {
               const tokQState = getTokQState()
-              const { precededByEq, precededByColon } = getPrefix()
+              const { precededByEq } = getPrefix()
               const rhsHead = text.slice(sep.rhsStart, Math.min(sep.lineStop, sep.rhsStart + 256))
               const validQuotedVarOrRedacted = hasAssignRhsAt(
                 sep.rhsStart,
@@ -1972,7 +1972,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                   keyInfo.isDoubleFlag,
                   sep.sepKind,
                   rhsHead,
-                  precededByEq || tokQState.inComment || precededByColon,
+                  precededByEq || tokQState.inComment,
                   validQuotedVarOrRedacted,
                 )
               ) {
@@ -2062,19 +2062,36 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             const tokQState = getTokQState()
             const { precededByEq } = getPrefix()
             const precededByEqOrInComment = precededByEq || tokQState.inComment
-            const isSensAssign = assignKey.length <= 100 && isSensitiveKey(assignKey)
             const allowPaddedLowerQuoteRhs =
-              isLowerWordKey && !endsWithDoubleEq && (precededByEqOrInComment || isSensAssign)
-            const allowPunctRhs =
-              (!endsWithDoubleEq && precededByEqOrInComment) || (isEmptyAssignIdentifier && isSensAssign)
-            const assignRhs = hasAssignRhsAt(
-              effectiveMatchEnd,
-              effectiveAfter,
-              tokQState,
-              coreToken,
-              allowPaddedLowerQuoteRhs,
-              allowPunctRhs,
-            )
+              isLowerWordKey && !endsWithDoubleEq && precededByEqOrInComment
+            const allowPunctRhs = !endsWithDoubleEq && precededByEqOrInComment
+            const isEmptyQuotedRhs =
+              ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`') &&
+                effectiveAfter[1] === effectiveAfter[0] &&
+                isDelimOrSpaceAfterQuote(effectiveAfter[2])) ||
+              (effectiveAfter[0] === '\\' &&
+                (effectiveAfter[1] === '"' || effectiveAfter[1] === "'") &&
+                effectiveAfter[2] === '\\' &&
+                effectiveAfter[3] === effectiveAfter[1] &&
+                isDelimOrSpaceAfterQuote(effectiveAfter[4]))
+            const quoteRhsBlockedWithoutAssignCtx =
+              !precededByEqOrInComment &&
+              (((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`') &&
+                isDelimOrSpaceAfterQuote(effectiveAfter[1])) ||
+                (effectiveAfter[0] === '\\' &&
+                  (effectiveAfter[1] === '"' || effectiveAfter[1] === "'") &&
+                  isDelimOrSpaceAfterQuote(effectiveAfter[2])))
+            const assignRhs =
+              !isEmptyQuotedRhs &&
+              !quoteRhsBlockedWithoutAssignCtx &&
+              hasAssignRhsAt(
+                effectiveMatchEnd,
+                effectiveAfter,
+                tokQState,
+                coreToken,
+                allowPaddedLowerQuoteRhs,
+                allowPunctRhs,
+              )
             if (assignRhs) {
               keepAndRewind()
               continue
@@ -2099,18 +2116,18 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                   ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`') &&
                     effectiveAfter[1] === effectiveAfter[0] &&
                     isDelimOrSpaceAfterQuote(effectiveAfter[2])) ||
-                  (trailingDots !== '' && (!isBase64PaddedToken(coreToken) || precededByEqOrInComment)) ||
-                  (precededByEqOrInComment &&
-                    (effectiveAfter[0] === '"' || effectiveAfter[0] === "'") &&
+                  trailingDots !== '' ||
+                  ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'") &&
                     isDelimOrSpaceAfterQuote(effectiveAfter[1]))
                 if (
                   isEmptyTailForAssign &&
-                  (precededByEqOrInComment || !isBase64PaddedToken(coreToken)) &&
+                  precededByEqOrInComment &&
                   (isEmptyAssignIdentifier ||
                     isConfigFlagShape ||
                     (keyWithinCap &&
                       (CAMEL_CASE_VERSION_KEY_RE.test(rawKeyPart) ||
-                        ((UPPER_WORD_KEY_RE.test(rawKeyPart) || isLowerWordKey) && precededByEqOrInComment) ||
+                        UPPER_WORD_KEY_RE.test(rawKeyPart) ||
+                        isLowerWordKey ||
                         LOWER_DOTTED_KEY_RE.test(rawKeyPart) ||
                         LOWER_KEBAB_KEY_RE.test(rawKeyPart))))
                 ) {
@@ -2214,9 +2231,9 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
         keepAndRewind()
         continue
       }
-      if (!inHeader && PASCAL_CASE_WORD_RE.test(coreToken)) {
+      if (!inHeader && PASCAL_CASE_WORD_RE.test(coreToken) && isDocumentationPascalPhrase(coreToken)) {
         const hasProseFollow = (hasNewline || space.includes('\u00a0')) && /^[ \t\u00a0]+[a-z]{2,}\b/.test(effectiveAfter)
-        if (hasProseFollow || (space.includes('\u00a0') && isDocumentationPascalPhrase(coreToken))) {
+        if (hasProseFollow || space.includes('\u00a0')) {
           keepAndRewind()
           continue
         }
