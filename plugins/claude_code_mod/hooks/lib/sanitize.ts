@@ -785,6 +785,8 @@ const STRUCTURED_CONFIG_KEY_RE = /^(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]*)+|[a-z]+(?:[_.
 const DIAGNOSTIC_SINGLE_WORD_RE =
   /^(?:unauthorized|forbidden|expired|rejected|denied|failed|invalid|missing|revoked|malformed|unauthenticated|unavailable|blocked|disabled|error|invalid_token|invalid_request|invalid_grant|access_denied|unauthorized_client|insufficient_scope|server_error)(?=$|[\s.,;:!?)\]}'"])/i
 const DIAGNOSTIC_PROSE_RE = /^(?:[A-Za-z]{2,}(?:[ \t]+[A-Za-z]{2,})+|(?:HTTP(?:\/[\d.]+)?[ \t]+)?(?:4\d\d|5\d\d)(?:[ \t]+[A-Za-z]+)*)(?=$|[\s.,;:!?)\]}'"])/
+const DIAGNOSTIC_STATUS_RE =
+  /^(?:(?:[A-Za-z]{2,}[ \t]+)?(?:unauthorized|forbidden|expired|rejected|denied|failed|invalid|missing|revoked|malformed|unauthenticated|unavailable|blocked|disabled|error|invalid_token|invalid_request|invalid_grant|access_denied|unauthorized_client|insufficient_scope|server_error)|(?:HTTP(?:\/[\d.]+)?[ \t]+)?(?:4\d\d|5\d\d)(?:[ \t]+[A-Za-z]+)*)(?=$|[\s.,;:!?)\]}'"])/i
 const ASSIGN_RHS_VAR_RE = /^\$(?:[A-Za-z_({'"$])/
 const ASSIGN_RHS_REDACTED_RE = /^\[REDACTED(?::[a-z-]+)?\](?:$|[\s,;:|)&'"`\].!?])/
 const ASSIGN_RHS_PUNCT_RE = /^(?:[@#%^*({[]|[!?:&](?!$|[\s'")\]},;!?])|\\(?:\\|\$|[^nrt"'\\]))/
@@ -804,7 +806,7 @@ const isHeaderWsAt = (text: string, idx: number): boolean => {
 }
 
 // Walks backward linearly from `idx` across arbitrary header/JSON whitespace
-// and an optional opening quote to detect `(?:proxy-)?authorization[:=]` without
+// and an optional opening quote to detect `*authorization[:=]` headers without
 // fixed-window cutoff or backtracking. Since each matched scheme starts with
 // non-whitespace letters, consecutive matches never re-scan prior whitespace.
 function hasExplicitAuthHeaderBefore(text: string, idx: number): boolean {
@@ -819,10 +821,6 @@ function hasExplicitAuthHeaderBefore(text: string, idx: number): boolean {
   if (p === 0) return false
   const sep = text.charCodeAt(p - 1)
   if (sep !== 58 && sep !== 61) return false
-  if (p >= 2) {
-    const prev = text.charCodeAt(p - 2)
-    if (sep === 61 ? prev === 61 || prev === 33 || prev === 60 || prev === 62 : prev === 58) return false
-  }
   p -= 1
   while (p > 0) {
     const c = text.charCodeAt(p - 1)
@@ -836,26 +834,21 @@ function hasExplicitAuthHeaderBefore(text: string, idx: number): boolean {
   if (p < 13) return false
   const z = text.charCodeAt(p - 6)
   if (z !== 122 && z !== 90) return false
-  if (text.slice(p - 13, p).toLowerCase() !== 'authorization') return false
-  return p === 13 || !/[A-Za-z0-9]/.test(text[p - 14] as string)
+  return text.slice(p - 13, p).toLowerCase() === 'authorization'
 }
 
-const isDiagnosticColonRhs = (rhs: string, keyName: string): boolean => {
+const isDiagnosticColonRhs = (rhs: string): boolean => {
   if (/^(?:["'`\$]|\\["']|\[REDACTED(?::[a-z-]+)?\])/.test(rhs)) return false
-  if (DIAGNOSTIC_PROSE_RE.test(rhs) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhs)) return true
-  if (!STRUCTURED_CONFIG_KEY_RE.test(keyName) && /^[a-z]{3,}(?=$|[\s.,;:!?)\]}'"])/.test(rhs)) return true
-  return false
+  return DIAGNOSTIC_STATUS_RE.test(rhs)
 }
 
 const isCrossLineKeyColonOrSpacedEq = (
   token: string,
   afterLine: string,
-  precededByEqOrComment: boolean,
-  precededByColon: boolean,
+  precededByAssign: boolean,
 ): boolean => {
-  if (token.length < 12) return false
   const isPlainKey = token.length <= 100 && /^[A-Za-z_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$/.test(token)
-  const isDoubleFlag = DOUBLE_DASH_LOWER_FLAG_RE.test(token)
+  const isDoubleFlag = !isPlainKey && token.length <= 102 && DOUBLE_DASH_LOWER_FLAG_RE.test(token)
   const isSensSingleFlag =
     !isPlainKey &&
     !isDoubleFlag &&
@@ -867,41 +860,43 @@ const isCrossLineKeyColonOrSpacedEq = (
   const keyCand = isPlainKey ? token : isDoubleFlag ? token.slice(2) : isSensSingleFlag ? token.slice(1) : ''
   if (keyCand === '') return false
 
-  const precededByAssign = precededByEqOrComment || precededByColon
-  const isConfigKey = STRUCTURED_CONFIG_KEY_RE.test(keyCand)
-    ? !PASCAL_CASE_WORD_RE.test(keyCand) || precededByAssign || isSensitiveKey(keyCand)
-    : isDoubleFlag ||
-      (precededByAssign &&
-        (CAMEL_CASE_KEY_RE.test(keyCand) ||
-          CAMEL_CASE_VERSION_KEY_RE.test(keyCand) ||
-          UPPER_WORD_KEY_RE.test(keyCand) ||
-          LOWER_WORD_KEY_RE.test(keyCand)))
+  const sensitive = isSensitiveKey(keyCand)
+  const isConfigKey =
+    isDoubleFlag ||
+    (precededByAssign &&
+      (STRUCTURED_CONFIG_KEY_RE.test(keyCand) ||
+        CAMEL_CASE_KEY_RE.test(keyCand) ||
+        CAMEL_CASE_VERSION_KEY_RE.test(keyCand) ||
+        UPPER_WORD_KEY_RE.test(keyCand) ||
+        LOWER_WORD_KEY_RE.test(keyCand)))
 
   const colonMatch = isPlainKey ? /^[ \t\u00a0]*:(?![:=])[ \t\u00a0]*([^\r\n]*)/.exec(afterLine) : null
   if (colonMatch !== null) {
     const rhs = colonMatch[1] as string
-    if (rhs !== '') {
-      if (/^(?:["'`\$]|\\["']|\[REDACTED(?::[a-z-]+)?\])/.test(rhs)) {
-        return isConfigKey || (isSensitiveKey(keyCand) && precededByAssign)
-      }
-      if (DIAGNOSTIC_PROSE_RE.test(rhs) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhs)) return false
-      if (!isConfigKey && !(isSensitiveKey(keyCand) && precededByAssign)) return false
-      if (
-        !STRUCTURED_CONFIG_KEY_RE.test(keyCand) &&
-        !(precededByAssign && (CAMEL_CASE_KEY_RE.test(keyCand) || CAMEL_CASE_VERSION_KEY_RE.test(keyCand))) &&
-        /^[a-z]{3,}(?=$|[\s.,;:!?)\]}'"])/.test(rhs)
-      ) {
-        return false
-      }
-      return true
+    if (rhs === '') return isConfigKey || (sensitive && precededByAssign)
+    if (sensitive) {
+      return precededByAssign || !isDiagnosticColonRhs(rhs)
     }
-    return isConfigKey
+    if (!isConfigKey) return false
+    if (/^(?:["'`\$]|\\["']|\[REDACTED(?::[a-z-]+)?\])/.test(rhs)) return true
+    if (DIAGNOSTIC_PROSE_RE.test(rhs) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhs)) return false
+    if (
+      !STRUCTURED_CONFIG_KEY_RE.test(keyCand) &&
+      !(CAMEL_CASE_KEY_RE.test(keyCand) || CAMEL_CASE_VERSION_KEY_RE.test(keyCand)) &&
+      /^[a-z]{3,}(?=$|[\s.,;:!?)\]}'"])/.test(rhs)
+    ) {
+      return false
+    }
+    return true
   }
 
   const spacedEqMatch = /^[ \t\u00a0]+=(?!=)[ \t\u00a0]*([^\r\n]*)/.exec(afterLine)
   if (spacedEqMatch !== null) {
     const eqRhs = spacedEqMatch[1] as string
-    if (!isConfigKey && !(isSensitiveKey(keyCand) && precededByAssign)) return false
+    if (sensitive) {
+      return eqRhs === '' ? precededByAssign : precededByAssign || !isDiagnosticColonRhs(eqRhs)
+    }
+    if (!isConfigKey) return false
     if (eqRhs !== '' && !precededByAssign && (DIAGNOSTIC_PROSE_RE.test(eqRhs) || DIAGNOSTIC_SINGLE_WORD_RE.test(eqRhs))) {
       return false
     }
@@ -1448,7 +1443,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
           if (/^[ \t\u00a0]+=(?!=)|^[ \t\u00a0]*:(?![:=])/.test(afterLine)) {
             const qState = quoteAt(m.index)
             const { precededByEq, precededByColon } = assignPrefixContext(m.index)
-            if (isCrossLineKeyColonOrSpacedEq(coreToken, afterLine, precededByEq || qState.inComment, precededByColon)) {
+            if (isCrossLineKeyColonOrSpacedEq(coreToken, afterLine, precededByEq || qState.inComment || precededByColon)) {
               keepAndRewind()
               continue
             }
@@ -1531,7 +1526,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
           const afterLine = text.slice(matchEnd, Math.min(text.length, matchEnd + 96))
           const spacedEq = /^[ \t\u00a0]+=(?!=)[ \t\u00a0]*\S/.test(afterLine)
           const colonMatch = /^[ \t\u00a0]*:(?!:)[ \t\u00a0]*(\S[^\r\n]*)/.exec(afterLine)
-          if (spacedEq || (colonMatch !== null && !isDiagnosticColonRhs(colonMatch[1] as string, keyCand))) {
+          if (spacedEq || (colonMatch !== null && !isDiagnosticColonRhs(colonMatch[1] as string))) {
             keepAndRewind()
             continue
           }
@@ -1556,13 +1551,11 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               }
               return /^\$(?:[A-Za-z_({'"$])/.test(effectiveAfter.slice(sp))
             })()
-          const emptyNonPaddedEnv =
+          const spaceBeforeValueRhs =
             !endsWithDoubleEq &&
             !isBase64PaddedToken(coreToken) &&
-            isEmptyAssignIdentifier &&
-            qState.inComment &&
-            (effectiveAfter === '' || /^[\s#]/.test(effectiveAfter))
-          if (singleAssignRhs || spaceBeforeQuoteRhs || emptyNonPaddedEnv) {
+            /^[ \t]+(?![#;)|&"'`$\\])(?!(?:bearer|basic)(?:[\s]|$))\S/i.test(effectiveAfter)
+          if (singleAssignRhs || spaceBeforeQuoteRhs || spaceBeforeValueRhs) {
             keepAndRewind()
             continue
           }

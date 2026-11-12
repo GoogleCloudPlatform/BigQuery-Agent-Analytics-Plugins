@@ -3396,7 +3396,7 @@ class TestRound3Fixes(unittest.TestCase):
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
             drain._skipped_paths.clear()
-            drain._overflow_high_water.clear()
+            drain._retry_meta_saturated.clear()
             drain._reported_skips.clear()
 
         self.addCleanup(_cleanup_drain_globals)
@@ -3424,11 +3424,12 @@ class TestRound3Fixes(unittest.TestCase):
             os.chmod(path, 0o600)
             return path
 
+        # Phase 1 (within 2 * cap = 4): include an event-legacy-* overflow envelope
+        # ('l' > '0'..'9') to prove filename order never starves timestamped healthy files.
         fail1 = _write_envelope("event-001-fail.json", "fail-1")
         fail2 = _write_envelope("event-002-fail.json", "fail-2")
         fail3 = _write_envelope("event-003-fail.json", "fail-3")
-        fail4 = _write_envelope("event-004-fail.json", "fail-4")
-        fail5 = _write_envelope("event-005-fail.json", "fail-5")
+        fail_legacy = _write_envelope("event-legacy-004-fail.json", "fail-legacy")
 
         attempts_by_marker: dict[str, int] = {}
         delivered: list[str] = []
@@ -3474,18 +3475,21 @@ class TestRound3Fixes(unittest.TestCase):
                  "_write_retry_meta",
                  side_effect=OSError(errno.ENOSPC, "No space left on device"),
              ):
-            # Pass 1 at t=1000.0: 5 failing envelopes with cap=2.
+            # Pass 1 at t=1000.0: 4 failing envelopes with cap=2 (2 tracked + 2 skipped).
             resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
             self.assertEqual(resolved1, 0)
             self.assertEqual(
                 attempts_by_marker,
-                {"fail-1": 1, "fail-2": 1, "fail-3": 1, "fail-4": 1, "fail-5": 1},
+                {"fail-1": 1, "fail-2": 1, "fail-3": 1, "fail-legacy": 1},
             )
-            # Existing tracked entries (fail1, fail2) are NOT evicted and cap is respected.
+            # Existing tracked entries (fail1, fail2) are NOT evicted and caps are respected.
             self.assertEqual(len(drain._in_memory_retry_meta), 2)
-            self.assertLessEqual(len(drain._skipped_paths), 2)
+            self.assertEqual(len(drain._skipped_paths), 2)
+            self.assertEqual(drain._retry_meta_saturated, set())
             self.assertIn(str(fail1), drain._in_memory_retry_meta)
             self.assertIn(str(fail2), drain._in_memory_retry_meta)
+            self.assertIn(str(fail3), drain._skipped_paths)
+            self.assertIn(str(fail_legacy), drain._skipped_paths)
             for tracked in (str(fail1), str(fail2)):
                 self.assertEqual(drain._in_memory_retry_meta[tracked]["first_failed_at"], 1000.0)
                 self.assertEqual(drain._in_memory_retry_meta[tracked]["attempts"], 1)
@@ -3496,18 +3500,66 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertIsNotNone(wait1)
             self.assertAlmostEqual(wait1, 5.0, places=3)
 
-            # During backoff window (t=1002.0): healthy envelope drains while overflow
-            # and tracked failing envelopes do NOT retry.
+            # During backoff window (t=1002.0): healthy envelopes sorting both BEFORE
+            # event-001-fail.json and BEFORE event-legacy-004-fail.json drain cleanly!
             now["t"] = 1002.0
-            healthy_env = _write_envelope("event-006-healthy.json", "healthy-ok")
+            healthy_early = _write_envelope("event-000-healthy.json", "healthy-early")
+            healthy_after = _write_envelope("event-006-healthy.json", "healthy-after-legacy")
             resolved2 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
-            self.assertEqual(resolved2, 1)
-            self.assertEqual(delivered, ["healthy-ok"])
-            self.assertFalse(healthy_env.exists())
+            self.assertEqual(resolved2, 2)
+            self.assertEqual(delivered, ["healthy-early", "healthy-after-legacy"])
+            self.assertFalse(healthy_early.exists())
+            self.assertFalse(healthy_after.exists())
             self.assertEqual(
                 attempts_by_marker,
-                {"fail-1": 1, "fail-2": 1, "fail-3": 1, "fail-4": 1, "fail-5": 1},
+                {"fail-1": 1, "fail-2": 1, "fail-3": 1, "fail-legacy": 1},
             )
+
+            # Phase 2 (saturated > 2 * cap at t=1003.0): an overflow envelope with a
+            # pre-existing stale .retry sidecar (written before ENOSPC, next_retry_at <= now)
+            # plus a sidecar-less overflow envelope fail under ENOSPC and saturate the spool.
+            now["t"] = 1003.0
+            fail_stale = _write_envelope("event-005-stale-fail.json", "fail-stale")
+            stale_sidecar = Path(spool_dir) / "event-005-stale-fail.json.retry"
+            stale_sidecar.write_text(
+                json.dumps({
+                    "first_failed_at": 995.0,
+                    "attempts": 1,
+                    "next_retry_at": 1000.0,
+                    "last_error": "prior 503 before ENOSPC",
+                }),
+                encoding="utf-8",
+            )
+            os.chmod(stale_sidecar, 0o600)
+            fail_over = _write_envelope("event-007-overflow-fail.json", "fail-over")
+
+            resolved_sat = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved_sat, 0)
+            self.assertEqual(
+                attempts_by_marker,
+                {
+                    "fail-1": 1,
+                    "fail-2": 1,
+                    "fail-3": 1,
+                    "fail-legacy": 1,
+                    "fail-stale": 1,
+                    "fail-over": 1,
+                },
+            )
+            self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
+            self.assertEqual(len(drain._in_memory_retry_meta), 2)
+            self.assertEqual(len(drain._skipped_paths), 2)
+            self.assertLessEqual(len(drain._reported_skips), 4)
+
+            # Critical P2 check: stale .retry sidecar on overflow envelope must NOT
+            # return 0.0 from _next_deferred_wait_seconds or spin on a second pass!
+            wait_sat = drain._next_deferred_wait_seconds(cfg)
+            self.assertIsNotNone(wait_sat)
+            self.assertAlmostEqual(wait_sat, 2.0, places=3)
+            resolved_sat_again = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved_sat_again, 0)
+            self.assertEqual(attempts_by_marker["fail-stale"], 1)
+            self.assertEqual(attempts_by_marker["fail-over"], 1)
 
             # Backoff elapsed (t=1005.0): only tracked fail-1 and fail-2 retry and
             # preserve first_failed_at=1000.0; overflow envelopes do not spin or evict them.
@@ -3516,7 +3568,14 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(resolved3, 0)
             self.assertEqual(
                 attempts_by_marker,
-                {"fail-1": 2, "fail-2": 2, "fail-3": 1, "fail-4": 1, "fail-5": 1},
+                {
+                    "fail-1": 2,
+                    "fail-2": 2,
+                    "fail-3": 1,
+                    "fail-legacy": 1,
+                    "fail-stale": 1,
+                    "fail-over": 1,
+                },
             )
             self.assertEqual(len(drain._in_memory_retry_meta), 2)
             for tracked in (str(fail1), str(fail2)):
@@ -3535,10 +3594,43 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(drain._in_memory_retry_meta, {})
             self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
 
+        # Disk recovery check: once _write_retry_meta succeeds again (or a new _run starts),
+        # saturation clears, healthy envelopes drain, and expired stale-sidecar files quarantine.
+        healthy_recovered = _write_envelope("event-008-healthy.json", "healthy-after-recovery")
+        with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
+             mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]):
+            drain._skipped_paths.clear()
+            resolved_rec = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved_rec, 2)
+            self.assertIn("healthy-after-recovery", delivered)
+            self.assertFalse(healthy_recovered.exists())
+            self.assertFalse(fail_stale.exists())
+            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-005-stale-fail.write-failed.json").is_file())
+            self.assertTrue((Path(spool_dir) / "event-003-fail.json.retry").is_file())
+            self.assertEqual(drain._retry_meta_saturated, set())
+
         log_text = log_path.read_text(encoding="utf-8")
         self.assertEqual(log_text.count("DRAINER retry_meta_cap_reached cap=2"), 1, log_text)
+        self.assertEqual(log_text.count("DRAINER retry_meta_saturated cap=2"), 1, log_text)
         self.assertIn("DRAINER retry_expired file=event-001-fail.json", log_text)
         self.assertIn("DRAINER retry_expired file=event-002-fail.json", log_text)
+
+        # Edge case: cap=0 must not crash or spin when retry sidecar writes fail.
+        _cleanup_drain_globals()
+        now["t"] = 1018.0
+        with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 0), \
+             mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(
+                 drain,
+                 "_write_retry_meta",
+                 side_effect=OSError(errno.ENOSPC, "No space left on device"),
+             ):
+            resolved_zero = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved_zero, 0)
+            self.assertEqual(drain._in_memory_retry_meta, {})
+            self.assertLessEqual(len(drain._skipped_paths), 1)
+            self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
+            self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
 
     def test_legacy_010_mid_turn_state_and_spool_migration_single_delivery(self):
         from bigquery_agent_analytics_tracing import drain

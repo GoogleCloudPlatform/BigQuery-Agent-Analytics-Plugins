@@ -1498,6 +1498,36 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer my_api_key_1234=', 'Bearer [REDACTED]', 'my_api_key_1234='],
     ['Bearer secret_token_value: failed', 'Bearer [REDACTED]: failed', 'secret_token_value'],
     ['Bearer secret_token_value: rejected', 'Bearer [REDACTED]: rejected', 'secret_token_value'],
+    ['Bearer\nsecret_token_value: request rejected', 'Bearer [REDACTED]: request rejected', 'secret_token_value'],
+    ['proxyAuthorization: Bearer\nReviewFixtureOnly more', 'proxyAuthorization: [REDACTED]', 'ReviewFixtureOnly'],
+    ['XAuthorization:\n' + ' '.repeat(20) + 'Bearer\nReviewFixtureOnly more', 'XAuthorization:\n' + ' '.repeat(20) + 'Bearer [REDACTED] more', 'ReviewFixtureOnly'],
+    ['httpAuthorization: Bearer\nReviewFixtureOnly more', 'httpAuthorization: [REDACTED]', 'ReviewFixtureOnly'],
+    ['preauthorization: Bearer\nReviewFixtureOnly more', 'preauthorization: [REDACTED]', 'ReviewFixtureOnly'],
+    ['proxyAuthorization: Basic\nreviewFixtureOnly9472', 'proxyAuthorization: [REDACTED]', 'reviewFixtureOnly9472'],
+    ['Authorization:\n\v\f\u2003\u3000Bearer\nReviewFixtureOnly more', 'Authorization:\n\v\f\u2003\u3000Bearer [REDACTED] more', 'ReviewFixtureOnly'],
+    ['AUTHORIZATION: Bearer\nReviewFixtureOnly more', 'AUTHORIZATION: [REDACTED]', 'ReviewFixtureOnly'],
+    ['Authorization:Bearer\nReviewFixtureOnly more', 'Authorization:[REDACTED]', 'ReviewFixtureOnly'],
+    ['Authorization = "Bearer\nReviewFixtureOnly"', 'Authorization = [REDACTED]', 'ReviewFixtureOnly'],
+    ["'Authorization': 'Bearer\nReviewFixtureOnly'", "'Authorization': [REDACTED]", 'ReviewFixtureOnly'],
+    ['Authorization\t\u00a0:\n\u00a0Bearer\nReviewFixtureOnly more', 'Authorization\t\u00a0:\n\u00a0Bearer [REDACTED] more', 'ReviewFixtureOnly'],
+    ['authorization== Bearer\nReviewFixtureOnly more', 'authorization=[REDACTED]\nReviewFixtureOnly more', 'Bearer'],
+    ['authorization:: Bearer\nReviewFixtureOnly more', 'authorization:[REDACTED]\nReviewFixtureOnly more', 'Bearer'],
+    ['# Bearer secret_token_value=', '# Bearer [REDACTED]', 'secret_token_value='],
+    ['// Bearer secret_token_value=', '// Bearer [REDACTED]', 'secret_token_value='],
+    ['# bearer CLIENT_SECRET=', '# bearer [REDACTED]', 'CLIENT_SECRET='],
+    ['# bearer client_secret=', '# bearer [REDACTED]', 'client_secret='],
+    ['# bearer CLIENT_SECRET= # comment', '# bearer [REDACTED] # comment', 'CLIENT_SECRET='],
+    ['Bearer\nreview_fixture_only: abc123', 'Bearer [REDACTED]: abc123', 'review_fixture_only'],
+    ['Bearer\nREVIEW_FIXTURE_ONLY: abc123', 'Bearer [REDACTED]: abc123', 'REVIEW_FIXTURE_ONLY'],
+    ['Bearer\nreview_fixture_only: request rejected', 'Bearer [REDACTED]: request rejected', 'review_fixture_only'],
+    ['x: Bearer\nreview_fixture_only: request rejected', 'x: Bearer [REDACTED]: request rejected', 'review_fixture_only'],
+    ['x: Bearer\nreview_fixture_only: expired', 'x: Bearer [REDACTED]: expired', 'review_fixture_only'],
+    ['Bearer\nreview_fixture_only = abc123', 'Bearer [REDACTED] = abc123', 'review_fixture_only'],
+    ['Bearer\n--config-file = request rejected', 'Bearer [REDACTED] = request rejected', '--config-file'],
+    ['Bearer\n--config-file: abc123', 'Bearer [REDACTED]: abc123', '--config-file'],
+    ['MODE=bearer\nconfiguration: details', 'MODE=bearer [REDACTED]: details', 'configuration'],
+    ['Bearer\nreview_fixture_only:', 'Bearer [REDACTED]:', 'review_fixture_only'],
+    ['x :: Bearer\nschemaV2Config: foo', 'x :: Bearer [REDACTED]: foo', 'schemaV2Config'],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1538,6 +1568,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['"{\\"auth\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', 'mySecretTokenAb=', undefined],
     ['"Authorization": "\n' + ' '.repeat(60) + 'Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', '"Authorization": [REDACTED]'],
     ['\\"Authorization\\": \\"' + ' '.repeat(60) + 'Bearer\nReviewFixtureOnly more\\"', 'ReviewFixtureOnly', '\\"Authorization\\": [REDACTED]'],
+    ['Authorization = "Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'Authorization = [REDACTED]'],
+    ["'Authorization': 'Bearer\nReviewFixtureOnly more'", 'ReviewFixtureOnly', "'Authorization': [REDACTED]"],
     ['bash -c "curl -H \\"X-Auth: Bearer mySecretTokenAb=\\""', 'mySecretTokenAb=', undefined],
     ['Bearer\nlB79GsW66LvIcKaTzjh= Bearer\np2112MrvcRo=', 'p2112MrvcRo=', 'Bearer [REDACTED] Bearer [REDACTED]'],
   ] as const) {
@@ -1614,8 +1646,6 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\nschemaV2Config=',
     'MODE=bearer\napiTokenKey=',
     'MODE=bearer\n-client_secret=',
-    '# bearer CLIENT_SECRET=',
-    '# bearer client_secret=',
     'MODE=bearer\npublicvalue=" \'a\'"',
     String.raw`bash -c "mode=bearer` + '\n' + String.raw`publicvalue=\" \'a\'\""`,
     'MODE=bearer\nENVIRONMENT=',
@@ -1655,8 +1685,13 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\nendpoint_url: https://api.example.com',
     'MODE=bearer\nSERVER_ENDPOINT = localhost',
     'MODE=bearer\nredirectUri: https://example.com',
+    'MODE=bearer\nendpoint_url: "https://api.example.com"',
+    'MODE=bearer\nschemaV2Config:',
     'Bearer\n--config-file = /etc/app.conf',
     'x == ' + ' '.repeat(60) + 'Bearer\nConfiguration details follow',
+    'x == ' + ' '.repeat(20) + 'Bearer\nReviewFixtureOnly more',
+    ' '.repeat(20) + 'Bearer\nReviewFixtureOnly more',
+    'x_z12345: Bearer\nReviewFixtureOnly more',
     'Authorization:\n""\nBearer\nConfiguration details follow',
     'Authentication: ' + ' '.repeat(60) + 'Bearer\nConfiguration details follow',
   ]) {
@@ -1742,6 +1777,10 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Bearer single-line empty env flood', (n: number) => 'Bearer secret_token_value= '.repeat((n / 27) | 0), 160_000, 250, 120],
     ['Authorization 160k whitespace Bearer prose flood', (n: number) => 'Authorization:\n' + ' '.repeat(n) + 'Bearer\nReviewFixtureOnly more', 160_000, 150, 80],
     ['Authorization 160k backslash quote Bearer flood', (n: number) => 'Authorization:\n' + '\\'.repeat(n) + '"Bearer\nReviewFixtureOnly more', 160_000, 250, 120],
+    ['proxyAuthorization 160k whitespace Bearer prose flood', (n: number) => 'proxyAuthorization:\n' + ' '.repeat(n) + 'Bearer\nReviewFixtureOnly more', 160_000, 150, 80],
+    ['MODE=bearer CLIENT_SECRET multi-word colon flood', (n: number) => 'MODE=bearer\nCLIENT_SECRET: correct horse battery staple\n'.repeat((n / 57) | 0), 160_000, 250, 120],
+    ['Bearer bare non-sensitive colon flood', (n: number) => 'Bearer\nreview_fixture_only: abc123\n'.repeat((n / 36) | 0), 160_000, 250, 120],
+    ['# Bearer single-line empty env flood', (n: number) => '# Bearer secret_token_value=\n'.repeat((n / 29) | 0), 160_000, 250, 120],
   ] as const) {
     const small = gen(10_000)
     redactText(small, newStats())
@@ -1766,6 +1805,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     expect(outLarge).not.toContain('ReviewFixtureOnly')
     expect(outLarge).not.toContain('dXNlcjpwYXNz=')
     expect(outLarge).not.toContain('lB79GsW66LvIcKaTzjh=')
+    expect(outLarge).not.toContain('correct horse battery staple')
+    expect(outLarge).not.toContain('review_fixture_only')
     expect({
       label,
       withinBudget: msLarge < maxMs,
@@ -1911,6 +1952,21 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['bash -c "mode=bearer myTokenSecret12=\\"MySecret1234\\""', 'bash -c "mode=bearer myTokenSecret12=[REDACTED]', 'MySecret1234'],
     [`MODE=bearer\nCLIENT_SECRET: ${CANARY}`, 'MODE=bearer\nCLIENT_SECRET: [REDACTED]', CANARY],
     ['MODE=bearer\nCLIENT_SECRET: foo', 'MODE=bearer\nCLIENT_SECRET: [REDACTED]', 'foo'],
+    ['scheme: Bearer\ndatabase_password: Winter Is Coming', 'scheme: Bearer\ndatabase_password: [REDACTED]', 'Winter Is Coming'],
+    ['MODE=bearer\nCLIENT_SECRET: correct horse battery staple', 'MODE=bearer\nCLIENT_SECRET: [REDACTED]', 'correct horse battery staple'],
+    ['type: bearer\nssh_key_passphrase: correct horse battery staple', 'type: bearer\nssh_key_passphrase: [REDACTED]', 'correct horse battery staple'],
+    ['MODE=bearer\nCLIENT_SECRET: expired', 'MODE=bearer\nCLIENT_SECRET: [REDACTED]', 'expired'],
+    ['MODE=bearer\nmyTokenSecret12: Winter Is Coming', 'MODE=bearer\nmyTokenSecret12: [REDACTED]', 'Winter Is Coming'],
+    ['Bearer\nCLIENT_SECRET: correct horse battery staple', 'Bearer\nCLIENT_SECRET: [REDACTED]', 'correct horse battery staple'],
+    ['Bearer\nCLIENT_SECRET: two words', 'Bearer\nCLIENT_SECRET: [REDACTED]', 'two words'],
+    ['Bearer\nCLIENT_SECRET: abc123', 'Bearer\nCLIENT_SECRET: [REDACTED]', 'abc123'],
+    ['Bearer\nCLIENT_SECRET = two words', 'Bearer\nCLIENT_SECRET = [REDACTED]', 'two words'],
+    ['# bearer CLIENT_SECRET: correct horse battery staple', '# bearer CLIENT_SECRET: [REDACTED]', 'correct horse battery staple'],
+    ['# bearer client_secret: Winter Is Coming', '# bearer client_secret: [REDACTED]', 'Winter Is Coming'],
+    ['# bearer myTokenSecret123: foo', '# bearer myTokenSecret123: [REDACTED]', 'foo'],
+    ['# bearer myTokenSecret123= MySecret1234', '# bearer myTokenSecret123=[REDACTED]', 'MySecret1234'],
+    ['Bearer CLIENT_SECRET= MySecret1234', 'Bearer CLIENT_SECRET=[REDACTED]', 'MySecret1234'],
+    ['MODE=bearer\n-client_secret = mySecret1234', 'MODE=bearer\n-client_secret = [REDACTED]', 'mySecret1234'],
     [`MODE=bearer\nCLIENT_SECRET = ${CANARY}`, 'MODE=bearer\nCLIENT_SECRET = [REDACTED]', CANARY],
   ] as const) {
     const stats = newStats()
