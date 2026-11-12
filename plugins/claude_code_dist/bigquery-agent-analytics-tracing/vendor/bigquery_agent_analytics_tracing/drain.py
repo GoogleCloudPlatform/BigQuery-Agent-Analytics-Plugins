@@ -81,8 +81,10 @@ class _SkippedEnvelope(Exception):
 _reported_skips: set[str] = set()
 # Spooled filenames skipped in the active drainer so they do not hold _run alive.
 _skipped_paths: set[str] = set()
-# Spool directories where both _in_memory_retry_meta and _skipped_paths hit cap.
+# Spool directories where retry-meta fallback and _skipped_paths both hit cap.
 _retry_meta_saturated: set[str] = set()
+# Spool directories where non-retry skip recording hit _skipped_paths cap.
+_skip_cap_saturated: set[str] = set()
 # Bounded fallback retry metadata when writing <spool>.retry fails (e.g. ENOSPC).
 _IN_MEMORY_RETRY_META_CAP = 10_000
 _in_memory_retry_meta: dict[str, dict[str, Any]] = {}
@@ -113,27 +115,56 @@ def _store_in_memory_retry_meta(
   return True
 
 
-def _record_overflow_skip(spool: PrivateDir, spool_name: str) -> bool:
+def _record_overflow_skip(
+    spool: PrivateDir,
+    spool_name: str,
+    *,
+    config: BQAAConfig | None = None,
+    retry_overflow: bool = False,
+) -> bool:
   skip_cap = max(1, int(_IN_MEMORY_RETRY_META_CAP))
   key = _retry_mem_key(spool, spool_name)
+  spool_key = str(spool.path)
   if key in _skipped_paths:
-    return str(spool.path) in _retry_meta_saturated
+    return spool_key in (
+        _retry_meta_saturated if retry_overflow else _skip_cap_saturated
+    )
   if len(_skipped_paths) < skip_cap:
     _skipped_paths.add(key)
     return False
-  spool_key = str(spool.path)
-  if spool_key in _retry_meta_saturated or len(_retry_meta_saturated) < skip_cap:
-    _retry_meta_saturated.add(spool_key)
+  if retry_overflow:
+    if spool_key in _retry_meta_saturated or len(_retry_meta_saturated) < skip_cap:
+      _retry_meta_saturated.add(spool_key)
+    return True
+  if spool_key in _skip_cap_saturated or len(_skip_cap_saturated) < skip_cap:
+    _skip_cap_saturated.add(spool_key)
+  if config is not None:
+    sat_key = f"skip_cap_saturated:{spool_key}"
+    if len(_reported_skips) < skip_cap + 3 and sat_key not in _reported_skips:
+      _reported_skips.add(sat_key)
+      log_to_file(
+          config,
+          f"DRAINER skip_cap_saturated cap={_IN_MEMORY_RETRY_META_CAP}"
+          f" file={spool_name}",
+      )
   return True
 
 
-def _is_skipped_envelope(spool: PrivateDir, spool_name: str) -> bool:
+def _is_skipped_envelope(
+    spool: PrivateDir,
+    spool_name: str,
+    *,
+    include_skip_saturation: bool = False,
+) -> bool:
   key = _retry_mem_key(spool, spool_name)
   if key in _skipped_paths:
     return True
   if key in _in_memory_retry_meta:
     return False
-  if str(spool.path) in _retry_meta_saturated:
+  spool_key = str(spool.path)
+  if spool_key in _retry_meta_saturated:
+    return True
+  if include_skip_saturation and spool_key in _skip_cap_saturated:
     return True
   return False
 
@@ -286,8 +317,8 @@ def _quarantine(
   """Move ``name`` into ``dead-letter`` and drop its retry sidecar.
 
   Returns True if ``name`` was moved or had already vanished, False if an
-  ``OSError`` left it in ``spool`` (recording the path in ``_skipped_paths``
-  so the active drainer does not spin on it).
+  ``OSError`` left it in ``spool`` (recording the path in ``_skipped_paths``, or
+  ``_skip_cap_saturated`` once capped, so the active drainer does not spin on it).
   """
   removed = False
   try:
@@ -309,7 +340,7 @@ def _quarantine(
   except OSError as exc:
     skip_key = _retry_mem_key(spool, name)
     _in_memory_retry_meta.pop(skip_key, None)
-    _record_overflow_skip(spool, name)
+    _record_overflow_skip(spool, name, config=config, retry_overflow=False)
     if config is not None:
       log_key = f"{diag_event}:{skip_key}"
       if len(_reported_skips) < max(1, int(_IN_MEMORY_RETRY_META_CAP)) and (
@@ -381,11 +412,13 @@ def _read_envelope(
     data = json.loads(raw)
   except json.JSONDecodeError:
     if not _quarantine(spool, name, reason="corrupt-json", config=config):
-      _record_overflow_skip(spool, name)
+      _in_memory_retry_meta.pop(_retry_mem_key(spool, name), None)
+      _record_overflow_skip(spool, name, config=config, retry_overflow=False)
     return None
   if not isinstance(data, dict):
     if not _quarantine(spool, name, reason="corrupt-json", config=config):
-      _record_overflow_skip(spool, name)
+      _in_memory_retry_meta.pop(_retry_mem_key(spool, name), None)
+      _record_overflow_skip(spool, name, config=config, retry_overflow=False)
     return None
 
   env_cfg = _extract_envelope_config(data)
@@ -407,7 +440,8 @@ def _read_envelope(
         subdir="destination-mismatch",
         config=config,
     ):
-      _record_overflow_skip(spool, name)
+      _in_memory_retry_meta.pop(_retry_mem_key(spool, name), None)
+      _record_overflow_skip(spool, name, config=config, retry_overflow=False)
     return None
 
   row = data.get("row")
@@ -930,7 +964,7 @@ def _defer_or_expire(
     ):
       return 1
     _in_memory_retry_meta.pop(key, None)
-    _record_overflow_skip(spool, name)
+    _record_overflow_skip(spool, name, config=config, retry_overflow=False)
     return 0
 
   backoff = _compute_backoff_seconds(attempts, config)
@@ -955,7 +989,9 @@ def _defer_or_expire(
             f"DRAINER retry_meta_write_failed file={name}: {exc}",
         )
     else:
-      saturated = _record_overflow_skip(spool, name)
+      saturated = _record_overflow_skip(
+          spool, name, config=config, retry_overflow=True
+      )
       log_key = f"retry_meta_cap_reached:{spool.path}"
       if len(_reported_skips) < skip_cap + 2 and (
           log_key not in _reported_skips
@@ -1011,7 +1047,10 @@ async def _drain_group_async(
       ):
         resolved += 1
       else:
-        _record_overflow_skip(spool, env.path.name)
+        _in_memory_retry_meta.pop(_retry_mem_key(spool, env.path.name), None)
+        _record_overflow_skip(
+            spool, env.path.name, config=config, retry_overflow=False
+        )
     return resolved
 
   rows = [env.row for env in envelopes]
@@ -1075,7 +1114,10 @@ async def _drain_group_async(
         ):
           resolved += 1
         else:
-          _record_overflow_skip(spool, env.path.name)
+          _in_memory_retry_meta.pop(_retry_mem_key(spool, env.path.name), None)
+          _record_overflow_skip(
+              spool, env.path.name, config=config, retry_overflow=False
+          )
       else:
         has_retryable = True
         if not first_retry_err:
@@ -1096,7 +1138,10 @@ async def _drain_group_async(
       ):
         resolved += 1
       else:
-        _record_overflow_skip(spool, env.path.name)
+        _in_memory_retry_meta.pop(_retry_mem_key(spool, env.path.name), None)
+        _record_overflow_skip(
+            spool, env.path.name, config=config, retry_overflow=False
+        )
     return resolved
 
   resolved = 0
@@ -1145,6 +1190,7 @@ async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
         _skipped_paths.discard(skip_key)
     if not pending_set or len(_skipped_paths) < skip_cap:
       _retry_meta_saturated.discard(str(spool.path))
+      _skip_cap_saturated.discard(str(spool.path))
 
     envelopes: list[_Envelope] = []
     now = time.time()
@@ -1177,7 +1223,9 @@ async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
               resolved += 1
             else:
               _in_memory_retry_meta.pop(skip_key, None)
-              _record_overflow_skip(spool, name)
+              _record_overflow_skip(
+                  spool, name, config=config, retry_overflow=False
+              )
             continue
           if config.drain_retry_backoff_seconds != 0.0 and next_retry_at > now:
             continue
@@ -1186,13 +1234,16 @@ async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
         env = _read_envelope(spool, name, config)
       except _SkippedEnvelope as skipped:
         _in_memory_retry_meta.pop(skip_key, None)
-        _record_overflow_skip(spool, name)
+        _record_overflow_skip(spool, name, config=config, retry_overflow=False)
         if len(_reported_skips) < skip_cap and str(skipped) not in _reported_skips:
           _reported_skips.add(str(skipped))
           log_to_file(config, f"DRAINER skipped {skipped}")
         continue
       if env is None:
-        if not _is_skipped_envelope(spool, name) or not spool.exists(name):
+        if (
+            not _is_skipped_envelope(spool, name, include_skip_saturation=True)
+            or not spool.exists(name)
+        ):
           resolved += 1
         continue
       _skipped_paths.discard(skip_key)
@@ -1232,7 +1283,7 @@ def _next_deferred_wait_seconds(config: BQAAConfig) -> float | None:
       max_age = float(getattr(config, "drain_max_retry_age_seconds", 86400.0))
       earliest: float | None = None
       for name in pending_names:
-        if _is_skipped_envelope(spool, name):
+        if _is_skipped_envelope(spool, name, include_skip_saturation=True):
           continue
         meta = _read_retry_meta(spool, name)
         if meta is None or config.drain_retry_backoff_seconds == 0.0:
@@ -1254,6 +1305,7 @@ def _next_deferred_wait_seconds(config: BQAAConfig) -> float | None:
 async def _run(config: BQAAConfig) -> None:
   _skipped_paths.clear()
   _retry_meta_saturated.clear()
+  _skip_cap_saturated.clear()
   pidfile = Path(config.spool_dir).expanduser() / ".drainer.pid"
   use_storage_api = _storage_write_available()
   with _try_acquire_pidfile(pidfile) as fd:

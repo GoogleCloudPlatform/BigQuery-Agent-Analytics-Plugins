@@ -785,11 +785,12 @@ const STRUCTURED_CONFIG_KEY_RE = /^(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]*)+|[a-z]+(?:[_.
 const DIAGNOSTIC_SINGLE_WORD_RE =
   /^(?:unauthorized|forbidden|expired|rejected|denied|failed|invalid|missing|revoked|malformed|unauthenticated|unavailable|blocked|disabled|error|invalid_token|invalid_request|invalid_grant|access_denied|unauthorized_client|insufficient_scope|server_error)(?=$|[\s.,;:!?)\]}'"])/i
 const DIAGNOSTIC_PROSE_RE = /^(?:[A-Za-z]{2,}(?:[ \t]+[A-Za-z]{2,})+|(?:HTTP(?:\/[\d.]+)?[ \t]+)?(?:4\d\d|5\d\d)(?:[ \t]+[A-Za-z]+)*)(?=$|[\s.,;:!?)\]}'"])/
-const DIAGNOSTIC_STATUS_RE =
-  /^(?:(?:[A-Za-z]{2,}[ \t]+)?(?:unauthorized|forbidden|expired|rejected|denied|failed|invalid|missing|revoked|malformed|unauthenticated|unavailable|blocked|disabled|error|invalid_token|invalid_request|invalid_grant|access_denied|unauthorized_client|insufficient_scope|server_error)|(?:HTTP(?:\/[\d.]+)?[ \t]+)?(?:4\d\d|5\d\d)(?:[ \t]+[A-Za-z]+)*)(?=$|[\s.,;:!?)\]}'"])/i
 const ASSIGN_RHS_VAR_RE = /^\$(?:[A-Za-z_({'"$])/
 const ASSIGN_RHS_REDACTED_RE = /^\[REDACTED(?::[a-z-]+)?\](?:$|[\s,;:|)&'"`\].!?])/
 const ASSIGN_RHS_PUNCT_RE = /^(?:[@#%^*({[]|[!?:&](?!$|[\s'")\]},;!?])|\\(?:\\|\$|[^nrt"'\\]))/
+const UNICODE_WS_RE = /\s/
+const PLAIN_KEY_TOKEN_RE = /^[A-Za-z_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$/
+const QUOTED_OR_VAR_OR_REDACTED_RHS_RE = /^(?:["'`\$]|\\["']|\[REDACTED(?::[a-z-]+)?\])/
 
 const isHeaderWsAt = (text: string, idx: number): boolean => {
   const code = text.charCodeAt(idx)
@@ -801,66 +802,151 @@ const isHeaderWsAt = (text: string, idx: number): boolean => {
     code === 160 ||
     code === 11 ||
     code === 12 ||
-    (code >= 0x1680 && /\s/.test(text[idx] as string))
+    (code >= 0x1680 && UNICODE_WS_RE.test(text[idx] as string))
   )
 }
 
 // Walks backward linearly from `idx` across arbitrary header/JSON whitespace
-// and an optional opening quote to detect `*authorization[:=]` headers without
-// fixed-window cutoff or backtracking. Since each matched scheme starts with
-// non-whitespace letters, consecutive matches never re-scan prior whitespace.
-function hasExplicitAuthHeaderBefore(text: string, idx: number): boolean {
-  if (idx < 14) return false
+// and an optional opening quote to detect `*authorization` headers (`:`, `=`,
+// `:=`, `=>`, or quoted tuple `,`) without fixed-window cutoff or backtracking.
+// Since each matched scheme starts with non-whitespace letters, consecutive
+// matches never re-scan prior whitespace. Returns 0 (not header), 1 (same-line),
+// or 2 (cross-line after separator).
+function explicitAuthHeaderKind(text: string, idx: number): 0 | 1 | 2 {
+  if (idx < 14) return 0
   let p = idx
-  while (p > 0 && isHeaderWsAt(text, p - 1)) p -= 1
+  let sawNewline = false
+  while (p > 0 && isHeaderWsAt(text, p - 1)) {
+    const c = text.charCodeAt(p - 1)
+    if (c === 10 || c === 13) sawNewline = true
+    p -= 1
+  }
   if (p > 0 && (text.charCodeAt(p - 1) === 34 || text.charCodeAt(p - 1) === 39)) {
     p -= 1
     while (p > 0 && text.charCodeAt(p - 1) === 92) p -= 1
-    while (p > 0 && isHeaderWsAt(text, p - 1)) p -= 1
+    while (p > 0 && isHeaderWsAt(text, p - 1)) {
+      const c = text.charCodeAt(p - 1)
+      if (c === 10 || c === 13) sawNewline = true
+      p -= 1
+    }
   }
-  if (p === 0) return false
+  if (p === 0) return 0
   const sep = text.charCodeAt(p - 1)
-  if (sep !== 58 && sep !== 61) return false
-  p -= 1
+  if (sep === 58) {
+    p -= 1
+  } else if (sep === 61) {
+    p -= 1
+    if (p > 0 && text.charCodeAt(p - 1) === 58) p -= 1
+  } else if (sep === 62 && p >= 2 && text.charCodeAt(p - 2) === 61) {
+    p -= 2
+  } else if (sep === 44) {
+    p -= 1
+  } else {
+    return 0
+  }
   while (p > 0) {
     const c = text.charCodeAt(p - 1)
     if (c === 32 || c === 9 || c === 160) p -= 1
     else break
   }
-  if (p > 0 && (text.charCodeAt(p - 1) === 34 || text.charCodeAt(p - 1) === 39)) {
+  const hasKeyQuote = p > 0 && (text.charCodeAt(p - 1) === 34 || text.charCodeAt(p - 1) === 39)
+  if (sep === 44 && !hasKeyQuote) return 0
+  if (hasKeyQuote) {
     p -= 1
     while (p > 0 && text.charCodeAt(p - 1) === 92) p -= 1
   }
-  if (p < 13) return false
+  if (p < 13) return 0
   const z = text.charCodeAt(p - 6)
-  if (z !== 122 && z !== 90) return false
-  return text.slice(p - 13, p).toLowerCase() === 'authorization'
+  if (z !== 122 && z !== 90) return 0
+  if (text.slice(p - 13, p).toLowerCase() !== 'authorization') return 0
+  return sawNewline ? 2 : 1
 }
 
-const isDiagnosticColonRhs = (rhs: string): boolean => {
-  if (/^(?:["'`\$]|\\["']|\[REDACTED(?::[a-z-]+)?\])/.test(rhs)) return false
-  return DIAGNOSTIC_STATUS_RE.test(rhs)
+type BearerKeyInfo = {
+  keyCand: string
+  isPlainKey: boolean
+  isDoubleFlag: boolean
+  sensitive: boolean
 }
 
-const isCrossLineKeyColonOrSpacedEq = (
-  token: string,
-  afterLine: string,
-  precededByAssign: boolean,
-): boolean => {
-  const isPlainKey = token.length <= 100 && /^[A-Za-z_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$/.test(token)
+function classifyBearerKeyToken(token: string): BearerKeyInfo | null {
+  const isPlainKey = token.length <= 100 && PLAIN_KEY_TOKEN_RE.test(token)
   const isDoubleFlag = !isPlainKey && token.length <= 102 && DOUBLE_DASH_LOWER_FLAG_RE.test(token)
+  const isSensDoubleFlag =
+    !isPlainKey &&
+    !isDoubleFlag &&
+    token.startsWith('--') &&
+    token.length <= 102 &&
+    PLAIN_KEY_TOKEN_RE.test(token.slice(2)) &&
+    isSensitiveKey(token.slice(2))
   const isSensSingleFlag =
     !isPlainKey &&
     !isDoubleFlag &&
+    !isSensDoubleFlag &&
     token.startsWith('-') &&
     !token.startsWith('--') &&
     token.length <= 101 &&
-    /^[A-Za-z_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$/.test(token.slice(1)) &&
+    PLAIN_KEY_TOKEN_RE.test(token.slice(1)) &&
     isSensitiveKey(token.slice(1))
-  const keyCand = isPlainKey ? token : isDoubleFlag ? token.slice(2) : isSensSingleFlag ? token.slice(1) : ''
-  if (keyCand === '') return false
+  const keyCand = isPlainKey
+    ? token
+    : isDoubleFlag || isSensDoubleFlag
+      ? token.slice(2)
+      : isSensSingleFlag
+        ? token.slice(1)
+        : ''
+  if (keyCand === '') return null
+  return {
+    keyCand,
+    isPlainKey,
+    isDoubleFlag: isDoubleFlag || isSensDoubleFlag,
+    sensitive: isSensitiveKey(keyCand),
+  }
+}
 
-  const sensitive = isSensitiveKey(keyCand)
+type SameLineSep = {
+  sepKind: ':' | '='
+  rhsStart: number
+  lineStop: number
+}
+
+function scanSameLineColonOrSpacedEq(text: string, from: number, lineStop: number): SameLineSep | null {
+  let p = from
+  while (p < lineStop) {
+    const c = text.charCodeAt(p)
+    if (c === 32 || c === 9 || c === 160) p += 1
+    else break
+  }
+  if (p >= lineStop) return null
+  const sepCode = text.charCodeAt(p)
+  let sepKind: ':' | '='
+  if (sepCode === 58) {
+    const next = text.charCodeAt(p + 1)
+    if (next === 58 || next === 61) return null
+    sepKind = ':'
+  } else if (p > from && sepCode === 61) {
+    if (text.charCodeAt(p + 1) === 61) return null
+    sepKind = '='
+  } else {
+    return null
+  }
+  let rhsStart = p + 1
+  while (rhsStart < lineStop) {
+    const c = text.charCodeAt(rhsStart)
+    if (c === 32 || c === 9 || c === 160) rhsStart += 1
+    else break
+  }
+  return { sepKind, rhsStart, lineStop }
+}
+
+function isCrossLineNonSensitiveConfigColonOrSpacedEq(
+  keyCand: string,
+  isPlainKey: boolean,
+  isDoubleFlag: boolean,
+  sepKind: ':' | '=',
+  rhsHead: string,
+  precededByAssign: boolean,
+): boolean {
   const isConfigKey =
     isDoubleFlag ||
     (precededByAssign &&
@@ -869,41 +955,25 @@ const isCrossLineKeyColonOrSpacedEq = (
         CAMEL_CASE_VERSION_KEY_RE.test(keyCand) ||
         UPPER_WORD_KEY_RE.test(keyCand) ||
         LOWER_WORD_KEY_RE.test(keyCand)))
-
-  const colonMatch = isPlainKey ? /^[ \t\u00a0]*:(?![:=])[ \t\u00a0]*([^\r\n]*)/.exec(afterLine) : null
-  if (colonMatch !== null) {
-    const rhs = colonMatch[1] as string
-    if (rhs === '') return isConfigKey || (sensitive && precededByAssign)
-    if (sensitive) {
-      return precededByAssign || !isDiagnosticColonRhs(rhs)
-    }
-    if (!isConfigKey) return false
-    if (/^(?:["'`\$]|\\["']|\[REDACTED(?::[a-z-]+)?\])/.test(rhs)) return true
-    if (DIAGNOSTIC_PROSE_RE.test(rhs) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhs)) return false
+  if (!isConfigKey) return false
+  if (sepKind === ':') {
+    if (!isPlainKey) return false
+    if (rhsHead === '') return true
+    if (QUOTED_OR_VAR_OR_REDACTED_RHS_RE.test(rhsHead)) return true
+    if (DIAGNOSTIC_PROSE_RE.test(rhsHead) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhsHead)) return false
     if (
       !STRUCTURED_CONFIG_KEY_RE.test(keyCand) &&
       !(CAMEL_CASE_KEY_RE.test(keyCand) || CAMEL_CASE_VERSION_KEY_RE.test(keyCand)) &&
-      /^[a-z]{3,}(?=$|[\s.,;:!?)\]}'"])/.test(rhs)
+      /^[a-z]{3,}(?=$|[\s.,;:!?)\]}'"])/.test(rhsHead)
     ) {
       return false
     }
     return true
   }
-
-  const spacedEqMatch = /^[ \t\u00a0]+=(?!=)[ \t\u00a0]*([^\r\n]*)/.exec(afterLine)
-  if (spacedEqMatch !== null) {
-    const eqRhs = spacedEqMatch[1] as string
-    if (sensitive) {
-      return eqRhs === '' ? precededByAssign : precededByAssign || !isDiagnosticColonRhs(eqRhs)
-    }
-    if (!isConfigKey) return false
-    if (eqRhs !== '' && !precededByAssign && (DIAGNOSTIC_PROSE_RE.test(eqRhs) || DIAGNOSTIC_SINGLE_WORD_RE.test(eqRhs))) {
-      return false
-    }
-    return true
+  if (rhsHead !== '' && !precededByAssign && (DIAGNOSTIC_PROSE_RE.test(rhsHead) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhsHead))) {
+    return false
   }
-
-  return false
+  return true
 }
 
 type QuoteContext = {
@@ -1362,7 +1432,8 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const rewind = (): void => {
       AUTH_SCHEME_RE.lastIndex = Math.max(m.index + scheme.length, matchEnd - 6)
     }
-    const inHeader = hasExplicitAuthHeaderBefore(text, m.index)
+    const headerKind = explicitAuthHeaderKind(text, m.index)
+    const inHeader = headerKind !== 0
     const hasNewline = space.length === 1 ? space.charCodeAt(0) === 10 || space.charCodeAt(0) === 13 : space.includes('\n') || space.includes('\r')
     const after = text.slice(matchEnd, matchEnd + 32)
     const isBasic = scheme.length === 5 && (scheme === 'Basic' || scheme === 'basic' || scheme.toLowerCase() === 'basic')
@@ -1400,11 +1471,65 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
       }
       rewind()
     }
-    if (!inHeader && !basicB64) {
-      const rawKeyPart = eqIdx > 0 ? coreToken.slice(0, eqIdx) : ''
+    if (eqIdx === -1 && !basicB64 && headerKind !== 1) {
+      const keyInfo = classifyBearerKeyToken(token)
+      if (keyInfo !== null && (keyInfo.sensitive || (hasNewline && !isBasic && !inHeader && coreToken.length >= 12))) {
+        const ac0 = after.charCodeAt(0)
+        if (ac0 === 58 || ac0 === 61 || ac0 === 32 || ac0 === 9 || ac0 === 160) {
+          const sep = scanSameLineColonOrSpacedEq(text, matchEnd, lineStopFor(matchEnd))
+          if (sep !== null) {
+            if (keyInfo.sensitive) {
+              if (sep.rhsStart === sep.lineStop) {
+                if (!inHeader && hasNewline) {
+                  const qState = quoteAt(m.index)
+                  const { precededByEq, precededByColon } = assignPrefixContext(m.index)
+                  if (precededByEq || qState.inComment || precededByColon) {
+                    keepAndRewind()
+                    continue
+                  }
+                }
+              } else {
+                const rhsHead = text.slice(sep.rhsStart, Math.min(sep.lineStop, sep.rhsStart + 32))
+                if (QUOTED_OR_VAR_OR_REDACTED_RHS_RE.test(rhsHead)) {
+                  keepAndRewind()
+                  continue
+                }
+                // Unquoted non-empty RHS after a sensitive key-shaped token is
+                // ambiguous between a leaked token + diagnostic prose and a
+                // key + unquoted secret: fail closed on both sides up to EOL.
+                out += text.slice(copied, m.index) + scheme + ' ' + MARKER + text.slice(matchEnd, sep.rhsStart) + MARKER
+                stats.redactions += 1
+                copied = sep.lineStop
+                AUTH_SCHEME_RE.lastIndex = sep.lineStop
+                continue
+              }
+            } else {
+              const qState = quoteAt(m.index)
+              const { precededByEq, precededByColon } = assignPrefixContext(m.index)
+              const rhsHead = text.slice(sep.rhsStart, Math.min(sep.lineStop, sep.rhsStart + 256))
+              if (
+                isCrossLineNonSensitiveConfigColonOrSpacedEq(
+                  keyInfo.keyCand,
+                  keyInfo.isPlainKey,
+                  keyInfo.isDoubleFlag,
+                  sep.sepKind,
+                  rhsHead,
+                  precededByEq || qState.inComment || precededByColon,
+                )
+              ) {
+                keepAndRewind()
+                continue
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!inHeader && !basicB64 && eqIdx > 0) {
+      const rawKeyPart = coreToken.slice(0, eqIdx)
       const keyWithinCap = rawKeyPart.length <= 100
-      const isPlainAssignKey = eqIdx > 0 && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(rawKeyPart)
-      const isDashPrefixed = eqIdx > 0 && !isPlainAssignKey && rawKeyPart.charCodeAt(0) === 45
+      const isPlainAssignKey = /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(rawKeyPart)
+      const isDashPrefixed = !isPlainAssignKey && rawKeyPart.charCodeAt(0) === 45
       const flagStripped = isDashPrefixed ? (rawKeyPart.charCodeAt(1) === 45 ? rawKeyPart.slice(2) : rawKeyPart.slice(1)) : ''
       const isDoubleFlag = isDashPrefixed && rawKeyPart.charCodeAt(1) === 45
       const isConfigFlagShape =
@@ -1432,23 +1557,6 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
       const isEqPaddedEnd = endsWithEq || endsWithDoubleEq
 
       if (hasNewline) {
-        const ac0 = effectiveAfter.charCodeAt(0)
-        if (
-          eqIdx === -1 &&
-          !isBasic &&
-          coreToken.length >= 12 &&
-          (ac0 === 58 || ac0 === 61 || ac0 === 32 || ac0 === 9 || ac0 === 160)
-        ) {
-          const afterLine = text.slice(matchEnd, Math.min(text.length, matchEnd + 96))
-          if (/^[ \t\u00a0]+=(?!=)|^[ \t\u00a0]*:(?![:=])/.test(afterLine)) {
-            const qState = quoteAt(m.index)
-            const { precededByEq, precededByColon } = assignPrefixContext(m.index)
-            if (isCrossLineKeyColonOrSpacedEq(coreToken, afterLine, precededByEq || qState.inComment || precededByColon)) {
-              keepAndRewind()
-              continue
-            }
-          }
-        }
         if (isAssignKey) {
           if (!isEqPaddedEnd) {
             const safeAfter =
@@ -1516,45 +1624,39 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             }
           }
         }
-      } else if (eqIdx === -1) {
-        const keyCand = token.startsWith('--') ? token.slice(2) : token.startsWith('-') ? token.slice(1) : token
-        if (
-          keyCand.length <= 100 &&
-          /^[A-Za-z_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$/.test(keyCand) &&
-          isSensitiveKey(keyCand)
-        ) {
-          const afterLine = text.slice(matchEnd, Math.min(text.length, matchEnd + 96))
-          const spacedEq = /^[ \t\u00a0]+=(?!=)[ \t\u00a0]*\S/.test(afterLine)
-          const colonMatch = /^[ \t\u00a0]*:(?!:)[ \t\u00a0]*(\S[^\r\n]*)/.exec(afterLine)
-          if (spacedEq || (colonMatch !== null && !isDiagnosticColonRhs(colonMatch[1] as string))) {
-            keepAndRewind()
-            continue
-          }
-        }
       } else if (isAssignKey && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
         if (isEqPaddedEnd) {
           const qState = quoteAt(m.index)
           const singleAssignRhs = hasAssignRhsAt(effectiveMatchEnd, effectiveAfter, qState, coreToken, isLowerWordKey)
+          const eqLineStop = lineStopFor(effectiveMatchEnd)
+          let spEnd = effectiveMatchEnd
+          while (spEnd < eqLineStop) {
+            const sc = text.charCodeAt(spEnd)
+            if (sc === 32 || sc === 9 || sc === 160) spEnd += 1
+            else break
+          }
+          const hasSpacedRhs = spEnd > effectiveMatchEnd && spEnd < eqLineStop
           const spaceBeforeQuoteRhs =
             !isBase64PaddedToken(coreToken) &&
-            /^[ \t]+["'$\\]/.test(effectiveAfter) &&
+            hasSpacedRhs &&
             (() => {
-              let sp = 1
-              while (sp < effectiveAfter.length && (effectiveAfter[sp] === ' ' || effectiveAfter[sp] === '\t')) sp += 1
-              const qIdx = effectiveMatchEnd + sp
-              const ch = text[qIdx]
+              const ch = text[spEnd]
               if (ch === '"' || ch === "'" || ch === '`') {
-                return isOpeningUnescapedQuote(qIdx, ch, qState, coreToken, isLowerWordKey)
+                return isOpeningUnescapedQuote(spEnd, ch, qState, coreToken, isLowerWordKey)
               }
-              if (ch === '\\' && (text[qIdx + 1] === '"' || text[qIdx + 1] === "'")) {
-                return isOpeningEscapedQuote(qIdx, text[qIdx + 1] as string, qState, coreToken, isLowerWordKey)
+              if (ch === '\\' && (text[spEnd + 1] === '"' || text[spEnd + 1] === "'")) {
+                return isOpeningEscapedQuote(spEnd, text[spEnd + 1] as string, qState, coreToken, isLowerWordKey)
               }
-              return /^\$(?:[A-Za-z_({'"$])/.test(effectiveAfter.slice(sp))
+              if (ch === '$') {
+                return ASSIGN_RHS_VAR_RE.test(text.slice(spEnd, Math.min(eqLineStop, spEnd + 2)))
+              }
+              return false
             })()
           const spaceBeforeValueRhs =
             !endsWithDoubleEq &&
             !isBase64PaddedToken(coreToken) &&
-            /^[ \t]+(?![#;)|&"'`$\\])(?!(?:bearer|basic)(?:[\s]|$))\S/i.test(effectiveAfter)
+            hasSpacedRhs &&
+            /^(?![#;)|&"'`$\\])(?!(?:bearer|basic)(?:[\s]|$))\S/i.test(text.slice(spEnd, Math.min(eqLineStop, spEnd + 8)))
           if (singleAssignRhs || spaceBeforeQuoteRhs || spaceBeforeValueRhs) {
             keepAndRewind()
             continue
