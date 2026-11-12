@@ -120,14 +120,25 @@ def legacy_default_spool_dir() -> str:
   return os.path.join(legacy_default_state_dir(), "spool")
 
 
+def _norm_dest_component(value: object) -> str:
+  if value is None:
+    return ""
+  if isinstance(value, str):
+    return value.strip()
+  return str(value).strip()
+
+
 def destination_partition_id(
     project_id: str, dataset: str, table: str = "agent_events"
 ) -> str:
   """Return a deterministic, collision-free partition dir name for a destination."""
-  if not (project_id or "").strip() or not (dataset or "").strip():
+  p = _norm_dest_component(project_id)
+  d = _norm_dest_component(dataset)
+  t = _norm_dest_component(table) or "agent_events"
+  if not p or not d:
     return ""
   payload = json.dumps(
-      [project_id, dataset, table or "agent_events"],
+      [p, d, t],
       separators=(",", ":"),
   ).encode("utf-8")
   return f"dest-{hashlib.sha256(payload).hexdigest()[:16]}"

@@ -763,11 +763,10 @@ class ClaudeHookBQAAAdapter:
       pass
 
     if self.config.enabled:
-      destination = (
-          (self.config.project_id, self.config.dataset, self.config.table)
-          if (self.config.project_id and self.config.dataset)
-          else None
-      )
+      proj = (self.config.project_id or "").strip()
+      ds = (self.config.dataset or "").strip()
+      tbl = (self.config.table or "").strip() or "agent_events"
+      destination = (proj, ds, tbl) if (proj and ds) else None
       legacy_mig = migrate_legacy_spool(
           self.config.spool_dir, destination=destination
       )

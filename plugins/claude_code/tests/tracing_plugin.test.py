@@ -1254,11 +1254,15 @@ class TestSecurityAndConfig45(unittest.TestCase):
 
     def test_drain_quarantines_destination_mismatch_and_drains_legacy(self):
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_mm_spool_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+
+        part_dir = Path(destination_spool_dir(spool_dir, "target-proj", "target_ds", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         captured = []
         _install_fake_bigquery(
@@ -1285,7 +1289,7 @@ class TestSecurityAndConfig45(unittest.TestCase):
                 "is_truncated": False,
             }
 
-        mismatch_path = Path(spool_dir) / "event-mismatch.json"
+        mismatch_path = part_dir / "event-mismatch.json"
         mismatch_path.write_text(
             json.dumps({
                 "config": {"project_id": "other-proj", "dataset": "ds", "table": "agent_events"},
@@ -1293,11 +1297,22 @@ class TestSecurityAndConfig45(unittest.TestCase):
             }),
             encoding="utf-8",
         )
+        os.chmod(mismatch_path, 0o600)
+        foreign_root_path = Path(spool_dir) / "event-foreign-root.json"
+        foreign_root_path.write_text(
+            json.dumps({
+                "config": {"project_id": "other-proj", "dataset": "ds", "table": "agent_events"},
+                "row": _row("foreign-root"),
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(foreign_root_path, 0o600)
         legacy_path = Path(spool_dir) / "event-legacy.json"
         legacy_path.write_text(
             json.dumps({"config": {}, "row": _row("legacy")}),
             encoding="utf-8",
         )
+        os.chmod(legacy_path, 0o600)
 
         cfg = BQAAConfig(
             project_id="target-proj",
@@ -1315,8 +1330,9 @@ class TestSecurityAndConfig45(unittest.TestCase):
         self.assertEqual(captured[0][1][0]["session_id"], "legacy")
         self.assertFalse(mismatch_path.exists())
         self.assertFalse(legacy_path.exists())
+        self.assertTrue(foreign_root_path.is_file(), "foreign destination in root spool must stay untouched")
         quarantined = (
-            Path(spool_dir)
+            part_dir
             / "dead-letter"
             / "destination-mismatch"
             / "event-mismatch.destination-mismatch.json"
@@ -3074,11 +3090,14 @@ class TestReliabilityAndSetup46(unittest.TestCase):
 
     def test_drain_deferral_backoff_recovery_and_expiry(self):
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_46_retry_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         fail_mode = {"mode": "404"}
         captured = []
@@ -3096,7 +3115,7 @@ class TestReliabilityAndSetup46(unittest.TestCase):
             self, get_table_fn=_get_table, insert_fn=_insert
         )
 
-        env_path = Path(spool_dir) / "event-retry-1.json"
+        env_path = part_dir / "event-retry-1.json"
         env_path.write_text(
             json.dumps({
                 "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
@@ -3128,7 +3147,7 @@ class TestReliabilityAndSetup46(unittest.TestCase):
         resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
         self.assertEqual(resolved1, 0)
         self.assertTrue(env_path.is_file(), "spool file should stay buffered on 404")
-        retry_path = Path(spool_dir) / "event-retry-1.json.retry"
+        retry_path = part_dir / "event-retry-1.json.retry"
         self.assertTrue(retry_path.is_file())
         self.assertEqual(stat.S_IMODE(retry_path.stat().st_mode), 0o600)
 
@@ -3146,7 +3165,7 @@ class TestReliabilityAndSetup46(unittest.TestCase):
         self.assertFalse(retry_path.exists())
 
         # Expired retry age quarantines to dead-letter/<name>.write-failed.json and cleans .retry.
-        env2 = Path(spool_dir) / "event-expire-1.json"
+        env2 = part_dir / "event-expire-1.json"
         env2.write_text(
             json.dumps({
                 "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
@@ -3154,7 +3173,7 @@ class TestReliabilityAndSetup46(unittest.TestCase):
             }),
             encoding="utf-8",
         )
-        retry2 = Path(spool_dir) / "event-expire-1.json.retry"
+        retry2 = part_dir / "event-expire-1.json.retry"
         retry2.write_text(
             json.dumps({
                 "first_failed_at": time.time() - 7200,
@@ -3171,7 +3190,7 @@ class TestReliabilityAndSetup46(unittest.TestCase):
         self.assertFalse(env2.exists())
         self.assertFalse(retry2.exists())
         self.assertTrue(
-            (Path(spool_dir) / "dead-letter" / "event-expire-1.write-failed.json").is_file()
+            (part_dir / "dead-letter" / "event-expire-1.write-failed.json").is_file()
         )
 
     def test_ensure_drainer_skips_spawn_without_bigquery(self):
@@ -3335,11 +3354,14 @@ class TestReliabilityAndSetup46(unittest.TestCase):
 
     def test_drain_partial_transient_failure_does_not_replay_accepted_rows(self):
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_r2_partial_ok_retry_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         requests = []
         accepted = []
@@ -3362,7 +3384,7 @@ class TestReliabilityAndSetup46(unittest.TestCase):
         _install_fake_bigquery(self, insert_fn=_insert)
 
         for idx, marker in enumerate(("A", "B"), start=1):
-            env_file = Path(spool_dir) / f"event-00{idx}.json"
+            env_file = part_dir / f"event-00{idx}.json"
             env_file.write_text(
                 json.dumps({
                     "config": {
@@ -3395,25 +3417,28 @@ class TestReliabilityAndSetup46(unittest.TestCase):
         )
         resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
         self.assertEqual(resolved1, 1)
-        self.assertFalse((Path(spool_dir) / "event-001.json").exists())
-        self.assertFalse((Path(spool_dir) / "event-001.json.retry").exists())
-        self.assertTrue((Path(spool_dir) / "event-002.json").is_file())
-        self.assertTrue((Path(spool_dir) / "event-002.json.retry").is_file())
+        self.assertFalse((part_dir / "event-001.json").exists())
+        self.assertFalse((part_dir / "event-001.json.retry").exists())
+        self.assertTrue((part_dir / "event-002.json").is_file())
+        self.assertTrue((part_dir / "event-002.json.retry").is_file())
 
         resolved2 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
         self.assertEqual(resolved2, 1)
         self.assertEqual(requests, [["A", "B"], ["B"]])
         self.assertEqual(accepted, ["A", "B"])
-        self.assertEqual(list(Path(spool_dir).glob("event-*.json")), [])
-        self.assertEqual(list(Path(spool_dir).glob("event-*.retry")), [])
+        self.assertEqual(list(part_dir.glob("event-*.json")), [])
+        self.assertEqual(list(part_dir.glob("event-*.retry")), [])
 
     def test_drain_partial_mixed_ok_permanent_and_retryable(self):
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_r2_partial_mix_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         requests = []
         accepted = []
@@ -3442,7 +3467,7 @@ class TestReliabilityAndSetup46(unittest.TestCase):
         _install_fake_bigquery(self, insert_fn=_insert)
 
         for idx, marker in enumerate(("A", "B", "C"), start=1):
-            env_file = Path(spool_dir) / f"event-00{idx}.json"
+            env_file = part_dir / f"event-00{idx}.json"
             env_file.write_text(
                 json.dumps({
                     "config": {
@@ -3475,24 +3500,24 @@ class TestReliabilityAndSetup46(unittest.TestCase):
         )
         resolved1 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
         self.assertEqual(resolved1, 2)
-        self.assertFalse((Path(spool_dir) / "event-001.json").exists())
+        self.assertFalse((part_dir / "event-001.json").exists())
         self.assertFalse(
-            (Path(spool_dir) / "dead-letter" / "event-001.write-failed.json").exists()
+            (part_dir / "dead-letter" / "event-001.write-failed.json").exists()
         )
-        self.assertFalse((Path(spool_dir) / "event-002.json").exists())
-        self.assertFalse((Path(spool_dir) / "event-002.json.retry").exists())
+        self.assertFalse((part_dir / "event-002.json").exists())
+        self.assertFalse((part_dir / "event-002.json.retry").exists())
         self.assertTrue(
-            (Path(spool_dir) / "dead-letter" / "event-002.write-failed.json").is_file()
+            (part_dir / "dead-letter" / "event-002.write-failed.json").is_file()
         )
-        self.assertTrue((Path(spool_dir) / "event-003.json").is_file())
-        self.assertTrue((Path(spool_dir) / "event-003.json.retry").is_file())
+        self.assertTrue((part_dir / "event-003.json").is_file())
+        self.assertTrue((part_dir / "event-003.json.retry").is_file())
 
         resolved2 = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
         self.assertEqual(resolved2, 1)
         self.assertEqual(requests, [["A", "B", "C"], ["C"]])
         self.assertEqual(accepted, ["A", "C"])
-        self.assertEqual(list(Path(spool_dir).glob("event-*.json")), [])
-        self.assertEqual(list(Path(spool_dir).glob("event-*.retry")), [])
+        self.assertEqual(list(part_dir.glob("event-*.json")), [])
+        self.assertEqual(list(part_dir.glob("event-*.retry")), [])
 
     def test_resolve_python_and_bare_bqaa_python3_no_traceback(self):
         from bigquery_agent_analytics_tracing import logger as bq_logger
@@ -3641,7 +3666,9 @@ class TestReliabilityAndSetup46(unittest.TestCase):
         self.assertNotIn("DRAINER fatal:", log_text)
         self.assertNotIn("Traceback", log_text)
         self.assertIn("DRAINER_SKIPPED", log_text)
-        self.assertTrue(env_file.is_file(), "spooled file must remain when bigquery is absent")
+        from bigquery_agent_analytics_tracing.config import destination_spool_dir
+        part_env = Path(destination_spool_dir(spool_dir, "p", "d")) / "event-001.json"
+        self.assertTrue(part_env.is_file(), "spooled file must remain when bigquery is absent")
 
     def test_storage_write_404_falls_back_without_unexpected_error_traceback(self):
         from bigquery_agent_analytics_tracing import drain
@@ -3870,11 +3897,14 @@ class TestRound3Fixes(unittest.TestCase):
         import errno
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_p2_retry_enospc_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             prefix = f"{Path(spool_dir)}{os.sep}"
@@ -3894,7 +3924,7 @@ class TestRound3Fixes(unittest.TestCase):
         self.addCleanup(_cleanup_drain_globals)
 
         def _write_envelope(name: str, marker: str) -> Path:
-            path = Path(spool_dir) / name
+            path = part_dir / name
             path.write_text(
                 json.dumps({
                     "config": {
@@ -3962,7 +3992,7 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(resolved1, 0)
             self.assertEqual(attempts["fail"], 1)
             self.assertTrue(fail_env.is_file())
-            self.assertFalse((Path(spool_dir) / "event-001-fail.json.retry").exists())
+            self.assertFalse((part_dir / "event-001-fail.json.retry").exists())
 
             mem_key = str(fail_env)
             self.assertIn(mem_key, drain._in_memory_retry_meta)
@@ -4003,7 +4033,7 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertFalse(fail_env.exists())
             self.assertNotIn(mem_key, drain._in_memory_retry_meta)
             self.assertTrue(
-                (Path(spool_dir) / "dead-letter" / "event-001-fail.write-failed.json").is_file()
+                (part_dir / "dead-letter" / "event-001-fail.write-failed.json").is_file()
             )
 
         log_text = log_path.read_text(encoding="utf-8")
@@ -4049,7 +4079,7 @@ class TestRound3Fixes(unittest.TestCase):
         self.assertLessEqual(attempts["fail"], 3)
         self.assertFalse(run_fail_env.exists())
         self.assertTrue(
-            (Path(spool_dir) / "dead-letter" / "event-003-run.write-failed.json").is_file()
+            (part_dir / "dead-letter" / "event-003-run.write-failed.json").is_file()
         )
 
     def test_drain_quarantine_oserror_skips_expired_without_spinning_and_drains_healthy(self):
@@ -4057,11 +4087,14 @@ class TestRound3Fixes(unittest.TestCase):
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
         from bigquery_agent_analytics_tracing._utils import PrivateDir
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_p2_quar_enospc_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             prefix = f"{Path(spool_dir)}{os.sep}"
@@ -4082,7 +4115,7 @@ class TestRound3Fixes(unittest.TestCase):
         self.addCleanup(_cleanup_drain_globals)
 
         def _write_envelope(name: str, marker: str) -> Path:
-            path = Path(spool_dir) / name
+            path = part_dir / name
             path.write_text(
                 json.dumps({
                     "config": {
@@ -4155,7 +4188,7 @@ class TestRound3Fixes(unittest.TestCase):
              ), \
              mock.patch.object(PrivateDir, "subdir", _failing_dead_letter):
             # Seed failure state as if prior pass failed .retry write under ENOSPC.
-            with drain.ensure_private_dir(spool_dir) as spool_priv:
+            with drain.ensure_private_dir(part_dir) as spool_priv:
                 drain._store_in_memory_retry_meta(
                     spool_priv,
                     "event-001-expired.json",
@@ -4181,7 +4214,7 @@ class TestRound3Fixes(unittest.TestCase):
         self.assertEqual(delivered, ["healthy-ok"])
         self.assertFalse(healthy_env.exists())
         self.assertTrue(expired_env.is_file(), "un-quarantinable file must stay in spool")
-        self.assertFalse((Path(spool_dir) / "dead-letter").exists())
+        self.assertFalse((part_dir / "dead-letter").exists())
         self.assertIn(str(expired_env), drain._skipped_paths)
         self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
         self.assertTrue(all(d > 0.0 for d in sleeps), f"unexpected zero sleep: {sleeps}")
@@ -4200,11 +4233,14 @@ class TestRound3Fixes(unittest.TestCase):
         import errno
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_retry_cap_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
@@ -4220,7 +4256,7 @@ class TestRound3Fixes(unittest.TestCase):
         _cleanup_drain_globals()
 
         def _write_envelope(name: str, marker: str) -> Path:
-            path = Path(spool_dir) / name
+            path = part_dir / name
             path.write_text(
                 json.dumps({
                     "config": {
@@ -4338,7 +4374,7 @@ class TestRound3Fixes(unittest.TestCase):
             # plus a sidecar-less overflow envelope fail under ENOSPC and saturate the spool.
             now["t"] = 1003.0
             fail_stale = _write_envelope("event-005-stale-fail.json", "fail-stale")
-            stale_sidecar = Path(spool_dir) / "event-005-stale-fail.json.retry"
+            stale_sidecar = part_dir / "event-005-stale-fail.json.retry"
             stale_sidecar.write_text(
                 json.dumps({
                     "first_failed_at": 995.0,
@@ -4364,7 +4400,7 @@ class TestRound3Fixes(unittest.TestCase):
                     "fail-over": 1,
                 },
             )
-            self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
+            self.assertEqual(drain._retry_meta_saturated, {str(part_dir)})
             self.assertEqual(len(drain._in_memory_retry_meta), 2)
             self.assertEqual(drain._skipped_paths, set())
             self.assertEqual(len(drain._retry_skipped_paths), 2)
@@ -4412,9 +4448,9 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertFalse(fail1.exists())
             self.assertFalse(fail2.exists())
             self.assertFalse(fail_stale.exists())
-            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-001-fail.write-failed.json").is_file())
-            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-002-fail.write-failed.json").is_file())
-            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-005-stale-fail.write-failed.json").is_file())
+            self.assertTrue((part_dir / "dead-letter" / "event-001-fail.write-failed.json").is_file())
+            self.assertTrue((part_dir / "dead-letter" / "event-002-fail.write-failed.json").is_file())
+            self.assertTrue((part_dir / "dead-letter" / "event-005-stale-fail.write-failed.json").is_file())
             self.assertEqual(set(drain._in_memory_retry_meta), {str(fail3), str(fail_over)})
             self.assertEqual(drain._retry_skipped_paths, {str(fail_legacy)})
             self.assertEqual(drain._retry_meta_saturated, set())
@@ -4432,10 +4468,10 @@ class TestRound3Fixes(unittest.TestCase):
             now["t"] = 1017.0
             self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
             self.assertEqual(drain._retry_skipped_paths, set())
-            self.assertTrue((Path(spool_dir) / "event-003-fail.json.retry").is_file())
+            self.assertTrue((part_dir / "event-003-fail.json.retry").is_file())
             now["t"] = 1018.0
             self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
-            self.assertTrue((Path(spool_dir) / "event-legacy-004-fail.json.retry").is_file())
+            self.assertTrue((part_dir / "event-legacy-004-fail.json.retry").is_file())
             self.assertEqual(drain._retry_meta_saturated, set())
 
         log_text = log_path.read_text(encoding="utf-8")
@@ -4446,7 +4482,7 @@ class TestRound3Fixes(unittest.TestCase):
 
         # Edge case: cap=0 must not crash or spin when retry sidecar writes fail.
         _cleanup_drain_globals()
-        for sidecar in Path(spool_dir).glob("*.retry"):
+        for sidecar in part_dir.glob("*.retry"):
             sidecar.unlink()
         now["t"] = 1018.0
         with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 0), \
@@ -4461,17 +4497,20 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(drain._in_memory_retry_meta, {})
             self.assertEqual(drain._skipped_paths, set())
             self.assertLessEqual(len(drain._retry_skipped_paths), 1)
-            self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
+            self.assertEqual(drain._retry_meta_saturated, {str(part_dir)})
             self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
 
     def test_drain_non_retry_skip_cap_does_not_starve_healthy_or_pin_run(self):
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_nonretry_skip_cap_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
@@ -4486,8 +4525,8 @@ class TestRound3Fixes(unittest.TestCase):
         self.addCleanup(_cleanup_drain_globals)
         _cleanup_drain_globals()
 
-        def _write_healthy(name: str, marker: str) -> Path:
-            path = Path(spool_dir) / name
+        def _write_healthy(name: str, marker: str, target_dir: Path | None = None) -> Path:
+            path = (target_dir or part_dir) / name
             path.write_text(
                 json.dumps({
                     "config": {
@@ -4560,7 +4599,7 @@ class TestRound3Fixes(unittest.TestCase):
         # healthy file must still drain, _retry_meta_saturated must stay empty, and
         # _next_deferred_wait_seconds must return None once only junk remains.
         for idx in (1, 2, 3):
-            corrupt = Path(spool_dir) / f"event-00{idx}-corrupt.json"
+            corrupt = part_dir / f"event-00{idx}-corrupt.json"
             corrupt.write_text("{corrupt-json", encoding="utf-8")
             os.chmod(corrupt, 0o600)
         healthy_env = _write_healthy("event-004-healthy.json", "healthy-after-corrupt")
@@ -4572,7 +4611,7 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(delivered, ["healthy-after-corrupt"])
             self.assertFalse(healthy_env.exists())
             self.assertEqual(drain._retry_meta_saturated, set())
-            self.assertEqual(drain._skip_cap_saturated, {str(Path(spool_dir))})
+            self.assertEqual(drain._skip_cap_saturated, {str(part_dir)})
             self.assertEqual(len(drain._skipped_paths), 2)
             self.assertEqual(drain._in_memory_retry_meta, {})
             self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
@@ -4613,7 +4652,7 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(delivered, ["healthy-cap-zero"])
             self.assertFalse(healthy_zero.exists())
             self.assertEqual(drain._retry_meta_saturated, set())
-            self.assertEqual(drain._skip_cap_saturated, {str(Path(spool_dir))})
+            self.assertEqual(drain._skip_cap_saturated, {str(part_dir)})
             self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
 
         # Quarantine-failure paths (missing-config, partial permanent, whole-batch permanent)
@@ -4633,29 +4672,31 @@ class TestRound3Fixes(unittest.TestCase):
             drain_idle_seconds=0.06,
             drain_poll_seconds=0.02,
         )
-        for label, case_fn in (
-            ("missing_config", lambda: _write_healthy("event-010-perm.json", "missing").write_text(
-                json.dumps({"config": {}, "row": {"event_type": "LLM_REQUEST"}}), encoding="utf-8"
-            )),
-            ("permanent_partial", lambda: (
-                _write_healthy("event-010-perm.json", "perm-partial"),
-                _write_healthy("event-011-ok.json", "ok-alongside"),
-            )),
-            ("permanent_all", lambda: _write_healthy("event-010-perm.json", "perm-all")),
-        ):
+        for label in ("missing_config", "permanent_partial", "permanent_all"):
             with self.subTest(quarantine_fail_path=label):
                 _cleanup_drain_globals()
-                for stale in Path(spool_dir).glob("event-*"):
-                    stale.unlink()
-                dead_dir = Path(spool_dir) / "dead-letter"
-                if dead_dir.exists():
-                    shutil.rmtree(dead_dir, ignore_errors=True)
-                s1 = _write_healthy("event-001-skip.json", "s1")
+                active_dir = Path(spool_dir) if label == "missing_config" else part_dir
+                for d in (Path(spool_dir), part_dir):
+                    for stale in d.glob("event-*"):
+                        stale.unlink()
+                    dead_dir = d / "dead-letter"
+                    if dead_dir.exists():
+                        shutil.rmtree(dead_dir, ignore_errors=True)
+                s1 = _write_healthy("event-001-skip.json", "s1", active_dir)
                 s1.write_text("{bad", encoding="utf-8")
-                s2 = _write_healthy("event-002-skip.json", "s2")
+                s2 = _write_healthy("event-002-skip.json", "s2", active_dir)
                 s2.write_text("{bad", encoding="utf-8")
-                case_fn()
-                p_perm = Path(spool_dir) / "event-010-perm.json"
+                if label == "missing_config":
+                    _write_healthy("event-010-perm.json", "missing", active_dir).write_text(
+                        json.dumps({"config": {}, "row": {"event_type": "LLM_REQUEST"}}),
+                        encoding="utf-8",
+                    )
+                elif label == "permanent_partial":
+                    _write_healthy("event-010-perm.json", "perm-partial", active_dir)
+                    _write_healthy("event-011-ok.json", "ok-alongside", active_dir)
+                else:
+                    _write_healthy("event-010-perm.json", "perm-all", active_dir)
+                p_perm = active_dir / "event-010-perm.json"
                 sub_cfg = cfg_missing if label == "missing_config" else cfg
                 mode["kind"] = "ok" if label == "missing_config" else label
                 insert_calls["n"] = 0
@@ -4699,11 +4740,14 @@ class TestRound3Fixes(unittest.TestCase):
         import errno
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_inproc_rec_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
@@ -4719,7 +4763,7 @@ class TestRound3Fixes(unittest.TestCase):
         _cleanup_drain_globals()
 
         def _write_envelope(name: str, marker: str) -> Path:
-            path = Path(spool_dir) / name
+            path = part_dir / name
             path.write_text(
                 json.dumps({
                     "config": {
@@ -4740,7 +4784,7 @@ class TestRound3Fixes(unittest.TestCase):
             os.chmod(path, 0o600)
             return path
 
-        junk = Path(spool_dir) / "event-000-corrupt.json"
+        junk = part_dir / "event-000-corrupt.json"
         junk.write_text("{corrupt-json", encoding="utf-8")
         os.chmod(junk, 0o600)
         fail1 = _write_envelope("event-001-fail.json", "fail-1")
@@ -4809,7 +4853,7 @@ class TestRound3Fixes(unittest.TestCase):
                 now["t"] = 1001.0
                 fail5 = _write_envelope("event-005-fail.json", "fail-5")
                 self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
-                self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
+                self.assertEqual(drain._retry_meta_saturated, {str(part_dir)})
 
                 # Healthy file written while saturated waits for recovery.
                 now["t"] = 1002.0
@@ -4838,8 +4882,8 @@ class TestRound3Fixes(unittest.TestCase):
                 {str(junk)},
                 "non-retry _skipped_paths must remain intact across in-process recovery",
             )
-            self.assertTrue((Path(spool_dir) / "event-001-fail.json.retry").is_file())
-            self.assertTrue((Path(spool_dir) / "event-002-fail.json.retry").is_file())
+            self.assertTrue((part_dir / "event-001-fail.json.retry").is_file())
+            self.assertTrue((part_dir / "event-002-fail.json.retry").is_file())
 
             # Next pass drains healthy_while_sat AND writes sidecars for previously parked fail3..fail5.
             now["t"] = 1006.0
@@ -4847,20 +4891,23 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(resolved_healthy, 1)
             self.assertEqual(delivered, ["healthy-while-sat"])
             self.assertFalse(healthy_while_sat.exists())
-            self.assertTrue((Path(spool_dir) / "event-003-fail.json.retry").is_file())
-            self.assertTrue((Path(spool_dir) / "event-004-fail.json.retry").is_file())
-            self.assertTrue((Path(spool_dir) / "event-005-fail.json.retry").is_file())
+            self.assertTrue((part_dir / "event-003-fail.json.retry").is_file())
+            self.assertTrue((part_dir / "event-004-fail.json.retry").is_file())
+            self.assertTrue((part_dir / "event-005-fail.json.retry").is_file())
             self.assertEqual(drain._skipped_paths, {str(junk)})
 
     def test_drain_run_sleep_floor_zero_wait_due_and_saturated_idle_exit(self):
         import errno
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_run_floor_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
@@ -4876,7 +4923,7 @@ class TestRound3Fixes(unittest.TestCase):
         _cleanup_drain_globals()
 
         def _write_envelope(name: str, marker: str) -> Path:
-            path = Path(spool_dir) / name
+            path = part_dir / name
             path.write_text(
                 json.dumps({
                     "config": {
@@ -5068,7 +5115,7 @@ class TestRound3Fixes(unittest.TestCase):
              mock.patch.object(drain.asyncio, "sleep", side_effect=_fake_sleep_2):
             asyncio.run(asyncio.wait_for(drain._run(cfg_sat), timeout=2.0))
 
-        self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
+        self.assertEqual(drain._retry_meta_saturated, {str(part_dir)})
         self.assertEqual(len(drain._skipped_paths), 2)
         self.assertEqual(len(drain._retry_skipped_paths), 2)
         self.assertEqual(len(drain._in_memory_retry_meta), 2)
@@ -5084,11 +5131,14 @@ class TestRound3Fixes(unittest.TestCase):
         import errno
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_bq_rec_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
@@ -5104,7 +5154,7 @@ class TestRound3Fixes(unittest.TestCase):
         _cleanup_drain_globals()
 
         def _write_envelope(name: str, marker: str) -> Path:
-            path = Path(spool_dir) / name
+            path = part_dir / name
             path.write_text(
                 json.dumps({
                     "config": {
@@ -5174,7 +5224,7 @@ class TestRound3Fixes(unittest.TestCase):
             now["t"] = 1001.0
             _write_envelope("event-005-fail.json", "fail-5")
             self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
-            self.assertEqual(drain._retry_meta_saturated, {str(Path(spool_dir))})
+            self.assertEqual(drain._retry_meta_saturated, {str(part_dir)})
             self.assertEqual(len(drain._retry_skipped_paths), 2)
 
             healthy_h = _write_envelope("event-006-healthy.json", "healthy-H")
@@ -5223,11 +5273,14 @@ class TestRound3Fixes(unittest.TestCase):
     def test_drain_skip_cap_saturated_keeps_valid_deferred_sidecar_wait_in_run_and_dedupes_logs(self):
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_skip_sat_wait_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
@@ -5248,7 +5301,7 @@ class TestRound3Fixes(unittest.TestCase):
         for idx in (1, 2, 3):
             name = f"event-00{idx}-mismatch.json"
             mismatch_names.add(name)
-            p = Path(spool_dir) / name
+            p = part_dir / name
             p.write_text(
                 json.dumps({
                     "config": {"project_id": "other-proj", "dataset": "d", "table": "t"},
@@ -5258,7 +5311,7 @@ class TestRound3Fixes(unittest.TestCase):
             )
             os.chmod(p, 0o600)
 
-        valid_deferred = Path(spool_dir) / "event-900-deferred.json"
+        valid_deferred = part_dir / "event-900-deferred.json"
         valid_deferred.write_text(
             json.dumps({
                 "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
@@ -5335,7 +5388,7 @@ class TestRound3Fixes(unittest.TestCase):
 
         self.assertEqual(delivered, ["deferred-900"])
         self.assertFalse(valid_deferred.exists())
-        self.assertEqual(drain._skip_cap_saturated, {str(Path(spool_dir))})
+        self.assertEqual(drain._skip_cap_saturated, {str(part_dir)})
         self.assertIsNone(drain._next_deferred_wait_seconds(cfg))
         self.assertGreaterEqual(now["t"], 1000.5)
 
@@ -5349,7 +5402,7 @@ class TestRound3Fixes(unittest.TestCase):
 
         # Also test mutant killer: when _skip_cap_saturated is ALREADY set, quarantining a
         # newly arrived corrupt file succeeds and must count resolved == 1.
-        corrupt_resolvable = Path(spool_dir) / "event-901-corrupt-ok.json"
+        corrupt_resolvable = part_dir / "event-901-corrupt-ok.json"
         corrupt_resolvable.write_text("{bad", encoding="utf-8")
         os.chmod(corrupt_resolvable, 0o600)
         with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
@@ -5362,11 +5415,14 @@ class TestRound3Fixes(unittest.TestCase):
     def test_drain_quarantine_pending_preserves_expiry_and_dedupes_expired_logs(self):
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_qpending_exp_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
@@ -5382,11 +5438,11 @@ class TestRound3Fixes(unittest.TestCase):
         _cleanup_drain_globals()
 
         for idx in (1, 2, 3):
-            c = Path(spool_dir) / f"event-00{idx}-junk.json"
+            c = part_dir / f"event-00{idx}-junk.json"
             c.write_text("{bad", encoding="utf-8")
             os.chmod(c, 0o600)
 
-        held_env = Path(spool_dir) / "event-009-held.json"
+        held_env = part_dir / "event-009-held.json"
         held_env.write_text(
             json.dumps({
                 "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
@@ -5402,7 +5458,7 @@ class TestRound3Fixes(unittest.TestCase):
         )
         os.chmod(held_env, 0o600)
 
-        exp_env = Path(spool_dir) / "event-010-expired.json"
+        exp_env = part_dir / "event-010-expired.json"
         exp_env.write_text(
             json.dumps({
                 "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
@@ -5418,7 +5474,7 @@ class TestRound3Fixes(unittest.TestCase):
         )
         os.chmod(exp_env, 0o600)
 
-        exp_over_env = Path(spool_dir) / "event-011-expired-overflow.json"
+        exp_over_env = part_dir / "event-011-expired-overflow.json"
         exp_over_env.write_text(
             json.dumps({
                 "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
@@ -5433,7 +5489,7 @@ class TestRound3Fixes(unittest.TestCase):
             encoding="utf-8",
         )
         os.chmod(exp_over_env, 0o600)
-        exp_over_sidecar = Path(spool_dir) / "event-011-expired-overflow.json.retry"
+        exp_over_sidecar = part_dir / "event-011-expired-overflow.json.retry"
         exp_over_sidecar.write_text(
             json.dumps({
                 "first_failed_at": 1000.0,
@@ -5482,7 +5538,7 @@ class TestRound3Fixes(unittest.TestCase):
         with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
              mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
              mock.patch.object(drain.PrivateDir, "subdir", _deny_dead_letter):
-            with drain.ensure_private_dir(spool_dir) as spool_priv:
+            with drain.ensure_private_dir(part_dir) as spool_priv:
                 drain._store_in_memory_retry_meta(
                     spool_priv,
                     "event-009-held.json",
@@ -5528,8 +5584,8 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertFalse(exp_env.exists())
             self.assertFalse(exp_over_env.exists())
             self.assertNotIn(str(exp_env), drain._in_memory_retry_meta)
-            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-010-expired.write-failed.json").is_file())
-            self.assertTrue((Path(spool_dir) / "dead-letter" / "event-011-expired-overflow.write-failed.json").is_file())
+            self.assertTrue((part_dir / "dead-letter" / "event-010-expired.write-failed.json").is_file())
+            self.assertTrue((part_dir / "dead-letter" / "event-011-expired-overflow.write-failed.json").is_file())
 
         log_text = log_path.read_text(encoding="utf-8")
         self.assertEqual(
@@ -5552,11 +5608,14 @@ class TestRound3Fixes(unittest.TestCase):
         import errno
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_stale_sidecar_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
@@ -5571,7 +5630,7 @@ class TestRound3Fixes(unittest.TestCase):
         self.addCleanup(_cleanup_drain_globals)
         _cleanup_drain_globals()
 
-        env_path = Path(spool_dir) / "event-001-stale.json"
+        env_path = part_dir / "event-001-stale.json"
         env_path.write_text(
             json.dumps({
                 "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
@@ -5586,7 +5645,7 @@ class TestRound3Fixes(unittest.TestCase):
             encoding="utf-8",
         )
         os.chmod(env_path, 0o600)
-        sidecar_path = Path(spool_dir) / "event-001-stale.json.retry"
+        sidecar_path = part_dir / "event-001-stale.json.retry"
         sidecar_path.write_text(
             json.dumps({
                 "first_failed_at": 995.0,
@@ -5645,7 +5704,7 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 0)
             self.assertEqual(calls["n"], 1)
 
-            with drain.ensure_private_dir(spool_dir) as spool_priv:
+            with drain.ensure_private_dir(part_dir) as spool_priv:
                 effective = drain._read_retry_meta(spool_priv, "event-001-stale.json")
             self.assertIsNotNone(effective)
             self.assertEqual(effective["attempts"], 2)
@@ -5670,11 +5729,14 @@ class TestRound3Fixes(unittest.TestCase):
     def test_drain_read_retry_meta_strips_quarantine_keys_from_disk_sidecar(self):
         from unittest import mock
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_tampered_sidecar_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         def _cleanup_drain_globals():
             drain._in_memory_retry_meta.clear()
@@ -5690,7 +5752,7 @@ class TestRound3Fixes(unittest.TestCase):
         _cleanup_drain_globals()
 
         def _write_env(name: str, marker: str) -> Path:
-            path = Path(spool_dir) / name
+            path = part_dir / name
             path.write_text(
                 json.dumps({
                     "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
@@ -5708,7 +5770,7 @@ class TestRound3Fixes(unittest.TestCase):
             return path
 
         env1 = _write_env("event-001-tampered.json", "tampered-healthy")
-        sidecar1 = Path(spool_dir) / "event-001-tampered.json.retry"
+        sidecar1 = part_dir / "event-001-tampered.json.retry"
         sidecar1.write_text(
             json.dumps({
                 "first_failed_at": 995.0,
@@ -5724,7 +5786,7 @@ class TestRound3Fixes(unittest.TestCase):
         os.chmod(sidecar1, 0o600)
 
         env2 = _write_env("event-002-tampered-only-q.json", "tampered-only-q")
-        sidecar2 = Path(spool_dir) / "event-002-tampered-only-q.json.retry"
+        sidecar2 = part_dir / "event-002-tampered-only-q.json.retry"
         sidecar2.write_text(
             json.dumps({
                 "quarantine_pending": True,
@@ -5738,7 +5800,7 @@ class TestRound3Fixes(unittest.TestCase):
 
         now = {"t": 1000.0}
         with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]):
-            with drain.ensure_private_dir(spool_dir) as spool_priv:
+            with drain.ensure_private_dir(part_dir) as spool_priv:
                 # Even when disk sidecar has higher attempts than an older in-memory entry,
                 # quarantine_* keys loaded from disk must be stripped.
                 drain._in_memory_retry_meta[str(env1)] = {
@@ -5794,7 +5856,7 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertFalse(sidecar1.exists())
             self.assertFalse(env2.exists())
             self.assertFalse(sidecar2.exists())
-            self.assertFalse((Path(spool_dir) / "dead-letter").exists())
+            self.assertFalse((part_dir / "dead-letter").exists())
 
     def test_drain_attempt_quarantine_unlinks_retry_once(self):
         from unittest import mock
@@ -6040,11 +6102,12 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(report["spool_pending"], 1)
             self.assertEqual(report["legacy_unsafe_count"], 5)
             from bigquery_agent_analytics_tracing.config import destination_spool_dir
-            self.assertTrue((Path(destination_spool_dir(new_spool, "p", "d")) / "event-safe.json").is_file())
+            part_p_d = Path(destination_spool_dir(new_spool, "p", "d"))
+            self.assertTrue((part_p_d / "event-safe.json").is_file())
             self.assertFalse(safe_env.exists())
-            self.assertFalse((new_spool / "event-sym.json").exists())
-            self.assertFalse((new_spool / "event-hard.json").exists())
-            self.assertFalse((new_spool / "event-writable.json").exists())
+            for unsafe_name in ("event-sym.json", "event-hard.json", "event-writable.json"):
+                self.assertFalse((part_p_d / unsafe_name).exists())
+                self.assertEqual(list(new_spool.rglob(unsafe_name)), [])
 
             buf_text = io.StringIO()
             with contextlib.redirect_stdout(buf_text):
@@ -6182,22 +6245,30 @@ class TestRound3Fixes(unittest.TestCase):
         new_spool.mkdir(mode=0o700)
 
         # Duplicate crash recovery: identical payload in both dirs unlinks legacy without duplicating.
+        from bigquery_agent_analytics_tracing.config import destination_spool_dir
+        part_p_d = Path(destination_spool_dir(new_spool, "p", "d", "agent_events"))
+        part_p_d.mkdir(mode=0o700)
+        os.chmod(part_p_d, 0o700)
         dup_bytes = json.dumps({
             "config": {"project_id": "p", "dataset": "d"},
             "row": {"event_type": "LLM_REQUEST", "content": {"k": "dup"}},
         }).encode("utf-8")
         (legacy_spool / "event-dup.json").write_bytes(dup_bytes)
-        (new_spool / "event-dup.json").write_bytes(dup_bytes)
+        (part_p_d / "event-dup.json").write_bytes(dup_bytes)
         os.chmod(legacy_spool / "event-dup.json", 0o600)
-        os.chmod(new_spool / "event-dup.json", 0o600)
+        os.chmod(part_p_d / "event-dup.json", 0o600)
 
         # Also leave a legacy dead-letter file to confirm reporting.
         (legacy_dl / "event-old.write-failed.json").write_text("{}", encoding="utf-8")
 
-        mig = _utils.migrate_legacy_spool(new_spool, legacy_spool_dir=legacy_spool)
+        mig = _utils.migrate_legacy_spool(
+            new_spool,
+            legacy_spool_dir=legacy_spool,
+            destination=("p", "d", "agent_events"),
+        )
         self.assertEqual(mig["migrated"], 0)
         self.assertFalse((legacy_spool / "event-dup.json").exists())
-        self.assertEqual(len(list(new_spool.glob("event-*.json"))), 1)
+        self.assertEqual(len(list(part_p_d.glob("event-*.json"))), 1)
 
         # Dead-letter legacy file is reported by setup_check without disturbing new spool.
         env_backup = os.environ.copy()
@@ -6223,7 +6294,9 @@ class TestRound3Fixes(unittest.TestCase):
         os.chmod(legacy_spool / "event-xuser.json", 0o600)
         with mock.patch("os.geteuid", return_value=os.geteuid() + 1000):
             xuser_mig = _utils.migrate_legacy_spool(
-                new_spool, legacy_spool_dir=legacy_spool
+                new_spool,
+                legacy_spool_dir=legacy_spool,
+                destination=("p", "d", "agent_events"),
             )
             self.assertEqual(xuser_mig["migrated"], 0)
             self.assertIsNotNone(xuser_mig["error"])
@@ -6232,11 +6305,14 @@ class TestRound3Fixes(unittest.TestCase):
     def test_drain_malformed_and_non_finite_retry_sidecars(self):
         import math
         from bigquery_agent_analytics_tracing import drain
-        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
 
         spool_dir = tempfile.mkdtemp(prefix="bqaa_r3b_retry_")
         self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
         os.chmod(spool_dir, 0o700)
+        part_dir = Path(destination_spool_dir(spool_dir, "p", "d", "agent_events"))
+        part_dir.mkdir(mode=0o700)
+        os.chmod(part_dir, 0o700)
 
         malformed_sidecars = [
             ("event-001.json", '{"first_failed_at": 0, "next_retry_at": 0, "attempts": null}'),
@@ -6245,7 +6321,7 @@ class TestRound3Fixes(unittest.TestCase):
             ("event-004.json", '{"first_failed_at": 0, "next_retry_at": 99999999999.0, "attempts": -3}'),
         ]
         for idx, (env_name, retry_raw) in enumerate(malformed_sidecars):
-            env_path = Path(spool_dir) / env_name
+            env_path = part_dir / env_name
             env_path.write_text(
                 json.dumps({
                     "config": {
@@ -6264,7 +6340,7 @@ class TestRound3Fixes(unittest.TestCase):
                 encoding="utf-8",
             )
             os.chmod(env_path, 0o600)
-            retry_path = Path(spool_dir) / f"{env_name}.retry"
+            retry_path = part_dir / f"{env_name}.retry"
             retry_path.write_text(retry_raw, encoding="utf-8")
             os.chmod(retry_path, 0o600)
 
@@ -6305,7 +6381,7 @@ class TestRound3Fixes(unittest.TestCase):
         self.assertEqual(resolved, 0)
         self.assertEqual(calls["n"], 1)
         for env_name, _ in malformed_sidecars:
-            meta = json.loads((Path(spool_dir) / f"{env_name}.retry").read_text(encoding="utf-8"))
+            meta = json.loads((part_dir / f"{env_name}.retry").read_text(encoding="utf-8"))
             self.assertEqual(meta["attempts"], 1)
             self.assertNotIsInstance(meta["attempts"], bool)
             self.assertTrue(math.isfinite(meta["first_failed_at"]))
@@ -6313,7 +6389,7 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertGreaterEqual(meta["next_retry_at"], meta["first_failed_at"])
 
         # Re-inject a bool/NaN/Infinity sidecar and confirm _run completes promptly without busy-spinning.
-        (Path(spool_dir) / "event-001.json.retry").write_text(
+        (part_dir / "event-001.json.retry").write_text(
             '{"attempts": true, "first_failed_at": NaN, "next_retry_at": Infinity}',
             encoding="utf-8",
         )
@@ -6323,13 +6399,13 @@ class TestRound3Fixes(unittest.TestCase):
         self.assertEqual(len(delivered), 4)
         self.assertEqual({r["content"]["idx"] for r in delivered}, {0, 1, 2, 3})
         for env_name, _ in malformed_sidecars:
-            self.assertFalse((Path(spool_dir) / env_name).exists())
-            self.assertFalse((Path(spool_dir) / f"{env_name}.retry").exists())
-        self.assertFalse((Path(spool_dir) / "dead-letter").exists())
+            self.assertFalse((part_dir / env_name).exists())
+            self.assertFalse((part_dir / f"{env_name}.retry").exists())
+        self.assertFalse((part_dir / "dead-letter").exists())
 
         # Expired sidecar with string "attempts": "1" must parse cleanly and quarantine
         # instead of raising TypeError on integer comparison.
-        str_env = Path(spool_dir) / "event-str-attempts.json"
+        str_env = part_dir / "event-str-attempts.json"
         str_env.write_text(
             json.dumps({
                 "config": {
@@ -6348,7 +6424,7 @@ class TestRound3Fixes(unittest.TestCase):
             encoding="utf-8",
         )
         os.chmod(str_env, 0o600)
-        str_retry = Path(spool_dir) / "event-str-attempts.json.retry"
+        str_retry = part_dir / "event-str-attempts.json.retry"
         str_retry.write_text(
             '{"attempts": "1", "first_failed_at": 0.0}',
             encoding="utf-8",
@@ -6363,7 +6439,7 @@ class TestRound3Fixes(unittest.TestCase):
         self.assertFalse(str_env.exists())
         self.assertFalse(str_retry.exists())
         self.assertTrue(
-            (Path(spool_dir) / "dead-letter" / "event-str-attempts.write-failed.json").is_file()
+            (part_dir / "dead-letter" / "event-str-attempts.write-failed.json").is_file()
         )
 
 
@@ -7406,14 +7482,18 @@ class TestDestinationPartitionedSpool(unittest.TestCase):
             BigQueryAgentAnalyticsLogger(cfg_t1).log_event(event_type="LLM_REQUEST", content={"t": 1})
             BigQueryAgentAnalyticsLogger(cfg_t2).log_event(event_type="LLM_REQUEST", content={"t": 2})
 
-        # Seed a skipped entry in p1 and confirm concurrent drain._run(cfg_t2) does not wipe p1's tracking.
+        # Seed a skipped entry in p1 and confirm drain._run(cfg_t2) does not wipe p1's tracking
+        # before p1 runs, then drain p1 cleanly.
         p1_skip_key = str(p1 / "event-synthetic.json")
         drain._skipped_paths.add(p1_skip_key)
         try:
-            async def _both():
-                await asyncio.gather(drain._run(cfg_t1), drain._run(cfg_t2))
-
-            asyncio.run(_both())
+            asyncio.run(drain._run(cfg_t2))
+            self.assertIn(
+                p1_skip_key,
+                drain._skipped_paths,
+                "drainer for table 2 must not clear table 1 tracking state",
+            )
+            asyncio.run(drain._run(cfg_t1))
         finally:
             drain._skipped_paths.discard(p1_skip_key)
 
@@ -7615,6 +7695,368 @@ class TestDestinationPartitionedSpool(unittest.TestCase):
         self.assertEqual(len(delivered.get("proj-a.ds_a.agent_events", [])), 2)
         self.assertEqual(len(delivered.get("proj-b.ds_b.agent_events", [])), 1)
         self.assertEqual(list(new_spool.rglob("*destination-mismatch*")), [])
+
+    def test_root_spool_foreign_a_with_future_retry_untouched_and_unpinned_by_b_then_adopted_by_a(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r7b_root_adopt_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        spool_dir.mkdir(mode=0o700)
+        os.chmod(spool_dir, 0o700)
+
+        root_a_fresh = spool_dir / "event-1700000001-rootA-fresh.json"
+        root_a_fresh.write_text(
+            json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "a_fresh"}},
+            }),
+            encoding="utf-8",
+        )
+        root_a_retry = spool_dir / "event-1700000002-rootA-retry.json"
+        root_a_retry.write_text(
+            json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "a_retry"}},
+            }),
+            encoding="utf-8",
+        )
+        root_a_sidecar = spool_dir / "event-1700000002-rootA-retry.json.retry"
+        now = {"t": 2000.0}
+        root_a_sidecar.write_text(
+            json.dumps({
+                "first_failed_at": 1995.0,
+                "attempts": 1,
+                "next_retry_at": 2010.0,
+                "last_error": "503 Service Unavailable",
+            }),
+            encoding="utf-8",
+        )
+        for p in (root_a_fresh, root_a_retry, root_a_sidecar):
+            os.chmod(p, 0o600)
+
+        delivered: dict[str, list[dict]] = {}
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda tid, rows: delivered.setdefault(tid, []).extend(rows) or [],
+            get_table_fn=lambda tid: object(),
+        )
+
+        cfg_a = BQAAConfig(
+            project_id="proj-a",
+            dataset="ds_a",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(spool_dir),
+            state_dir=os.path.join(tmp_root, "state_a"),
+            log_file=os.path.join(tmp_root, "a.log"),
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+            drain_max_retry_age_seconds=60.0,
+        )
+        cfg_b = BQAAConfig(
+            project_id="proj-b",
+            dataset="ds_b",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(spool_dir),
+            state_dir=os.path.join(tmp_root, "state_b"),
+            log_file=os.path.join(tmp_root, "b.log"),
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+            drain_max_retry_age_seconds=60.0,
+        )
+
+        # Drainer B runs: must exit promptly without quarantining A or pinning on A's future retry.
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]):
+            t0 = time.monotonic()
+            asyncio.run(drain._run(cfg_b))
+            elapsed_b = time.monotonic() - t0
+        self.assertLess(elapsed_b, 0.8, f"drainer B pinned on A's root retry ({elapsed_b:.2f}s)")
+        self.assertTrue(root_a_fresh.is_file())
+        self.assertTrue(root_a_retry.is_file())
+        self.assertTrue(root_a_sidecar.is_file())
+        self.assertEqual(list(spool_dir.rglob("*destination-mismatch*")), [])
+        self.assertEqual(delivered, {})
+
+        # Drainer A runs before retry due (t=2000.0 < 2010.0):
+        # adopts both into dest-<hA> (.retry moved before envelope), delivers fresh immediately,
+        # and keeps retry deferred until due.
+        part_a = Path(destination_spool_dir(spool_dir, "proj-a", "ds_a", "agent_events"))
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]):
+            resolved_a1 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+            self.assertEqual(resolved_a1, 1)
+            self.assertFalse(root_a_fresh.exists())
+            self.assertFalse(root_a_retry.exists())
+            self.assertFalse(root_a_sidecar.exists())
+            self.assertTrue((part_a / root_a_retry.name).is_file())
+            self.assertTrue((part_a / root_a_sidecar.name).is_file())
+            self.assertEqual(
+                [r["content"] for r in delivered.get("proj-a.ds_a.agent_events", [])],
+                [{"k": "a_fresh"}],
+            )
+            wait_a = drain._next_deferred_wait_seconds(cfg_a)
+            self.assertIsNotNone(wait_a)
+            self.assertAlmostEqual(wait_a, 10.0, places=3)
+
+            # Once due (t=2010.0), A delivers the deferred row cleanly.
+            now["t"] = 2010.0
+            resolved_a2 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+            self.assertEqual(resolved_a2, 1)
+            self.assertFalse((part_a / root_a_retry.name).exists())
+            self.assertFalse((part_a / root_a_sidecar.name).exists())
+            self.assertEqual(
+                [r["content"] for r in delivered.get("proj-a.ds_a.agent_events", [])],
+                [{"k": "a_fresh"}, {"k": "a_retry"}],
+            )
+            self.assertEqual(list(spool_dir.rglob("*destination-mismatch*")), [])
+
+    def test_mixed_version_old_drainer_root_pid_lock_does_not_block_b(self):
+        import fcntl
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing import logger as bq_logger
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r7b_old_lock_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        spool_dir.mkdir(mode=0o700)
+        os.chmod(spool_dir, 0o700)
+
+        root_a = spool_dir / "event-root-old.json"
+        root_a.write_text(
+            json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "old"}},
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(root_a, 0o600)
+
+        delivered: dict[str, list[dict]] = {}
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda tid, rows: delivered.setdefault(tid, []).extend(rows) or [],
+            get_table_fn=lambda tid: object(),
+        )
+        cfg_b = BQAAConfig(
+            project_id="proj-b",
+            dataset="ds_b",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(spool_dir),
+            state_dir=os.path.join(tmp_root, "state_b"),
+            log_file=os.path.join(tmp_root, "b.log"),
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+        )
+        with mock.patch.object(bq_logger, "_ensure_drainer", return_value=None):
+            BigQueryAgentAnalyticsLogger(cfg_b).log_event(
+                event_type="LLM_REQUEST", content={"k": "new_b"}
+            )
+
+        # Hold exclusive flock on root_spool/.drainer.pid simulating an old pre-partition drainer.
+        old_pid_fd = os.open(str(spool_dir / ".drainer.pid"), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(old_pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            t0 = time.monotonic()
+            asyncio.run(drain._run(cfg_b))
+            elapsed = time.monotonic() - t0
+        finally:
+            try:
+                fcntl.flock(old_pid_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(old_pid_fd)
+
+        self.assertLess(elapsed, 0.8)
+        self.assertTrue(root_a.is_file(), "new drainer must not touch root while old .drainer.pid lock is held")
+        b_rows = delivered.get("proj-b.ds_b.agent_events", [])
+        self.assertEqual(len(b_rows), 1)
+        self.assertEqual(json.loads(b_rows[0]["content"]), {"k": "new_b"})
+
+    def test_migrate_legacy_spool_skips_when_destination_is_none(self):
+        from bigquery_agent_analytics_tracing import _utils
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r7b_mig_none_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        legacy_spool = Path(tmp_root) / "legacy" / "spool"
+        legacy_spool.mkdir(parents=True, mode=0o700)
+        os.chmod(legacy_spool.parent, 0o700)
+        os.chmod(legacy_spool, 0o700)
+        new_spool = Path(tmp_root) / "new_spool"
+        new_spool.mkdir(mode=0o700)
+        os.chmod(new_spool, 0o700)
+
+        for name, cfg_dict in (
+            ("event-a.json", {"project_id": "proj-a", "dataset": "ds_a"}),
+            ("event-b.json", {"project_id": "proj-b", "dataset": "ds_b"}),
+            ("event-empty.json", {}),
+        ):
+            p = legacy_spool / name
+            p.write_text(json.dumps({"config": cfg_dict, "row": {"event_type": "LLM_REQUEST"}}), encoding="utf-8")
+            os.chmod(p, 0o600)
+
+        for dest in (None, ("", "", ""), ("  ", "ds", "agent_events")):
+            mig = _utils.migrate_legacy_spool(
+                new_spool, legacy_spool_dir=legacy_spool, destination=dest
+            )
+            self.assertEqual(mig["migrated"], 0)
+            self.assertIsNone(mig["error"])
+
+        self.assertEqual(sorted(p.name for p in legacy_spool.iterdir()), ["event-a.json", "event-b.json", "event-empty.json"])
+        self.assertEqual(list(new_spool.iterdir()), [])
+
+    def test_destination_partition_whitespace_normalization_parity(self):
+        from bigquery_agent_analytics_tracing import _utils, drain
+        from bigquery_agent_analytics_tracing.config import (
+            BQAAConfig,
+            destination_partition_id,
+            destination_spool_dir,
+        )
+
+        self.assertEqual(
+            destination_partition_id(" proj ", " ds ", " "),
+            destination_partition_id("proj", "ds", "agent_events"),
+        )
+        self.assertEqual(
+            destination_spool_dir("/tmp/sp", " proj ", " ds ", " "),
+            destination_spool_dir("/tmp/sp", "proj", "ds", "agent_events"),
+        )
+        self.assertFalse(
+            _utils.is_destination_mismatch_for(
+                {"project_id": "proj", "dataset": "ds", "table": "agent_events"},
+                " proj ",
+                " ds ",
+                " ",
+            )
+        )
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r7b_norm_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        legacy_spool = Path(tmp_root) / "legacy" / "spool"
+        legacy_spool.mkdir(parents=True, mode=0o700)
+        os.chmod(legacy_spool.parent, 0o700)
+        os.chmod(legacy_spool, 0o700)
+        new_spool = Path(tmp_root) / "new_spool"
+        new_spool.mkdir(mode=0o700)
+        os.chmod(new_spool, 0o700)
+
+        leg = legacy_spool / "event-ws.json"
+        leg.write_text(
+            json.dumps({
+                "config": {"project_id": "proj", "dataset": "ds", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "ws"}},
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(leg, 0o600)
+
+        mig = _utils.migrate_legacy_spool(
+            new_spool, legacy_spool_dir=legacy_spool, destination=(" proj ", " ds ", " ")
+        )
+        self.assertEqual(mig["migrated"], 1)
+
+        delivered: dict[str, list[dict]] = {}
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda tid, rows: delivered.setdefault(tid, []).extend(rows) or [],
+            get_table_fn=lambda tid: object(),
+        )
+        cfg = BQAAConfig(
+            project_id=" proj ",
+            dataset=" ds ",
+            table=" ",
+            auto_create_table=False,
+            spool_dir=str(new_spool),
+            state_dir=os.path.join(tmp_root, "state"),
+            log_file=os.path.join(tmp_root, "norm.log"),
+        )
+        self.assertEqual(asyncio.run(drain._drain_once(cfg, use_storage_api=False)), 1)
+        self.assertEqual(len(delivered.get("proj.ds.agent_events", [])), 1)
+        self.assertEqual(list(new_spool.rglob("*destination-mismatch*")), [])
+
+    def test_ensure_drainer_isolates_child_env_from_malformed_parent_bqaa_vars(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import logger as bq_logger
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r7b_env_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        spool_dir.mkdir(mode=0o700)
+        os.chmod(spool_dir, 0o700)
+
+        cfg = BQAAConfig(
+            project_id="proj-b",
+            dataset="ds_b",
+            table="events_b",
+            agent_name="custom-agent",
+            user_id="custom-user",
+            enabled=True,
+            dry_run=False,
+            direct_write=False,
+            auto_create_table=False,
+            auto_create_dataset=True,
+            location="EU",
+            max_content_length=1234,
+            log_file=os.path.join(tmp_root, "b.log"),
+            max_log_bytes=4096,
+            spool_dir=str(spool_dir),
+            state_dir=os.path.join(tmp_root, "state"),
+            state_ttl_hours=12.5,
+            transcript_max_bytes=8192,
+            drain_idle_seconds=2.5,
+            drain_batch_size=10,
+            drain_poll_seconds=0.25,
+            drain_retry_backoff_seconds=1.5,
+            drain_max_retry_age_seconds=300.0,
+            writer_label="custom-writer",
+        )
+
+        env_backup = os.environ.copy()
+        try:
+            os.environ.update({
+                "BQAA_PROJECT_ID": "stale-a",
+                "BQAA_DATASET": "stale_ds",
+                "BQAA_TABLE": "stale_tbl",
+                "BQAA_MAX_CONTENT_LENGTH": "bad",
+                "BQAA_TRANSCRIPT_MAX_BYTES": "bad",
+                "BQAA_STATE_TTL_HOURS": "bad",
+                "BQAA_MAX_LOG_BYTES": "bad",
+                "BQAA_DRAIN_IDLE_SECONDS": "bad",
+                "BQAA_DRAIN_POLL_SECONDS": "bad",
+                "BQAA_DRAIN_BATCH_SIZE": "bad",
+                "BQAA_DRAIN_MAX_RETRY_AGE_SECONDS": "bad",
+                "BQAA_DRY_RUN": "true",
+                "BQAA_TRACE_ENABLED": "false",
+                "BQAA_DIRECT_WRITE": "true",
+            })
+            spawn_calls: list[dict] = []
+            with mock.patch.object(bq_logger, "_bigquery_spec_available", return_value=True), \
+                 mock.patch.object(
+                     bq_logger.subprocess,
+                     "Popen",
+                     side_effect=lambda *a, **kw: spawn_calls.append(dict(kw)) or None,
+                 ):
+                BigQueryAgentAnalyticsLogger(cfg).log_event(
+                    event_type="LLM_REQUEST", content={"k": "isolated"}
+                )
+            self.assertEqual(len(spawn_calls), 1)
+            child_env = spawn_calls[0]["env"]
+
+            os.environ.clear()
+            os.environ.update(child_env)
+            parsed = BQAAConfig.from_env()
+            self.assertEqual(parsed, cfg)
+        finally:
+            os.environ.clear()
+            os.environ.update(env_backup)
 
 
 if __name__ == "__main__":

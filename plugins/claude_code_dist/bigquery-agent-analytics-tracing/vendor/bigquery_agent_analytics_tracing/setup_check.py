@@ -264,9 +264,10 @@ def collect_report(python_bin: str | None = None) -> _SetupReport:
       or os.environ.get("BQ_TABLE")
       or "agent_events"
   )
-  destination = (
-      (project_id, dataset, table) if (project_id and dataset) else None
-  )
+  proj = (project_id or "").strip()
+  ds = (dataset or "").strip()
+  tbl = (table or "").strip() or "agent_events"
+  destination = (proj, ds, tbl) if (proj and ds) else None
   legacy_mig = migrate_legacy_spool(spool_dir, destination=destination)
   spool_status = inspect_spool_status(spool_dir)
   legacy_status = inspect_legacy_backlog(state_dir, spool_dir)

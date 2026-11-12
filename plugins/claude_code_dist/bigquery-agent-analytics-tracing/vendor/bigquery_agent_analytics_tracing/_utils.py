@@ -718,6 +718,22 @@ def extract_envelope_config(data: dict[str, Any]) -> dict[str, Any]:
   return cfg if isinstance(cfg, dict) else {}
 
 
+def _norm_dest_value(value: Any) -> str:
+  if value is None:
+    return ""
+  if isinstance(value, str):
+    return value.strip()
+  return str(value).strip()
+
+
+def has_envelope_destination(envelope_cfg: dict[str, Any]) -> bool:
+  """Return True if ``envelope_cfg`` specifies any non-empty destination field."""
+  return any(
+      bool(_norm_dest_value(envelope_cfg.get(k)))
+      for k in ("project_id", "dataset", "table")
+  )
+
+
 def is_destination_mismatch_for(
     envelope_cfg: dict[str, Any],
     project_id: str,
@@ -725,17 +741,15 @@ def is_destination_mismatch_for(
     table: str = "agent_events",
 ) -> bool:
   """Return True if an envelope embeds a different non-empty destination."""
+  exp_proj = _norm_dest_value(project_id)
+  exp_ds = _norm_dest_value(dataset)
+  exp_tbl = _norm_dest_value(table) or "agent_events"
   for key, expected in (
-      ("project_id", project_id),
-      ("dataset", dataset),
-      ("table", table),
+      ("project_id", exp_proj),
+      ("dataset", exp_ds),
+      ("table", exp_tbl),
   ):
-    raw_val = envelope_cfg.get(key)
-    val = (
-        raw_val.strip()
-        if isinstance(raw_val, str)
-        else (str(raw_val).strip() if raw_val is not None else "")
-    )
+    val = _norm_dest_value(envelope_cfg.get(key))
     if not val:
       continue
     if val != expected:
@@ -1157,7 +1171,9 @@ def migrate_legacy_spool(
   ``project_id`` and ``dataset``, only envelopes matching that destination
   (or carrying no destination fields) are migrated into that destination's
   partition; envelopes targeting other destinations stay untouched in the
-  legacy spool so their own sessions/drainers can claim them.
+  legacy spool so their own sessions/drainers can claim them. When
+  ``destination`` is unset or incomplete, migration is skipped so
+  multi-destination legacy files are never dumped into the shared root spool.
   """
   result: dict[str, Any] = {
       "migrated": 0,
@@ -1169,10 +1185,12 @@ def migrate_legacy_spool(
   dest_proj = dest_ds = dest_tbl = ""
   if destination is not None:
     raw_proj, raw_ds, raw_tbl = destination
-    dest_proj = (raw_proj or "").strip()
-    dest_ds = (raw_ds or "").strip()
-    dest_tbl = (raw_tbl or "").strip() or "agent_events"
+    dest_proj = _norm_dest_value(raw_proj)
+    dest_ds = _norm_dest_value(raw_ds)
+    dest_tbl = _norm_dest_value(raw_tbl) or "agent_events"
   has_dest = bool(dest_proj and dest_ds)
+  if not has_dest:
+    return result
 
   legacy_path = resolve_legacy_spool_dir(
       spool_dir, legacy_spool_dir=legacy_spool_dir

@@ -19,8 +19,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
+import errno
 import fcntl
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -35,8 +37,12 @@ from typing import Any, Iterator
 # plugin behavior and keeps the channel safe if the host agent forks us.
 os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 
-from ._utils import ensure_private_dir  # noqa: E402  (after env tweak)
+from ._utils import _read_private_bytes  # noqa: E402  (after env tweak)
+from ._utils import _read_verified_legacy_file  # noqa: E402
+from ._utils import _write_atomic_private_bytes  # noqa: E402
+from ._utils import ensure_private_dir  # noqa: E402
 from ._utils import extract_envelope_config  # noqa: E402
+from ._utils import has_envelope_destination  # noqa: E402
 from ._utils import is_destination_mismatch_for  # noqa: E402
 from ._utils import log_to_file  # noqa: E402
 from ._utils import migrate_legacy_spool  # noqa: E402
@@ -613,10 +619,13 @@ def _group_envelopes(
     eff_dataset = bool(config.auto_create_dataset) and bool(
         auto_create_dataset
     )
+    norm_proj = (config.project_id or "").strip()
+    norm_ds = (config.dataset or "").strip()
+    norm_tbl = (config.table or "").strip() or "agent_events"
     key = (
-        config.project_id,
-        config.dataset,
-        config.table,
+        norm_proj,
+        norm_ds,
+        norm_tbl,
         cfg.get("location") or config.location,
         cfg.get("writer_label") or config.writer_label or DEFAULT_WRITER_LABEL,
         eff_table,
@@ -1274,21 +1283,6 @@ async def _drain_group_async(
   return resolved
 
 
-def _has_tracked_spool_state(spool_path: Path) -> bool:
-  """Return True if module-level retry/skip tracking holds entries for ``spool_path``."""
-  spool_key = str(spool_path)
-  if spool_key in _retry_meta_saturated or spool_key in _skip_cap_saturated:
-    return True
-  return any(
-      Path(k).parent == spool_path
-      for k in (
-          *_in_memory_retry_meta.keys(),
-          *_skipped_paths,
-          *_retry_skipped_paths,
-      )
-  )
-
-
 def _clear_spool_tracking_state(spool_path: Path) -> None:
   """Reset startup skip/saturation state for ``spool_path`` only."""
   spool_key = str(spool_path)
@@ -1302,32 +1296,170 @@ def _clear_spool_tracking_state(spool_path: Path) -> None:
   _skip_cap_saturated.discard(spool_key)
 
 
-def _is_root_drain_unclaimed(root_path: Path) -> bool:
-  """Return True if ``root_path`` has no active ``.root-drain.lock`` holder."""
-  if not os.path.lexists(root_path / ".root-drain.lock"):
-    return True
+def _adopt_matching_root_under_lock(
+    root_spool: PrivateDir, part_spool: PrivateDir, config: BQAAConfig
+) -> None:
+  """Move matching or destination-less root envelopes (and .retry) into ``part_spool``."""
+  root_names = sorted(
+      n for n in root_spool.names() if fnmatch.fnmatchcase(n, "event-*.json")
+  )
+  skip_cap = max(1, int(_IN_MEMORY_RETRY_META_CAP))
+  for name in root_names:
+    try:
+      raw = _read_verified_legacy_file(root_spool, name)
+    except FileNotFoundError:
+      continue
+    except OSError as exc:
+      _log_bounded_once(
+          config,
+          _reported_skips,
+          skip_cap,
+          f"{root_spool.path / name}: {exc}",
+          f"DRAINER skipped {root_spool.path / name}: {exc}",
+      )
+      continue
+    try:
+      parsed = json.loads(raw.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+      _quarantine(root_spool, name, reason="corrupt-json", config=config)
+      continue
+    if not isinstance(parsed, dict):
+      _quarantine(root_spool, name, reason="corrupt-json", config=config)
+      continue
+
+    env_cfg = _extract_envelope_config(parsed)
+    if has_envelope_destination(env_cfg) and is_destination_mismatch(
+        env_cfg, config
+    ):
+      continue
+
+    retry_name = _retry_sidecar_name(name)
+    retry_bytes: bytes | None = None
+    if root_spool.exists(retry_name):
+      try:
+        retry_bytes = _read_verified_legacy_file(root_spool, retry_name)
+      except FileNotFoundError:
+        retry_bytes = None
+      except OSError as exc:
+        _log_bounded_once(
+            config,
+            _reported_skips,
+            skip_cap,
+            f"{root_spool.path / retry_name}: {exc}",
+            f"DRAINER skipped {root_spool.path / retry_name}: {exc}",
+        )
+        continue
+
+    dst_name = name
+    if part_spool.exists(dst_name):
+      existing = _read_private_bytes(part_spool, dst_name)
+      if existing == raw:
+        try:
+          root_spool.unlink(name)
+        except FileNotFoundError:
+          pass
+        if retry_bytes is not None:
+          try:
+            root_spool.unlink(retry_name)
+          except (FileNotFoundError, OSError):
+            pass
+        continue
+      digest = hashlib.sha256(raw).hexdigest()[:12]
+      dst_name = f"event-root-{digest}-{name[len('event-'):]}"
+      if part_spool.exists(dst_name):
+        existing_dedup = _read_private_bytes(part_spool, dst_name)
+        if existing_dedup == raw:
+          try:
+            root_spool.unlink(name)
+          except FileNotFoundError:
+            pass
+          if retry_bytes is not None:
+            try:
+              root_spool.unlink(retry_name)
+            except (FileNotFoundError, OSError):
+              pass
+          continue
+        continue
+
+    dst_retry_name = _retry_sidecar_name(dst_name)
+    moved_retry = False
+    if retry_bytes is not None and not part_spool.exists(dst_retry_name):
+      try:
+        root_spool.replace(retry_name, dst_retry_name, part_spool)
+        moved_retry = True
+      except OSError as exc:
+        if exc.errno == errno.EXDEV:
+          _write_atomic_private_bytes(part_spool, dst_retry_name, retry_bytes)
+          try:
+            root_spool.unlink(retry_name)
+          except (FileNotFoundError, OSError):
+            pass
+          moved_retry = True
+        else:
+          _log_diagnostic_once(
+              config,
+              f"root_adopt_failed:{root_spool.path / name}",
+              f"DRAINER root_adopt_failed file={name}: {exc}",
+          )
+          continue
+
+    try:
+      root_spool.replace(name, dst_name, part_spool)
+    except OSError as exc:
+      if exc.errno == errno.EXDEV:
+        _write_atomic_private_bytes(part_spool, dst_name, raw)
+        try:
+          root_spool.unlink(name)
+        except FileNotFoundError:
+          pass
+      else:
+        if moved_retry:
+          try:
+            part_spool.replace(dst_retry_name, retry_name, root_spool)
+          except OSError:
+            pass
+        _log_diagnostic_once(
+            config,
+            f"root_adopt_failed:{root_spool.path / name}",
+            f"DRAINER root_adopt_failed file={name}: {exc}",
+        )
+        continue
+
+    if retry_bytes is not None and root_spool.exists(retry_name):
+      try:
+        root_spool.unlink(retry_name)
+      except (FileNotFoundError, OSError):
+        pass
+
+
+def _adopt_matching_root_spool_files(
+    root_path: Path, part_spool: PrivateDir, config: BQAAConfig
+) -> None:
+  """Adopt matching/destination-less envelopes from ``root_path`` into ``part_spool``.
+
+  Acquires a non-blocking flock on ``root_path/.drainer.pid`` (only when
+  candidate ``event-*.json`` entries are present) so pre-partition drainers and
+  partitioned drainers never race over unpartitioned root files.
+  """
+  try:
+    with open_existing_private_dir(root_path) as probe_root:
+      has_candidates = any(
+          fnmatch.fnmatchcase(n, "event-*.json") for n in probe_root.names()
+      )
+  except (OSError, RuntimeError):
+    return
+  if not has_candidates:
+    return
+
   try:
     with open_existing_private_dir(root_path) as root_spool:
-      fd = root_spool.open(".root-drain.lock", os.O_RDWR)
-  except FileNotFoundError:
-    return True
+      lock_fd = root_spool.open(".drainer.pid", os.O_CREAT | os.O_RDWR, 0o600)
+      with _flock_pidfile_fd(lock_fd) as acquired:
+        if acquired is None:
+          return
+        _adopt_matching_root_under_lock(root_spool, part_spool, config)
   except (OSError, RuntimeError):
-    return False
-  try:
-    try:
-      fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-      return False
-    try:
-      fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError:
-      pass
-    return True
-  finally:
-    try:
-      os.close(fd)
-    except OSError:
-      pass
+    return
 
 
 async def _drain_single_spool(
@@ -1472,10 +1604,11 @@ async def _drain_single_spool(
 async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
   resolved = 0
   skip_cap = max(1, int(_IN_MEMORY_RETRY_META_CAP))
+  norm_proj = (config.project_id or "").strip()
+  norm_ds = (config.dataset or "").strip()
+  norm_tbl = (config.table or "").strip() or "agent_events"
   destination = (
-      (config.project_id, config.dataset, config.table)
-      if (config.project_id and config.dataset)
-      else None
+      (norm_proj, norm_ds, norm_tbl) if (norm_proj and norm_ds) else None
   )
   legacy_res = migrate_legacy_spool(config.spool_dir, destination=destination)
   if legacy_res.get("error"):
@@ -1494,6 +1627,12 @@ async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
         f"DRAINER migrated_legacy_envelopes={legacy_res['migrated']}",
     )
 
+  root_path = Path(config.spool_dir).expanduser()
+  part_path = Path(
+      destination_spool_dir(
+          root_path, config.project_id, config.dataset, config.table
+      )
+  )
   with open_destination_spool_dir(
       config.spool_dir,
       config.project_id,
@@ -1501,47 +1640,9 @@ async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
       config.table,
       create=True,
   ) as part_spool:
+    if part_path != root_path and os.path.lexists(root_path):
+      _adopt_matching_root_spool_files(root_path, part_spool, config)
     resolved += await _drain_single_spool(part_spool, config, use_storage_api)
-
-  root_path = Path(config.spool_dir).expanduser()
-  part_path = Path(
-      destination_spool_dir(
-          root_path, config.project_id, config.dataset, config.table
-      )
-  )
-  if part_path != root_path:
-    with ensure_private_dir(root_path) as root_spool:
-      root_names = root_spool.names()
-      has_root_work = (
-          any(
-              fnmatch.fnmatchcase(n, "event-*.json") or n.endswith(".retry")
-              for n in root_names
-          )
-          or _has_tracked_spool_state(root_spool.path)
-      )
-      if has_root_work:
-        lock_fd = root_spool.open(".root-drain.lock", os.O_CREAT | os.O_RDWR)
-        try:
-          try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            locked = True
-          except BlockingIOError:
-            locked = False
-          if locked:
-            try:
-              resolved += await _drain_single_spool(
-                  root_spool, config, use_storage_api
-              )
-            finally:
-              try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-              except OSError:
-                pass
-        finally:
-          try:
-            os.close(lock_fd)
-          except OSError:
-            pass
   return resolved
 
 
@@ -1598,30 +1699,19 @@ def _next_deferred_wait_seconds(config: BQAAConfig) -> float | None:
           root_path, config.project_id, config.dataset, config.table
       )
   )
-  waits: list[float] = []
-  if os.path.lexists(part_path):
-    try:
-      with open_destination_spool_dir(
-          root_path,
-          config.project_id,
-          config.dataset,
-          config.table,
-          create=False,
-      ) as part_spool:
-        part_wait = _next_deferred_wait_for_dir(part_spool, config)
-        if part_wait is not None:
-          waits.append(part_wait)
-    except (OSError, RuntimeError):
-      pass
-  if part_path != root_path and os.path.lexists(root_path):
-    try:
-      with open_existing_private_dir(root_path) as root_spool:
-        root_wait = _next_deferred_wait_for_dir(root_spool, config)
-        if root_wait is not None:
-          waits.append(root_wait)
-    except (OSError, RuntimeError):
-      pass
-  return min(waits) if waits else None
+  if not os.path.lexists(part_path):
+    return None
+  try:
+    with open_destination_spool_dir(
+        root_path,
+        config.project_id,
+        config.dataset,
+        config.table,
+        create=False,
+    ) as part_spool:
+      return _next_deferred_wait_for_dir(part_spool, config)
+  except (OSError, RuntimeError):
+    return None
 
 
 async def _run(config: BQAAConfig) -> None:
@@ -1636,8 +1726,6 @@ async def _run(config: BQAAConfig) -> None:
     if fd is None:
       return
     _clear_spool_tracking_state(part_path)
-    if part_path != root_path and _is_root_drain_unclaimed(root_path):
-      _clear_spool_tracking_state(root_path)
     idle = 0.0
     while idle < config.drain_idle_seconds:
       wrote = await _drain_once(config, use_storage_api=use_storage_api)

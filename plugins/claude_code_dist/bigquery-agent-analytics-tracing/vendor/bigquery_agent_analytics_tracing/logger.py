@@ -179,35 +179,42 @@ def _ensure_drainer(config: BQAAConfig) -> None:
   child_env = os.environ.copy()
   child_env["BQAA_PROJECT_ID"] = config.project_id
   child_env["BQAA_DATASET"] = config.dataset
-  child_env["BQAA_TABLE"] = config.table or "agent_events"
-  child_env["BQAA_SPOOL_DIR"] = config.spool_dir
-  child_env["BQAA_STATE_DIR"] = config.state_dir
-  child_env["BQAA_LOG_FILE"] = config.log_file
-  child_env["BQAA_MAX_LOG_BYTES"] = str(config.max_log_bytes)
+  child_env["BQAA_TABLE"] = (config.table or "").strip() or "agent_events"
+  child_env["BQAA_AGENT_NAME"] = config.agent_name or "coding-agent"
+  child_env["BQAA_USER_ID"] = config.user_id or "local-user"
+  child_env["BQAA_TRACE_ENABLED"] = "true" if config.enabled else "false"
+  child_env["BQAA_DRY_RUN"] = "true" if config.dry_run else "false"
+  child_env["BQAA_DIRECT_WRITE"] = "true" if config.direct_write else "false"
   child_env["BQAA_AUTO_CREATE_TABLE"] = (
       "true" if config.auto_create_table else "false"
   )
   child_env["BQAA_AUTO_CREATE_DATASET"] = (
       "true" if config.auto_create_dataset else "false"
   )
-  child_env["BQAA_WRITER_LABEL"] = config.writer_label
-  child_env["BQAA_DRAIN_IDLE_SECONDS"] = str(config.drain_idle_seconds)
-  child_env["BQAA_DRAIN_POLL_SECONDS"] = str(config.drain_poll_seconds)
-  child_env["BQAA_DRAIN_BATCH_SIZE"] = str(config.drain_batch_size)
-  child_env["BQAA_DRAIN_MAX_RETRY_AGE_SECONDS"] = str(
-      config.drain_max_retry_age_seconds
-  )
-  child_env["BQAA_DRY_RUN"] = "true" if config.dry_run else "false"
   if config.location:
     child_env["BQAA_LOCATION"] = config.location
   else:
     child_env.pop("BQAA_LOCATION", None)
+  child_env["BQAA_MAX_CONTENT_LENGTH"] = str(config.max_content_length)
+  child_env["BQAA_LOG_FILE"] = config.log_file
+  child_env["BQAA_MAX_LOG_BYTES"] = str(config.max_log_bytes)
+  child_env["BQAA_SPOOL_DIR"] = config.spool_dir
+  child_env["BQAA_STATE_DIR"] = config.state_dir
+  child_env["BQAA_STATE_TTL_HOURS"] = str(config.state_ttl_hours)
+  child_env["BQAA_TRANSCRIPT_MAX_BYTES"] = str(config.transcript_max_bytes)
+  child_env["BQAA_DRAIN_IDLE_SECONDS"] = str(config.drain_idle_seconds)
+  child_env["BQAA_DRAIN_POLL_SECONDS"] = str(config.drain_poll_seconds)
+  child_env["BQAA_DRAIN_BATCH_SIZE"] = str(config.drain_batch_size)
   if config.drain_retry_backoff_seconds is not None:
     child_env["BQAA_DRAIN_RETRY_BACKOFF_SECONDS"] = str(
         config.drain_retry_backoff_seconds
     )
   else:
     child_env.pop("BQAA_DRAIN_RETRY_BACKOFF_SECONDS", None)
+  child_env["BQAA_DRAIN_MAX_RETRY_AGE_SECONDS"] = str(
+      config.drain_max_retry_age_seconds
+  )
+  child_env["BQAA_WRITER_LABEL"] = config.writer_label or DEFAULT_WRITER_LABEL
 
   python_bin = env_python or sys.executable or "python3"
   try:
