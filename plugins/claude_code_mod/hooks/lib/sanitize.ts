@@ -1922,8 +1922,9 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     isLowerWordKey: boolean,
     tokQState: QuoteContext,
     isRecognizedConfigKey: boolean,
+    isSensitiveAssignKey: boolean,
   ): boolean => {
-    if (hasCtx && isBase64PaddedToken(coreToken) && !isRecognizedConfigKey) return false
+    if (hasCtx && isBase64PaddedToken(coreToken) && !isRecognizedConfigKey && !isSensitiveAssignKey) return false
     const eqLineStop = lineStopFor(curEffectiveMatchEnd)
     let spEnd = curEffectiveMatchEnd
     while (spEnd < eqLineStop && isSameLineWsAt(text, spEnd)) spEnd += 1
@@ -1931,7 +1932,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const boundedStop = Math.min(eqLineStop, spEnd + 64)
     const dualHeadStop = computeDualStop(spEnd, boundedStop, tokQState, curHasNewline)
     if (spEnd >= dualHeadStop) return false
-    const allowQuoteRhs = isLowerWordKey || !hasCtx || isRecognizedConfigKey
+    const allowQuoteRhs = isLowerWordKey || !hasCtx || isRecognizedConfigKey || isSensitiveAssignKey
     const spaceBeforeQuoteRhs = (() => {
       const ch = text[spEnd]
       if (ch === '"' || ch === "'" || ch === '`') {
@@ -2194,9 +2195,14 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             }
           } else {
             const hasAssignOrLineCommentCtx = precededByEqOrInComment
-            const allowPaddedLowerQuoteRhs =
-              isLowerWordKey && !endsWithDoubleEq && hasAssignOrLineCommentCtx
-            const allowPunctRhs = !endsWithDoubleEq && hasAssignOrLineCommentCtx
+            const isSensitiveAssignKey = assignKey.length <= 100 && isSensitiveKey(assignKey)
+            const allowPaddedQuoteRhs =
+              hasAssignOrLineCommentCtx &&
+              (isSensitiveAssignKey ||
+                isEmptyAssignIdentifier ||
+                ((isLowerWordKey || isRecognizedConfigKey) && !endsWithDoubleEq))
+            const allowPunctRhs =
+              hasAssignOrLineCommentCtx && (!endsWithDoubleEq || isSensitiveAssignKey)
             const isEmptyQuotedRhs =
               ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`') &&
                 effectiveAfter[1] === effectiveAfter[0] &&
@@ -2208,7 +2214,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                 isDelimOrSpaceAfterQuote(effectiveAfter[4]))
             const canKeepAssignRhs =
               hasAssignOrLineCommentCtx &&
-              (isRecognizedConfigKey || (assignKey.length <= 100 && isSensitiveKey(assignKey)))
+              (isRecognizedConfigKey || isSensitiveAssignKey)
             const assignRhs =
               canKeepAssignRhs &&
               !isEmptyQuotedRhs &&
@@ -2217,14 +2223,14 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                 effectiveAfter,
                 tokQState,
                 coreToken,
-                allowPaddedLowerQuoteRhs,
+                allowPaddedQuoteRhs,
                 allowPunctRhs,
               )
             if (assignRhs) {
               keepAndRewind()
               continue
             }
-            if (!hasAssignOrLineCommentCtx && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
+            if (!hasAssignOrLineCommentCtx && isSensitiveAssignKey) {
               if (
                 !isEmptyQuotedRhs &&
                 hasAssignRhsAt(
@@ -2232,8 +2238,8 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                   effectiveAfter,
                   tokQState,
                   coreToken,
-                  isLowerWordKey && !endsWithDoubleEq,
-                  !endsWithDoubleEq,
+                  true,
+                  true,
                 )
               ) {
                 const eqLineStop = lineStopFor(effectiveMatchEnd)
@@ -2241,7 +2247,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                 emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
                 continue
               }
-              if (trySpacedSensitiveEqRhs(false, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey)) {
+              if (trySpacedSensitiveEqRhs(false, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey, true)) {
                 continue
               }
               if (isEmptyQuotedRhs) {
@@ -2251,9 +2257,8 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             }
             if (
               hasAssignOrLineCommentCtx &&
-              assignKey.length <= 100 &&
-              isSensitiveKey(assignKey) &&
-              trySpacedSensitiveEqRhs(true, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey)
+              isSensitiveAssignKey &&
+              trySpacedSensitiveEqRhs(true, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey, true)
             ) {
               continue
             }
@@ -2298,11 +2303,18 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             effectiveAfter,
             tokQState,
             coreToken,
-            isLowerWordKey && !endsWithDoubleEq,
-            !endsWithDoubleEq || (isEmptyAssignIdentifier && isSensitiveKey(assignKey)),
+            true,
+            true,
           )
           if (singleAssignRhs) {
-            if (hasAssignOrCommentCtx) {
+            const quotedDelimOnPadded =
+              isBase64PaddedToken(coreToken) &&
+              ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`')
+                ? isDelimOrSpaceAfterQuote(effectiveAfter[1])
+                : effectiveAfter[0] === '\\' && (effectiveAfter[1] === '"' || effectiveAfter[1] === "'")
+                  ? isDelimOrSpaceAfterQuote(effectiveAfter[2])
+                  : false)
+            if (precededByEq || precededByColon || (tokQState.inComment && !quotedDelimOnPadded)) {
               keepAndRewind()
               continue
             }
@@ -2311,7 +2323,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
             continue
           }
-          if (trySpacedSensitiveEqRhs(hasAssignOrCommentCtx, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey)) {
+          if (trySpacedSensitiveEqRhs(hasAssignOrCommentCtx, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey, true)) {
             continue
           }
         } else if (!isBase64PaddedToken(coreToken)) {
@@ -4657,28 +4669,31 @@ function stripTrailingParenQualifier(s: string, withSep: boolean): string {
     end -= 1
     while (end > 0 && (s.charCodeAt(end - 1) === 32 || s.charCodeAt(end - 1) === 9)) end -= 1
   }
-  if (end === 0 || s.charCodeAt(end - 1) !== 41) return s
-  const closeIdx = end - 1
-  const minOpen = Math.max(0, closeIdx - 41)
-  let openIdx = -1
-  let depth = 1
-  for (let i = closeIdx - 1; i >= minOpen; i -= 1) {
-    const c = s.charCodeAt(i)
-    if (c === 10) break
-    if (c === 41) {
-      if (depth <= 0) break
-      depth += 1
-    } else if (c === 40) {
-      depth -= 1
-      if (depth <= 0) openIdx = i
+  for (let pass = 0; pass < 8; pass += 1) {
+    if (end === 0 || s.charCodeAt(end - 1) !== 41) break
+    const closeIdx = end - 1
+    const minOpen = Math.max(0, closeIdx - 41)
+    let openIdx = -1
+    let depth = 1
+    for (let i = closeIdx - 1; i >= minOpen; i -= 1) {
+      const c = s.charCodeAt(i)
+      if (c === 10) break
+      if (c === 41) {
+        if (depth <= 0) break
+        depth += 1
+      } else if (c === 40) {
+        depth -= 1
+        if (depth <= 0) openIdx = i
+      }
     }
+    if (openIdx === -1) break
+    const innerLen = closeIdx - openIdx - 1
+    if (innerLen < 1 || innerLen > 40) break
+    let labelEnd = openIdx
+    while (labelEnd > 0 && (s.charCodeAt(labelEnd - 1) === 32 || s.charCodeAt(labelEnd - 1) === 9)) labelEnd -= 1
+    end = labelEnd
   }
-  if (openIdx === -1) return s
-  const innerLen = closeIdx - openIdx - 1
-  if (innerLen < 1 || innerLen > 40) return s
-  let labelEnd = openIdx
-  while (labelEnd > 0 && (s.charCodeAt(labelEnd - 1) === 32 || s.charCodeAt(labelEnd - 1) === 9)) labelEnd -= 1
-  return s.slice(0, labelEnd)
+  return end === s.length ? s : s.slice(0, end)
 }
 
 const YAML_BLOCK_HEADER = /^([ \t]*(?:-[ \t]+)?)([A-Za-z0-9_.*"`'-]+(?:[ \t]*\([^\n]{1,40}\))?)[ \t]*:[ \t]*(?:[|>][+-]?\d*|\d*[|>][+-]?)[ \t]*(?:#[^\n]*)?$/
@@ -4764,8 +4779,8 @@ function redactK8sAndYamlBlocks(text: string, stats: SanitizeStats): string {
   return out.map(r => r.line + r.eol).join('')
 }
 
-const MD_WRAP_CLOSED = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_`])([A-Za-z_][A-Za-z0-9_.\t -]{0,80})\2([ \t]*(?:\([^\n]{1,40}\)[ \t]*)?[:=][ \t]*)(.+)$/
-const MD_WRAP_AROUND_SEP = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_])([A-Za-z_][A-Za-z0-9_.\t -]{0,80})([:=])\2([ \t]*)(.+)$/
+const MD_WRAP_CLOSED = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_`])([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,79}[A-Za-z0-9_.-])?(?:[ \t]*\([^\n]{1,40}\))?)\2([ \t]*(?:\([^\n]{1,40}\)[ \t]*)?[:=][ \t]*)(.+)$/
+const MD_WRAP_AROUND_SEP = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_])([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,79}[A-Za-z0-9_.-])?(?:[ \t]*\([^\n]{1,40}\))?)([:=])\2([ \t]*)(.+)$/
 const MD_PAREN_LABEL = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,59}[A-Za-z0-9_.-])?[ \t]*\([^\n]{1,40}\)[ \t]*[:=][ \t]*)(.+)$/
 const MD_SEPARATOR_ROW = /^\|(?:\s*:?-{2,}:?\s*\|)+\s*$/
 const GENERIC_KEY_COL_HEADERS = new Set([
@@ -4862,13 +4877,13 @@ function redactMarkdownLabelsAndTables(text: string, stats: SanitizeStats): stri
       let prefix = ''
       let val = ''
       const m1 = MD_WRAP_CLOSED.exec(line)
-      if (m1 !== null && isSensitiveLabel(m1[3] as string)) {
+      if (m1 !== null && isSensitiveLabel(stripTrailingParenQualifier(m1[3] as string, false))) {
         prefix = `${m1[1]}${m1[2]}${m1[3]}${m1[2]}${m1[4]}`
         val = m1[5] as string
         matched = true
       } else {
         const m2 = MD_WRAP_AROUND_SEP.exec(line)
-        if (m2 !== null && isSensitiveLabel(m2[3] as string)) {
+        if (m2 !== null && isSensitiveLabel(stripTrailingParenQualifier(m2[3] as string, false))) {
           prefix = `${m2[1]}${m2[2]}${m2[3]}${m2[4]}${m2[2]}${m2[5]}`
           val = m2[6] as string
           matched = true

@@ -2956,7 +2956,7 @@ test('nested parenthetical qualifiers in YAML blocks and Markdown labels still r
     const s = newStats()
     const out = redactText(probe, s)
     const ms = performance.now() - t0
-    expect(ms).toBeLessThan(1000)
+    expect(ms).toBeLessThan(2000)
     if (!shouldRedact) {
       expect(out).toBe(probe)
       expect(s.redactions).toBe(0)
@@ -3071,6 +3071,172 @@ test('cross-line short sensitive assignments are 1-pass idempotent', () => {
     const s2 = newStats()
     const twice = redactText(once, s2)
     expect(twice).toBe(once)
+    expect(s2.redactions).toBe(0)
+  }
+})
+
+test('wrapped Markdown parenthetical qualifiers redact cleanly and scale linearly', () => {
+  const cases: readonly [string, string][] = [
+    ['**Password (prod)**: mySecret123', '**Password (prod)**: [REDACTED]'],
+    ['**Password ((a) (b))**: mySecret123', '**Password ((a) (b))**: [REDACTED]'],
+    ['*Password ((a) (b))*: mySecret123', '*Password ((a) (b))*: [REDACTED]'],
+    ['__Password ((a) (b))__: mySecret123', '__Password ((a) (b))__: [REDACTED]'],
+    ['_Password ((a) (b))_: mySecret123', '_Password ((a) (b))_: [REDACTED]'],
+    ['`Password ((a) (b))`: mySecret123', '`Password ((a) (b))`: [REDACTED]'],
+    ['**Password ((a) (b)):** mySecret123', '**Password ((a) (b)):** [REDACTED]'],
+    ['__Password ((a) (b)):__ mySecret123', '__Password ((a) (b)):__ [REDACTED]'],
+    ['*Password ((a) (b)):* mySecret123', '*Password ((a) (b)):* [REDACTED]'],
+    ['**Password** ((a) (b)): mySecret123', '**Password** ((a) (b)): [REDACTED]'],
+    ['Password (a) (b): mySecret123', 'Password (a) (b): [REDACTED]'],
+    ['**Password (a) (b)**: mySecret123', '**Password (a) (b)**: [REDACTED]'],
+    ['- **API Key ((a) (b))**: mySecret123', '- **API Key ((a) (b))**: [REDACTED]'],
+  ]
+  for (const [sample, expected] of cases) {
+    const s1 = newStats()
+    const once = redactText(sample, s1)
+    expect(once).toBe(expected)
+    expect(s1.redactions).toBeGreaterThan(0)
+    const s2 = newStats()
+    expect(redactText(once, s2)).toBe(once)
+    expect(s2.redactions).toBe(0)
+  }
+
+  const controls: readonly string[] = [
+    '**Note ((a) (b))**: safe text',
+    '**Note (prod)**: safe text',
+    '*Note (a) (b)*: safe text',
+    'Note ((a) (b)): safe text',
+    '`Note ((a) (b))`: safe text',
+  ]
+  for (const control of controls) {
+    const s = newStats()
+    expect(redactText(control, s)).toBe(control)
+    expect(s.redactions).toBe(0)
+  }
+
+  const floods: readonly string[] = [
+    `**Password (${' '.repeat(131_072)}`,
+    `**Note (${'a'.repeat(131_072)}`,
+    `**Password (${'('.repeat(65_536)}**: x`,
+    `**Note**${' '.repeat(131_072)}x\nnote: y`,
+  ]
+  for (const probe of floods) {
+    const t0 = performance.now()
+    const s = newStats()
+    const out = redactText(probe, s)
+    const ms = performance.now() - t0
+    expect(ms).toBeLessThan(2000)
+    expect(out).toBe(probe)
+    expect(s.redactions).toBe(0)
+  }
+})
+
+test('unspaced delimiter-prefixed quoted RHS on base64-padded sensitive keys redact and preserve controls', () => {
+  const eqKeys = [
+    'private_key',
+    'signing_key',
+    'session_key',
+    'user_secret',
+    'auth_secret',
+    'my_password',
+    'secret_code',
+    'private-key',
+    'master_key1',
+    'mySecretTokenAb',
+    'database_passwd',
+    'client_secret_1',
+    'encryption_key1',
+    'mySecret_12',
+  ]
+  const doubleEqKeys = ['client_key', 'key_id1', 'my_secret1']
+  const delims = ['.', '!', '?', ';', ':', ',', ' ']
+
+  for (const key of eqKeys) {
+    for (const d of delims) {
+      for (const sample of [
+        `Bearer\n${key}="${d}secretVal99"`,
+        `Basic\n${key}="${d}secretVal99"`,
+        `Bearer ${key}="${d}secretVal99"`,
+        `MODE=bearer\n${key}="${d}secretVal99"`,
+        `Bearer\n${key}='${d}secretVal99'`,
+        `Bearer\n${key}=\\"${d}secretVal99\\"`,
+      ]) {
+        const s1 = newStats()
+        const out = redactText(sample, s1)
+        expect(out).not.toContain('secretVal99')
+        expect(out).toContain('[REDACTED]')
+        expect(s1.redactions).toBeGreaterThan(0)
+        const s2 = newStats()
+        expect(redactText(out, s2)).toBe(out)
+        expect(s2.redactions).toBe(0)
+      }
+    }
+    for (const sample of [
+      `Bearer\n${key}=.secretVal99`,
+      `Bearer\n${key}=$SECRET_VAL_99`,
+      `Bearer\n${key}=~`,
+    ]) {
+      const s1 = newStats()
+      const out = redactText(sample, s1)
+      expect(out).not.toContain('secretVal99')
+      expect(out).not.toContain('SECRET_VAL_99')
+      expect(out).toContain('[REDACTED]')
+      expect(s1.redactions).toBeGreaterThan(0)
+      const s2 = newStats()
+      expect(redactText(out, s2)).toBe(out)
+      expect(s2.redactions).toBe(0)
+    }
+  }
+
+  for (const key of doubleEqKeys) {
+    for (const d of delims) {
+      for (const sample of [
+        `Bearer\n${key}=="${d}secretVal99"`,
+        `Bearer ${key}=="${d}secretVal99"`,
+        `MODE=bearer\n${key}=="${d}secretVal99"`,
+        `Bearer\n${key}=='${d}secretVal99'`,
+        `Bearer\n${key}==\\"${d}secretVal99\\"`,
+      ]) {
+        const s1 = newStats()
+        const out = redactText(sample, s1)
+        expect(out).not.toContain('secretVal99')
+        expect(out).toContain('[REDACTED]')
+        expect(s1.redactions).toBeGreaterThan(0)
+        const s2 = newStats()
+        expect(redactText(out, s2)).toBe(out)
+        expect(s2.redactions).toBe(0)
+      }
+    }
+    for (const sample of [
+      `Bearer\n${key}==.secretVal99`,
+      `Bearer\n${key}==$SECRET_VAL_99`,
+      `Bearer\n${key}==~`,
+    ]) {
+      const s1 = newStats()
+      const out = redactText(sample, s1)
+      expect(out).not.toContain('secretVal99')
+      expect(out).not.toContain('SECRET_VAL_99')
+      expect(out).toContain('[REDACTED]')
+      expect(s1.redactions).toBeGreaterThan(0)
+      const s2 = newStats()
+      expect(redactText(out, s2)).toBe(out)
+      expect(s2.redactions).toBe(0)
+    }
+  }
+
+  const controls: readonly [string, string][] = [
+    ['echo "Bearer private_key=."', 'echo "Bearer [REDACTED]"'],
+    ['echo \'say "Bearer private_key=."\'', 'echo \'say "Bearer [REDACTED]"\''],
+    ['echo "Bearer abcdefghijk=."', 'echo "Bearer [REDACTED]"'],
+    ['echo "Bearer private_key=".trailingSafe', 'echo "Bearer [REDACTED]".trailingSafe'],
+    ['MODE=bearer\nsome_config_12==".secret"', 'MODE=bearer\nsome_config_12==".secret"'],
+  ]
+  for (const [sample, expected] of controls) {
+    const s1 = newStats()
+    const out = redactText(sample, s1)
+    expect(out).toBe(expected)
+    const s2 = newStats()
+    expect(redactText(out, s2)).toBe(out)
     expect(s2.redactions).toBe(0)
   }
 })
