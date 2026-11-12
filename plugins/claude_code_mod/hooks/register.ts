@@ -1442,7 +1442,6 @@ export const register: Register = (on, registered) => {
         })
       : null
     let waitFloorExpired = false
-    const listCap = shouldWait && waitMs > 0 ? Math.min(listBudget, waitMs) : listBudget
     const floorTimer =
       shouldWait && !isInteractiveSession && waitMs >= MIN_NON_INTERACTIVE_BACKFILL_WAIT_MS
         ? $.clock.after(Math.max(0, waitMs - MIN_NON_INTERACTIVE_BACKFILL_WAIT_MS + 1), () => {
@@ -1452,7 +1451,8 @@ export const register: Register = (on, registered) => {
     try {
       let summary: DeadLetterSummary
       try {
-        summary = await deadLetterSummary($, listCap)
+        // Always bound listing by listBudget (monotonic in remainingMs) while timer/floorTimer run concurrently.
+        summary = await deadLetterSummary($, listBudget)
       } finally {
         floorTimer?.cancel()
       }

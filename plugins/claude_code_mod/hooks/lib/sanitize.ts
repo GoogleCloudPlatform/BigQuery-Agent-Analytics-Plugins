@@ -450,6 +450,13 @@ function isPrintableLatin1WithColon(bytes: number[]): boolean {
   return hasColon && hasNonColon
 }
 
+// Accepts printable UTF-8 or Latin-1 (ISO-8859-1) `user:password` shapes per RFC 7617
+// without token-casing vetoes, so lowercase or mixed-case Latin-1 Basic secrets redact.
+// Trade-off: capitalized Base64-decodable tokens beginning with `O[i-n]` or `O[q-v]` whose
+// trailing groups also decode as printable (e.g. `Output`, `Okay`, `Outcome`, `Overview`,
+// `Ours`, `Ouch`, `Only`) decode to `:<password>` and are conservatively redacted, while
+// `Og`/`Oh` (C0 control `0x00`-`0x1f`) and `Oo`/`Op` (C1 control `0x80`-`0x9f`, e.g.
+// `Options`) are rejected and preserved.
 function decodeBase64PrintableColon(token: string): boolean {
   let cleanLen = token.length
   while (cleanLen > 0 && token.charCodeAt(cleanLen - 1) === 61) cleanLen -= 1

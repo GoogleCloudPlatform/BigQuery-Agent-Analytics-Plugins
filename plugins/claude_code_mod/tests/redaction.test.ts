@@ -3100,6 +3100,8 @@ test('RFC 7617 Latin-1 credentials redact across single-line, wrapped, content, 
   const controls: readonly string[] = [
     'The API uses basic overview notes.',
     'Follow the Basic options guide below.',
+    'Basic Options',
+    'Basic\nOptions',
     'basic output format notes',
     'Basic\noptions guide',
     'Basic\norder of operations',
@@ -3120,9 +3122,12 @@ test('RFC 7617 Latin-1 credentials redact across single-line, wrapped, content, 
   }
 
   // Intentional conservative trade-off: capitalized prose tokens starting with
-  // 'O[g-v]' (such as Output/Okay/Outcome/Overview) decode in Base64 Latin-1 to
-  // printable strings starting with ':' (valid RFC 7617 empty-user credentials),
-  // so they are conservatively redacted while lowercase forms remain preserved.
+  // 'O[i-n]' or 'O[q-v]' whose trailing groups also decode as printable
+  // (such as Output/Okay/Outcome/Overview/Ours/Ouch/Only) decode in Base64
+  // Latin-1/UTF-8 to printable strings starting with ':' (valid RFC 7617
+  // empty-user credentials), so they are conservatively redacted while
+  // 'Og'/'Oh' (C0 controls) and 'Oo'/'Op' (C1 controls 0x80-0x9f, e.g. Options)
+  // and lowercase forms remain preserved.
   const conservativeCapitalizedProse: readonly [string, string][] = [
     ['Basic Output', 'Output'],
     ['Basic\nOutput', 'Output'],
@@ -3132,6 +3137,12 @@ test('RFC 7617 Latin-1 credentials redact across single-line, wrapped, content, 
     ['Basic\nOutcome', 'Outcome'],
     ['Basic Overview', 'Overview'],
     ['Basic\nOverview', 'Overview'],
+    ['Basic Ours', 'Ours'],
+    ['Basic\nOurs', 'Ours'],
+    ['Basic Ouch', 'Ouch'],
+    ['Basic\nOuch', 'Ouch'],
+    ['Basic Only', 'Only'],
+    ['Basic\nOnly', 'Only'],
   ]
   for (const [sample, token] of conservativeCapitalizedProse) {
     const s = newStats()

@@ -57,6 +57,14 @@ DIST_DIR = (
     / "claude_code_dist"
     / "bigquery-agent-analytics-tracing"
 )
+
+
+def _ignore_claude_code_src(src: str, names: list[str]) -> set[str]:
+    """Ignore Python bytecode everywhere, and ignore vendor/ only at SRC_DIR root."""
+    ignored = set(shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")(src, names))
+    if Path(src).resolve() == SRC_DIR.resolve() and "vendor" in names:
+        ignored.add("vendor")
+    return ignored
 VENDOR_DIR = DIST_DIR / "vendor" / "bigquery_agent_analytics_tracing"
 CATALOG_PATH = REPO_ROOT / ".claude-plugin" / "marketplace.json"
 
@@ -5791,11 +5799,11 @@ class TestBuildDist39(unittest.TestCase):
         for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
             dst = tmp_repo / item
             dst.parent.mkdir(parents=True, exist_ok=True)
-            ignored = ("__pycache__", "*.pyc", "*.pyo", "vendor") if item == "plugins/claude_code" else ("__pycache__", "*.pyc", "*.pyo")
+            ignore_fn = _ignore_claude_code_src if item == "plugins/claude_code" else shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
             shutil.copytree(
                 REPO_ROOT / item,
                 dst,
-                ignore=shutil.ignore_patterns(*ignored),
+                ignore=ignore_fn,
             )
 
         def _git(*args, cwd=tmp_repo):
@@ -5889,11 +5897,11 @@ class TestBuildDist39(unittest.TestCase):
         for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
             dst = plugins_repo / item
             dst.parent.mkdir(parents=True, exist_ok=True)
-            ignored = ("__pycache__", "*.pyc", "*.pyo", "vendor") if item == "plugins/claude_code" else ("__pycache__", "*.pyc", "*.pyo")
+            ignore_fn = _ignore_claude_code_src if item == "plugins/claude_code" else shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
             shutil.copytree(
                 REPO_ROOT / item,
                 dst,
-                ignore=shutil.ignore_patterns(*ignored),
+                ignore=ignore_fn,
             )
         _git("init", "-q", cwd=plugins_repo)
         _git("add", "-A", cwd=plugins_repo)
@@ -5906,7 +5914,7 @@ class TestBuildDist39(unittest.TestCase):
         shutil.copytree(
             REPO_ROOT / "plugins/claude_code",
             sdk_repo / "plugins/claude_code",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "vendor"),
+            ignore=_ignore_claude_code_src,
         )
         shutil.copytree(
             VENDOR_DIR,
@@ -5977,11 +5985,11 @@ class TestBuildDist39(unittest.TestCase):
         for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
             dst = isolated_plugins / item
             dst.parent.mkdir(parents=True, exist_ok=True)
-            ignored = ("__pycache__", "*.pyc", "*.pyo", "vendor") if item == "plugins/claude_code" else ("__pycache__", "*.pyc", "*.pyo")
+            ignore_fn = _ignore_claude_code_src if item == "plugins/claude_code" else shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
             shutil.copytree(
                 REPO_ROOT / item,
                 dst,
-                ignore=shutil.ignore_patterns(*ignored),
+                ignore=ignore_fn,
             )
         _git("init", "-q", cwd=isolated_plugins)
         _git("remote", "add", "origin", str(plugins_repo), cwd=isolated_plugins)
@@ -6080,11 +6088,11 @@ class TestBuildDist39(unittest.TestCase):
         for item in (".claude-plugin", "plugins/claude_code", "plugins/claude_code_dist"):
             dst = target_dir / item
             dst.parent.mkdir(parents=True, exist_ok=True)
-            ignored = ("__pycache__", "*.pyc", "*.pyo", "vendor") if item == "plugins/claude_code" else ("__pycache__", "*.pyc", "*.pyo")
+            ignore_fn = _ignore_claude_code_src if item == "plugins/claude_code" else shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
             shutil.copytree(
                 REPO_ROOT / item,
                 dst,
-                ignore=shutil.ignore_patterns(*ignored),
+                ignore=ignore_fn,
             )
         for cmd in (
             ("init", "-q"),
@@ -6440,7 +6448,7 @@ class TestBuildDist39(unittest.TestCase):
         shutil.copytree(
             REPO_ROOT / "plugins/claude_code",
             sdk_matching / "plugins/claude_code",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "vendor"),
+            ignore=_ignore_claude_code_src,
         )
         shutil.copytree(
             dist_dir / "vendor",
@@ -6484,7 +6492,7 @@ class TestBuildDist39(unittest.TestCase):
         shutil.copytree(
             REPO_ROOT / "plugins/claude_code",
             sdk_missing / "plugins/claude_code",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "vendor"),
+            ignore=_ignore_claude_code_src,
         )
         _git("init", "-q", cwd=sdk_missing)
         _git("add", "-A", cwd=sdk_missing)
@@ -6507,7 +6515,7 @@ class TestBuildDist39(unittest.TestCase):
         shutil.copytree(
             REPO_ROOT / "plugins/claude_code",
             sdk_pyc_only / "plugins/claude_code",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "vendor"),
+            ignore=_ignore_claude_code_src,
         )
         pyc_dir = sdk_pyc_only / "plugins/claude_code/vendor/bigquery_agent_analytics_tracing/__pycache__"
         pyc_dir.mkdir(parents=True, exist_ok=True)
@@ -6563,6 +6571,16 @@ class TestBuildDist39(unittest.TestCase):
             expected_drain,
         )
         self.assertFalse((out_dir / "vendor/extra_untracked.py").exists())
+
+    def test_ignore_claude_code_src_scoped_to_root(self):
+        self.assertEqual(
+            _ignore_claude_code_src(str(SRC_DIR), ["vendor", "hooks", "__pycache__", "a.pyc"]),
+            {"vendor", "__pycache__", "a.pyc"},
+        )
+        self.assertEqual(
+            _ignore_claude_code_src(str(SRC_DIR / "hooks"), ["vendor", "common.sh", "__pycache__", "b.pyo"]),
+            {"__pycache__", "b.pyo"},
+        )
 
 
 if __name__ == "__main__":
