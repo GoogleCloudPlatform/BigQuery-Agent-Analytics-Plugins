@@ -27,7 +27,7 @@ import { packFiles, parseFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
 
-import { ACCESS_TOKEN, COMMAND, OK_INSERT, OPTIONS, PARTITION_DIR, SESSION_ID, TABLE_REF, type World, deadLetterFiles, setUp, startSession, utf8Bytes } from './helpers.ts'
+import { ACCESS_TOKEN, COMMAND, DEAD_LETTER_DIR, OK_INSERT, OPTIONS, PARTITION_DIR, SESSION_ID, TABLE_REF, type World, deadLetterFiles, setUp, startSession, utf8Bytes } from './helpers.ts'
 
 const PLUGIN = 'bigquery-agent-analytics-mod'
 
@@ -1981,5 +1981,96 @@ for (const remainingMs of [Number.NaN, 1_500, 1_501] as const) {
     }
     const status = await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 200 })
     expect(status.text ?? '').toContain('backfill: running')
+  })
+}
+
+for (const mode of [
+  { label: 'interactive /bqaa-status', isInteractive: true, args: '', expectProbe: false },
+  { label: 'interactive /bqaa-status check', isInteractive: true, args: 'check', expectProbe: true },
+  { label: 'headless -p /bqaa-status', isInteractive: false, args: '', expectProbe: true },
+] as const) {
+  test(`${mode.label} shares a single 1800 ms command deadline across slow fs.list and destination probe`, { options: OPTIONS }, async ($, on) => {
+    const worldSlow = setUp(on)
+    worldSlow.processDelayMs = 15_000
+    worldSlow.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-slow-1.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    let listDelayMs = 2_000
+    const listCalls: string[] = []
+    for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+      on('fs.list', { path: dir }, async (_$, e, next) => {
+        listCalls.push(e.path)
+        if (listDelayMs > 0) await worldSlow.clock.sleep(listDelayMs)
+        return next(e)
+      })
+    }
+    await $.session.start({ surface: mode.isInteractive ? 'terminal' : null, isInteractive: mode.isInteractive, cwd: '/work/my-repo' })
+
+    const t0 = worldSlow.clock.now()
+    let finishedAt = -1
+    const running = $.command.run({ command: 'bqaa-status', args: mode.args, ...COMMAND }, { budgetMs: 1_800 }).then(res => {
+      finishedAt = worldSlow.clock.now()
+      return res
+    })
+    await worldSlow.clock.advance(300)
+    const res = await running
+    const text = res.text ?? ''
+    expect(finishedAt - t0).toBeLessThanOrEqual(300)
+    expect(finishedAt - t0).toBeLessThan(1_800)
+    expect(text).toContain('dead-letter: timed out listing dead-letter directory')
+    if (mode.expectProbe) expect(text).toContain('destination check: no token within')
+    expect(listCalls).toHaveLength(1)
+
+    await worldSlow.clock.advance(2_000)
+    expect(listCalls).toHaveLength(1)
+
+    listDelayMs = 0
+    worldSlow.processDelayMs = 0
+    const recovered = await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 1_800 })
+    expect(recovered.text ?? '').toContain(`dead-letter: 1 file(s)`)
+  })
+}
+
+for (const mode of [
+  { label: 'interactive /bqaa-backfill wait', isInteractive: true, args: 'wait' },
+  { label: 'headless -p /bqaa-backfill', isInteractive: false, args: '' },
+] as const) {
+  test(`${mode.label} bounds slow fs.list under 1800 ms command deadline`, { options: OPTIONS }, async ($, on) => {
+    const worldSlow = setUp(on)
+    worldSlow.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-slow-2.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    let listDelayMs = 2_000
+    const listCalls: string[] = []
+    for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+      on('fs.list', { path: dir }, async (_$, e, next) => {
+        listCalls.push(e.path)
+        if (listDelayMs > 0) await worldSlow.clock.sleep(listDelayMs)
+        return next(e)
+      })
+    }
+    await $.session.start({ surface: mode.isInteractive ? 'terminal' : null, isInteractive: mode.isInteractive, cwd: '/work/my-repo' })
+
+    const t0 = worldSlow.clock.now()
+    let finishedAt = -1
+    const running = $.command.run({ command: 'bqaa-backfill', args: mode.args, ...COMMAND }, { budgetMs: 1_800 }).then(res => {
+      finishedAt = worldSlow.clock.now()
+      return res
+    })
+    await worldSlow.clock.advance(300)
+    const res = await running
+    expect(finishedAt - t0).toBeLessThanOrEqual(300)
+    expect(finishedAt - t0).toBeLessThan(1_800)
+    expect(res.text ?? '').toContain('timed out listing dead-letter directory')
+    expect(listCalls).toHaveLength(1)
+
+    await worldSlow.clock.advance(2_000)
+    expect(listCalls).toHaveLength(1)
+
+    listDelayMs = 0
+    const statusAfter = await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 1_800 })
+    expect(statusAfter.text ?? '').toContain('dead-letter: 1 file(s)')
   })
 }

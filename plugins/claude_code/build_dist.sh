@@ -77,6 +77,7 @@ build() {
   local src="$1"
   local out="$2"
   local target_version="${3:-}"
+  local allow_dist_vendor="${4:-1}"
   local tmp_stage
   tmp_stage="$(mktemp -d)"
 
@@ -120,7 +121,8 @@ pathlib.Path(sys.argv[2]).write_text(
 PY
 
   # Vendor directly from producers/ when building from an SDK layout, else
-  # preserve vendor/ from existing out dir or committed dist/vendor.
+  # use archived vendor/ from src when present, else (when permitted) preserve
+  # vendor/ from existing out dir or committed dist/vendor.
   local sdk_pkg_src="$src/../../producers/src/bigquery_agent_analytics_tracing"
   if [[ -d "$sdk_pkg_src" ]]; then
     mkdir -p "$tmp_stage/vendor"
@@ -130,10 +132,16 @@ PY
     printf 'Metadata-Version: 2.1\nName: bigquery-agent-analytics-tracing\nVersion: %s\n' \
       "$target_version" > "$dist_info_dir/METADATA"
     chmod 0644 "$dist_info_dir/METADATA"
-  elif [[ -d "$out/vendor" ]]; then
+  elif [[ -d "$src/vendor" ]]; then
+    cp -Rp "$src/vendor" "$tmp_stage/vendor"
+  elif [[ "$allow_dist_vendor" -eq 1 && -d "$out/vendor" ]]; then
     cp -Rp "$out/vendor" "$tmp_stage/vendor"
-  elif [[ -d "$dist/vendor" ]]; then
+  elif [[ "$allow_dist_vendor" -eq 1 && -d "$dist/vendor" ]]; then
     cp -Rp "$dist/vendor" "$tmp_stage/vendor"
+  elif [[ "$allow_dist_vendor" -eq 0 ]]; then
+    rm -rf "$tmp_stage"
+    echo "not ok - cannot reconstruct vendor/ for snapshot (neither producers/ nor archived vendor/ exists)"
+    return 1
   fi
   strip_bytecode "$tmp_stage"
 
@@ -391,12 +399,15 @@ verify_tag_snapshot() {
       if ! git_sdk "$tag_repo" archive "$tag_name" plugins/claude_code producers | tar -x -C "$tag_stage"; then
         return 1
       fi
-    else
+    elif git_sdk "$tag_repo" ls-tree -r --name-only "$tag_name" -- plugins/claude_code/vendor | grep -q .; then
       if ! git_sdk "$tag_repo" archive "$tag_name" plugins/claude_code | tar -x -C "$tag_stage"; then
         return 1
       fi
+    else
+      echo "not ok - release tag $tag_name has neither producers/ nor plugins/claude_code/vendor to reconstruct vendor/"
+      return 1
     fi
-    build "$tag_stage/plugins/claude_code" "$tag_built" "$target_ver" || return 1
+    build "$tag_stage/plugins/claude_code" "$tag_built" "$target_ver" 0 || return 1
     same_tree "$tag_built" "$dist"
     return $?
   else

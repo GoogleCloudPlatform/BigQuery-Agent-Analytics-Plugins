@@ -2772,16 +2772,15 @@ test('cross-line Bearer/Basic prose and empty-assignment regressions redact in r
     'Basic\ncredentials',
     'Basic\nAuthenticationGuide',
     'Basic\nConfiguration details follow',
-    'Basic Output formatting',
-    'Basic\nOutput',
-    'Basic\nOutputs',
-    'Basic\nOutcome',
-    'Basic\nOkay',
-    'Basic\nOverview',
+    'Basic output formatting',
+    'Basic\noutput',
+    'Basic\noutputs',
+    'Basic\noutcome',
+    'Basic\noverview',
     'Basic\nOptions',
     'Basic\nObjects',
     'Basic\nOrder',
-    'Basic\nOutputFormat',
+    'Basic\noutput format',
     'Bearer\nfoo=""',
   ]
 
@@ -3016,8 +3015,20 @@ test('base64-padded-length sensitive keys with spaced RHS redact and stay 1-pass
   }
 })
 
-test('RFC 7617 Latin-1 credentials redact while mixed-case/suffixed Basic prose stays preserved', () => {
+test('RFC 7617 Latin-1 credentials redact across single-line, wrapped, content, and error_message while ordinary Basic prose stays preserved', () => {
   const leaks: readonly [string, string][] = [
+    ['Basic Yjrpampqampq', 'Yjrpampqampq'],
+    ['Basic\nYjrpampqampq', 'Yjrpampqampq'],
+    ['Basic Ouchampqampq', 'Ouchampqampq'],
+    ['Basic\nOuchampqampq', 'Ouchampqampq'],
+    ['Basic\r\nYjrpampqampq', 'Yjrpampqampq'],
+    ['Basic\u2028Ouchampqampq', 'Ouchampqampq'],
+    ['Basic\u2029Yjrpampqampq', 'Yjrpampqampq'],
+    ['Basic YTpi', 'YTpi'],
+    ['Basic Yjpj', 'Yjpj'],
+    ['Basic\nYjpj', 'Yjpj'],
+    ['Basic w6k6eg==', 'w6k6eg=='],
+    ['Basic\nw6k6eg==', 'w6k6eg=='],
     ['Basic OmtlecPh', 'OmtlecPh'],
     ['Basic OmtlefOx', 'OmtlefOx'],
     ['Basic Omtleeft', 'Omtleeft'],
@@ -3033,16 +3044,57 @@ test('RFC 7617 Latin-1 credentials redact while mixed-case/suffixed Basic prose 
     const reStats = newStats()
     expect(redactText(out, reStats)).toBe(out)
     expect(reStats.redactions).toBe(0)
+
+    const builtContent = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e-latin1-c',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: sample },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    const serializedContent = builtContent.row.content ?? ''
+    expect(serializedContent).not.toContain(token)
+    expect(serializedContent).toContain('[REDACTED]')
+    expect(builtContent.redactions).toBeGreaterThan(0)
+
+    const builtError = buildRow({
+      eventType: 'TOOL_ERROR',
+      timestampMs: 0,
+      eventId: 'e-latin1-e',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: null,
+      attributes: {},
+      status: 'ERROR',
+      errorMessage: sample,
+      maxPayloadChars: 16_384,
+    })
+    const errOut = builtError.row.error_message ?? ''
+    expect(errOut).not.toContain(token)
+    expect(errOut).toContain('[REDACTED]')
+    expect(builtError.redactions).toBeGreaterThan(0)
   }
 
   const controls: readonly string[] = [
-    'Basic OutputJSON support',
-    'Basic OutputHTML',
-    'Basic Output2',
-    'Basic Order66',
-    'Basic Ours',
-    'Basic Ouch',
-    'Basic OutputFormat',
+    'The API uses basic overview notes.',
+    'Follow the Basic options guide below.',
+    'basic output format notes',
+    'Basic\noptions guide',
+    'Basic\norder of operations',
+    'Basic\nobjects overview',
   ]
   for (const control of controls) {
     const s = newStats()

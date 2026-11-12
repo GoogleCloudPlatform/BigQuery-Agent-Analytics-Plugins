@@ -847,7 +847,7 @@ function closeWelcome($: EngineInterface, landedOnly = false): void {
 // records beside an emptied file in the same directory. A record beside a
 // file that still holds rows (a replay's mark while it sends, say), or beside
 // no file at all, is no leftover.
-async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary> {
+async function deadLetterSummary($: EngineInterface, timeoutMs?: number): Promise<DeadLetterSummary> {
   if (config.deadLetterDir === '') return { error: 'no dead-letter directory configured' }
   const dir = deadLetterPartition(config)
   const summary = {
@@ -883,39 +883,65 @@ async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary>
     }
     summary.elsewhereRetired += recordsOfEmptied(entries)
   }
-  try {
-    if (!(await $.fs.exists(config.deadLetterDir))) return summary
-    if (await $.fs.exists(dir)) {
-      const entries = await $.fs.list(dir)
-      for (const entry of entries) {
-        const kind = kindOf(entry.name)
-        if (entry.kind !== 'file' || kind === null) continue
-        if (entry.size === 0) {
-          summary.emptyFiles += 1
-          continue
+  let timedOut = false
+  const walk = async (): Promise<DeadLetterSummary> => {
+    try {
+      const hasRoot = await $.fs.exists(config.deadLetterDir)
+      if (timedOut || !hasRoot) return summary
+      const hasPartition = await $.fs.exists(dir)
+      if (timedOut) return summary
+      if (hasPartition) {
+        const entries = await $.fs.list(dir)
+        if (timedOut) return summary
+        for (const entry of entries) {
+          const kind = kindOf(entry.name)
+          if (entry.kind !== 'file' || kind === null) continue
+          if (entry.size === 0) {
+            summary.emptyFiles += 1
+            continue
+          }
+          summary.files += 1
+          summary.bytes += entry.size
+          summary.byKind[kind] = (summary.byKind[kind] ?? 0) + 1
+          if (entry.size > HOST_FILE_BYTES) summary.oversized.push(entry.name)
         }
-        summary.files += 1
-        summary.bytes += entry.size
-        summary.byKind[kind] = (summary.byKind[kind] ?? 0) + 1
-        if (entry.size > HOST_FILE_BYTES) summary.oversized.push(entry.name)
+        summary.recordFiles = recordsOfEmptied(entries)
+        summary.retiredFiles = summary.emptyFiles + summary.recordFiles
       }
-      summary.recordFiles = recordsOfEmptied(entries)
-      summary.retiredFiles = summary.emptyFiles + summary.recordFiles
-    }
-    const mine = destinationDir(tableRef(config))
-    let dirs = 0
-    const loose: Entry[] = []
-    for (const entry of await $.fs.list(config.deadLetterDir)) {
-      if (entry.kind !== 'dir') loose.push(entry)
-      else if (entry.name !== mine && entry.name !== 'dry-run' && dirs < 50) {
-        dirs += 1
-        countElsewhere(await $.fs.list(joinPath(config.deadLetterDir, entry.name)))
+      const mine = destinationDir(tableRef(config))
+      let dirs = 0
+      const loose: Entry[] = []
+      const rootEntries = await $.fs.list(config.deadLetterDir)
+      if (timedOut) return summary
+      for (const entry of rootEntries) {
+        if (entry.kind !== 'dir') loose.push(entry)
+        else if (entry.name !== mine && entry.name !== 'dry-run' && dirs < 50) {
+          dirs += 1
+          const subEntries = await $.fs.list(joinPath(config.deadLetterDir, entry.name))
+          if (timedOut) return summary
+          countElsewhere(subEntries)
+        }
       }
+      countElsewhere(loose)
+      return summary
+    } catch (err) {
+      return { error: clean(`could not list ${config.deadLetterDir}: ${errorText(err)}`, 300) }
     }
-    countElsewhere(loose)
-    return summary
-  } catch (err) {
-    return { error: clean(`could not list ${config.deadLetterDir}: ${errorText(err)}`, 300) }
+  }
+  if (timeoutMs === undefined || timeoutMs === Number.POSITIVE_INFINITY) return walk()
+  const limitMs = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 0
+  let onTimeout = (): void => undefined
+  const timedOutPromise = new Promise<DeadLetterSummary>(resolve => {
+    onTimeout = () => {
+      timedOut = true
+      resolve({ error: 'timed out listing dead-letter directory' })
+    }
+  })
+  const timer = $.clock.after(limitMs, onTimeout)
+  try {
+    return await Promise.race([walk(), timedOutPromise])
+  } finally {
+    timer.cancel()
   }
 }
 
@@ -1340,8 +1366,11 @@ export const register: Register = (on, registered) => {
     // command hook budget (leaving room for a retry with a fresh token after
     // a 401 when time remains).
     const explicitCheck = (e.args ?? '').trim() === 'check'
-    const destinationCheck = !isInteractiveSession || explicitCheck ? await current.probeDestination(3000, explicitCheck, commandBudgetMs(next, Date.now() - hookStartedAt)) : null
-    const summary = await deadLetterSummary($)
+    const budgetMs = commandBudgetMs(next, Date.now() - hookStartedAt)
+    const [destinationCheck, summary] = await Promise.all([
+      !isInteractiveSession || explicitCheck ? current.probeDestination(3000, explicitCheck, budgetMs) : Promise.resolve(null),
+      deadLetterSummary($, budgetMs),
+    ])
     const snap = current.snapshot()
     const maskTransientSessionStart =
       !tracer.hasActivity && snap.consecutiveFailures === 0 && snap.inFlight === 0 && current.hasOnlyUnsentSessionStart(tracer.sessionId)
@@ -1382,12 +1411,6 @@ export const register: Register = (on, registered) => {
     const current = writer
     if (!current) return say('BigQuery Agent Analytics mod: not started.')
     if (current.isBackfilling) return say('BigQuery Agent Analytics mod: a backfill is already running; /bqaa-status shows progress.')
-    const summary = await deadLetterSummary($)
-    if ('error' in summary) return say(`BigQuery Agent Analytics mod: ${summary.error}`)
-    if (summary.files === 0) {
-      const elsewhere = summary.elsewhere > 0 ? ` ${summary.elsewhere} file(s) elsewhere in ${config.deadLetterDir} are for other tables or an older layout; they are replayed only under a configuration for their table.` : ''
-      return say(`BigQuery Agent Analytics mod: no dead-letter files for ${tableRef(config)} in ${summary.dir}.${elsewhere}`)
-    }
     // `force` replays afresh, too, a file another session's replay holds (its
     // mark, or its record cut off part-way): for a session that stopped
     // mid-replay. Runs in the background: the command returns now, and its
@@ -1398,52 +1421,57 @@ export const register: Register = (on, registered) => {
     const waitMs = Math.min(BACKFILL_WAIT_MS, commandBudgetMs(next, Date.now() - hookStartedAt))
     const shouldWait = !isInteractiveSession || words.includes('wait')
     const triggerMode = words.includes('force') ? 'force' : 'command'
-    if (shouldWait && !isInteractiveSession && waitMs < MIN_NON_INTERACTIVE_BACKFILL_WAIT_MS) {
-      return say(
-        `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} timed out (insufficient command budget) before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
-      )
-    }
-    const running = current.backfill(['spill', 'retry', 'rejected'], triggerMode)
-    const logWhenDone = (): void => {
-      void running
-        .then(report => $.ui.log(clean(formatBackfillReport(report), 500)))
-        .catch(() => {
-          internalErrors += 1
-        })
-    }
-    if (shouldWait && waitMs <= 0) {
-      logWhenDone()
-      return say(
-        `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} timed out waiting (insufficient command budget); backfill started in background; /bqaa-status shows progress.`,
-      )
-    }
-    if (!shouldWait) {
-      logWhenDone()
-      return say(`BigQuery Agent Analytics mod: backfill started for ${summary.files} file(s) in ${summary.dir}; /bqaa-status shows progress.`)
-    }
     let stopWaiting = (): void => undefined
     const waited = new Promise<null>(resolve => (stopWaiting = () => resolve(null)))
     const timer = $.clock.after(waitMs, () => stopWaiting())
-    let report: Awaited<ReturnType<typeof current.backfill>> | null
     try {
-      report = await Promise.race([running, waited])
+      const summary = await deadLetterSummary($, waitMs)
+      if ('error' in summary) return say(`BigQuery Agent Analytics mod: ${summary.error}`)
+      if (summary.files === 0) {
+        const elsewhere = summary.elsewhere > 0 ? ` ${summary.elsewhere} file(s) elsewhere in ${config.deadLetterDir} are for other tables or an older layout; they are replayed only under a configuration for their table.` : ''
+        return say(`BigQuery Agent Analytics mod: no dead-letter files for ${tableRef(config)} in ${summary.dir}.${elsewhere}`)
+      }
+      if (shouldWait && !isInteractiveSession && waitMs < MIN_NON_INTERACTIVE_BACKFILL_WAIT_MS) {
+        return say(
+          `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} timed out (insufficient command budget) before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
+        )
+      }
+      const running = current.backfill(['spill', 'retry', 'rejected'], triggerMode)
+      const logWhenDone = (): void => {
+        void running
+          .then(report => $.ui.log(clean(formatBackfillReport(report), 500)))
+          .catch(() => {
+            internalErrors += 1
+          })
+      }
+      if (shouldWait && waitMs <= 0) {
+        logWhenDone()
+        return say(
+          `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} timed out waiting (insufficient command budget); backfill started in background; /bqaa-status shows progress.`,
+        )
+      }
+      if (!shouldWait) {
+        logWhenDone()
+        return say(`BigQuery Agent Analytics mod: backfill started for ${summary.files} file(s) in ${summary.dir}; /bqaa-status shows progress.`)
+      }
+      const report = await Promise.race([running, waited])
+      if (report !== null) return say(formatBackfillReport(report))
+      if (!isInteractiveSession) {
+        // The run ends once this returns: no /bqaa-status comes after it, and
+        // the replay stops with the process. Whatever it comes to is no
+        // unhandled rejection.
+        void running.catch(() => {
+          internalErrors += 1
+        })
+        return say(
+          `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} did not finish within ${waitMs / 1000} s before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
+        )
+      }
+      logWhenDone()
+      return say(`BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} still running after ${waitMs / 1000} s; /bqaa-status shows progress.`)
     } finally {
       timer.cancel()
     }
-    if (report !== null) return say(formatBackfillReport(report))
-    if (!isInteractiveSession) {
-      // The run ends once this returns: no /bqaa-status comes after it, and
-      // the replay stops with the process. Whatever it comes to is no
-      // unhandled rejection.
-      void running.catch(() => {
-        internalErrors += 1
-      })
-      return say(
-        `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} did not finish within ${waitMs / 1000} s before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
-      )
-    }
-    logWhenDone()
-    return say(`BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} still running after ${waitMs / 1000} s; /bqaa-status shows progress.`)
   })
 
   // /bqaa-mod-setup, and /bqaa-setup, its earlier name: the setup.sh command

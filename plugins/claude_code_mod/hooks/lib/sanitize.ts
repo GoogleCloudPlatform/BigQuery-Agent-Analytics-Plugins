@@ -494,38 +494,10 @@ function decodeBase64PrintableColon(token: string): boolean {
     bytes.push((n >>> 16) & 0xff, (n >>> 8) & 0xff)
   }
   if (bytes.length < 3) return false
-  if (isPrintableUtf8WithColon(bytes)) return true
-  if (!isPrintableLatin1WithColon(bytes)) return false
-  return !LATIN1_PROSE_TOKEN_RE.test(token) || hasStructuredLatin1Credential(bytes)
+  return isPrintableUtf8WithColon(bytes) || isPrintableLatin1WithColon(bytes)
 }
 
 const PASCAL_CASE_WORD_RE = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/
-const LATIN1_PROSE_TOKEN_RE = /^(?:[a-z]+|[A-Z][a-z]+(?:[A-Z][a-z]{2,})*|[A-Z][a-z]{2,}(?:[A-Z]{2,}|\d{1,2}))$/
-
-const isAsciiUserByte = (b: number): boolean =>
-  (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b === 46 || b === 95 || b === 45
-
-const isAsciiLowerOrDigit = (b: number): boolean =>
-  (b >= 97 && b <= 122) || (b >= 48 && b <= 57)
-
-function hasStructuredLatin1Credential(bytes: number[]): boolean {
-  const colonIdx = bytes.indexOf(0x3a)
-  if (colonIdx >= 2) {
-    for (let i = 0; i < colonIdx; i += 1) {
-      if (!isAsciiUserByte(bytes[i] as number)) return false
-    }
-    return true
-  }
-  if (colonIdx === 0) {
-    return (
-      bytes.length >= 4 &&
-      isAsciiLowerOrDigit(bytes[1] as number) &&
-      isAsciiLowerOrDigit(bytes[2] as number) &&
-      isAsciiLowerOrDigit(bytes[3] as number)
-    )
-  }
-  return false
-}
 const PASCAL_COMPONENT_RE = /[A-Z][a-z]+/g
 const PROSE_PASCAL_WORDS = new Set([
   'configuration', 'word', 'words', 'authentication', 'authorization',

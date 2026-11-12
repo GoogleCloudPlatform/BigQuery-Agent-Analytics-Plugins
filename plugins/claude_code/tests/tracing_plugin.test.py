@@ -6413,6 +6413,113 @@ class TestBuildDist39(unittest.TestCase):
         )
         self.assertNotIn("ok - no tracing-v release tags exist yet", res.stdout)
 
+    def test_verify_tag_snapshot_source_only_vendor_reconstruction(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bqaa_tag_vendor_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        env = self._clean_git_env()
+
+        def _git(*args, cwd):
+            return subprocess.run(
+                ["git", "-C", str(cwd), *args],
+                capture_output=True, text=True, env=env, check=True, timeout=30,
+            )
+
+        plugins_repo = tmp / "plugins_repo"
+        check_script = self._init_plugins_repo(plugins_repo, env)
+        dist_dir = plugins_repo / "plugins/claude_code_dist/bigquery-agent-analytics-tracing"
+        dist_ver = json.loads((dist_dir / ".claude-plugin/plugin.json").read_text())["version"]
+        tag_name = f"tracing-v{dist_ver}"
+
+        # 1. Source-only tag (no producers/, no plugins/claude_code_dist/) with archived
+        #    plugins/claude_code/vendor/ matching dist/vendor -> --check PASSES.
+        sdk_matching = tmp / "sdk_matching"
+        shutil.copytree(
+            REPO_ROOT / "plugins/claude_code",
+            sdk_matching / "plugins/claude_code",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        shutil.copytree(
+            dist_dir / "vendor",
+            sdk_matching / "plugins/claude_code/vendor",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        _git("init", "-q", cwd=sdk_matching)
+        _git("add", "-f", "-A", cwd=sdk_matching)
+        _git("commit", "-q", "-m", "source-only with archived vendor", cwd=sdk_matching)
+        _git("tag", tag_name, cwd=sdk_matching)
+
+        ok_res = subprocess.run(
+            ["bash", str(check_script), "--check", "--sdk-repo", str(sdk_matching)],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertEqual(ok_res.returncode, 0, f"{ok_res.stdout}\n{ok_res.stderr}")
+        self.assertIn(f"ok - {tag_name} exists and committed dist matches {tag_name}", ok_res.stdout)
+
+        # 2. Source-only tag with archived plugins/claude_code/vendor/ differing from dist/vendor
+        #    must fail with differs: vendor/... (must not borrow current dist/vendor).
+        sdk_diff = tmp / "sdk_diff"
+        shutil.copytree(sdk_matching, sdk_diff)
+        _git("tag", "-d", tag_name, cwd=sdk_diff)
+        archived_drain = sdk_diff / "plugins/claude_code/vendor/bigquery_agent_analytics_tracing/drain.py"
+        archived_drain.write_text(archived_drain.read_text() + "\n# archived tag marker\n", encoding="utf-8")
+        _git("add", "-f", "-A", cwd=sdk_diff)
+        _git("commit", "-q", "-m", "archived vendor differs", cwd=sdk_diff)
+        _git("tag", tag_name, cwd=sdk_diff)
+
+        diff_res = subprocess.run(
+            ["bash", str(check_script), "--check", "--sdk-repo", str(sdk_diff)],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(diff_res.returncode, 0)
+        self.assertIn("differs: vendor/bigquery_agent_analytics_tracing/drain.py", diff_res.stdout)
+        self.assertIn(f"changed since release tag {tag_name}", diff_res.stdout)
+
+        # 3. Source-only tag with NEITHER producers/ NOR plugins/claude_code/vendor/
+        #    must fail closed outright.
+        sdk_missing = tmp / "sdk_missing"
+        shutil.copytree(
+            REPO_ROOT / "plugins/claude_code",
+            sdk_missing / "plugins/claude_code",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        _git("init", "-q", cwd=sdk_missing)
+        _git("add", "-A", cwd=sdk_missing)
+        _git("commit", "-q", "-m", "source-only without vendor", cwd=sdk_missing)
+        _git("tag", tag_name, cwd=sdk_missing)
+
+        missing_res = subprocess.run(
+            ["bash", str(check_script), "--check", "--sdk-repo", str(sdk_missing)],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(missing_res.returncode, 0)
+        self.assertIn(
+            f"not ok - release tag {tag_name} has neither producers/ nor plugins/claude_code/vendor to reconstruct vendor/",
+            missing_res.stdout,
+        )
+
+        # 4. Source-only tag whose plugins/claude_code/vendor/ holds only bytecode
+        #    detects vendor mismatch after strip_bytecode.
+        sdk_pyc_only = tmp / "sdk_pyc_only"
+        shutil.copytree(
+            REPO_ROOT / "plugins/claude_code",
+            sdk_pyc_only / "plugins/claude_code",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        pyc_dir = sdk_pyc_only / "plugins/claude_code/vendor/bigquery_agent_analytics_tracing/__pycache__"
+        pyc_dir.mkdir(parents=True, exist_ok=True)
+        (pyc_dir / "drain.cpython-314.pyc").write_bytes(b"fake-pyc")
+        _git("init", "-q", cwd=sdk_pyc_only)
+        _git("add", "-f", "-A", cwd=sdk_pyc_only)
+        _git("commit", "-q", "-m", "source-only with bytecode-only vendor", cwd=sdk_pyc_only)
+        _git("tag", tag_name, cwd=sdk_pyc_only)
+
+        pyc_res = subprocess.run(
+            ["bash", str(check_script), "--check", "--sdk-repo", str(sdk_pyc_only)],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        self.assertNotEqual(pyc_res.returncode, 0)
+        self.assertIn("differs: vendor/", pyc_res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
