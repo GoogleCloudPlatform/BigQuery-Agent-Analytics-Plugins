@@ -2475,6 +2475,593 @@ class TestTranscriptAndHooks38(unittest.TestCase):
         st = StateStore("cmp-mid", state_mid_dir)
         self.assertEqual(st.get("transcript_line"), 2)
 
+    @staticmethod
+    def _read_spool_envelopes(spool_dir: str) -> list[dict]:
+        envelopes = []
+        for path in sorted(Path(spool_dir).glob("event-*.json")):
+            envelopes.append(json.loads(path.read_text(encoding="utf-8")))
+        return envelopes
+
+    @staticmethod
+    def _late_flush_rows(envelopes: list[dict]) -> list[tuple[dict, dict]]:
+        found = []
+        for env in envelopes:
+            row = env["row"]
+            attrs = json.loads(row["attributes"]) if isinstance(row["attributes"], str) else row["attributes"]
+            if attrs.get("late_transcript_flush"):
+                found.append((row, attrs))
+        return found
+
+    def test_late_transcript_flush_preserves_checkpoint_on_spool_failure_stop(self):
+        from unittest import mock
+        import bigquery_agent_analytics_tracing.logger as bq_logger
+        from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter, StateStore
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_late_spool_stop_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        def _assistant_150(msg_id: str, text: str) -> str:
+            return json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": msg_id,
+                    "model": "claude-late-test",
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                    "content": [{"type": "text", "text": text}],
+                },
+            }) + "\n"
+
+        # Case A: Stop -> late transcript write -> SessionEnd fails via read-only spool_dir
+        # (real OS spool-write failure when non-root, or fail-once _spool fallback) -> retry SessionEnd.
+        state_a = os.path.join(tmp_root, "state_a")
+        spool_a = os.path.join(tmp_root, "spool_a")
+        cfg_a = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=False,
+            direct_write=False,
+            log_file=os.path.join(tmp_root, "a.log"),
+            state_dir=state_a,
+            spool_dir=spool_a,
+        )
+        t_a = Path(tmp_root) / "t_a.jsonl"
+        t_a.write_text("", encoding="utf-8")
+
+        with mock.patch.object(bq_logger, "_ensure_drainer", return_value=None):
+            logger_a = BigQueryAgentAnalyticsLogger(cfg_a)
+            adapter_a = ClaudeHookBQAAAdapter(logger_a)
+            adapter_a.process("SessionStart", {"session_id": "late-fail-stop-a", "cwd": tmp_root})
+            adapter_a.process("UserPromptSubmit", {
+                "session_id": "late-fail-stop-a",
+                "prompt": "turn 1",
+                "transcript_path": str(t_a),
+            })
+            adapter_a.process("Stop", {
+                "session_id": "late-fail-stop-a",
+                "transcript_path": str(t_a),
+            })
+            st_before_late = StateStore("late-fail-stop-a", state_a)
+            trace_a = st_before_late.get("last_trace_id")
+            self.assertEqual(st_before_late.get("transcript_line"), 0)
+            self.assertFalse(st_before_late.get("last_response_captured"))
+
+            # Late transcript usage lands after Stop.
+            t_a.write_text(_assistant_150("msg_late_stop_a", "late stop recovered text"), encoding="utf-8")
+
+            use_chmod = hasattr(os, "geteuid") and os.geteuid() != 0
+            if use_chmod:
+                os.chmod(spool_a, 0o500)
+                self.addCleanup(lambda: os.path.exists(spool_a) and os.chmod(spool_a, 0o700))
+                with self.assertRaises(OSError):
+                    adapter_a.process("SessionEnd", {
+                        "session_id": "late-fail-stop-a",
+                        "transcript_path": str(t_a),
+                    })
+                os.chmod(spool_a, 0o700)
+            else:
+                orig_spool = logger_a._spool
+                calls = {"n": 0}
+
+                def _fail_once(bq_row):
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        raise OSError("simulated transient spool write failure")
+                    return orig_spool(bq_row)
+
+                with mock.patch.object(logger_a, "_spool", side_effect=_fail_once):
+                    with self.assertRaises(OSError):
+                        adapter_a.process("SessionEnd", {
+                            "session_id": "late-fail-stop-a",
+                            "transcript_path": str(t_a),
+                        })
+
+            # Checkpoint must remain intact after failed spool write.
+            st_after_fail = StateStore("late-fail-stop-a", state_a)
+            self.assertEqual(st_after_fail.get("transcript_line"), 0)
+            self.assertNotIn("msg_late_stop_a", st_after_fail.get("seen_usage") or {})
+            self.assertFalse(st_after_fail.get("last_response_captured"))
+            self.assertEqual(st_after_fail.get("last_trace_id"), trace_a)
+            self.assertEqual(self._late_flush_rows(self._read_spool_envelopes(spool_a)), [])
+
+            # Retry SessionEnd now that spool is writable again.
+            adapter_a.process("SessionEnd", {
+                "session_id": "late-fail-stop-a",
+                "transcript_path": str(t_a),
+            })
+
+        envs_a = self._read_spool_envelopes(spool_a)
+        late_a = self._late_flush_rows(envs_a)
+        self.assertEqual(len(late_a), 1, f"expected exact 1 late-flush row, got {late_a}")
+        row_a, attrs_a = late_a[0]
+        self.assertEqual(row_a["event_type"], "LLM_RESPONSE")
+        self.assertEqual(row_a["trace_id"], trace_a)
+        self.assertEqual(
+            json.loads(row_a["content"]),
+            {"response": "late stop recovered text"},
+        )
+        self.assertEqual(
+            attrs_a["usage_metadata"],
+            {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        )
+        self.assertFalse((Path(state_a) / "state_late-fail-stop-a.json").exists())
+
+        # Case B: Stop -> late write -> UserPromptSubmit fails once in _spool -> retry
+        # UserPromptSubmit -> verify checkpoint, exact 1 late row, and 0 duplicates on Turn 2 Stop/SessionEnd.
+        state_b = os.path.join(tmp_root, "state_b")
+        spool_b = os.path.join(tmp_root, "spool_b")
+        cfg_b = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=False,
+            direct_write=False,
+            log_file=os.path.join(tmp_root, "b.log"),
+            state_dir=state_b,
+            spool_dir=spool_b,
+        )
+        t_b = Path(tmp_root) / "t_b.jsonl"
+        t_b.write_text("", encoding="utf-8")
+
+        with mock.patch.object(bq_logger, "_ensure_drainer", return_value=None):
+            logger_b = BigQueryAgentAnalyticsLogger(cfg_b)
+            adapter_b = ClaudeHookBQAAAdapter(logger_b)
+            adapter_b.process("SessionStart", {"session_id": "late-fail-stop-b", "cwd": tmp_root})
+            adapter_b.process("UserPromptSubmit", {
+                "session_id": "late-fail-stop-b",
+                "prompt": "turn 1",
+                "transcript_path": str(t_b),
+            })
+            adapter_b.process("Stop", {
+                "session_id": "late-fail-stop-b",
+                "last_assistant_message": "stop text already captured",
+                "transcript_path": str(t_b),
+            })
+            trace_b1 = StateStore("late-fail-stop-b", state_b).get("last_trace_id")
+            t_b.write_text(_assistant_150("msg_late_stop_b", "ignored duplicate text"), encoding="utf-8")
+
+            orig_spool_b = logger_b._spool
+            calls_b = {"n": 0}
+
+            def _fail_first_b(bq_row):
+                calls_b["n"] += 1
+                if calls_b["n"] == 1:
+                    raise OSError("simulated transient spool failure")
+                return orig_spool_b(bq_row)
+
+            with mock.patch.object(logger_b, "_spool", side_effect=_fail_first_b):
+                with self.assertRaises(OSError):
+                    adapter_b.process("UserPromptSubmit", {
+                        "session_id": "late-fail-stop-b",
+                        "prompt": "turn 2",
+                        "transcript_path": str(t_b),
+                    })
+
+            st_b_fail = StateStore("late-fail-stop-b", state_b)
+            self.assertEqual(st_b_fail.get("transcript_line"), 0)
+            self.assertNotIn("msg_late_stop_b", st_b_fail.get("seen_usage") or {})
+            self.assertIsNone(st_b_fail.get("current_trace_id"))
+            self.assertEqual(st_b_fail.get("last_trace_id"), trace_b1)
+            self.assertEqual(self._late_flush_rows(self._read_spool_envelopes(spool_b)), [])
+
+            # Retry UserPromptSubmit (succeeds: flushes turn 1 late usage and starts turn 2).
+            adapter_b.process("UserPromptSubmit", {
+                "session_id": "late-fail-stop-b",
+                "prompt": "turn 2",
+                "transcript_path": str(t_b),
+            })
+            st_b_retry = StateStore("late-fail-stop-b", state_b)
+            self.assertEqual(st_b_retry.get("transcript_line"), 1)
+            self.assertIn("msg_late_stop_b", st_b_retry.get("seen_usage") or {})
+
+            # Finish turn 2 and end session: must emit 0 additional late-flush rows.
+            adapter_b.process("Stop", {
+                "session_id": "late-fail-stop-b",
+                "last_assistant_message": "turn 2 done",
+                "transcript_path": str(t_b),
+            })
+            adapter_b.process("SessionEnd", {
+                "session_id": "late-fail-stop-b",
+                "transcript_path": str(t_b),
+            })
+
+        late_b = self._late_flush_rows(self._read_spool_envelopes(spool_b))
+        self.assertEqual(len(late_b), 1, f"expected exact 1 late-flush row across retry, got {late_b}")
+        self.assertEqual(late_b[0][0]["event_type"], "LLM_RESPONSE")
+        self.assertEqual(late_b[0][0]["trace_id"], trace_b1)
+        self.assertEqual(
+            late_b[0][1]["usage_metadata"],
+            {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        )
+
+        # Case C: Direct _flush_late_transcript fail -> retry commits atomically in 1 transaction -> repeated flush emits 0 duplicates.
+        from bigquery_agent_analytics_tracing.claude_code import _LockedJSONStore
+
+        state_c = os.path.join(tmp_root, "state_c")
+        spool_c = os.path.join(tmp_root, "spool_c")
+        cfg_c = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=False,
+            direct_write=False,
+            log_file=os.path.join(tmp_root, "c.log"),
+            state_dir=state_c,
+            spool_dir=spool_c,
+        )
+        t_c = Path(tmp_root) / "t_c.jsonl"
+        t_c.write_text("", encoding="utf-8")
+
+        with mock.patch.object(bq_logger, "_ensure_drainer", return_value=None):
+            logger_c = BigQueryAgentAnalyticsLogger(cfg_c)
+            adapter_c = ClaudeHookBQAAAdapter(logger_c)
+            adapter_c.process("SessionStart", {"session_id": "late-fail-stop-c", "cwd": tmp_root})
+            adapter_c.process("UserPromptSubmit", {
+                "session_id": "late-fail-stop-c",
+                "prompt": "turn 1",
+                "transcript_path": str(t_c),
+            })
+            adapter_c.process("Stop", {
+                "session_id": "late-fail-stop-c",
+                "transcript_path": str(t_c),
+            })
+            t_c.write_text(_assistant_150("msg_late_stop_c", "direct recovered text"), encoding="utf-8")
+
+            write_txns: list[dict] = []
+            orig_txn = _LockedJSONStore.transaction
+
+            @contextlib.contextmanager
+            def _recording_txn(store_self):
+                with orig_txn(store_self) as state:
+                    before = dict(state)
+                    yield state
+                    after = dict(state)
+                    if after != before:
+                        write_txns.append(after)
+
+            st_c_fail_arg = StateStore("late-fail-stop-c", state_c)
+            with mock.patch.object(_LockedJSONStore, "transaction", _recording_txn):
+                with mock.patch.object(logger_c, "_spool", side_effect=OSError("boom")):
+                    with self.assertRaises(OSError):
+                        adapter_c._flush_late_transcript(
+                            {"session_id": "late-fail-stop-c", "transcript_path": str(t_c)},
+                            st_c_fail_arg,
+                        )
+            self.assertEqual(write_txns, [], "failed flush must not mutate persisted state")
+            st_c_fail = StateStore("late-fail-stop-c", state_c)
+            self.assertEqual(st_c_fail.get("transcript_line"), 0)
+            self.assertNotIn("msg_late_stop_c", st_c_fail.get("seen_usage") or {})
+            self.assertFalse(st_c_fail.get("last_response_captured"))
+
+            # Retry succeeds, commits cursor=1, seen_usage, and last_response_captured=True in 1 transaction.
+            st_c_retry_arg = StateStore("late-fail-stop-c", state_c)
+            with mock.patch.object(_LockedJSONStore, "transaction", _recording_txn):
+                adapter_c._flush_late_transcript(
+                    {"session_id": "late-fail-stop-c", "transcript_path": str(t_c)},
+                    st_c_retry_arg,
+                )
+            self.assertEqual(
+                len(write_txns),
+                1,
+                f"retry flush must commit cursor, seen_usage, and response flag in 1 atomic write: {write_txns}",
+            )
+            st_c_ok = StateStore("late-fail-stop-c", state_c)
+            self.assertEqual(st_c_ok.get("transcript_line"), 1)
+            self.assertIn("msg_late_stop_c", st_c_ok.get("seen_usage") or {})
+            self.assertTrue(st_c_ok.get("last_response_captured"))
+
+            # Third flush emits 0 additional rows.
+            adapter_c._flush_late_transcript(
+                {"session_id": "late-fail-stop-c", "transcript_path": str(t_c)},
+                StateStore("late-fail-stop-c", state_c),
+            )
+            late_c = self._late_flush_rows(self._read_spool_envelopes(spool_c))
+            self.assertEqual(len(late_c), 1)
+            self.assertEqual(
+                late_c[0][1]["usage_metadata"],
+                {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            )
+
+    def test_late_transcript_flush_preserves_checkpoint_on_spool_failure_stop_failure(self):
+        from unittest import mock
+        import bigquery_agent_analytics_tracing.logger as bq_logger
+        from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter, StateStore
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_late_spool_sf_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        def _assistant_150(msg_id: str, text: str) -> str:
+            return json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": msg_id,
+                    "model": "claude-sf-late-test",
+                    "usage": {
+                        "input_tokens": 90,
+                        "cache_read_input_tokens": 10,
+                        "output_tokens": 50,
+                    },
+                    "content": [{"type": "text", "text": text}],
+                },
+            }) + "\n"
+
+        # Case A: StopFailure -> late write -> SessionEnd fails on spool write -> retry SessionEnd.
+        state_a = os.path.join(tmp_root, "state_sf_a")
+        spool_a = os.path.join(tmp_root, "spool_sf_a")
+        cfg_a = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=False,
+            direct_write=False,
+            log_file=os.path.join(tmp_root, "sf_a.log"),
+            state_dir=state_a,
+            spool_dir=spool_a,
+        )
+        t_a = Path(tmp_root) / "t_sf_a.jsonl"
+        t_a.write_text("", encoding="utf-8")
+
+        with mock.patch.object(bq_logger, "_ensure_drainer", return_value=None):
+            logger_a = BigQueryAgentAnalyticsLogger(cfg_a)
+            adapter_a = ClaudeHookBQAAAdapter(logger_a)
+            adapter_a.process("SessionStart", {"session_id": "late-fail-sf-a", "cwd": tmp_root})
+            adapter_a.process("UserPromptSubmit", {
+                "session_id": "late-fail-sf-a",
+                "prompt": "trigger sf",
+                "transcript_path": str(t_a),
+            })
+            adapter_a.process("StopFailure", {
+                "session_id": "late-fail-sf-a",
+                "error": "rate_limit_exceeded",
+                "error_type": "rate_limit",
+                "reason": "quota_exceeded",
+                "transcript_path": str(t_a),
+            })
+            trace_a = StateStore("late-fail-sf-a", state_a).get("last_trace_id")
+            t_a.write_text(_assistant_150("msg_late_sf_a", "late failure recovered text"), encoding="utf-8")
+
+            use_chmod = hasattr(os, "geteuid") and os.geteuid() != 0
+            if use_chmod:
+                os.chmod(spool_a, 0o500)
+                self.addCleanup(lambda: os.path.exists(spool_a) and os.chmod(spool_a, 0o700))
+                with self.assertRaises(OSError):
+                    adapter_a.process("SessionEnd", {
+                        "session_id": "late-fail-sf-a",
+                        "transcript_path": str(t_a),
+                    })
+                os.chmod(spool_a, 0o700)
+            else:
+                orig_spool = logger_a._spool
+                calls = {"n": 0}
+
+                def _fail_once(bq_row):
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        raise OSError("simulated transient spool write failure")
+                    return orig_spool(bq_row)
+
+                with mock.patch.object(logger_a, "_spool", side_effect=_fail_once):
+                    with self.assertRaises(OSError):
+                        adapter_a.process("SessionEnd", {
+                            "session_id": "late-fail-sf-a",
+                            "transcript_path": str(t_a),
+                        })
+
+            st_after_fail = StateStore("late-fail-sf-a", state_a)
+            self.assertEqual(st_after_fail.get("transcript_line"), 0)
+            self.assertNotIn("msg_late_sf_a", st_after_fail.get("seen_usage") or {})
+            self.assertFalse(st_after_fail.get("last_response_captured"))
+            self.assertTrue(st_after_fail.get("last_stop_failed"))
+            self.assertEqual(st_after_fail.get("last_stop_failed_trace_id"), trace_a)
+            self.assertEqual(self._late_flush_rows(self._read_spool_envelopes(spool_a)), [])
+
+            adapter_a.process("SessionEnd", {
+                "session_id": "late-fail-sf-a",
+                "transcript_path": str(t_a),
+            })
+
+        late_a = self._late_flush_rows(self._read_spool_envelopes(spool_a))
+        self.assertEqual(len(late_a), 1, f"expected exact 1 late-flush error row, got {late_a}")
+        row_a, attrs_a = late_a[0]
+        self.assertEqual(row_a["event_type"], "LLM_ERROR")
+        self.assertEqual(row_a["status"], "ERROR")
+        self.assertEqual(row_a["error_message"], "rate_limit_exceeded")
+        self.assertEqual(row_a["trace_id"], trace_a)
+        self.assertEqual(
+            json.loads(row_a["content"]),
+            {"response": "late failure recovered text"},
+        )
+        self.assertTrue(attrs_a.get("late_transcript_flush"))
+        self.assertTrue(attrs_a.get("stop_failure"))
+        self.assertEqual(attrs_a.get("hook_event_name"), "StopFailure")
+        self.assertEqual(attrs_a.get("error_type"), "rate_limit")
+        self.assertEqual(attrs_a.get("reason"), "quota_exceeded")
+        self.assertEqual(
+            attrs_a["usage_metadata"],
+            {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        )
+
+        # Case B: StopFailure -> late write -> UserPromptSubmit fails once -> retry UserPromptSubmit
+        # -> verify checkpoint advanced, exact 1 late error row, and 0 duplicates on subsequent flush.
+        state_b = os.path.join(tmp_root, "state_sf_b")
+        spool_b = os.path.join(tmp_root, "spool_sf_b")
+        cfg_b = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=False,
+            direct_write=False,
+            log_file=os.path.join(tmp_root, "sf_b.log"),
+            state_dir=state_b,
+            spool_dir=spool_b,
+        )
+        t_b = Path(tmp_root) / "t_sf_b.jsonl"
+        t_b.write_text("", encoding="utf-8")
+
+        with mock.patch.object(bq_logger, "_ensure_drainer", return_value=None):
+            logger_b = BigQueryAgentAnalyticsLogger(cfg_b)
+            adapter_b = ClaudeHookBQAAAdapter(logger_b)
+            adapter_b.process("SessionStart", {"session_id": "late-fail-sf-b", "cwd": tmp_root})
+            adapter_b.process("UserPromptSubmit", {
+                "session_id": "late-fail-sf-b",
+                "prompt": "turn 1 fails",
+                "transcript_path": str(t_b),
+            })
+            adapter_b.process("StopFailure", {
+                "session_id": "late-fail-sf-b",
+                "error": "overload",
+                "error_type": "529",
+                "reason": "capacity",
+                "transcript_path": str(t_b),
+            })
+            trace_b1 = StateStore("late-fail-sf-b", state_b).get("last_trace_id")
+            t_b.write_text(_assistant_150("msg_late_sf_b", "turn 1 late error text"), encoding="utf-8")
+
+            orig_spool_b = logger_b._spool
+            calls_b = {"n": 0}
+
+            def _fail_first_sf(bq_row):
+                calls_b["n"] += 1
+                if calls_b["n"] == 1:
+                    raise OSError("simulated transient spool failure")
+                return orig_spool_b(bq_row)
+
+            with mock.patch.object(logger_b, "_spool", side_effect=_fail_first_sf):
+                with self.assertRaises(OSError):
+                    adapter_b.process("UserPromptSubmit", {
+                        "session_id": "late-fail-sf-b",
+                        "prompt": "turn 2",
+                        "transcript_path": str(t_b),
+                    })
+
+            st_b_fail = StateStore("late-fail-sf-b", state_b)
+            self.assertEqual(st_b_fail.get("transcript_line"), 0)
+            self.assertNotIn("msg_late_sf_b", st_b_fail.get("seen_usage") or {})
+            self.assertTrue(st_b_fail.get("last_stop_failed"))
+            self.assertEqual(self._late_flush_rows(self._read_spool_envelopes(spool_b)), [])
+
+            adapter_b.process("UserPromptSubmit", {
+                "session_id": "late-fail-sf-b",
+                "prompt": "turn 2",
+                "transcript_path": str(t_b),
+            })
+            st_b_retry = StateStore("late-fail-sf-b", state_b)
+            self.assertEqual(st_b_retry.get("transcript_line"), 1)
+            self.assertIn("msg_late_sf_b", st_b_retry.get("seen_usage") or {})
+
+            adapter_b.process("Stop", {
+                "session_id": "late-fail-sf-b",
+                "last_assistant_message": "turn 2 ok",
+                "transcript_path": str(t_b),
+            })
+            adapter_b.process("SessionEnd", {
+                "session_id": "late-fail-sf-b",
+                "transcript_path": str(t_b),
+            })
+
+        late_b = self._late_flush_rows(self._read_spool_envelopes(spool_b))
+        self.assertEqual(len(late_b), 1, f"expected exact 1 late-flush error row, got {late_b}")
+        row_b, attrs_b = late_b[0]
+        self.assertEqual(row_b["event_type"], "LLM_ERROR")
+        self.assertEqual(row_b["trace_id"], trace_b1)
+        self.assertTrue(attrs_b.get("stop_failure"))
+        self.assertEqual(attrs_b.get("hook_event_name"), "StopFailure")
+        self.assertTrue(attrs_b.get("late_transcript_flush"))
+        self.assertEqual(
+            attrs_b["usage_metadata"],
+            {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        )
+
+    def test_late_transcript_flush_noop_advances_cursor_and_no_trace_skips(self):
+        from unittest import mock
+        import bigquery_agent_analytics_tracing.logger as bq_logger
+        from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter, StateStore
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_late_noop_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        state_dir = os.path.join(tmp_root, "state")
+        spool_dir = os.path.join(tmp_root, "spool")
+        cfg = BQAAConfig(
+            project_id="p",
+            dataset="d",
+            dry_run=False,
+            direct_write=False,
+            log_file=os.path.join(tmp_root, "noop.log"),
+            state_dir=state_dir,
+            spool_dir=spool_dir,
+        )
+        t_path = Path(tmp_root) / "t_noop.jsonl"
+        t_path.write_text("", encoding="utf-8")
+
+        with mock.patch.object(bq_logger, "_ensure_drainer", return_value=None):
+            adapter = ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(cfg))
+            # No target_trace yet (SessionStart only): _flush_late_transcript must not advance cursor.
+            adapter.process("SessionStart", {"session_id": "late-noop-1", "cwd": tmp_root})
+            t_path.write_text(
+                json.dumps({"type": "user", "message": {"content": "orphan line"}}) + "\n",
+                encoding="utf-8",
+            )
+            st_no_trace = StateStore("late-noop-1", state_dir)
+            adapter._flush_late_transcript(
+                {"session_id": "late-noop-1", "transcript_path": str(t_path)},
+                st_no_trace,
+            )
+            self.assertIsNone(StateStore("late-noop-1", state_dir).get("transcript_line"))
+
+            # Start Turn 1, Stop with captured text, then append a zero-token user line.
+            t_path.write_text("", encoding="utf-8")
+            adapter.process("UserPromptSubmit", {
+                "session_id": "late-noop-1",
+                "prompt": "hello",
+                "transcript_path": str(t_path),
+            })
+            adapter.process("Stop", {
+                "session_id": "late-noop-1",
+                "last_assistant_message": "already captured",
+                "transcript_path": str(t_path),
+            })
+            t_path.write_text(
+                json.dumps({
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg_zero_tok",
+                        "model": "claude-test",
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                        "content": [{"type": "text", "text": "already captured elsewhere"}],
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            adapter._flush_late_transcript(
+                {"session_id": "late-noop-1", "transcript_path": str(t_path)},
+                StateStore("late-noop-1", state_dir),
+            )
+            st_after_noop = StateStore("late-noop-1", state_dir)
+            self.assertEqual(st_after_noop.get("transcript_line"), 1)
+            self.assertIn("msg_zero_tok", st_after_noop.get("seen_usage") or {})
+            self.assertEqual(self._late_flush_rows(self._read_spool_envelopes(spool_dir)), [])
+
 
 class TestReliabilityAndSetup46(unittest.TestCase):
     """Issue #46: retry deferral, missing env warning, log rotation, find_spec, setup surfacing."""

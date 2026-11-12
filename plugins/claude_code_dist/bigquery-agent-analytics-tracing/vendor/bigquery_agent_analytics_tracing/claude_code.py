@@ -641,6 +641,9 @@ class ClaudeHookBQAAAdapter:
     )
     if not transcript:
       return
+    target_trace = state.get("current_trace_id") or state.get("last_trace_id")
+    if not target_trace:
+      return
     cursor = int(
         state.get("transcript_line")
         if state.get("transcript_line") is not None
@@ -655,21 +658,18 @@ class ClaudeHookBQAAAdapter:
             seen_usage,
         )
     )
-    state.update(
-        {
-            "transcript_line": next_line,
-            "seen_usage": next_seen,
-        }
-    )
-    target_trace = state.get("current_trace_id") or state.get("last_trace_id")
-    if not target_trace:
-      return
     captured_for_trace = (
         bool(state.get("last_response_captured"))
         and state.get("last_response_captured_trace_id") == target_trace
     )
     need_text = not captured_for_trace and bool(text.strip())
     if usage["total_tokens"] <= 0 and not need_text:
+      state.update(
+          {
+              "transcript_line": next_line,
+              "seen_usage": next_seen,
+          }
+      )
       return
     inv_id = (
         state.get("current_invocation_id")
@@ -731,13 +731,14 @@ class ClaudeHookBQAAAdapter:
           attributes=attrs,
           is_truncated=was_truncated if need_text else False,
       )
+    state_updates: dict[str, Any] = {
+        "transcript_line": next_line,
+        "seen_usage": next_seen,
+    }
     if need_text:
-      state.update(
-          {
-              "last_response_captured": True,
-              "last_response_captured_trace_id": target_trace,
-          }
-      )
+      state_updates["last_response_captured"] = True
+      state_updates["last_response_captured_trace_id"] = target_trace
+    state.update(state_updates)
 
   def _session_start(self, payload: dict[str, Any], state: StateStore) -> None:
     cwd = payload.get("cwd") or os.getcwd()
