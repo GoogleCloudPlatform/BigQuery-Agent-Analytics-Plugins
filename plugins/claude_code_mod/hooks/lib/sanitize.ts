@@ -387,51 +387,9 @@ const B64_LOOKUP = (() => {
 })()
 
 // Pure ES2023 Base64 validator (no Buffer/atob) returning true iff `token`
-// decodes to valid printable UTF-8 (no C0/C1/DEL control chars) containing `:`.
-function decodeBase64PrintableColon(token: string): boolean {
-  let cleanLen = token.length
-  while (cleanLen > 0 && token.charCodeAt(cleanLen - 1) === 61) cleanLen -= 1
-  const pad = token.length - cleanLen
-  if (pad > 2 || cleanLen < 4 || (pad > 0 && token.length % 4 !== 0) || cleanLen % 4 === 1) return false
-  const bytes: number[] = []
-  let i = 0
-  while (i + 4 <= cleanLen) {
-    const c0 = token.charCodeAt(i)
-    const c1 = token.charCodeAt(i + 1)
-    const c2 = token.charCodeAt(i + 2)
-    const c3 = token.charCodeAt(i + 3)
-    if (c0 > 127 || c1 > 127 || c2 > 127 || c3 > 127) return false
-    const v0 = B64_LOOKUP[c0] as number
-    const v1 = B64_LOOKUP[c1] as number
-    const v2 = B64_LOOKUP[c2] as number
-    const v3 = B64_LOOKUP[c3] as number
-    if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) return false
-    const n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3
-    bytes.push((n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff)
-    i += 4
-  }
-  const rem = cleanLen - i
-  if (rem === 2) {
-    const c0 = token.charCodeAt(i)
-    const c1 = token.charCodeAt(i + 1)
-    if (c0 > 127 || c1 > 127) return false
-    const v0 = B64_LOOKUP[c0] as number
-    const v1 = B64_LOOKUP[c1] as number
-    if (v0 < 0 || v1 < 0) return false
-    bytes.push(((v0 << 18) | (v1 << 12)) >>> 16)
-  } else if (rem === 3) {
-    const c0 = token.charCodeAt(i)
-    const c1 = token.charCodeAt(i + 1)
-    const c2 = token.charCodeAt(i + 2)
-    if (c0 > 127 || c1 > 127 || c2 > 127) return false
-    const v0 = B64_LOOKUP[c0] as number
-    const v1 = B64_LOOKUP[c1] as number
-    const v2 = B64_LOOKUP[c2] as number
-    if (v0 < 0 || v1 < 0 || v2 < 0) return false
-    const n = (v0 << 18) | (v1 << 12) | (v2 << 6)
-    bytes.push((n >>> 16) & 0xff, (n >>> 8) & 0xff)
-  }
-  if (bytes.length < 3) return false
+// decodes to valid printable UTF-8 or RFC 7617 section 2 ISO-8859-1 (Latin-1)
+// (no C0/C1/DEL control chars) containing `:`.
+function isPrintableUtf8WithColon(bytes: number[]): boolean {
   let hasColon = false
   let hasNonColon = false
   for (let idx = 0; idx < bytes.length; ) {
@@ -478,6 +436,65 @@ function decodeBase64PrintableColon(token: string): boolean {
     idx += seqLen
   }
   return hasColon && hasNonColon
+}
+
+function isPrintableLatin1WithColon(bytes: number[]): boolean {
+  let hasColon = false
+  let hasNonColon = false
+  for (let idx = 0; idx < bytes.length; idx += 1) {
+    const b = bytes[idx] as number
+    if (b < 0x20 || (b >= 0x7f && b <= 0x9f)) return false
+    if (b === 0x3a) hasColon = true
+    else hasNonColon = true
+  }
+  return hasColon && hasNonColon
+}
+
+function decodeBase64PrintableColon(token: string): boolean {
+  let cleanLen = token.length
+  while (cleanLen > 0 && token.charCodeAt(cleanLen - 1) === 61) cleanLen -= 1
+  const pad = token.length - cleanLen
+  if (pad > 2 || cleanLen < 4 || (pad > 0 && token.length % 4 !== 0) || cleanLen % 4 === 1) return false
+  const bytes: number[] = []
+  let i = 0
+  while (i + 4 <= cleanLen) {
+    const c0 = token.charCodeAt(i)
+    const c1 = token.charCodeAt(i + 1)
+    const c2 = token.charCodeAt(i + 2)
+    const c3 = token.charCodeAt(i + 3)
+    if (c0 > 127 || c1 > 127 || c2 > 127 || c3 > 127) return false
+    const v0 = B64_LOOKUP[c0] as number
+    const v1 = B64_LOOKUP[c1] as number
+    const v2 = B64_LOOKUP[c2] as number
+    const v3 = B64_LOOKUP[c3] as number
+    if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) return false
+    const n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3
+    bytes.push((n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff)
+    i += 4
+  }
+  const rem = cleanLen - i
+  if (rem === 2) {
+    const c0 = token.charCodeAt(i)
+    const c1 = token.charCodeAt(i + 1)
+    if (c0 > 127 || c1 > 127) return false
+    const v0 = B64_LOOKUP[c0] as number
+    const v1 = B64_LOOKUP[c1] as number
+    if (v0 < 0 || v1 < 0) return false
+    bytes.push(((v0 << 18) | (v1 << 12)) >>> 16)
+  } else if (rem === 3) {
+    const c0 = token.charCodeAt(i)
+    const c1 = token.charCodeAt(i + 1)
+    const c2 = token.charCodeAt(i + 2)
+    if (c0 > 127 || c1 > 127 || c2 > 127) return false
+    const v0 = B64_LOOKUP[c0] as number
+    const v1 = B64_LOOKUP[c1] as number
+    const v2 = B64_LOOKUP[c2] as number
+    if (v0 < 0 || v1 < 0 || v2 < 0) return false
+    const n = (v0 << 18) | (v1 << 12) | (v2 << 6)
+    bytes.push((n >>> 16) & 0xff, (n >>> 8) & 0xff)
+  }
+  if (bytes.length < 3) return false
+  return isPrintableUtf8WithColon(bytes) || isPrintableLatin1WithColon(bytes)
 }
 
 const PASCAL_CASE_WORD_RE = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/
@@ -1032,7 +1049,11 @@ function isCrossLineNonSensitiveConfigColonOrSpacedEq(
     }
     return true
   }
-  if (rhsHead !== '' && !precededByAssign && (DIAGNOSTIC_PROSE_RE.test(rhsHead) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhsHead))) {
+  if (
+    !precededByAssign &&
+    (validQuotedOrVarOrRedactedRhs ||
+      (rhsHead !== '' && (DIAGNOSTIC_PROSE_RE.test(rhsHead) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhsHead))))
+  ) {
     return false
   }
   return true
@@ -1835,6 +1856,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
   let curMatchEnd = 0
   let curEffectiveMatchEnd = 0
   let curHasNewline = false
+  let cachedRawTokQState: QuoteContext | undefined
   let cachedTokQState: QuoteContext | undefined
   let cachedPrefix: { precededByEq: boolean; precededByColon: boolean } | undefined
   const rewind = (): void => {
@@ -1847,8 +1869,12 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     }
     rewind()
   }
+  const getRawTokQState = (): QuoteContext => {
+    if (cachedRawTokQState === undefined) cachedRawTokQState = quoteAt(curMatchIndex)
+    return cachedRawTokQState
+  }
   const getTokQState = (): QuoteContext => {
-    if (cachedTokQState === undefined) cachedTokQState = effectiveQuoteState(quoteAt(curMatchIndex), curHasNewline)
+    if (cachedTokQState === undefined) cachedTokQState = effectiveQuoteState(getRawTokQState(), curHasNewline)
     return cachedTokQState
   }
   const getPrefix = (): { precededByEq: boolean; precededByColon: boolean } => {
@@ -1909,6 +1935,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     curMatchEnd = matchEnd
     curEffectiveMatchEnd = effectiveMatchEnd
     curHasNewline = hasNewline
+    cachedRawTokQState = undefined
     cachedTokQState = undefined
     cachedPrefix = undefined
     let forceHeaderTokenRedact = false
@@ -2075,9 +2102,10 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               continue
             }
           } else {
+            const hasAssignOrLineCommentCtx = precededByEqOrInComment || getRawTokQState().inComment
             const allowPaddedLowerQuoteRhs =
-              isLowerWordKey && !endsWithDoubleEq && precededByEqOrInComment
-            const allowPunctRhs = !endsWithDoubleEq && precededByEqOrInComment
+              isLowerWordKey && !endsWithDoubleEq && hasAssignOrLineCommentCtx
+            const allowPunctRhs = !endsWithDoubleEq && hasAssignOrLineCommentCtx
             const isEmptyQuotedRhs =
               ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`') &&
                 effectiveAfter[1] === effectiveAfter[0] &&
@@ -2087,20 +2115,12 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                 effectiveAfter[2] === '\\' &&
                 effectiveAfter[3] === effectiveAfter[1] &&
                 isDelimOrSpaceAfterQuote(effectiveAfter[4]))
-            const quoteRhsBlockedWithoutAssignCtx =
-              !precededByEqOrInComment &&
-              (((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`') &&
-                isDelimOrSpaceAfterQuote(effectiveAfter[1])) ||
-                (effectiveAfter[0] === '\\' &&
-                  (effectiveAfter[1] === '"' || effectiveAfter[1] === "'") &&
-                  isDelimOrSpaceAfterQuote(effectiveAfter[2])))
-            const canKeepAssignRhs = precededByEqOrInComment
-              ? isRecognizedConfigKey || !isBase64PaddedToken(coreToken) || (assignKey.length <= 100 && isSensitiveKey(assignKey))
-              : isRecognizedConfigKey && !endsWithDoubleEq
+            const canKeepAssignRhs =
+              hasAssignOrLineCommentCtx &&
+              (isRecognizedConfigKey || (assignKey.length <= 100 && isSensitiveKey(assignKey)))
             const assignRhs =
               canKeepAssignRhs &&
               !isEmptyQuotedRhs &&
-              !quoteRhsBlockedWithoutAssignCtx &&
               hasAssignRhsAt(
                 effectiveMatchEnd,
                 effectiveAfter,
@@ -2111,6 +2131,25 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               )
             if (assignRhs) {
               keepAndRewind()
+              continue
+            }
+            if (
+              !hasAssignOrLineCommentCtx &&
+              assignKey.length <= 100 &&
+              isSensitiveKey(assignKey) &&
+              !isEmptyQuotedRhs &&
+              hasAssignRhsAt(
+                effectiveMatchEnd,
+                effectiveAfter,
+                tokQState,
+                coreToken,
+                isLowerWordKey && !endsWithDoubleEq,
+                !endsWithDoubleEq,
+              )
+            ) {
+              const eqLineStop = lineStopFor(effectiveMatchEnd)
+              const dualStop = computeDualStop(effectiveMatchEnd, eqLineStop, tokQState, hasNewline)
+              emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
               continue
             }
             if (!endsWithDoubleEq) {
@@ -4524,8 +4563,50 @@ function indentCols(line: string): number {
   return c
 }
 
+const isLabelTrimChar = (raw: string, i: number): boolean => {
+  const c = raw.charCodeAt(i)
+  return (
+    c === 42 || // *
+    c === 34 || // "
+    c === 39 || // '
+    c === 96 || // `
+    c === 95 || // _
+    c === 32 || // space
+    (c >= 9 && c <= 13) ||
+    (c >= 127 && /\s/.test(raw[i] as string))
+  )
+}
+
 function cleanLabelKey(raw: string): string {
-  return raw.replace(/^[*"'`_\s]+|[*"'`_\s]+$/g, '').trim()
+  let start = 0
+  let end = raw.length
+  while (start < end && isLabelTrimChar(raw, start)) start += 1
+  while (end > start && isLabelTrimChar(raw, end - 1)) end -= 1
+  return raw.slice(start, end)
+}
+
+function stripTrailingParenQualifier(s: string, withSep: boolean): string {
+  let end = s.length
+  if (withSep) {
+    while (end > 0 && (s.charCodeAt(end - 1) === 32 || s.charCodeAt(end - 1) === 9)) end -= 1
+    if (end === 0) return s
+    const sep = s.charCodeAt(end - 1)
+    if (sep !== 58 && sep !== 61) return s
+    end -= 1
+    while (end > 0 && (s.charCodeAt(end - 1) === 32 || s.charCodeAt(end - 1) === 9)) end -= 1
+  }
+  if (end === 0 || s.charCodeAt(end - 1) !== 41) return s
+  const closeIdx = end - 1
+  const openIdx = s.lastIndexOf('(', closeIdx - 1)
+  if (openIdx === -1) return s
+  const innerLen = closeIdx - openIdx - 1
+  if (innerLen < 1 || innerLen > 40) return s
+  for (let i = openIdx + 1; i < closeIdx; i += 1) {
+    if (s.charCodeAt(i) === 10) return s
+  }
+  let labelEnd = openIdx
+  while (labelEnd > 0 && (s.charCodeAt(labelEnd - 1) === 32 || s.charCodeAt(labelEnd - 1) === 9)) labelEnd -= 1
+  return s.slice(0, labelEnd)
 }
 
 const YAML_BLOCK_HEADER = /^([ \t]*(?:-[ \t]+)?)([A-Za-z0-9_.*"`'-]+(?:[ \t]*\([^)\n]{1,40}\))?)[ \t]*:[ \t]*(?:[|>][+-]?\d*|\d*[|>][+-]?)[ \t]*(?:#[^\n]*)?$/
@@ -4584,7 +4665,7 @@ function redactK8sAndYamlBlocks(text: string, stats: SanitizeStats): string {
     const ym = YAML_BLOCK_HEADER.exec(line)
     if (ym !== null) {
       const lead = ym[1] as string
-      const rawKey = (ym[2] as string).replace(/[ \t]*\([^)\n]{1,40}\)$/, '')
+      const rawKey = stripTrailingParenQualifier(ym[2] as string, false)
       const cleaned = cleanLabelKey(rawKey)
       if (cleaned !== '' && (isSensitiveKey(cleaned) || isSensitiveKey(cleaned.replace(/\s+/g, '_')))) {
         const keyCol = lead.length
@@ -4629,16 +4710,39 @@ const isSensitiveLabel = (raw: string): boolean => {
   return isSensitiveKey(cleaned) || (cleaned.includes(' ') && isSensitiveKey(cleaned.replace(/[ \t]+/g, '_')))
 }
 
+const isMdWrapperChar = (c: number): boolean =>
+  c === 42 || c === 34 || c === 39 || c === 95 || c === 96
+
+function stripMarkdownWrappers(s: string): string {
+  let start = 0
+  let end = s.length
+  while (start < end && isMdWrapperChar(s.charCodeAt(start))) start += 1
+  while (end > start && isMdWrapperChar(s.charCodeAt(end - 1))) end -= 1
+  return s.slice(start, end)
+}
+
 const isSkippedCellOrVal = (raw: string): boolean => {
   const t = raw.trim()
   if (t === '' || /^:?-{2,}:?$/.test(t) || /^(?:n\/a|none|null|unset|empty|tbd)$/i.test(t)) return true
-  return isMarkerLike(t) || isMarkerLike(t.replace(/^[*"'_`]+|[*"'_`]+$/g, ''))
+  return isMarkerLike(t) || isMarkerLike(stripMarkdownWrappers(t))
 }
 
 function redactCellText(rawCell: string, stats: SanitizeStats): string {
-  const lead = /^[ \t]*/.exec(rawCell)?.[0] ?? ''
-  const trail = /[ \t]*$/.exec(rawCell)?.[0] ?? ''
-  const inner = rawCell.slice(lead.length, rawCell.length - trail.length)
+  let leadEnd = 0
+  while (leadEnd < rawCell.length) {
+    const c = rawCell.charCodeAt(leadEnd)
+    if (c !== 32 && c !== 9) break
+    leadEnd += 1
+  }
+  let trailStart = rawCell.length
+  while (trailStart > leadEnd) {
+    const c = rawCell.charCodeAt(trailStart - 1)
+    if (c !== 32 && c !== 9) break
+    trailStart -= 1
+  }
+  const lead = rawCell.slice(0, leadEnd)
+  const trail = rawCell.slice(trailStart)
+  const inner = rawCell.slice(leadEnd, trailStart)
   if (isSkippedCellOrVal(inner)) return rawCell
   stats.redactions += 1
   if (inner.startsWith('`') && inner.endsWith('`') && inner.length >= 2) return `${lead}\`${MARKER}\`${trail}`
@@ -4699,7 +4803,7 @@ function redactMarkdownLabelsAndTables(text: string, stats: SanitizeStats): stri
         } else {
           const m3 = MD_PAREN_LABEL.exec(line)
           if (m3 !== null) {
-            const labelNoParen = (m3[2] as string).replace(/[ \t]*\([^)\n]{1,40}\)[ \t]*[:=][ \t]*$/, '')
+            const labelNoParen = stripTrailingParenQualifier(m3[2] as string, true)
             if (isSensitiveLabel(labelNoParen)) {
               prefix = `${m3[1]}${m3[2]}`
               val = m3[3] as string

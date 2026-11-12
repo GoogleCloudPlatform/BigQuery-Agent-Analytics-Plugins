@@ -513,7 +513,9 @@ declare module 'claude-code/testing' {
   import type { EngineInterface, OnFunction } from 'claude-code'
 
   export type Engine = Pick<EngineInterface, 'plugin' | 'session' | 'classic' | 'prompt' | 'turn' | 'tool' | 'telemetry'> & {
-    readonly command: Pick<EngineInterface['command'], 'run'>
+    readonly command: {
+      run(e: import('claude-code').CommandRunInput, opts?: { budgetMs?: number }): Promise<{ text?: string }>
+    }
     readonly ui: Pick<EngineInterface['ui'], 'mount'>
   }
 

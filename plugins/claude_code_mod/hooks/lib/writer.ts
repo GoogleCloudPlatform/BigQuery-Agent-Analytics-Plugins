@@ -766,11 +766,15 @@ export class Writer {
     const c = this.config()
     if (!canDeliver(c) || c.dryRun || this.closing || (!explicit && (this.problem !== null || this.lastSuccessAt !== null || this.lastError !== null))) return null
     if (explicit) this.resetHeldCooldown()
+    if (budgetMs !== undefined && (!Number.isFinite(budgetMs) || budgetMs <= 0)) {
+      this.recordError('destination check: timed out (insufficient command budget)')
+      return 'timed out (insufficient command budget)'
+    }
     const startedAt = this.io.now()
-    const totalBudgetMs = budgetMs !== undefined ? Math.max(100, budgetMs) : Math.max(timeoutMs, c.tokenCommandTimeoutMs) + timeoutMs * 2
+    const totalBudgetMs = budgetMs !== undefined ? budgetMs : Math.max(timeoutMs, c.tokenCommandTimeoutMs) + timeoutMs * 2
     // When the whole check is over, the fresh token after a 401 included.
     const deadline = startedAt + totalBudgetMs
-    const reqBudgetMs = budgetMs !== undefined ? Math.min(timeoutMs, Math.max(200, Math.floor(totalBudgetMs / 2))) : timeoutMs
+    const reqBudgetMs = budgetMs !== undefined ? Math.min(timeoutMs, Math.max(1, Math.floor(totalBudgetMs / 2))) : timeoutMs
     const tokenTimeoutMs = Math.min(Math.max(timeoutMs, c.tokenCommandTimeoutMs), Math.max(1, totalBudgetMs - reqBudgetMs))
     const url = `${tablesUrl(c)}/${encodeURIComponent(c.table)}?fields=tableReference`
     for (let attempt = 0; attempt < 2; attempt += 1) {

@@ -62,8 +62,13 @@ let isInteractiveSession = true
 // How long /bqaa-backfill waits for its result in a `-p` run (or with `wait`),
 // within the host CLI's 10 s command.run hook budget.
 const BACKFILL_WAIT_MS = 8_000
-const commandBudgetMs = (next?: { budget?: { remainingMs?: number } }): number =>
-  Math.min(8_000, Math.max(1_000, (next?.budget?.remainingMs ?? 10_000) - 1_500))
+const COMMAND_BUDGET_RESERVE_MS = 1_500
+const commandBudgetMs = (next?: { budget?: { remainingMs?: number } }): number => {
+  const remaining = next?.budget?.remainingMs
+  if (remaining === undefined) return BACKFILL_WAIT_MS
+  if (!Number.isFinite(remaining)) return 0
+  return Math.max(0, Math.min(BACKFILL_WAIT_MS, remaining - COMMAND_BUDGET_RESERVE_MS))
+}
 // The host's timer, from session.start's `$`, for work that waits briefly
 // outside any hook (a finished tool call waiting for its decision).
 let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null = null
@@ -1387,6 +1392,16 @@ export const register: Register = (on, registered) => {
     // so there (and with `wait`) it waits for the result instead, up to
     // `waitMs` (`BACKFILL_WAIT_MS` capped inside the command hook budget).
     const words = (e.args ?? '').trim().split(/\s+/)
+    const waitMs = Math.min(BACKFILL_WAIT_MS, commandBudgetMs(next))
+    const shouldWait = !isInteractiveSession || words.includes('wait')
+    if (shouldWait && waitMs <= 0) {
+      if (!isInteractiveSession) {
+        return say(
+          `BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} timed out (insufficient command budget) before this non-interactive run ended; remaining files stay queued for a later session (or /bqaa-backfill force after 10 minutes if a batch was still in flight).`,
+        )
+      }
+      return say(`BigQuery Agent Analytics mod: backfill of ${summary.files} file(s) in ${summary.dir} timed out waiting (insufficient command budget); /bqaa-status shows progress.`)
+    }
     const running = current.backfill(['spill', 'retry', 'rejected'], words.includes('force') ? 'force' : 'command')
     const logWhenDone = (): void => {
       void running
@@ -1395,11 +1410,10 @@ export const register: Register = (on, registered) => {
           internalErrors += 1
         })
     }
-    if (isInteractiveSession && !words.includes('wait')) {
+    if (!shouldWait) {
       logWhenDone()
       return say(`BigQuery Agent Analytics mod: backfill started for ${summary.files} file(s) in ${summary.dir}; /bqaa-status shows progress.`)
     }
-    const waitMs = Math.min(BACKFILL_WAIT_MS, commandBudgetMs(next))
     let stopWaiting = (): void => undefined
     const waited = new Promise<null>(resolve => (stopWaiting = () => resolve(null)))
     const timer = $.clock.after(waitMs, () => stopWaiting())

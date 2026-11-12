@@ -1732,9 +1732,9 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\npublicvalue="hello" # "unclosed',
     "MODE=bearer\npublicvalue='hello' // 'unclosed",
     'MODE=bearer\n--secret_pw=',
-    "Users' guide to bearer\npublicvalue='hello'",
-    "fn f<'a>() -> bearer\npublicvalue='hello'",
-    "fn f<T: 'a + 'b>() -> bearer\npublicvalue='hello'",
+    "Users' guide; MODE=bearer\npublicvalue='hello'",
+    "fn f<'a>() -> () { /* */\nMODE=bearer\npublicvalue='hello' }",
+    "fn f<T: 'a + 'b>() -> () { /* */\nMODE=bearer\npublicvalue='hello' }",
     "$'it\\'s'\nMODE=bearer\npublicvalue='hello'",
     '# "todo\nMODE=bearer\npublicvalue="hello"',
     "// 'todo\nMODE=bearer\npublicvalue='hello'",
@@ -2077,7 +2077,7 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     [`scheme: bearer\nclient_secret: ${CANARY}`, 'scheme: bearer [REDACTED]: [REDACTED]', CANARY],
     [`scheme: bearer\npassword_hash: ${CANARY}`, 'scheme: bearer [REDACTED]: [REDACTED]', CANARY],
     [`MODE=bearer\nCLIENT_SECRET="${CANARY}"`, 'MODE=bearer\nCLIENT_SECRET=[REDACTED]', CANARY],
-    [`Don't use bearer\nCLIENT_SECRET='${CANARY}'`, "Don't use bearer\nCLIENT_SECRET=[REDACTED]", CANARY],
+    [`Don't use bearer\nCLIENT_SECRET='${CANARY}'`, "Don't use bearer [REDACTED]=[REDACTED]", CANARY],
     [`MODE=bearer\nCLIENT_SECRET=${CANARY}`, 'MODE=bearer\nCLIENT_SECRET=[REDACTED]', CANARY],
     ['MODE=bearer\nCLIENT_SECRET=$MY_TOKEN_VAR', 'MODE=bearer\nCLIENT_SECRET=[REDACTED]', '$MY_TOKEN_VAR'],
     ['MODE=bearer\nCLIENT_SECRET=${MY_TOKEN_VAR}', 'MODE=bearer\nCLIENT_SECRET=[REDACTED]', '${MY_TOKEN_VAR}'],
@@ -2094,7 +2094,7 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['MODE=bearer\n--client-secret=!MySuperSecret123', 'MODE=bearer\n--client-secret=[REDACTED]', '!MySuperSecret123'],
     ['MODE=bearer\n--secret_pw=@pplePass123', 'MODE=bearer\n--secret_pw=[REDACTED]', '@pplePass123'],
     ['MODE=basic\nCLIENT_SECRET=!MySuperSecret123', 'MODE=basic\nCLIENT_SECRET=[REDACTED]', '!MySuperSecret123'],
-    [`Users' guide to bearer\nCLIENT_SECRET='${CANARY}'`, "Users' guide to bearer\nCLIENT_SECRET=[REDACTED]", CANARY],
+    [`Users' guide to bearer\nCLIENT_SECRET='${CANARY}'`, "Users' guide to bearer [REDACTED]=[REDACTED]", CANARY],
     [`fn f<'a>() // bearer\nCLIENT_SECRET='${CANARY}'`, "fn f<'a>() // bearer\nCLIENT_SECRET=[REDACTED]", CANARY],
     [`$'it\\'s'\nMODE=bearer\nCLIENT_SECRET='${CANARY}'`, "$'it\\'s'\nMODE=bearer\nCLIENT_SECRET=[REDACTED]", CANARY],
     [`# "todo\nMODE=bearer\nCLIENT_SECRET="${CANARY}"`, '# "todo\nMODE=bearer\nCLIENT_SECRET=[REDACTED]', CANARY],
@@ -2630,7 +2630,35 @@ test('cross-line Bearer/Basic prose and empty-assignment regressions redact in r
     ['MODE=bearer\nlB79GsW66LvIcKaTzjh="x"', 'MODE=bearer [REDACTED]"x"', 'lB79GsW66LvIcKaTzjh='],
     ['MODE=bearer\nlB79GsW66LvIcKaTzjh=$x', 'MODE=bearer [REDACTED]$x', 'lB79GsW66LvIcKaTzjh='],
     ['Bearer\nabcdefghijklmg=="x"', 'Bearer [REDACTED]"x"', 'abcdefghijklmg=='],
-    ['Bearer\nsecret_token_value="x"', 'Bearer\nsecret_token_value=[REDACTED]', '"x"'],
+    ['Bearer\nsecret_token_value="x"', 'Bearer [REDACTED]=[REDACTED]', 'secret_token_value='],
+    ['Bearer\nreview_fixture9472="request rejected"', 'Bearer [REDACTED]"request rejected"', 'review_fixture9472='],
+    ['Bearer\nreviewFixtureOnly="hello"', 'Bearer [REDACTED]"hello"', 'reviewFixtureOnly='],
+    ['error: Bearer\nreviewFixtureOnly=$suffix', 'error: Bearer [REDACTED]$suffix', 'reviewFixtureOnly='],
+    ['Bearer\npublicvalue=$HOME', 'Bearer [REDACTED]$HOME', 'publicvalue='],
+    ['Bearer\nsecret_token_value="request rejected"', 'Bearer [REDACTED]=[REDACTED]', 'secret_token_value='],
+    ["Bearer\nreviewFixtureOnly='hello'", "Bearer [REDACTED]'hello'", 'reviewFixtureOnly='],
+    ['Bearer\nreviewFixtureOnly=`hello`', 'Bearer [REDACTED]`hello`', 'reviewFixtureOnly='],
+    ['Bearer\nreviewFixtureOnly=${SUFFIX}', 'Bearer [REDACTED]${SUFFIX}', 'reviewFixtureOnly='],
+    ['Bearer\nreviewFixtureOnly=\\"hello\\"', 'Bearer [REDACTED]\\"hello\\"', 'reviewFixtureOnly='],
+    ['Basic\nreview_fixture9472="request rejected"', 'Basic [REDACTED]"request rejected"', 'review_fixture9472='],
+    ['Basic\nreviewFixtureOnly="hello"', 'Basic [REDACTED]"hello"', 'reviewFixtureOnly='],
+    ['error: Basic\nreviewFixtureOnly=$suffix', 'error: Basic [REDACTED]$suffix', 'reviewFixtureOnly='],
+    ['Basic\npublicvalue=$HOME', 'Basic [REDACTED]$HOME', 'publicvalue='],
+    ['Basic\nsecret_token_value="request rejected"', 'Basic [REDACTED]=[REDACTED]', 'secret_token_value='],
+    ['Bearer\nCLIENT_SECRET="MySecretCanary"', 'Bearer [REDACTED]=[REDACTED]', 'MySecretCanary'],
+    ["Basic\nreviewFixtureOnly='hello'", "Basic [REDACTED]'hello'", 'reviewFixtureOnly='],
+    ['Basic\nreviewFixtureOnly=`hello`', 'Basic [REDACTED]`hello`', 'reviewFixtureOnly='],
+    ['Basic\nreviewFixtureOnly=${SUFFIX}', 'Basic [REDACTED]${SUFFIX}', 'reviewFixtureOnly='],
+    ['Basic\nreviewFixtureOnly=\\"hello\\"', 'Basic [REDACTED]\\"hello\\"', 'reviewFixtureOnly='],
+    ['Bearer\n--review-fixture = "hello"', 'Bearer [REDACTED] = "hello"', '--review-fixture'],
+    ['Bearer\n--review-fixture = $HOME', 'Bearer [REDACTED] = $HOME', '--review-fixture'],
+    ['MODE=bearer\nlB79GsW66LvIcKaTzjhX="x"', 'MODE=bearer [REDACTED]"x"', 'lB79GsW66LvIcKaTzjhX='],
+    ['Basic\ncmV2aWV3OnLpdu9ld09ubHkx', 'Basic [REDACTED]', 'cmV2aWV3OnLpdu9ld09ubHkx'],
+    ['Basic\ndXNlcjrDuQ==', 'Basic [REDACTED]', 'dXNlcjrDuQ=='],
+    ['Basic\ncmV2aWV3OnLpdu9ld09ubHkx.', 'Basic [REDACTED]', 'cmV2aWV3OnLpdu9ld09ubHkx'],
+    ['Basic\ndXNlcjrDqXZpw6h3', 'Basic [REDACTED]', 'dXNlcjrDqXZpw6h3'],
+    ['Basic\nOnLpdu9ld09ubHkx', 'Basic [REDACTED]', 'OnLpdu9ld09ubHkx'],
+    ['Basic\ncmV2aWV3Og==', 'Basic [REDACTED]', 'cmV2aWV3Og=='],
   ]
 
   for (const [sample, expected, token] of redactFixtures) {
@@ -2712,11 +2740,21 @@ test('cross-line Bearer/Basic prose and empty-assignment regressions redact in r
     'Basic\nconfiguration guide',
     'MODE=bearer\nARTIFACT_DIR=~',
     'MODE=bearer\nPUBLIC_NAME="hello"',
+    'MODE=bearer\nPUBLIC_NAME=$HOME',
     'MODE=bearer\npublicvalue=hello',
     'MODE=bearer\npublicvalue==hello',
-    "Users' guide to bearer\npublicvalue='hello'",
+    "MODE=bearer\npublicvalue='hello'",
     'MODE=basic\nPUBLIC_NAME="hello"',
     'MODE=basic\nARTIFACT_DIR=~',
+    'Basic\nconfiguration',
+    'Basic\nconfiguration guide',
+    'Basic\nauthentication',
+    'Basic\nauthorization',
+    'Basic\ndocumentation',
+    'Basic\nimplementation',
+    'Basic\ncredentials',
+    'Basic\nAuthenticationGuide',
+    'Basic\nConfiguration details follow',
   ]
 
   for (const control of controlFixtures) {
@@ -2762,4 +2800,55 @@ test('cross-line Bearer/Basic prose and empty-assignment regressions redact in r
     expect(builtError.row.error_message).toBe(control)
     expect(builtError.redactions).toBe(0)
   }
+})
+
+test('Markdown label and table trimmers scale linearly on 64k whitespace and wrapper inputs', () => {
+  const n = 64_000
+  const spacedTable = `| a${' '.repeat(n)}b | safe |\n| --- | --- |\n| data | value |`
+  const warmStats = newStats()
+  redactText(spacedTable.slice(0, 1024), warmStats)
+
+  const t0 = performance.now()
+  const stats1 = newStats()
+  const out1 = redactText(spacedTable, stats1)
+  const ms1 = performance.now() - t0
+  expect(out1).toBe(spacedTable)
+  expect(stats1.redactions).toBe(0)
+  expect(ms1).toBeLessThan(1000)
+
+  const built = buildRow({
+    eventType: 'TOOL_COMPLETED',
+    timestampMs: 0,
+    eventId: 'md-redos-1',
+    agent: 'a',
+    sessionId: 's',
+    invocationId: 'i',
+    userId: 'u',
+    traceId: 't',
+    spanId: 'p',
+    parentSpanId: null,
+    content: { result: spacedTable },
+    attributes: {},
+    maxPayloadChars: 100_000,
+  })
+  expect(built.redactions).toBe(0)
+
+  const wrappedTable = `| Password | ${'*'.repeat(n)}b |\n| --- | --- |\n| Password | ${' '.repeat(n)}x |`
+  const t1 = performance.now()
+  const stats2 = newStats()
+  const out2 = redactText(wrappedTable, stats2)
+  const ms2 = performance.now() - t1
+  expect(out2).toContain('[REDACTED]')
+  expect(stats2.redactions).toBeGreaterThan(0)
+  expect(ms2).toBeLessThan(1000)
+
+  const parenFlood = `Password${' '.repeat(8_000)}(staging): secretValue123`
+  const t2 = performance.now()
+  const stats3 = newStats()
+  const out3 = redactText(parenFlood, stats3)
+  const ms3 = performance.now() - t2
+  expect(out3).toContain('[REDACTED]')
+  expect(out3).not.toContain('secretValue123')
+  expect(stats3.redactions).toBeGreaterThan(0)
+  expect(ms3).toBeLessThan(1000)
 })
