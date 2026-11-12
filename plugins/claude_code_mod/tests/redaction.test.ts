@@ -1629,6 +1629,19 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['authorization: $"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
     ['authorization: @"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
     ["authorization: rf'Bearer\nReviewFixtureOnly more'", 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
+    ['authorization: ur"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
+    ['authorization: ru"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
+    ['authorization: u8"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
+    ['authorization: L"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
+    ['authorization = $@"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization = [REDACTED]'],
+    ['authorization = @$"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization = [REDACTED]'],
+    ['authorization = ur"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization = [REDACTED]'],
+    ['authorization = ru"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization = [REDACTED]'],
+    ['authorization = u8"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization = [REDACTED]'],
+    ['authorization = L"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization = [REDACTED]'],
+    ['authorization = """\nBearer Abcd1234xyz\n"""', 'Abcd1234xyz', 'authorization = [REDACTED]\nBearer [REDACTED]\n"""'],
+    ["authorization = '''\nBearer Abcd1234xyz\n'''", 'Abcd1234xyz', "authorization = [REDACTED]\nBearer [REDACTED]\n'''"],
+    ["('Authorization', \"\"\"\nBearer Abcd1234xyz\n\"\"\")", 'Abcd1234xyz', "('Authorization', \"\"\"\nBearer [REDACTED]\n\"\"\")"],
     ['Authorization:\u2028Bearer\u2028ReviewFixtureOnly more', 'ReviewFixtureOnly', 'Authorization:\u2028Bearer [REDACTED] more'],
     ['Authorization:\u2028  Bearer\u2028  ReviewFixtureOnly more', 'ReviewFixtureOnly', 'Authorization:\u2028  Bearer [REDACTED] more'],
     // Comparison/scope operators (`==`, `::`) are not explicit auth headers, so
@@ -1797,6 +1810,19 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'MODE=bearer\nfoo=="bar"',
     'MODE=bearer\u2028CLIENT_SECRET=',
     'MODE=bearer\u2029CLIENT_SECRET=',
+    // Single-`=` identifiers under `MODE=bearer\n` (`precededByEq && !endsWithDoubleEq`)
+    // are preserved as empty config assignments, whereas `Bearer\nabcdefghijklmno=`
+    // (without `MODE=`) and `MODE=bearer\nabcdefghijklmg==` (`==`-padded) redact.
+    'MODE=bearer\nabcdefghijklmno=',
+    'MODE=bearer\nABCDEFGHIJKLMNO=',
+    // Comparison/relational operators (`!=`, `<=`, `>=`) are not explicit auth headers
+    // or assignments, so both `authorization` and trailing prose stay untouched.
+    'authorization != Bearer\nReviewFixtureOnly more',
+    'authorization <= Bearer\nReviewFixtureOnly more',
+    'authorization >= Bearer\nReviewFixtureOnly more',
+    'authorization!= Bearer\nReviewFixtureOnly more',
+    'authorization<= Bearer\nReviewFixtureOnly more',
+    'authorization>= Bearer\nReviewFixtureOnly more',
     'Authorization:\n  Bearer\nnone',
     'Authorization:\n  Bearer\nnull',
     'Authorization:\n  Bearer\nempty',
@@ -2247,6 +2273,10 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Note {see docs\nBearer secret_token_value: Pa}ss-w0rd-secret', 'Note {see docs\nBearer [REDACTED]: [REDACTED]', ['secret_token_value', 'Pa}ss-w0rd-secret', 'ss-w0rd-secret']],
     ['Note [see docs\nBearer secret_token_value: Pa]ss-w0rd-secret', 'Note [see docs\nBearer [REDACTED]: [REDACTED]', ['secret_token_value', 'Pa]ss-w0rd-secret', 'ss-w0rd-secret']],
     ['Note "see docs\nBearer secret_token_value: Pa"ss-w0rd-secret', 'Note "see docs\nBearer [REDACTED]: [REDACTED]', ['secret_token_value', 'Pa"ss-w0rd-secret', 'ss-w0rd-secret']],
+    ['He said "hi\nx = "(" + "Bearer secret_token_value: Pa)ss-w0rd"', 'He said "hi\nx = "(" + "Bearer [REDACTED]: [REDACTED]"', ['secret_token_value', 'Pa)ss-w0rd', 'ss-w0rd']],
+    ['He said "hi\nx = "[" + "Bearer secret_token_value: Pa]ss-w0rd"', 'He said "hi\nx = "[" + "Bearer [REDACTED]: [REDACTED]"', ['secret_token_value', 'Pa]ss-w0rd', 'ss-w0rd']],
+    ['He said "hi\nx = "{" + "Bearer secret_token_value: Pa}ss-w0rd"', 'He said "hi\nx = "{" + "Bearer [REDACTED]: [REDACTED]"', ['secret_token_value', 'Pa}ss-w0rd', 'ss-w0rd']],
+    ['He said "hi\nx = "(\\"Bearer secret_token_value: Pa)ss-w0rd\\""', 'He said "hi\nx = "(\\"Bearer [REDACTED]: [REDACTED]\\""', ['secret_token_value', 'Pa)ss-w0rd', 'ss-w0rd']],
     ['Authorization: Bearer client_secret= #s3cret', 'Authorization: [REDACTED]', ['client_secret', 's3cret']],
     ['Authorization:\nBearer client_secret= #s3cret', 'Authorization:\nBearer [REDACTED]', ['client_secret', 's3cret']],
     ['X-Auth: Bearer client_secret= #s3cret', 'X-Auth: [REDACTED]', ['client_secret', 's3cret']],
@@ -2308,6 +2338,92 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
       label,
       withinBudget: msLarge < 250,
       linearScaling: msLarge <= Math.max(120, msSmall * 25),
+    }).toEqual({ label, withinBudget: true, linearScaling: true })
+  }
+
+  // Documented JSON allowlist / compact re-serialization divergence:
+  // `redactText()` and `buildRow()` match 100% on allowlisted compact JSON keys above,
+  // whereas `buildRow()` parses JSON strings inside tool results, enforces the key
+  // allowlist (redacting unlisted keys' values whole), and re-serializes compactly.
+  for (const [sample, expectedText, forbidden, rowResultExpected, expectedBuildRedactions] of [
+    ['{"error": "Rejected Bearer my_access_token_99: "}', '{"error": "Rejected Bearer [REDACTED]: "}', ['my_access_token_99'], '{"error":"Rejected Bearer [REDACTED]: "}', 1],
+    ['{"e":"Bearer secret_token_value: denied","next":"ok"}', '{"e":"Bearer [REDACTED]: [REDACTED]","next":"ok"}', ['secret_token_value', 'denied'], '{"e":"[REDACTED]","next":"[REDACTED]"}', 2],
+    ['"{\\"note\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', '"{\\"note\\": \\"Bearer [REDACTED]\\", \\"id\\": 123}"', ['mySecretTokenAb='], '"{\\"note\\":\\"[REDACTED]\\",\\"id\\":\\"[REDACTED]\\"}"', 2],
+  ] as const) {
+    const stats = newStats()
+    const out = redactText(sample, stats)
+    expect(out).toBe(expectedText)
+    for (const part of forbidden) expect(out).not.toContain(part)
+    expect(stats.redactions).toBe(1)
+
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
+
+    const built = buildRow({
+      eventType: 'TOOL_COMPLETED',
+      timestampMs: 0,
+      eventId: 'e1',
+      agent: 'a',
+      sessionId: 's',
+      invocationId: 'i',
+      userId: 'u',
+      traceId: 't',
+      spanId: 'p',
+      parentSpanId: null,
+      content: { result: sample },
+      attributes: {},
+      maxPayloadChars: 16_384,
+    })
+    const serialized = JSON.stringify(built.row)
+    for (const part of forbidden) expect(serialized).not.toContain(part)
+    expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(rowResultExpected)
+    expect(built.redactions).toBe(expectedBuildRedactions)
+  }
+})
+
+test('lineStopFor and lineEnd scale linearly (1,600 vs 8,000 lines) with distant CR/LS and many KV pairs', () => {
+  for (const [label, gen, expectedGen] of [
+    [
+      'lineStopFor Bearer client_secret + trailing CR',
+      (n: number) => 'Bearer client_secret: x\n'.repeat(n) + '\r',
+      (n: number) => 'Bearer [REDACTED]: [REDACTED]\n'.repeat(n) + '\r',
+    ],
+    [
+      'lineStopFor Bearer client_secret + trailing LS',
+      (n: number) => 'Bearer client_secret: x\n'.repeat(n) + '\u2028',
+      (n: number) => 'Bearer [REDACTED]: [REDACTED]\n'.repeat(n) + '\u2028',
+    ],
+    [
+      'lineEnd password KV pairs',
+      (n: number) => 'password: x\n'.repeat(n),
+      (n: number) => 'password: [REDACTED]\n'.repeat(n),
+    ],
+    [
+      'lineEnd password KV pairs + trailing LS',
+      (n: number) => 'password: x\n'.repeat(n) + '\u2028',
+      (n: number) => 'password: [REDACTED]\n'.repeat(n) + '\u2028',
+    ],
+  ] as const) {
+    const small = gen(1_600)
+    redactText(small, newStats())
+    const t0 = performance.now()
+    redactText(small, newStats())
+    const msSmall = Math.max(1, performance.now() - t0)
+
+    const large = gen(8_000)
+    redactText(large.slice(0, 400), newStats())
+    const statsLarge = newStats()
+    const t1 = performance.now()
+    const outLarge = redactText(large, statsLarge)
+    const msLarge = performance.now() - t1
+
+    expect(outLarge === expectedGen(8_000)).toBe(true)
+    expect(statsLarge.redactions).toBe(8_000)
+    expect({
+      label,
+      withinBudget: msLarge < 250,
+      linearScaling: msLarge <= Math.max(50, msSmall * 15),
     }).toEqual({ label, withinBudget: true, linearScaling: true })
   }
 })
