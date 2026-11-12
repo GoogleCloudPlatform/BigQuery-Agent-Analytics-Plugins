@@ -1390,7 +1390,7 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['# echo "\\"Bearer mySecretTokenAb=\\""', '# echo "\\"Bearer [REDACTED]\\""', 'mySecretTokenAb='],
     ['echo \'"Bearer mySecretTokenAb=" foo "unclosed\'', 'echo \'"Bearer [REDACTED]" foo "unclosed\'', 'mySecretTokenAb='],
     ['echo \'"Bearer mySecretTokenAb=", "unclosed\'', 'echo \'"Bearer [REDACTED]", "unclosed\'', 'mySecretTokenAb='],
-    ['echo \'Bearer mySecretTokenAb= "next"\'', 'echo \'Bearer [REDACTED] "next"\'', 'mySecretTokenAb='],
+    ['echo \'Bearer mySecretTokenAb= "next"\'', 'echo \'Bearer [REDACTED]= [REDACTED]\'', 'mySecretTokenAb='],
     ["echo 'Bearer\nmySecretTokenAb='", "echo 'Bearer [REDACTED]'", 'mySecretTokenAb='],
     ['log="Bearer\nmySecretTokenAb="', 'log="Bearer [REDACTED]"', 'mySecretTokenAb='],
     ['echo "\\"Bearer\nmySecretTokenAb=\\""', 'echo "\\"Bearer [REDACTED]\\""', 'mySecretTokenAb='],
@@ -2921,4 +2921,156 @@ test('nested parenthetical qualifiers in YAML blocks and Markdown labels still r
   expect(outMd).not.toContain('nested-md-secret-value')
   expect(outMd).toContain('[REDACTED]')
   expect(statsMd.redactions).toBeGreaterThan(0)
+
+  const balancedCases: readonly [string, string][] = [
+    ['password ((a) (b)): |\n  secret-val-double-1', 'secret-val-double-1'],
+    ['Password ((a) (b)): secret-val-double-md', 'secret-val-double-md'],
+    ['password (((a))): |\n  secret-val-triple-1', 'secret-val-triple-1'],
+    ['**Password** ((a) (b)): secret-val-bold-nested', 'secret-val-bold-nested'],
+  ]
+  for (const [sample, secret] of balancedCases) {
+    const s = newStats()
+    const out = redactText(sample, s)
+    expect(out).not.toContain(secret)
+    expect(out).toContain('[REDACTED]')
+    expect(s.redactions).toBeGreaterThan(0)
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
+  }
+
+  const safeNested = 'Note (a) (b): public-value'
+  const safeStats = newStats()
+  expect(redactText(safeNested, safeStats)).toBe(safeNested)
+  expect(safeStats.redactions).toBe(0)
+
+  // Verify O(N) linear scaling on 131,072-char nested-paren floods.
+  const floods: readonly [string, boolean][] = [
+    [`**Note**${' '.repeat(131_072)}x\nnote: y`, false],
+    [`**Note** (a)${' '.repeat(131_072)}x\nnote: y`, false],
+    [`password (${' '.repeat(131_072)}): |`, false],
+    [`Password (${'('.repeat(20)}${')'.repeat(20)})${' '.repeat(131_072)}x: secret`, false],
+  ]
+  for (const [probe, shouldRedact] of floods) {
+    const t0 = performance.now()
+    const s = newStats()
+    const out = redactText(probe, s)
+    const ms = performance.now() - t0
+    expect(ms).toBeLessThan(1000)
+    if (!shouldRedact) {
+      expect(out).toBe(probe)
+      expect(s.redactions).toBe(0)
+    }
+  }
+})
+
+test('base64-padded-length sensitive keys with spaced RHS redact and stay 1-pass idempotent', () => {
+  const elevenCharKeys = [
+    'private_key',
+    'signing_key',
+    'session_key',
+    'user_secret',
+    'auth_secret',
+    'my_password',
+    'secret_code',
+    'private-key',
+    'master_key1',
+  ]
+  for (const key of elevenCharKeys) {
+    const samples: readonly [string, string][] = [
+      [`Bearer\n${key}= "secret-val" # comment`, 'secret-val'],
+      [`Bearer\n${key}= ".secret" # comment`, '.secret'],
+      [`Bearer\n${key}= hunter2 # comment`, 'hunter2'],
+      [`Basic\n${key}= hunter2`, 'hunter2'],
+      [`Bearer ${key}= hunter2`, 'hunter2'],
+      [`Bearer ${key}= "secret-val"`, 'secret-val'],
+      [`MODE=bearer\n${key}= hunter2`, 'hunter2'],
+      [`MODE=bearer\n${key}= "secret-val"`, 'secret-val'],
+    ]
+    for (const [sample, secret] of samples) {
+      const s = newStats()
+      const out = redactText(sample, s)
+      expect(out).not.toContain(secret)
+      expect(out).toContain('[REDACTED]')
+      expect(s.redactions).toBeGreaterThan(0)
+      const reStats = newStats()
+      expect(redactText(out, reStats)).toBe(out)
+      expect(reStats.redactions).toBe(0)
+    }
+  }
+  const extraSamples: readonly [string, string][] = [
+    ['MODE=bearer\nCLIENT_SECRET= hunter2', 'hunter2'],
+    ['Bearer\nmy_secret_token= hunter2', 'hunter2'],
+    ['Bearer\nclient_key== hunter2', 'hunter2'],
+    ['Bearer\nkey_id1== hunter2', 'hunter2'],
+  ]
+  for (const [sample, secret] of extraSamples) {
+    const s = newStats()
+    const out = redactText(sample, s)
+    expect(out).not.toContain(secret)
+    expect(out).toContain('[REDACTED]')
+    expect(s.redactions).toBeGreaterThan(0)
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
+  }
+})
+
+test('RFC 7617 Latin-1 credentials redact while mixed-case/suffixed Basic prose stays preserved', () => {
+  const leaks: readonly [string, string][] = [
+    ['Basic OmtlecPh', 'OmtlecPh'],
+    ['Basic OmtlefOx', 'OmtlefOx'],
+    ['Basic Omtleeft', 'Omtleeft'],
+    ['Basic\nOmtleeft', 'Omtleeft'],
+    ['Basic\ncmV2aWV3OnLpdu9ld09ubHkx', 'cmV2aWV3OnLpdu9ld09ubHkx'],
+  ]
+  for (const [sample, token] of leaks) {
+    const s = newStats()
+    const out = redactText(sample, s)
+    expect(out).not.toContain(token)
+    expect(out).toContain('[REDACTED]')
+    expect(s.redactions).toBeGreaterThan(0)
+    const reStats = newStats()
+    expect(redactText(out, reStats)).toBe(out)
+    expect(reStats.redactions).toBe(0)
+  }
+
+  const controls: readonly string[] = [
+    'Basic OutputJSON support',
+    'Basic OutputHTML',
+    'Basic Output2',
+    'Basic Order66',
+    'Basic Ours',
+    'Basic Ouch',
+    'Basic OutputFormat',
+  ]
+  for (const control of controls) {
+    const s = newStats()
+    expect(redactText(control, s)).toBe(control)
+    expect(s.redactions).toBe(0)
+  }
+})
+
+test('cross-line short sensitive assignments are 1-pass idempotent', () => {
+  const cases: readonly [string, string][] = [
+    ['Bearer\nsecret=~', 'Bearer [REDACTED]=[REDACTED]'],
+    ['Basic\nsecret=~', 'Basic [REDACTED]=[REDACTED]'],
+    ['Bearer\nsecret=abc', 'Bearer [REDACTED]=[REDACTED]'],
+    ['Bearer\nsecret=""', 'Bearer [REDACTED]""'],
+    ['Bearer\nCLIENT_SECRET=hunter2', 'Bearer [REDACTED]'],
+    ['Bearer\nprivate_key= hunter2', 'Bearer [REDACTED]= [REDACTED]'],
+    ['Bearer\nsecret=[REDACTED]', 'Bearer [REDACTED]=[REDACTED]'],
+    ['"Bearer\nsecret=~"', '"Bearer [REDACTED]=[REDACTED]"'],
+    ['Bearer\nsecret=~\n# trailing line', 'Bearer [REDACTED]=[REDACTED]\n# trailing line'],
+  ]
+  for (const [sample, expected] of cases) {
+    const s1 = newStats()
+    const once = redactText(sample, s1)
+    expect(once).toBe(expected)
+    expect(s1.redactions).toBeGreaterThan(0)
+    const s2 = newStats()
+    const twice = redactText(once, s2)
+    expect(twice).toBe(once)
+    expect(s2.redactions).toBe(0)
+  }
 })

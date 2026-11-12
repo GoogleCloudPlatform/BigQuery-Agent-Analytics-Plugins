@@ -766,14 +766,15 @@ export class Writer {
     const c = this.config()
     if (!canDeliver(c) || c.dryRun || this.closing || (!explicit && (this.problem !== null || this.lastSuccessAt !== null || this.lastError !== null))) return null
     if (explicit) this.resetHeldCooldown()
-    if (budgetMs !== undefined && (!Number.isFinite(budgetMs) || budgetMs <= 0)) {
+    const effectiveBudgetMs = budgetMs === Number.POSITIVE_INFINITY ? undefined : budgetMs
+    if (effectiveBudgetMs !== undefined && (!Number.isFinite(effectiveBudgetMs) || effectiveBudgetMs <= 0)) {
       return 'timed out (insufficient command budget)'
     }
     const startedAt = this.io.now()
-    const totalBudgetMs = budgetMs !== undefined ? budgetMs : Math.max(timeoutMs, c.tokenCommandTimeoutMs) + timeoutMs * 2
+    const totalBudgetMs = effectiveBudgetMs !== undefined ? effectiveBudgetMs : Math.max(timeoutMs, c.tokenCommandTimeoutMs) + timeoutMs * 2
     // When the whole check is over, the fresh token after a 401 included.
     const deadline = startedAt + totalBudgetMs
-    const reqBudgetMs = budgetMs !== undefined ? Math.min(timeoutMs, Math.max(1, Math.floor(totalBudgetMs / 2))) : timeoutMs
+    const reqBudgetMs = effectiveBudgetMs !== undefined ? Math.min(timeoutMs, Math.max(1, Math.floor(totalBudgetMs / 2))) : timeoutMs
     const tokenTimeoutMs = Math.min(Math.max(timeoutMs, c.tokenCommandTimeoutMs), Math.max(1, totalBudgetMs - reqBudgetMs))
     const url = `${tablesUrl(c)}/${encodeURIComponent(c.table)}?fields=tableReference`
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -782,7 +783,7 @@ export class Writer {
       // least 500 ms on bounded post-401 retries so a fresh-token retry still
       // proceeds when 500 ms .. reqBudgetMs of the deadline remains.
       const remainingBeforeToken = attempt === 0 ? totalBudgetMs : deadline - this.io.now()
-      const reserveMs = attempt === 0 || (budgetMs === undefined && remainingBeforeToken > reqBudgetMs)
+      const reserveMs = attempt === 0 || (effectiveBudgetMs === undefined && remainingBeforeToken > reqBudgetMs)
         ? reqBudgetMs
         : Math.min(reqBudgetMs, 500)
       const tokenMs = Math.min(tokenTimeoutMs, Math.max(0, remainingBeforeToken - reserveMs))

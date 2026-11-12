@@ -496,11 +496,36 @@ function decodeBase64PrintableColon(token: string): boolean {
   if (bytes.length < 3) return false
   if (isPrintableUtf8WithColon(bytes)) return true
   if (!isPrintableLatin1WithColon(bytes)) return false
-  return !PASCAL_CASE_WORD_RE.test(token) && !LOWER_ALPHA_WORD_RE.test(token)
+  return !LATIN1_PROSE_TOKEN_RE.test(token) || hasStructuredLatin1Credential(bytes)
 }
 
 const PASCAL_CASE_WORD_RE = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/
-const LOWER_ALPHA_WORD_RE = /^[a-z]+$/
+const LATIN1_PROSE_TOKEN_RE = /^(?:[a-z]+|[A-Z][a-z]+(?:[A-Z][a-z]{2,})*|[A-Z][a-z]{2,}(?:[A-Z]{2,}|\d{1,2}))$/
+
+const isAsciiUserByte = (b: number): boolean =>
+  (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b === 46 || b === 95 || b === 45
+
+const isAsciiLowerOrDigit = (b: number): boolean =>
+  (b >= 97 && b <= 122) || (b >= 48 && b <= 57)
+
+function hasStructuredLatin1Credential(bytes: number[]): boolean {
+  const colonIdx = bytes.indexOf(0x3a)
+  if (colonIdx >= 2) {
+    for (let i = 0; i < colonIdx; i += 1) {
+      if (!isAsciiUserByte(bytes[i] as number)) return false
+    }
+    return true
+  }
+  if (colonIdx === 0) {
+    return (
+      bytes.length >= 4 &&
+      isAsciiLowerOrDigit(bytes[1] as number) &&
+      isAsciiLowerOrDigit(bytes[2] as number) &&
+      isAsciiLowerOrDigit(bytes[3] as number)
+    )
+  }
+  return false
+}
 const PASCAL_COMPONENT_RE = /[A-Z][a-z]+/g
 const PROSE_PASCAL_WORDS = new Set([
   'configuration', 'word', 'words', 'authentication', 'authorization',
@@ -1895,9 +1920,10 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     coreToken: string,
     eqIdx: number,
     isLowerWordKey: boolean,
-    endsWithDoubleEq: boolean,
     tokQState: QuoteContext,
+    isRecognizedConfigKey: boolean,
   ): boolean => {
+    if (hasCtx && isBase64PaddedToken(coreToken) && !isRecognizedConfigKey) return false
     const eqLineStop = lineStopFor(curEffectiveMatchEnd)
     let spEnd = curEffectiveMatchEnd
     while (spEnd < eqLineStop && isSameLineWsAt(text, spEnd)) spEnd += 1
@@ -1905,30 +1931,27 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     const boundedStop = Math.min(eqLineStop, spEnd + 64)
     const dualHeadStop = computeDualStop(spEnd, boundedStop, tokQState, curHasNewline)
     if (spEnd >= dualHeadStop) return false
-    const spaceBeforeQuoteRhs =
-      !isBase64PaddedToken(coreToken) &&
-      (() => {
-        const ch = text[spEnd]
-        if (ch === '"' || ch === "'" || ch === '`') {
-          return isOpeningUnescapedQuote(spEnd, ch, tokQState, coreToken, isLowerWordKey && !endsWithDoubleEq)
-        }
-        if (ch === '\\' && (text[spEnd + 1] === '"' || text[spEnd + 1] === "'")) {
-          return isOpeningEscapedQuote(spEnd, text[spEnd + 1] as string, tokQState, coreToken, isLowerWordKey && !endsWithDoubleEq)
-        }
-        if (ch === '$') {
-          return isValidVarRhsAt(
-            spEnd,
-            text.slice(spEnd, dualHeadStop),
-            tokQState,
-            coreToken,
-            isLowerWordKey && !endsWithDoubleEq,
-          )
-        }
-        return false
-      })()
+    const allowQuoteRhs = isLowerWordKey || !hasCtx || isRecognizedConfigKey
+    const spaceBeforeQuoteRhs = (() => {
+      const ch = text[spEnd]
+      if (ch === '"' || ch === "'" || ch === '`') {
+        return isOpeningUnescapedQuote(spEnd, ch, tokQState, coreToken, allowQuoteRhs)
+      }
+      if (ch === '\\' && (text[spEnd + 1] === '"' || text[spEnd + 1] === "'")) {
+        return isOpeningEscapedQuote(spEnd, text[spEnd + 1] as string, tokQState, coreToken, allowQuoteRhs)
+      }
+      if (ch === '$') {
+        return isValidVarRhsAt(
+          spEnd,
+          text.slice(spEnd, dualHeadStop),
+          tokQState,
+          coreToken,
+          allowQuoteRhs,
+        )
+      }
+      return false
+    })()
     const spaceBeforeValueRhs =
-      !endsWithDoubleEq &&
-      !isBase64PaddedToken(coreToken) &&
       /^(?!(?:#(?:$|[\s])|[;)|&"'`$\\\]},]))(?!(?:bearer|basic)(?:[\s]|$))\S/i.test(
         text.slice(spEnd, Math.min(dualHeadStop, spEnd + 8)),
       )
@@ -2156,6 +2179,19 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               keepAndRewind()
               continue
             }
+            if (
+              !precededByEqOrInComment &&
+              assignKey.length <= 100 &&
+              isSensitiveKey(assignKey) &&
+              !isBase64PaddedToken(coreToken) &&
+              (coreToken.length < 12 || (effectiveAfter !== '' && !/^[\s#;)|&]/.test(effectiveAfter)))
+            ) {
+              const eqLineStop = lineStopFor(effectiveMatchEnd)
+              const rhsAt = m.index + scheme.length + space.length + eqIdx + 1
+              const dualStop = computeDualStop(rhsAt, eqLineStop, tokQState, hasNewline)
+              emitSpanRedaction('=' + MARKER, dualStop)
+              continue
+            }
           } else {
             const hasAssignOrLineCommentCtx = precededByEqOrInComment
             const allowPaddedLowerQuoteRhs =
@@ -2205,7 +2241,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                 emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
                 continue
               }
-              if (trySpacedSensitiveEqRhs(false, coreToken, eqIdx, isLowerWordKey, endsWithDoubleEq, tokQState)) {
+              if (trySpacedSensitiveEqRhs(false, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey)) {
                 continue
               }
               if (isEmptyQuotedRhs) {
@@ -2217,7 +2253,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               hasAssignOrLineCommentCtx &&
               assignKey.length <= 100 &&
               isSensitiveKey(assignKey) &&
-              trySpacedSensitiveEqRhs(true, coreToken, eqIdx, isLowerWordKey, endsWithDoubleEq, tokQState)
+              trySpacedSensitiveEqRhs(true, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey)
             ) {
               continue
             }
@@ -2275,7 +2311,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
             continue
           }
-          if (trySpacedSensitiveEqRhs(hasAssignOrCommentCtx, coreToken, eqIdx, isLowerWordKey, endsWithDoubleEq, tokQState)) {
+          if (trySpacedSensitiveEqRhs(hasAssignOrCommentCtx, coreToken, eqIdx, isLowerWordKey, tokQState, isRecognizedConfigKey)) {
             continue
           }
         } else if (!isBase64PaddedToken(coreToken)) {
@@ -4625,10 +4661,17 @@ function stripTrailingParenQualifier(s: string, withSep: boolean): string {
   const closeIdx = end - 1
   const minOpen = Math.max(0, closeIdx - 41)
   let openIdx = -1
+  let depth = 1
   for (let i = closeIdx - 1; i >= minOpen; i -= 1) {
     const c = s.charCodeAt(i)
-    if (c === 10 || c === 41) break
-    if (c === 40) openIdx = i
+    if (c === 10) break
+    if (c === 41) {
+      if (depth <= 0) break
+      depth += 1
+    } else if (c === 40) {
+      depth -= 1
+      if (depth <= 0) openIdx = i
+    }
   }
   if (openIdx === -1) return s
   const innerLen = closeIdx - openIdx - 1
@@ -4638,7 +4681,7 @@ function stripTrailingParenQualifier(s: string, withSep: boolean): string {
   return s.slice(0, labelEnd)
 }
 
-const YAML_BLOCK_HEADER = /^([ \t]*(?:-[ \t]+)?)([A-Za-z0-9_.*"`'-]+(?:[ \t]*\([^)\n]{1,40}\))?)[ \t]*:[ \t]*(?:[|>][+-]?\d*|\d*[|>][+-]?)[ \t]*(?:#[^\n]*)?$/
+const YAML_BLOCK_HEADER = /^([ \t]*(?:-[ \t]+)?)([A-Za-z0-9_.*"`'-]+(?:[ \t]*\([^\n]{1,40}\))?)[ \t]*:[ \t]*(?:[|>][+-]?\d*|\d*[|>][+-]?)[ \t]*(?:#[^\n]*)?$/
 const K8S_NAME_LINE = /^([ \t]*-[ \t]+)name[ \t]*:[ \t]*(?:"([^"\n]+)"|'([^'\n]+)'|([^\s#]+))[ \t]*(?:#.*)?$/
 const K8S_VALUE_LINE = /^([ \t]+)value[ \t]*:[ \t]*(.*)$/
 
@@ -4721,9 +4764,9 @@ function redactK8sAndYamlBlocks(text: string, stats: SanitizeStats): string {
   return out.map(r => r.line + r.eol).join('')
 }
 
-const MD_WRAP_CLOSED = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_`])([A-Za-z_][A-Za-z0-9_.\t -]{0,80})\2([ \t]*(?:\([^)\n]{1,40}\)[ \t]*)?[:=][ \t]*)(.+)$/
+const MD_WRAP_CLOSED = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_`])([A-Za-z_][A-Za-z0-9_.\t -]{0,80})\2([ \t]*(?:\([^\n]{1,40}\)[ \t]*)?[:=][ \t]*)(.+)$/
 const MD_WRAP_AROUND_SEP = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_])([A-Za-z_][A-Za-z0-9_.\t -]{0,80})([:=])\2([ \t]*)(.+)$/
-const MD_PAREN_LABEL = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,59}[A-Za-z0-9_.-])?[ \t]*\([^)\n]{1,40}\)[ \t]*[:=][ \t]*)(.+)$/
+const MD_PAREN_LABEL = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,59}[A-Za-z0-9_.-])?[ \t]*\([^\n]{1,40}\)[ \t]*[:=][ \t]*)(.+)$/
 const MD_SEPARATOR_ROW = /^\|(?:\s*:?-{2,}:?\s*\|)+\s*$/
 const GENERIC_KEY_COL_HEADERS = new Set([
   'key', 'keys', 'name', 'names', 'field', 'fields', 'setting', 'settings',

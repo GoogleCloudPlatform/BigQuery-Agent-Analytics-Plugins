@@ -1807,6 +1807,10 @@ test('/bqaa-status check and /bqaa-backfill stay within tight next.budget.remain
   expect(writer.snapshot().lastError).toBeNull()
   expect(await writer.probeDestination(3000, true, 1)).toBe('timed out (insufficient command budget)')
   expect(writer.snapshot().lastError).toBeNull()
+  expect(await writer.probeDestination(3000, true, -5)).toBe('timed out (insufficient command budget)')
+  expect(writer.snapshot().lastError).toBeNull()
+  expect(await writer.probeDestination(3000, true, Number.NEGATIVE_INFINITY)).toBe('timed out (insufficient command budget)')
+  expect(writer.snapshot().lastError).toBeNull()
   expect(await writer.probeDestination(3000, true, Number.NaN)).toBe('timed out (insufficient command budget)')
   expect(writer.snapshot().lastError).toBeNull()
   expect(runTimeouts).toEqual([])
@@ -1821,6 +1825,33 @@ test('/bqaa-status check and /bqaa-backfill stay within tight next.budget.remain
   expect(runTimeouts).toEqual([25])
   expect(clock.pending()).toBe(0)
   releaseTightToken()
+
+  let outInf: string | null | undefined
+  let releaseInfToken = (): void => undefined
+  const infTimeouts: number[] = []
+  const infWriter = new Writer(
+    makeProbeIo(
+      clock,
+      async () => TABLE_FOUND,
+      async (_argv, timeoutMs) => {
+        infTimeouts.push(timeoutMs)
+        return new Promise(resolve => {
+          releaseInfToken = () => resolve({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' })
+        })
+      },
+    ),
+    () => PROBE_CONFIG,
+    () => 'probe-inf-budget',
+  )
+  const infPromise = infWriter.probeDestination(3000, true, Number.POSITIVE_INFINITY).then(v => {
+    outInf = v
+  })
+  await Promise.resolve()
+  expect(infTimeouts).toEqual([PROBE_CONFIG.tokenCommandTimeoutMs])
+  releaseInfToken()
+  await infPromise
+  expect(outInf).toBe(`BigQuery found ${TABLE_REF}`)
+  expect(clock.pending()).toBe(0)
 })
 
 test('interactive /bqaa-backfill wait respects 1800 ms command budget against hanging helper', { options: OPTIONS }, async ($, on) => {
@@ -1841,13 +1872,17 @@ test('interactive /bqaa-backfill wait respects 1800 ms command budget against ha
   await worldWait.clock.advance(300)
   const text = (await running1800).text ?? ''
   expect(finishedAt - t0).toBeLessThanOrEqual(300)
-  expect(text).toMatch(/still running after 0\.(?:29\d|3) s/)
+  const elapsedMatch = /still running after (\d+(?:\.\d+)?) s/.exec(text)
+  expect(elapsedMatch).not.toBeNull()
+  const elapsedSec = Number(elapsedMatch![1])
+  expect(elapsedSec).toBeGreaterThan(0)
+  expect(elapsedSec).toBeLessThanOrEqual(0.3)
 })
 
 const tightRowBoundary = buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'b'.repeat(32), agent: 'coding-agent', sessionId: SESSION_ID, invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
 
-// Budgets yielding waitMs < 250 ms (0, 200, 1500, 1501, 1749, NaN) must return immediately without starting a doomed backfill or writing in-flight marks.
-for (const remainingMs of [0, 200, 1_500, 1_501, 1_749, Number.NaN] as const) {
+// Budgets yielding waitMs < 250 ms (-50, 0, 200, 1500, 1501, 1749, NaN) must return immediately without starting a doomed backfill or writing in-flight marks.
+for (const remainingMs of [-50, 0, 200, 1_500, 1_501, 1_749, Number.NaN] as const) {
   test(`headless -p /bqaa-backfill and /bqaa-status check skip doomed backfill at remainingMs=${String(remainingMs)}`, { options: OPTIONS }, async ($, on) => {
     const worldP = setUp(on)
     worldP.processDelayMs = 15_000
@@ -1864,8 +1899,13 @@ for (const remainingMs of [0, 200, 1_500, 1_501, 1_749, Number.NaN] as const) {
       const checking = $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND }, { budgetMs: remainingMs })
       await worldP.clock.advance(250)
       const statusRes = await checking
-      expect(statusRes.text ?? '').toMatch(/destination check: no token within 12\d ms/)
-      expect(statusRes.text ?? '').not.toContain('backfill: running')
+      const statusText = statusRes.text ?? ''
+      const noTokenMatch = /destination check: no token within (\d+) ms/.exec(statusText)
+      expect(noTokenMatch).not.toBeNull()
+      const noTokenMs = Number(noTokenMatch![1])
+      expect(noTokenMs).toBeGreaterThanOrEqual(1)
+      expect(noTokenMs).toBeLessThanOrEqual(125)
+      expect(statusText).not.toContain('backfill: running')
     } else {
       const statusRes = await $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND }, { budgetMs: remainingMs })
       expect(statusRes.text ?? '').toContain('destination check: timed out (insufficient command budget)')

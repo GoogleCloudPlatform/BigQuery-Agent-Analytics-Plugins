@@ -693,7 +693,7 @@ export function createTestHarness(pluginRoot) {
       register: spec => unwrapEnvelope('command.register', spec),
       run: async (e, opts) => {
         const budgetMs = opts?.budgetMs ?? 10_000
-        const limitMs = Number.isNaN(budgetMs) ? 0 : budgetMs
+        const limitMs = Number.isNaN(budgetMs) || budgetMs < 0 ? 0 : budgetMs
         const startNow = clock.now()
         const result = await runTopDispatch('command.run', e, { budget: { remainingMs: budgetMs } })
         const elapsed = clock.now() - startNow
