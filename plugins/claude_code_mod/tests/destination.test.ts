@@ -1773,29 +1773,19 @@ test('/bqaa-status check and /bqaa-backfill stay within tight next.budget.remain
     expect(world.fetches).toEqual([])
   }
 
-  // 3. /bqaa-backfill wait (interactive) and headless -p /bqaa-backfill with remainingMs=200 and remainingMs=1800:
+  // 3. /bqaa-backfill wait (interactive) and tight-budget boundaries (0, 200, 1500, 1501, 1749, 1800, 2000, NaN, Infinity):
   const tightRow1 = buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'a'.repeat(32), agent: 'coding-agent', sessionId: SESSION_ID, invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
   world.files.set(
     `${PARTITION_DIR}/spill-20261112T100000000Z-tight-1.jsonl`,
     packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRow1 })])[0] as string,
   )
   const interactive200 = await $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: 200 })
-  expect(interactive200.text ?? '').toContain('timed out waiting (insufficient command budget)')
+  expect(interactive200.text ?? '').toContain('timed out waiting (insufficient command budget); backfill started in background; /bqaa-status shows progress.')
+  const statusDuringTightBackfill = await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 200 })
+  expect(statusDuringTightBackfill.text ?? '').toContain('backfill: running')
 
-  {
-    const t0 = world.clock.now()
-    let finishedAt = -1
-    const running1800 = $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: 1_800 }).then(res => {
-      finishedAt = world.clock.now()
-      return res
-    })
-    await world.clock.advance(300)
-    const text = (await running1800).text ?? ''
-    expect(finishedAt - t0).toBeLessThanOrEqual(300)
-    expect(text).toContain('still running after 0.3 s')
-  }
-
-  // 4. Direct Writer.probeDestination(3000, true, 0) and (3000, true, 50) never inflate above budgetMs.
+  // 4. Direct Writer.probeDestination(3000, true, 0), (3000, true, 1), and (3000, true, NaN)
+  //    never inflate above budgetMs and never set lastError.
   const clock = probeClock()
   const runTimeouts: number[] = []
   let releaseTightToken = (): void => undefined
@@ -1814,6 +1804,11 @@ test('/bqaa-status check and /bqaa-backfill stay within tight next.budget.remain
     () => 'probe-tight-budget',
   )
   expect(await writer.probeDestination(3000, true, 0)).toBe('timed out (insufficient command budget)')
+  expect(writer.snapshot().lastError).toBeNull()
+  expect(await writer.probeDestination(3000, true, 1)).toBe('timed out (insufficient command budget)')
+  expect(writer.snapshot().lastError).toBeNull()
+  expect(await writer.probeDestination(3000, true, Number.NaN)).toBe('timed out (insufficient command budget)')
+  expect(writer.snapshot().lastError).toBeNull()
   expect(runTimeouts).toEqual([])
   expect(clock.pending()).toBe(0)
 
@@ -1828,26 +1823,123 @@ test('/bqaa-status check and /bqaa-backfill stay within tight next.budget.remain
   releaseTightToken()
 })
 
-test('headless -p /bqaa-backfill respects tight next.budget.remainingMs (200 ms and 1800 ms) against hanging network/helper', { options: OPTIONS }, async ($, on) => {
-  const worldP = setUp(on)
-  worldP.processDelayMs = 15_000
-  const tightRow2 = buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'b'.repeat(32), agent: 'coding-agent', sessionId: SESSION_ID, invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
-  worldP.files.set(
-    `${PARTITION_DIR}/spill-20261112T100000000Z-tight-2.jsonl`,
-    packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRow2 })])[0] as string,
+test('interactive /bqaa-backfill wait respects 1800 ms command budget against hanging helper', { options: OPTIONS }, async ($, on) => {
+  const worldWait = setUp(on)
+  worldWait.processDelayMs = 15_000
+  const tightRow1b = buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'a'.repeat(32), agent: 'coding-agent', sessionId: SESSION_ID, invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+  worldWait.files.set(
+    `${PARTITION_DIR}/spill-20261112T100000000Z-tight-1b.jsonl`,
+    packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRow1b })])[0] as string,
   )
-  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
-  const headless200 = await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs: 200 })
-  expect(headless200.text ?? '').toContain('timed out (insufficient command budget) before this non-interactive run ended')
-
-  const t0 = worldP.clock.now()
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  const t0 = worldWait.clock.now()
   let finishedAt = -1
-  const running1800 = $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs: 1_800 }).then(res => {
-    finishedAt = worldP.clock.now()
+  const running1800 = $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: 1_800 }).then(res => {
+    finishedAt = worldWait.clock.now()
     return res
   })
-  await worldP.clock.advance(300)
-  const text1800 = (await running1800).text ?? ''
+  await worldWait.clock.advance(300)
+  const text = (await running1800).text ?? ''
   expect(finishedAt - t0).toBeLessThanOrEqual(300)
-  expect(text1800).toContain('did not finish within 0.3 s before this non-interactive run ended')
+  expect(text).toMatch(/still running after 0\.(?:29\d|3) s/)
 })
+
+const tightRowBoundary = buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'b'.repeat(32), agent: 'coding-agent', sessionId: SESSION_ID, invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+
+// Budgets yielding waitMs < 250 ms (0, 200, 1500, 1501, 1749, NaN) must return immediately without starting a doomed backfill or writing in-flight marks.
+for (const remainingMs of [0, 200, 1_500, 1_501, 1_749, Number.NaN] as const) {
+  test(`headless -p /bqaa-backfill and /bqaa-status check skip doomed backfill at remainingMs=${String(remainingMs)}`, { options: OPTIONS }, async ($, on) => {
+    const worldP = setUp(on)
+    worldP.processDelayMs = 15_000
+    worldP.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-tight-2.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+    const res = await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs: remainingMs })
+    expect(res.text ?? '').toContain('timed out (insufficient command budget) before this non-interactive run ended')
+    expect(worldP.files.has(`${PARTITION_DIR}/spill-20261112T100000000Z-tight-2.jsonl.mark`)).toBe(false)
+    expect(worldP.fetches).toEqual([])
+    if (remainingMs === 1_749) {
+      const checking = $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND }, { budgetMs: remainingMs })
+      await worldP.clock.advance(250)
+      const statusRes = await checking
+      expect(statusRes.text ?? '').toMatch(/destination check: no token within 12\d ms/)
+      expect(statusRes.text ?? '').not.toContain('backfill: running')
+    } else {
+      const statusRes = await $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND }, { budgetMs: remainingMs })
+      expect(statusRes.text ?? '').toContain('destination check: timed out (insufficient command budget)')
+      expect(statusRes.text ?? '').not.toContain('backfill: running')
+    }
+  })
+}
+
+// remainingMs = 1800 (waitMs ~300ms >= 250ms) and 2000 (waitMs ~500ms) run bounded wait.
+for (const [remainingMs, expectedWait] of [
+  [1_800, 300],
+  [2_000, 500],
+] as const) {
+  test(`headless -p /bqaa-backfill runs bounded wait at remainingMs=${remainingMs}`, { options: OPTIONS }, async ($, on) => {
+    const worldP = setUp(on)
+    worldP.processDelayMs = 15_000
+    worldP.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-tight-3.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+    const t0 = worldP.clock.now()
+    let finishedAt = -1
+    const running = $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs: remainingMs }).then(res => {
+      finishedAt = worldP.clock.now()
+      return res
+    })
+    await worldP.clock.advance(expectedWait)
+    const text = (await running).text ?? ''
+    expect(finishedAt - t0).toBeLessThanOrEqual(expectedWait)
+    expect(text).toContain('did not finish within')
+    expect(text).toContain('before this non-interactive run ended')
+  })
+}
+
+test('headless -p /bqaa-backfill caps remainingMs=Infinity at BACKFILL_WAIT_MS (8000 ms)', { options: OPTIONS }, async ($, on) => {
+  const worldInf = setUp(on)
+  worldInf.processDelayMs = 15_000
+  worldInf.files.set(
+    `${PARTITION_DIR}/spill-20261112T100000000Z-tight-inf.jsonl`,
+    packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+  )
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  const t0 = worldInf.clock.now()
+  let finishedAt = -1
+  const runningInf = $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs: Number.POSITIVE_INFINITY }).then(res => {
+    finishedAt = worldInf.clock.now()
+    return res
+  })
+  await worldInf.clock.advance(8_000)
+  const textInf = (await runningInf).text ?? ''
+  expect(finishedAt - t0).toBeLessThanOrEqual(8_000)
+  expect(textInf).toMatch(/did not finish within (?:7\.9\d+|8) s before this non-interactive run ended/)
+})
+
+for (const remainingMs of [Number.NaN, 1_500, 1_501] as const) {
+  test(`interactive /bqaa-backfill wait starts background backfill at remainingMs=${String(remainingMs)}`, { options: OPTIONS }, async ($, on) => {
+    const worldInt = setUp(on)
+    worldInt.processDelayMs = 15_000
+    worldInt.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-tight-int.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+    if (remainingMs === 1_501) {
+      const running = $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: remainingMs })
+      await worldInt.clock.advance(5)
+      const res = await running
+      expect(res.text ?? '').toContain('/bqaa-status shows progress.')
+    } else {
+      const res = await $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: remainingMs })
+      expect(res.text ?? '').toContain('backfill started in background; /bqaa-status shows progress.')
+    }
+    const status = await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 200 })
+    expect(status.text ?? '').toContain('backfill: running')
+  })
+}

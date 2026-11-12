@@ -494,10 +494,13 @@ function decodeBase64PrintableColon(token: string): boolean {
     bytes.push((n >>> 16) & 0xff, (n >>> 8) & 0xff)
   }
   if (bytes.length < 3) return false
-  return isPrintableUtf8WithColon(bytes) || isPrintableLatin1WithColon(bytes)
+  if (isPrintableUtf8WithColon(bytes)) return true
+  if (!isPrintableLatin1WithColon(bytes)) return false
+  return !PASCAL_CASE_WORD_RE.test(token) && !LOWER_ALPHA_WORD_RE.test(token)
 }
 
 const PASCAL_CASE_WORD_RE = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/
+const LOWER_ALPHA_WORD_RE = /^[a-z]+$/
 const PASCAL_COMPONENT_RE = /[A-Z][a-z]+/g
 const PROSE_PASCAL_WORDS = new Set([
   'configuration', 'word', 'words', 'authentication', 'authorization',
@@ -1887,6 +1890,58 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
     copied = stopIdx
     AUTH_SCHEME_RE.lastIndex = stopIdx
   }
+  const trySpacedSensitiveEqRhs = (
+    hasCtx: boolean,
+    coreToken: string,
+    eqIdx: number,
+    isLowerWordKey: boolean,
+    endsWithDoubleEq: boolean,
+    tokQState: QuoteContext,
+  ): boolean => {
+    const eqLineStop = lineStopFor(curEffectiveMatchEnd)
+    let spEnd = curEffectiveMatchEnd
+    while (spEnd < eqLineStop && isSameLineWsAt(text, spEnd)) spEnd += 1
+    if (spEnd <= curEffectiveMatchEnd || spEnd >= eqLineStop) return false
+    const boundedStop = Math.min(eqLineStop, spEnd + 64)
+    const dualHeadStop = computeDualStop(spEnd, boundedStop, tokQState, curHasNewline)
+    if (spEnd >= dualHeadStop) return false
+    const spaceBeforeQuoteRhs =
+      !isBase64PaddedToken(coreToken) &&
+      (() => {
+        const ch = text[spEnd]
+        if (ch === '"' || ch === "'" || ch === '`') {
+          return isOpeningUnescapedQuote(spEnd, ch, tokQState, coreToken, isLowerWordKey && !endsWithDoubleEq)
+        }
+        if (ch === '\\' && (text[spEnd + 1] === '"' || text[spEnd + 1] === "'")) {
+          return isOpeningEscapedQuote(spEnd, text[spEnd + 1] as string, tokQState, coreToken, isLowerWordKey && !endsWithDoubleEq)
+        }
+        if (ch === '$') {
+          return isValidVarRhsAt(
+            spEnd,
+            text.slice(spEnd, dualHeadStop),
+            tokQState,
+            coreToken,
+            isLowerWordKey && !endsWithDoubleEq,
+          )
+        }
+        return false
+      })()
+    const spaceBeforeValueRhs =
+      !endsWithDoubleEq &&
+      !isBase64PaddedToken(coreToken) &&
+      /^(?!(?:#(?:$|[\s])|[;)|&"'`$\\\]},]))(?!(?:bearer|basic)(?:[\s]|$))\S/i.test(
+        text.slice(spEnd, Math.min(dualHeadStop, spEnd + 8)),
+      )
+    if (!spaceBeforeQuoteRhs && !spaceBeforeValueRhs) return false
+    if (hasCtx) {
+      keepAndRewind()
+      return true
+    }
+    const dualStop =
+      dualHeadStop < boundedStop ? dualHeadStop : computeDualStop(spEnd, eqLineStop, tokQState, curHasNewline)
+    emitSpanRedaction(coreToken.slice(eqIdx) + text.slice(curEffectiveMatchEnd, spEnd) + MARKER, dualStop)
+    return true
+  }
   for (let m = AUTH_SCHEME_RE.exec(text); m !== null; m = AUTH_SCHEME_RE.exec(text)) {
     const scheme = m[1] as string
     const space = m[2] as string
@@ -2102,7 +2157,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               continue
             }
           } else {
-            const hasAssignOrLineCommentCtx = precededByEqOrInComment || getRawTokQState().inComment
+            const hasAssignOrLineCommentCtx = precededByEqOrInComment
             const allowPaddedLowerQuoteRhs =
               isLowerWordKey && !endsWithDoubleEq && hasAssignOrLineCommentCtx
             const allowPunctRhs = !endsWithDoubleEq && hasAssignOrLineCommentCtx
@@ -2133,23 +2188,37 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               keepAndRewind()
               continue
             }
+            if (!hasAssignOrLineCommentCtx && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
+              if (
+                !isEmptyQuotedRhs &&
+                hasAssignRhsAt(
+                  effectiveMatchEnd,
+                  effectiveAfter,
+                  tokQState,
+                  coreToken,
+                  isLowerWordKey && !endsWithDoubleEq,
+                  !endsWithDoubleEq,
+                )
+              ) {
+                const eqLineStop = lineStopFor(effectiveMatchEnd)
+                const dualStop = computeDualStop(effectiveMatchEnd, eqLineStop, tokQState, hasNewline)
+                emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
+                continue
+              }
+              if (trySpacedSensitiveEqRhs(false, coreToken, eqIdx, isLowerWordKey, endsWithDoubleEq, tokQState)) {
+                continue
+              }
+              if (isEmptyQuotedRhs) {
+                emitSpanRedaction('', effectiveMatchEnd)
+                continue
+              }
+            }
             if (
-              !hasAssignOrLineCommentCtx &&
+              hasAssignOrLineCommentCtx &&
               assignKey.length <= 100 &&
               isSensitiveKey(assignKey) &&
-              !isEmptyQuotedRhs &&
-              hasAssignRhsAt(
-                effectiveMatchEnd,
-                effectiveAfter,
-                tokQState,
-                coreToken,
-                isLowerWordKey && !endsWithDoubleEq,
-                !endsWithDoubleEq,
-              )
+              trySpacedSensitiveEqRhs(true, coreToken, eqIdx, isLowerWordKey, endsWithDoubleEq, tokQState)
             ) {
-              const eqLineStop = lineStopFor(effectiveMatchEnd)
-              const dualStop = computeDualStop(effectiveMatchEnd, eqLineStop, tokQState, hasNewline)
-              emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
               continue
             }
             if (!endsWithDoubleEq) {
@@ -2206,51 +2275,8 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
             emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
             continue
           }
-          const eqLineStop = lineStopFor(effectiveMatchEnd)
-          let spEnd = effectiveMatchEnd
-          while (spEnd < eqLineStop && isSameLineWsAt(text, spEnd)) spEnd += 1
-          if (spEnd > effectiveMatchEnd && spEnd < eqLineStop) {
-            const boundedStop = Math.min(eqLineStop, spEnd + 64)
-            const dualHeadStop = computeDualStop(spEnd, boundedStop, tokQState, hasNewline)
-            if (spEnd < dualHeadStop) {
-              const spaceBeforeQuoteRhs =
-                !isBase64PaddedToken(coreToken) &&
-                (() => {
-                  const ch = text[spEnd]
-                  if (ch === '"' || ch === "'" || ch === '`') {
-                    return isOpeningUnescapedQuote(spEnd, ch, tokQState, coreToken, isLowerWordKey && !endsWithDoubleEq)
-                  }
-                  if (ch === '\\' && (text[spEnd + 1] === '"' || text[spEnd + 1] === "'")) {
-                    return isOpeningEscapedQuote(spEnd, text[spEnd + 1] as string, tokQState, coreToken, isLowerWordKey && !endsWithDoubleEq)
-                  }
-                  if (ch === '$') {
-                    return isValidVarRhsAt(
-                      spEnd,
-                      text.slice(spEnd, dualHeadStop),
-                      tokQState,
-                      coreToken,
-                      isLowerWordKey && !endsWithDoubleEq,
-                    )
-                  }
-                  return false
-                })()
-              const spaceBeforeValueRhs =
-                !endsWithDoubleEq &&
-                !isBase64PaddedToken(coreToken) &&
-                /^(?!(?:#(?:$|[\s])|[;)|&"'`$\\\]},]))(?!(?:bearer|basic)(?:[\s]|$))\S/i.test(
-                  text.slice(spEnd, Math.min(dualHeadStop, spEnd + 8)),
-                )
-              if (spaceBeforeQuoteRhs || spaceBeforeValueRhs) {
-                if (hasAssignOrCommentCtx) {
-                  keepAndRewind()
-                  continue
-                }
-                const dualStop =
-                  dualHeadStop < boundedStop ? dualHeadStop : computeDualStop(spEnd, eqLineStop, tokQState, hasNewline)
-                emitSpanRedaction(coreToken.slice(eqIdx) + text.slice(effectiveMatchEnd, spEnd) + MARKER, dualStop)
-                continue
-              }
-            }
+          if (trySpacedSensitiveEqRhs(hasAssignOrCommentCtx, coreToken, eqIdx, isLowerWordKey, endsWithDoubleEq, tokQState)) {
+            continue
           }
         } else if (!isBase64PaddedToken(coreToken)) {
           if (hasAssignOrCommentCtx) {
@@ -4597,13 +4623,16 @@ function stripTrailingParenQualifier(s: string, withSep: boolean): string {
   }
   if (end === 0 || s.charCodeAt(end - 1) !== 41) return s
   const closeIdx = end - 1
-  const openIdx = s.lastIndexOf('(', closeIdx - 1)
+  const minOpen = Math.max(0, closeIdx - 41)
+  let openIdx = -1
+  for (let i = closeIdx - 1; i >= minOpen; i -= 1) {
+    const c = s.charCodeAt(i)
+    if (c === 10 || c === 41) break
+    if (c === 40) openIdx = i
+  }
   if (openIdx === -1) return s
   const innerLen = closeIdx - openIdx - 1
   if (innerLen < 1 || innerLen > 40) return s
-  for (let i = openIdx + 1; i < closeIdx; i += 1) {
-    if (s.charCodeAt(i) === 10) return s
-  }
   let labelEnd = openIdx
   while (labelEnd > 0 && (s.charCodeAt(labelEnd - 1) === 32 || s.charCodeAt(labelEnd - 1) === 9)) labelEnd -= 1
   return s.slice(0, labelEnd)
@@ -4692,9 +4721,9 @@ function redactK8sAndYamlBlocks(text: string, stats: SanitizeStats): string {
   return out.map(r => r.line + r.eol).join('')
 }
 
-const MD_WRAP_CLOSED = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_`])([A-Za-z_][A-Za-z0-9_.\t -]{0,80})\2([ \t]*(?:\([^)\n]{1,40}\))?[ \t]*[:=][ \t]*)(.+)$/
+const MD_WRAP_CLOSED = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_`])([A-Za-z_][A-Za-z0-9_.\t -]{0,80})\2([ \t]*(?:\([^)\n]{1,40}\)[ \t]*)?[:=][ \t]*)(.+)$/
 const MD_WRAP_AROUND_SEP = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_])([A-Za-z_][A-Za-z0-9_.\t -]{0,80})([:=])\2([ \t]*)(.+)$/
-const MD_PAREN_LABEL = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)([A-Za-z_][A-Za-z0-9_.\t -]{0,60}[ \t]*\([^)\n]{1,40}\)[ \t]*[:=][ \t]*)(.+)$/
+const MD_PAREN_LABEL = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,59}[A-Za-z0-9_.-])?[ \t]*\([^)\n]{1,40}\)[ \t]*[:=][ \t]*)(.+)$/
 const MD_SEPARATOR_ROW = /^\|(?:\s*:?-{2,}:?\s*\|)+\s*$/
 const GENERIC_KEY_COL_HEADERS = new Set([
   'key', 'keys', 'name', 'names', 'field', 'fields', 'setting', 'settings',

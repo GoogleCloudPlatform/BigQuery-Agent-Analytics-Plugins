@@ -1362,12 +1362,12 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['echo "\\"Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=\\""', 'echo "\\"Bearer [REDACTED]\\""', 'cmV2aWV3Rml4dHVyZU9ubHk='],
     ['echo "\\"Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=\\" \\"next\nline\\""', 'echo "\\"Bearer [REDACTED]\\" \\"next\nline\\""', 'cmV2aWV3Rml4dHVyZU9ubHk='],
     ['Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=\\n', 'Bearer [REDACTED]\\n', 'cmV2aWV3Rml4dHVyZU9ubHk='],
-    ['# "todo Bearer\ncustomValue="x"\nlog="Bearer\nU2VjcmV0VG9rZW4="foo"', '# "todo Bearer\ncustomValue="x"\nlog="Bearer [REDACTED]"foo"', 'U2VjcmV0VG9rZW4='],
-    ['// "todo Bearer\ncustomValue="x"\nlog="Bearer\nU2VjcmV0VG9rZW4="foo"', '// "todo Bearer\ncustomValue="x"\nlog="Bearer [REDACTED]"foo"', 'U2VjcmV0VG9rZW4='],
-    ["# 'todo: check bearer\npublicvalue='hello'\necho 'Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=' 'next\nline'", "# 'todo: check bearer\npublicvalue='hello'\necho 'Bearer [REDACTED]' 'next\nline'", 'cmV2aWV3Rml4dHVyZU9ubHk='],
-    ['# `todo Bearer\ncustomValue=`x`\nlog=`Bearer\nU2VjcmV0VG9rZW4=`foo`', '# `todo Bearer\ncustomValue=`x`\nlog=`Bearer [REDACTED]`foo`', 'U2VjcmV0VG9rZW4='],
-    ['# "todo Bearer\r\ncustomValue="x"\r\nlog="Bearer\r\nU2VjcmV0VG9rZW4="foo"', '# "todo Bearer\r\ncustomValue="x"\r\nlog="Bearer [REDACTED]"foo"', 'U2VjcmV0VG9rZW4='],
-    ['# "todo Bearer\rcustomValue="x"\rlog="Bearer\rU2VjcmV0VG9rZW4="foo"', '# "todo Bearer\rcustomValue="x"\rlog="Bearer [REDACTED]"foo"', 'U2VjcmV0VG9rZW4='],
+    ['# "todo Bearer note\nMODE=bearer\ncustomValue="x"\nlog="Bearer\nU2VjcmV0VG9rZW4="foo"', '# "todo Bearer note\nMODE=bearer\ncustomValue="x"\nlog="Bearer [REDACTED]"foo"', 'U2VjcmV0VG9rZW4='],
+    ['// "todo Bearer note\nMODE=bearer\ncustomValue="x"\nlog="Bearer\nU2VjcmV0VG9rZW4="foo"', '// "todo Bearer note\nMODE=bearer\ncustomValue="x"\nlog="Bearer [REDACTED]"foo"', 'U2VjcmV0VG9rZW4='],
+    ["# 'todo: check bearer note\nMODE=bearer\npublicvalue='hello'\necho 'Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=' 'next\nline'", "# 'todo: check bearer note\nMODE=bearer\npublicvalue='hello'\necho 'Bearer [REDACTED]' 'next\nline'", 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['# `todo Bearer note\nMODE=bearer\ncustomValue=`x`\nlog=`Bearer\nU2VjcmV0VG9rZW4=`foo`', '# `todo Bearer note\nMODE=bearer\ncustomValue=`x`\nlog=`Bearer [REDACTED]`foo`', 'U2VjcmV0VG9rZW4='],
+    ['# "todo Bearer note\r\nMODE=bearer\r\ncustomValue="x"\r\nlog="Bearer\r\nU2VjcmV0VG9rZW4="foo"', '# "todo Bearer note\r\nMODE=bearer\r\ncustomValue="x"\r\nlog="Bearer [REDACTED]"foo"', 'U2VjcmV0VG9rZW4='],
+    ['# "todo Bearer note\rcustomValue="x"\rlog="Bearer\rU2VjcmV0VG9rZW4="foo"', '# "todo Bearer note\rcustomValue="x"\rlog="Bearer [REDACTED]"foo"', 'U2VjcmV0VG9rZW4='],
     ["# echo 'Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=' 'next\nline'", "# echo 'Bearer [REDACTED]' 'next\nline'", 'cmV2aWV3Rml4dHVyZU9ubHk='],
     ['# echo `Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=` `next\nline`', '# echo `Bearer [REDACTED]` `next\nline`', 'cmV2aWV3Rml4dHVyZU9ubHk='],
     ['# echo "\\"Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=\\" \\"next\nline\\""', '# echo "\\"Bearer [REDACTED]\\" \\"next\nline\\""', 'cmV2aWV3Rml4dHVyZU9ubHk='],
@@ -1735,6 +1735,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     "Users' guide; MODE=bearer\npublicvalue='hello'",
     "fn f<'a>() -> () { /* */\nMODE=bearer\npublicvalue='hello' }",
     "fn f<T: 'a + 'b>() -> () { /* */\nMODE=bearer\npublicvalue='hello' }",
+    "fn f<'a>() { let _ = \"bearer 'a\"; }\nMODE=bearer\npublicvalue='hello'",
+    "fn f<'a>(x: &'a str) -> &'a str { let _ = \"bearer\"; x }\nMODE=bearer\npublicvalue='hello'",
     "$'it\\'s'\nMODE=bearer\npublicvalue='hello'",
     '# "todo\nMODE=bearer\npublicvalue="hello"',
     "// 'todo\nMODE=bearer\npublicvalue='hello'",
@@ -1745,8 +1747,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     "MODE=bearer\npublicvalue='hello' && Users' note",
     "MODE=bearer\npublicvalue='hello' && echo $'it\\'s'",
     "MODE=bearer\npublicvalue='hello' && fn<'a>()",
-    "# 'todo: check bearer\npublicvalue='hello'",
-    '// "todo: check bearer\npublicvalue="hello"',
+    "# 'todo: check bearer note\nMODE=bearer\npublicvalue='hello'",
+    '// "todo: check bearer note\nMODE=bearer\npublicvalue="hello"',
     'MODE=bearer\npublic_value=',
     'MODE=bearer\npublicvalue=',
     'MODE=bearer\nENVIRONMENT=',
@@ -2095,7 +2097,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['MODE=bearer\n--secret_pw=@pplePass123', 'MODE=bearer\n--secret_pw=[REDACTED]', '@pplePass123'],
     ['MODE=basic\nCLIENT_SECRET=!MySuperSecret123', 'MODE=basic\nCLIENT_SECRET=[REDACTED]', '!MySuperSecret123'],
     [`Users' guide to bearer\nCLIENT_SECRET='${CANARY}'`, "Users' guide to bearer [REDACTED]=[REDACTED]", CANARY],
-    [`fn f<'a>() // bearer\nCLIENT_SECRET='${CANARY}'`, "fn f<'a>() // bearer\nCLIENT_SECRET=[REDACTED]", CANARY],
+    [`fn f<'a>() // bearer\nCLIENT_SECRET='${CANARY}'`, "fn f<'a>() // bearer [REDACTED]=[REDACTED]", CANARY],
+    [`fn f<'a>() // todo: bearer note\nMODE=bearer\nCLIENT_SECRET='${CANARY}'`, "fn f<'a>() // todo: bearer note\nMODE=bearer\nCLIENT_SECRET=[REDACTED]", CANARY],
     [`$'it\\'s'\nMODE=bearer\nCLIENT_SECRET='${CANARY}'`, "$'it\\'s'\nMODE=bearer\nCLIENT_SECRET=[REDACTED]", CANARY],
     [`# "todo\nMODE=bearer\nCLIENT_SECRET="${CANARY}"`, '# "todo\nMODE=bearer\nCLIENT_SECRET=[REDACTED]', CANARY],
     [`// 'todo\nMODE=bearer\nCLIENT_SECRET='${CANARY}'`, "// 'todo\nMODE=bearer\nCLIENT_SECRET=[REDACTED]", CANARY],
@@ -2585,7 +2588,19 @@ test('cross-line Bearer/Basic prose and empty-assignment regressions redact in r
     ['Bearer\nsecret_token_value=""', 'Bearer [REDACTED]""', 'secret_token_value='],
     ["Bearer\nreviewFixtureOnly=''", "Bearer [REDACTED]''", 'reviewFixtureOnly='],
     ['Bearer\nsecret_token_value=!', 'Bearer [REDACTED]!', 'secret_token_value='],
-    ['Bearer\nsecret_token_value= expired', 'Bearer [REDACTED] expired', 'secret_token_value='],
+    ['Bearer\nsecret_token_value= expired', 'Bearer [REDACTED]= [REDACTED]', 'secret_token_value='],
+    ['Bearer\nCLIENT_SECRET= hunter2', 'Bearer [REDACTED]= [REDACTED]', 'hunter2'],
+    ['Basic\nCLIENT_SECRET= hunter2', 'Basic [REDACTED]= [REDACTED]', 'hunter2'],
+    ['Bearer\nAPI_KEY= "secret-val"', 'Bearer [REDACTED]= [REDACTED]', 'secret-val'],
+    ['# Bearer\nreviewFixtureOnly="hello"', '# Bearer [REDACTED]"hello"', 'reviewFixtureOnly='],
+    ['// bearer\nreviewFixtureOnly="hello"', '// bearer [REDACTED]"hello"', 'reviewFixtureOnly='],
+    ['Bearer\nsecret=""', 'Bearer [REDACTED]""', 'secret='],
+    ['Basic\nsecret=""', 'Basic [REDACTED]""', 'secret='],
+    ["Bearer\nsecret=''", "Bearer [REDACTED]''", 'secret='],
+    ['Bearer\nsecret=``', 'Bearer [REDACTED]``', 'secret='],
+    ['Bearer\nsecret=\\"\\"', 'Bearer [REDACTED]\\"\\"', 'secret='],
+    ["Bearer\nsecret=\\'\\'", "Bearer [REDACTED]\\'\\'", 'secret='],
+    ['Bearer\nsecret= ""', 'Bearer [REDACTED]= [REDACTED]', 'secret='],
     ['Basic\nsecret_token_value=', 'Basic [REDACTED]', 'secret_token_value='],
     ['Basic\nreview_fixture9472=', 'Basic [REDACTED]', 'review_fixture9472='],
     ['Basic\nreviewFixtureOnly=', 'Basic [REDACTED]', 'reviewFixtureOnly='],
@@ -2659,6 +2674,8 @@ test('cross-line Bearer/Basic prose and empty-assignment regressions redact in r
     ['Basic\ndXNlcjrDqXZpw6h3', 'Basic [REDACTED]', 'dXNlcjrDqXZpw6h3'],
     ['Basic\nOnLpdu9ld09ubHkx', 'Basic [REDACTED]', 'OnLpdu9ld09ubHkx'],
     ['Basic\ncmV2aWV3Og==', 'Basic [REDACTED]', 'cmV2aWV3Og=='],
+    ['Basic dXNlcjpw4XNz', 'Basic [REDACTED]', 'dXNlcjpw4XNz'],
+    ['Basic dXPpajo=', 'Basic [REDACTED]', 'dXPpajo='],
   ]
 
   for (const [sample, expected, token] of redactFixtures) {
@@ -2755,6 +2772,17 @@ test('cross-line Bearer/Basic prose and empty-assignment regressions redact in r
     'Basic\ncredentials',
     'Basic\nAuthenticationGuide',
     'Basic\nConfiguration details follow',
+    'Basic Output formatting',
+    'Basic\nOutput',
+    'Basic\nOutputs',
+    'Basic\nOutcome',
+    'Basic\nOkay',
+    'Basic\nOverview',
+    'Basic\nOptions',
+    'Basic\nObjects',
+    'Basic\nOrder',
+    'Basic\nOutputFormat',
+    'Bearer\nfoo=""',
   ]
 
   for (const control of controlFixtures) {
@@ -2851,4 +2879,46 @@ test('Markdown label and table trimmers scale linearly on 64k whitespace and wra
   expect(out3).not.toContain('secretValue123')
   expect(stats3.redactions).toBeGreaterThan(0)
   expect(ms3).toBeLessThan(1000)
+
+  const noteFlood = `**Note**${' '.repeat(65_536)}x\nnote: y`
+  const t3 = performance.now()
+  const stats4 = newStats()
+  const out4 = redactText(noteFlood, stats4)
+  const ms4 = performance.now() - t3
+  expect(out4).toBe(noteFlood)
+  expect(stats4.redactions).toBe(0)
+  expect(ms4).toBeLessThan(1000)
+
+  const builtNote = buildRow({
+    eventType: 'TOOL_COMPLETED',
+    timestampMs: 0,
+    eventId: 'md-redos-2',
+    agent: 'a',
+    sessionId: 's',
+    invocationId: 'i',
+    userId: 'u',
+    traceId: 't',
+    spanId: 'p',
+    parentSpanId: null,
+    content: { result: noteFlood },
+    attributes: {},
+    maxPayloadChars: 100_000,
+  })
+  expect(builtNote.redactions).toBe(0)
+})
+
+test('nested parenthetical qualifiers in YAML blocks and Markdown labels still redact', () => {
+  const yamlNested = 'password (prod (us-east1): |\n  nested-yaml-secret-value'
+  const statsYaml = newStats()
+  const outYaml = redactText(yamlNested, statsYaml)
+  expect(outYaml).not.toContain('nested-yaml-secret-value')
+  expect(outYaml).toContain('[REDACTED]')
+  expect(statsYaml.redactions).toBeGreaterThan(0)
+
+  const mdNested = 'Password (prod (us-east1): nested-md-secret-value'
+  const statsMd = newStats()
+  const outMd = redactText(mdNested, statsMd)
+  expect(outMd).not.toContain('nested-md-secret-value')
+  expect(outMd).toContain('[REDACTED]')
+  expect(statsMd.redactions).toBeGreaterThan(0)
 })

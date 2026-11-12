@@ -767,7 +767,6 @@ export class Writer {
     if (!canDeliver(c) || c.dryRun || this.closing || (!explicit && (this.problem !== null || this.lastSuccessAt !== null || this.lastError !== null))) return null
     if (explicit) this.resetHeldCooldown()
     if (budgetMs !== undefined && (!Number.isFinite(budgetMs) || budgetMs <= 0)) {
-      this.recordError('destination check: timed out (insufficient command budget)')
       return 'timed out (insufficient command budget)'
     }
     const startedAt = this.io.now()
@@ -788,8 +787,9 @@ export class Writer {
         : Math.min(reqBudgetMs, 500)
       const tokenMs = Math.min(tokenTimeoutMs, Math.max(0, remainingBeforeToken - reserveMs))
       if (tokenMs <= 0) {
-        this.recordError(`destination check: no token within ${tokenTimeoutMs} ms`)
-        return `no token within ${tokenTimeoutMs} ms`
+        if (attempt === 0) return 'timed out (insufficient command budget)'
+        this.recordError(`destination check: did not finish within ${totalBudgetMs} ms`)
+        return `did not finish within ${totalBudgetMs} ms`
       }
       const tokenTimers: Timer[] = []
       let token: string | symbol | null

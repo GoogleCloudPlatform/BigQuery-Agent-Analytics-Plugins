@@ -693,10 +693,11 @@ export function createTestHarness(pluginRoot) {
       register: spec => unwrapEnvelope('command.register', spec),
       run: async (e, opts) => {
         const budgetMs = opts?.budgetMs ?? 10_000
+        const limitMs = Number.isNaN(budgetMs) ? 0 : budgetMs
         const startNow = clock.now()
         const result = await runTopDispatch('command.run', e, { budget: { remainingMs: budgetMs } })
         const elapsed = clock.now() - startNow
-        if (elapsed > budgetMs) {
+        if (elapsed > limitMs) {
           const label = budgetMs === 10_000 ? '10s' : `${budgetMs}ms`
           throw new Error(`command.run hook skipped: ran past its ${label} budget (elapsed ${elapsed} ms)`)
         }
