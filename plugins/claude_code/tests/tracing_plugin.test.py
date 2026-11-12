@@ -2038,13 +2038,18 @@ class TestTranscriptAndHooks38(unittest.TestCase):
         transcript.write_text("", encoding="utf-8")
 
         snapshots: list[dict] = []
+        write_snapshots: list[dict] = []
         orig_transaction = _LockedJSONStore.transaction
 
         @contextlib.contextmanager
         def _recording_transaction(store_self):
             with orig_transaction(store_self) as state:
+                before_state = dict(state)
                 yield state
-                snapshots.append(dict(state))
+                after_state = dict(state)
+                snapshots.append(after_state)
+                if after_state != before_state:
+                    write_snapshots.append(after_state)
 
         sid = "atomic-sf-1"
         with mock.patch.object(_LockedJSONStore, "transaction", _recording_transaction):
@@ -2054,7 +2059,7 @@ class TestTranscriptAndHooks38(unittest.TestCase):
                 "prompt": "turn 1 fails",
                 "transcript_path": str(transcript),
             })
-            before_sf = len(snapshots)
+            before_sf_writes = len(write_snapshots)
             adapter.process("StopFailure", {
                 "session_id": sid,
                 "error": "rate_limit",
@@ -2062,34 +2067,37 @@ class TestTranscriptAndHooks38(unittest.TestCase):
                 "reason": "quota",
                 "transcript_path": str(transcript),
             })
-            after_sf = len(snapshots)
+            after_sf_writes = len(write_snapshots)
             adapter.process("UserPromptSubmit", {
                 "session_id": sid,
                 "prompt": "turn 2 starts",
                 "transcript_path": str(transcript),
             })
-            after_ups2 = len(snapshots)
+            after_ups2_writes = len(write_snapshots)
             adapter.process("Stop", {
                 "session_id": sid,
                 "transcript_path": str(transcript),
             })
 
-        # StateStore.__init__ reads once via transaction(); StopFailure itself must perform
-        # a single atomic write transaction (2 total transactions), with zero torn commits.
+        # StopFailure must commit failure markers and active-turn teardown in a single
+        # mutating transaction (independent of how many read transactions __init__ performs).
+        sf_writes = write_snapshots[before_sf_writes:after_sf_writes]
+        ups2_writes = write_snapshots[after_sf_writes:after_ups2_writes]
         self.assertEqual(
-            after_sf - before_sf,
-            2,
-            f"StopFailure must perform 1 read + 1 atomic write, saw {snapshots[before_sf:after_sf]}",
+            len(sf_writes),
+            1,
+            f"StopFailure must perform 1 atomic write transaction, saw {sf_writes}",
         )
+        self.assertTrue(ups2_writes)
         for snap in snapshots:
             self.assertFalse(
                 snap.get("last_stop_failed") and snap.get("current_trace_id"),
                 f"intermediate torn state committed with both last_stop_failed and current_trace_id: {snap}",
             )
-        self.assertIsNone(snapshots[after_sf - 1].get("current_trace_id"))
-        self.assertTrue(snapshots[after_sf - 1].get("last_stop_failed"))
-        self.assertIsNone(snapshots[after_ups2 - 1].get("last_stop_failed"))
-        self.assertIsNotNone(snapshots[after_ups2 - 1].get("current_trace_id"))
+        self.assertIsNone(sf_writes[0].get("current_trace_id"))
+        self.assertTrue(sf_writes[0].get("last_stop_failed"))
+        self.assertIsNone(ups2_writes[-1].get("last_stop_failed"))
+        self.assertIsNotNone(ups2_writes[-1].get("current_trace_id"))
 
     def test_multiturn_session_end_flushes_turn2_without_usage_after_turn1_stop(self):
         from bigquery_agent_analytics_tracing.claude_code import ClaudeHookBQAAAdapter
@@ -4341,6 +4349,7 @@ class TestRound3Fixes(unittest.TestCase):
             drain_poll_seconds=0.2,
         )
         orig_wait_fn = drain._next_deferred_wait_seconds
+        orig_sleep = asyncio.sleep
         wait_dues1: list[float | None] = []
         sleeps1: list[float] = []
 
@@ -4352,6 +4361,7 @@ class TestRound3Fixes(unittest.TestCase):
         async def _fake_sleep_1(delay):
             sleeps1.append(delay)
             now["t"] += delay
+            await orig_sleep(0)
 
         with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
              mock.patch.object(drain, "_next_deferred_wait_seconds", side_effect=_spy_wait_1), \
@@ -4405,6 +4415,7 @@ class TestRound3Fixes(unittest.TestCase):
                 _write_envelope("event-002-probe.json", "probe-2")
             else:
                 state["mode"] = "ok"
+            await orig_sleep(0)
 
         with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
              mock.patch.object(drain, "_next_deferred_wait_seconds", side_effect=_spy_wait_pos), \
@@ -4442,6 +4453,7 @@ class TestRound3Fixes(unittest.TestCase):
         async def _fake_sleep_2(delay):
             sleeps2.append(delay)
             now["t"] += delay
+            await orig_sleep(0)
 
         with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
              mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
@@ -4702,11 +4714,13 @@ class TestRound3Fixes(unittest.TestCase):
                 return False
             return orig_quarantine(spool, name, reason, **kwargs)
 
+        orig_sleep = asyncio.sleep
         sleeps: list[float] = []
 
         async def _fake_sleep(delay):
             sleeps.append(delay)
             now["t"] += delay
+            await orig_sleep(0)
 
         # First run _run end-to-end under fake clock: event-900 fails once at t=1000.0 with
         # backoff 0.5s (> drain_idle_seconds 0.1s) while _skip_cap_saturated is active.
@@ -5050,6 +5064,178 @@ class TestRound3Fixes(unittest.TestCase):
             self.assertEqual(delivered, ["stale-sidecar"])
             self.assertFalse(env_path.exists())
             self.assertFalse(sidecar_path.exists())
+
+    def test_drain_read_retry_meta_strips_quarantine_keys_from_disk_sidecar(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_tampered_sidecar_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        def _cleanup_drain_globals():
+            drain._in_memory_retry_meta.clear()
+            drain._skipped_paths.clear()
+            drain._retry_skipped_paths.clear()
+            drain._retry_meta_saturated.clear()
+            drain._skip_cap_saturated.clear()
+            drain._reported_skips.clear()
+            drain._diagnostic_logs.clear()
+            drain._reported_saturation_logs.clear()
+
+        self.addCleanup(_cleanup_drain_globals)
+        _cleanup_drain_globals()
+
+        def _write_env(name: str, marker: str) -> Path:
+            path = Path(spool_dir) / name
+            path.write_text(
+                json.dumps({
+                    "config": {"project_id": "p", "dataset": "d", "table": "agent_events"},
+                    "row": {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "event_type": "LLM_REQUEST",
+                        "content": {"marker": marker},
+                        "attributes": {},
+                        "latency_ms": {},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            return path
+
+        env1 = _write_env("event-001-tampered.json", "tampered-healthy")
+        sidecar1 = Path(spool_dir) / "event-001-tampered.json.retry"
+        sidecar1.write_text(
+            json.dumps({
+                "first_failed_at": 995.0,
+                "attempts": 2,
+                "next_retry_at": 999.0,
+                "last_error": "prior transient",
+                "quarantine_pending": True,
+                "quarantine_reason": "../../evil",
+                "quarantine_subdir": "../escape",
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(sidecar1, 0o600)
+
+        env2 = _write_env("event-002-tampered-only-q.json", "tampered-only-q")
+        sidecar2 = Path(spool_dir) / "event-002-tampered-only-q.json.retry"
+        sidecar2.write_text(
+            json.dumps({
+                "quarantine_pending": True,
+                "quarantine_reason": "../../evil2",
+                "quarantine_subdir": "../escape2",
+                "quarantine_extra": "ignored",
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(sidecar2, 0o600)
+
+        now = {"t": 1000.0}
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]):
+            with drain.ensure_private_dir(spool_dir) as spool_priv:
+                # Even when disk sidecar has higher attempts than an older in-memory entry,
+                # quarantine_* keys loaded from disk must be stripped.
+                drain._in_memory_retry_meta[str(env1)] = {
+                    "first_failed_at": 995.0,
+                    "attempts": 1,
+                    "next_retry_at": 998.0,
+                    "last_error": "older",
+                }
+                meta_fresher_disk = drain._read_retry_meta(spool_priv, env1.name)
+                self.assertIsNotNone(meta_fresher_disk)
+                self.assertEqual(meta_fresher_disk["attempts"], 2)
+                self.assertEqual(meta_fresher_disk["last_error"], "prior transient")
+                self.assertNotIn("quarantine_pending", meta_fresher_disk)
+                self.assertNotIn("quarantine_reason", meta_fresher_disk)
+                self.assertNotIn("quarantine_subdir", meta_fresher_disk)
+
+                drain._in_memory_retry_meta.clear()
+                meta1 = drain._read_retry_meta(spool_priv, env1.name)
+                self.assertIsNotNone(meta1)
+                self.assertEqual(meta1["attempts"], 2)
+                self.assertNotIn("quarantine_pending", meta1)
+                self.assertNotIn("quarantine_reason", meta1)
+                self.assertNotIn("quarantine_subdir", meta1)
+
+                meta2 = drain._read_retry_meta(spool_priv, env2.name)
+                self.assertEqual(meta2, {})
+
+            delivered: list[str] = []
+
+            def _insert(table_id, rows):
+                del table_id
+                delivered.extend(row["content"]["marker"] for row in rows)
+                return []
+
+            _install_fake_bigquery(self, insert_fn=_insert)
+            cfg = BQAAConfig(
+                project_id="p",
+                dataset="d",
+                table="agent_events",
+                auto_create_table=False,
+                spool_dir=spool_dir,
+                state_dir=spool_dir,
+                log_file=str(Path(spool_dir) / "drain.log"),
+                dry_run=False,
+                drain_retry_backoff_seconds=0.5,
+                drain_max_retry_age_seconds=60.0,
+            )
+            self.assertEqual(drain._next_deferred_wait_seconds(cfg), 0.0)
+            resolved = asyncio.run(drain._drain_once(cfg, use_storage_api=False))
+            self.assertEqual(resolved, 2)
+            self.assertEqual(sorted(delivered), ["tampered-healthy", "tampered-only-q"])
+            self.assertFalse(env1.exists())
+            self.assertFalse(sidecar1.exists())
+            self.assertFalse(env2.exists())
+            self.assertFalse(sidecar2.exists())
+            self.assertFalse((Path(spool_dir) / "dead-letter").exists())
+
+    def test_drain_attempt_quarantine_unlinks_retry_once(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import drain
+
+        spool_dir = tempfile.mkdtemp(prefix="bqaa_q_unlink_once_")
+        self.addCleanup(shutil.rmtree, spool_dir, ignore_errors=True)
+        os.chmod(spool_dir, 0o700)
+
+        def _cleanup_drain_globals():
+            drain._in_memory_retry_meta.clear()
+            drain._skipped_paths.clear()
+            drain._retry_skipped_paths.clear()
+            drain._retry_meta_saturated.clear()
+            drain._skip_cap_saturated.clear()
+            drain._reported_skips.clear()
+            drain._diagnostic_logs.clear()
+            drain._reported_saturation_logs.clear()
+
+        self.addCleanup(_cleanup_drain_globals)
+        _cleanup_drain_globals()
+
+        env_path = Path(spool_dir) / "event-001-corrupt.json"
+        env_path.write_text("{bad", encoding="utf-8")
+        os.chmod(env_path, 0o600)
+        retry_path = Path(spool_dir) / "event-001-corrupt.json.retry"
+        retry_path.write_text('{"attempts": 1}', encoding="utf-8")
+        os.chmod(retry_path, 0o600)
+
+        with drain.ensure_private_dir(spool_dir) as spool_priv:
+            with mock.patch.object(
+                drain, "_unlink_retry", wraps=drain._unlink_retry
+            ) as unlink_spy:
+                ok = drain._attempt_quarantine(
+                    spool_priv, env_path.name, reason="corrupt-json"
+                )
+        self.assertTrue(ok)
+        self.assertEqual(unlink_spy.call_count, 1)
+        self.assertFalse(env_path.exists())
+        self.assertFalse(retry_path.exists())
+        self.assertTrue(
+            (Path(spool_dir) / "dead-letter" / "event-001-corrupt.corrupt-json.json").is_file()
+        )
 
     def test_legacy_010_mid_turn_state_and_spool_migration_single_delivery(self):
         from bigquery_agent_analytics_tracing import drain

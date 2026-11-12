@@ -273,6 +273,14 @@ def _unlink_retry(spool: PrivateDir, spool_name: str) -> None:
     _release_retry_saturation(spool)
 
 
+# Keys reserved for in-memory quarantine tracking (ignored from disk).
+_IN_MEMORY_ONLY_RETRY_KEYS = frozenset({
+    "quarantine_pending",
+    "quarantine_reason",
+    "quarantine_subdir",
+})
+
+
 def _read_retry_meta(spool: PrivateDir, spool_name: str) -> dict[str, Any] | None:
   """Return fresher of in-memory retry meta or ``<spool_name>.retry``."""
   cached = _in_memory_retry_meta.get(_retry_mem_key(spool, spool_name))
@@ -284,7 +292,12 @@ def _read_retry_meta(spool: PrivateDir, spool_name: str) -> dict[str, Any] | Non
       raw = handle.read()
     parsed = safe_json_loads(raw, None)
     if isinstance(parsed, dict):
-      disk_meta = parsed
+      disk_meta = {
+          k: v
+          for k, v in parsed.items()
+          if k not in _IN_MEMORY_ONLY_RETRY_KEYS
+          and not (isinstance(k, str) and k.startswith("quarantine_"))
+      }
   except (FileNotFoundError, OSError):
     pass
 
@@ -464,7 +477,6 @@ def _attempt_quarantine(
       config=config,
       diag_event=diag_event,
   ):
-    _unlink_retry(spool, name)
     return True
   _record_quarantine_failure(
       spool,

@@ -1560,11 +1560,11 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['# bearer\nschemaV2Configx=', '# bearer [REDACTED]', 'schemaV2Configx='],
     ['# bearer\ncustom-headerxx=', '# bearer [REDACTED]', 'custom-headerxx='],
     ['# bearer\npublicvalue=', '# bearer [REDACTED]', 'publicvalue='],
-    ['MODE=bearer\nabcdefghijklmno=', 'MODE=bearer [REDACTED]', 'abcdefghijklmno='],
-    ['MODE=bearer\nABCDEFGHIJKLMNO=', 'MODE=bearer [REDACTED]', 'ABCDEFGHIJKLMNO='],
-    ['MODE=bearer\npublicvalue=', 'MODE=bearer [REDACTED]', 'publicvalue='],
-    ['MODE=bearer\nENVIRONMENT=', 'MODE=bearer [REDACTED]', 'ENVIRONMENT='],
     ['Authorization:\n`Bearer\nReviewFixtureOnly more`', 'Authorization:\n`Bearer [REDACTED] more`', 'ReviewFixtureOnly'],
+    ['Authorization:\n  Bearer\nAbcd1234xyz', 'Authorization:\n  Bearer [REDACTED]', 'Abcd1234xyz'],
+    ['Authorization:\n  Bearer\nAbcd1234xyz more', 'Authorization:\n  Bearer [REDACTED] more', 'Abcd1234xyz'],
+    ['Authorization: Bearer Abcd1234xyz', 'Authorization: [REDACTED]', 'Abcd1234xyz'],
+    ['Proxy-Authorization:\n  Bearer\nShortTok', 'Proxy-Authorization:\n  Bearer [REDACTED]', 'ShortTok'],
   ]
   for (const [sample, expected, secret] of redactCases) {
     const stats = newStats()
@@ -1598,14 +1598,18 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     expect(built.redactions).toBe(1)
   }
 
-  const multiExpectCases: readonly (readonly [string, string, string | undefined] | readonly [string, string, string | undefined, string | undefined])[] = [
+  const multiExpectCases: readonly (readonly [string, string, string | undefined])[] = [
     ['{"auth": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk=', undefined],
     ['{"note": "Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=", "user": "alice"}', 'cmV2aWV3Rml4dHVyZU9ubHk=', undefined],
     [
-      '"{\\"note\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"',
+      '"{\\"message\\":\\"Bearer mySecretTokenAb=\\",\\"step_index\\":123}"',
       'mySecretTokenAb=',
-      '"{\\"note\\": \\"Bearer [REDACTED]\\", \\"id\\": 123}"',
-      '"{\\"note\\":\\"[REDACTED]\\",\\"id\\":\\"[REDACTED]\\"}"',
+      '"{\\"message\\":\\"Bearer [REDACTED]\\",\\"step_index\\":123}"',
+    ],
+    [
+      'log: "{\\"note\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"',
+      'mySecretTokenAb=',
+      'log: "{\\"note\\": \\"Bearer [REDACTED]\\", \\"id\\": 123}"',
     ],
     ['"{\\"auth\\": \\"Bearer mySecretTokenAb=\\", \\"id\\": 123}"', 'mySecretTokenAb=', undefined],
     ['"Authorization": "\n' + ' '.repeat(60) + 'Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', '"Authorization": [REDACTED]'],
@@ -1614,6 +1618,19 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ["'Authorization': 'Bearer\nReviewFixtureOnly more'", 'ReviewFixtureOnly', "'Authorization': [REDACTED]"],
     ["'Authorization' => 'Bearer\nReviewFixtureOnly more'", 'ReviewFixtureOnly', "'Authorization' =[REDACTED]"],
     ['authorization := "Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization :[REDACTED]'],
+    ['authorization ::= "Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization :[REDACTED]'],
+    ['authorization: >-\n  Bearer\n  ReviewFixtureOnly more', 'ReviewFixtureOnly', 'authorization: [REDACTED]\n'],
+    ['authorization: >-\nBearer\nReviewFixtureOnly more', 'ReviewFixtureOnly', 'authorization: [REDACTED]\nBearer [REDACTED] more'],
+    ['authorization: |2-\nBearer\nReviewFixtureOnly more', 'ReviewFixtureOnly', 'authorization: [REDACTED]\nBearer [REDACTED] more'],
+    ['authorization: >2\nBearer\nReviewFixtureOnly more', 'ReviewFixtureOnly', 'authorization: [REDACTED]\nBearer [REDACTED] more'],
+    ['x-custom-auth: >-\n  Bearer\n  ReviewFixtureOnly more', 'ReviewFixtureOnly', 'x-custom-auth: [REDACTED]\n'],
+    ['authorization: f"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
+    ['authorization: r"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
+    ['authorization: $"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
+    ['authorization: @"Bearer\nReviewFixtureOnly more"', 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
+    ["authorization: rf'Bearer\nReviewFixtureOnly more'", 'ReviewFixtureOnly', 'authorization: [REDACTED]'],
+    ['Authorization:\u2028Bearer\u2028ReviewFixtureOnly more', 'ReviewFixtureOnly', 'Authorization:\u2028Bearer [REDACTED] more'],
+    ['Authorization:\u2028  Bearer\u2028  ReviewFixtureOnly more', 'ReviewFixtureOnly', 'Authorization:\u2028  Bearer [REDACTED] more'],
     // Comparison/scope operators (`==`, `::`) are not explicit auth headers, so
     // the KV pass redacts the `authorization` operand while `Bearer` keeps header neutrality.
     ['authorization== Bearer\nReviewFixtureOnly more', 'Bearer', 'authorization=[REDACTED]\nReviewFixtureOnly more'],
@@ -1633,7 +1650,7 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ['Authorization: Bearer client_secret="Hunter2Secret!"', 'Hunter2Secret!', 'Authorization: [REDACTED]'],
     ['Authorization: `Bearer\nReviewFixtureOnly more`', 'ReviewFixtureOnly', 'Authorization: [REDACTED]'],
   ]
-  for (const [sample, secret, expectedText, expectedRowResult] of multiExpectCases) {
+  for (const [sample, secret, expectedText] of multiExpectCases) {
     const stats = newStats()
     const out = redactText(sample, stats)
     if (expectedText !== undefined) expect(out).toBe(expectedText)
@@ -1663,9 +1680,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
       maxPayloadChars: 16_384,
     })
     expect(JSON.stringify(built.row)).not.toContain(secret)
-    const rowExpected = expectedRowResult ?? expectedText
-    if (rowExpected !== undefined) {
-      expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(rowExpected)
+    if (expectedText !== undefined) {
+      expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(expectedText)
     }
     expect(built.redactions >= 1).toBe(true)
   }
@@ -1710,6 +1726,8 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     "# 'todo: check bearer\npublicvalue='hello'",
     '// "todo: check bearer\npublicvalue="hello"',
     'MODE=bearer\npublic_value=',
+    'MODE=bearer\npublicvalue=',
+    'MODE=bearer\nENVIRONMENT=',
     'MODE=bearer\nclientSecret=',
     'MODE=bearer\nschemaV2Config=',
     'MODE=bearer\napiTokenKey=',
@@ -1777,6 +1795,15 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     'Bearer\ntoken=',
     'Bearer\nfoo== "bar"',
     'MODE=bearer\nfoo=="bar"',
+    'MODE=bearer\u2028CLIENT_SECRET=',
+    'MODE=bearer\u2029CLIENT_SECRET=',
+    'Authorization:\n  Bearer\nnone',
+    'Authorization:\n  Bearer\nnull',
+    'Authorization:\n  Bearer\nempty',
+    'Authorization:\n  Bearer\ntoken',
+    'Authorization:\n  Bearer\nplaceholder',
+    'Authorization:\n  Bearer\nredacted',
+    'Authorization:\n  Bearer\n<token>',
   ]) {
     const stats = newStats()
     expect(redactText(prose, stats)).toBe(prose)
@@ -2214,6 +2241,16 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     ["('Authorization', 'Bearer client_secret=\"Hunter2Secret!\"')", "('Authorization', 'Bearer [REDACTED]')", ['client_secret', 'Hunter2Secret!']],
     ["('Authorization', 'Bearer\nclient_secret: \"Hunter2Secret!\"')", "('Authorization', 'Bearer [REDACTED]: [REDACTED]')", ['client_secret', 'Hunter2Secret!']],
     ['{"message":"Bearer secret_token_value: denied","status":"ok"}', '{"message":"Bearer [REDACTED]: [REDACTED]","status":"ok"}', ['secret_token_value', 'denied']],
+    ['{"error":"Rejected Bearer my_access_token_99: "}', '{"error":"Rejected Bearer [REDACTED]: "}', ['my_access_token_99']],
+    ['Log: {"e":"Bearer secret_token_value: denied","next":"ok"}', 'Log: {"e":"Bearer [REDACTED]: [REDACTED]","next":"ok"}', ['secret_token_value', 'denied']],
+    ['Note (see docs\nBearer secret_token_value: Pa)ss-w0rd-secret', 'Note (see docs\nBearer [REDACTED]: [REDACTED]', ['secret_token_value', 'Pa)ss-w0rd-secret', 'ss-w0rd-secret']],
+    ['Note {see docs\nBearer secret_token_value: Pa}ss-w0rd-secret', 'Note {see docs\nBearer [REDACTED]: [REDACTED]', ['secret_token_value', 'Pa}ss-w0rd-secret', 'ss-w0rd-secret']],
+    ['Note [see docs\nBearer secret_token_value: Pa]ss-w0rd-secret', 'Note [see docs\nBearer [REDACTED]: [REDACTED]', ['secret_token_value', 'Pa]ss-w0rd-secret', 'ss-w0rd-secret']],
+    ['Note "see docs\nBearer secret_token_value: Pa"ss-w0rd-secret', 'Note "see docs\nBearer [REDACTED]: [REDACTED]', ['secret_token_value', 'Pa"ss-w0rd-secret', 'ss-w0rd-secret']],
+    ['Authorization: Bearer client_secret= #s3cret', 'Authorization: [REDACTED]', ['client_secret', 's3cret']],
+    ['Authorization:\nBearer client_secret= #s3cret', 'Authorization:\nBearer [REDACTED]', ['client_secret', 's3cret']],
+    ['X-Auth: Bearer client_secret= #s3cret', 'X-Auth: [REDACTED]', ['client_secret', 's3cret']],
+    ['X-Auth:\nBearer client_secret= #s3cret', 'X-Auth:\nBearer [REDACTED]= [REDACTED]', ['client_secret', 's3cret']],
   ] as const) {
     const stats = newStats()
     const out = redactText(sample, stats)
@@ -2246,44 +2283,14 @@ test('cross-line and NBSP Bearer and Basic credentials redact while multi-line p
     expect(built.redactions).toBe(1)
   }
 
-  for (const [sample, expected, forbidden, rowResultExpected] of [
-    ['{"error": "Rejected Bearer my_access_token_99: "}', '{"error": "Rejected Bearer [REDACTED]: "}', ['my_access_token_99'], '{"error":"Rejected Bearer [REDACTED]: "}'],
-    ['{"e":"Bearer secret_token_value: denied","next":"ok"}', '{"e":"Bearer [REDACTED]: [REDACTED]","next":"ok"}', ['secret_token_value', 'denied'], '{"e":"[REDACTED]","next":"[REDACTED]"}'],
-  ] as const) {
-    const stats = newStats()
-    const out = redactText(sample, stats)
-    expect(out).toBe(expected)
-    for (const part of forbidden) expect(out).not.toContain(part)
-    expect(stats.redactions).toBe(1)
-
-    const reStats = newStats()
-    expect(redactText(out, reStats)).toBe(out)
-    expect(reStats.redactions).toBe(0)
-
-    const built = buildRow({
-      eventType: 'TOOL_COMPLETED',
-      timestampMs: 0,
-      eventId: 'e1',
-      agent: 'a',
-      sessionId: 's',
-      invocationId: 'i',
-      userId: 'u',
-      traceId: 't',
-      spanId: 'p',
-      parentSpanId: null,
-      content: { result: sample },
-      attributes: {},
-      maxPayloadChars: 16_384,
-    })
-    const serialized = JSON.stringify(built.row)
-    for (const part of forbidden) expect(serialized).not.toContain(part)
-    expect((JSON.parse(built.row.content ?? '{}') as { result: string }).result).toBe(rowResultExpected)
-  }
-
   for (const [label, gen, expectedSecret] of [
     ['MODE=bearer CLIENT_SECRET quoted colon single-line flood', (n: number) => 'MODE=bearer CLIENT_SECRET: "x" '.repeat((n / 31) | 0), '"x"'],
     ['MODE=bearer CLIENT_SECRET spaced eq single-line flood', (n: number) => 'MODE=bearer CLIENT_SECRET= x '.repeat((n / 29) | 0), '= x'],
     ['MODE= 160k space + bearer\\nusername=', (n: number) => 'MODE=' + ' '.repeat(n) + 'bearer\nusername=', 'NONE_EXPECTED'],
+    ['open bracket + Bearer client_secret=, flood', (n: number) => '[' + 'Bearer client_secret=, '.repeat((n / 23) | 0), 'client_secret'],
+    ['open quote + Bearer client_secret=, flood', (n: number) => '"' + 'Bearer client_secret=, '.repeat((n / 23) | 0), 'client_secret'],
+    ['open bracket + k= Bearer client_secret: "y" flood', (n: number) => '[' + 'k= Bearer client_secret: "y" '.repeat((n / 29) | 0), '"y"'],
+    ['open bracket + Authorization: Bearer client_secret=, flood', (n: number) => '[' + 'Authorization: Bearer client_secret=, '.repeat((n / 38) | 0), 'client_secret'],
   ] as const) {
     const small = gen(10_000)
     redactText(small, newStats())
