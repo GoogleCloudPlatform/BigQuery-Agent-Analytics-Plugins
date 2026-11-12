@@ -2012,10 +2012,19 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
           ALL_CAPS_SNAKE_KEY_RE.test(assignKey) ||
           LOWER_SNAKE_KEY_RE.test(assignKey) ||
           CAMEL_CASE_KEY_RE.test(assignKey))
+      const isRecognizedConfigKey =
+        isEmptyAssignIdentifier ||
+        isConfigFlagShape ||
+        (keyWithinCap &&
+          (CAMEL_CASE_VERSION_KEY_RE.test(rawKeyPart) ||
+            UPPER_WORD_KEY_RE.test(rawKeyPart) ||
+            isLowerWordKey ||
+            LOWER_DOTTED_KEY_RE.test(rawKeyPart) ||
+            LOWER_KEBAB_KEY_RE.test(rawKeyPart)))
       const endsWithEq = isAssignKey && eqIdx === coreToken.length - 1
       const endsWithDoubleEq = isAssignKey && eqIdx === coreToken.length - 2 && coreToken[eqIdx + 1] === '='
       const isEqPaddedEnd = endsWithEq || endsWithDoubleEq
-      isPaddedBasicCandidate = !inHeader && isEqPaddedEnd && coreToken.length >= 12
+      isPaddedBasicCandidate = !inHeader && coreToken.length >= 12
 
       if (inHeader) {
         if (isAssignKey && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
@@ -2047,6 +2056,9 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
         }
       } else if (hasNewline) {
         if (isAssignKey) {
+          const tokQState = getTokQState()
+          const { precededByEq } = getPrefix()
+          const precededByEqOrInComment = precededByEq || tokQState.inComment
           if (!isEqPaddedEnd) {
             const safeAfter =
               effectiveAfter === '' ||
@@ -2054,14 +2066,15 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
               ((effectiveAfter.startsWith('\\"') || effectiveAfter.startsWith("\\'"))
                 ? !opensEscapedFast(effectiveMatchEnd, effectiveAfter[1] as string)
                 : /^\\[nrt]/.test(effectiveAfter))
-            if (!isBase64PaddedToken(coreToken) || isEmptyAssignIdentifier || coreToken[eqIdx + 1] === '~' || !safeAfter) {
+            if (
+              precededByEqOrInComment &&
+              isRecognizedConfigKey &&
+              (!isBase64PaddedToken(coreToken) || isEmptyAssignIdentifier || coreToken[eqIdx + 1] === '~' || !safeAfter)
+            ) {
               keepAndRewind()
               continue
             }
           } else {
-            const tokQState = getTokQState()
-            const { precededByEq } = getPrefix()
-            const precededByEqOrInComment = precededByEq || tokQState.inComment
             const allowPaddedLowerQuoteRhs =
               isLowerWordKey && !endsWithDoubleEq && precededByEqOrInComment
             const allowPunctRhs = !endsWithDoubleEq && precededByEqOrInComment
@@ -2081,7 +2094,11 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                 (effectiveAfter[0] === '\\' &&
                   (effectiveAfter[1] === '"' || effectiveAfter[1] === "'") &&
                   isDelimOrSpaceAfterQuote(effectiveAfter[2])))
+            const canKeepAssignRhs = precededByEqOrInComment
+              ? isRecognizedConfigKey || !isBase64PaddedToken(coreToken) || (assignKey.length <= 100 && isSensitiveKey(assignKey))
+              : isRecognizedConfigKey && !endsWithDoubleEq
             const assignRhs =
+              canKeepAssignRhs &&
               !isEmptyQuotedRhs &&
               !quoteRhsBlockedWithoutAssignCtx &&
               hasAssignRhsAt(
@@ -2119,18 +2136,7 @@ function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
                   trailingDots !== '' ||
                   ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'") &&
                     isDelimOrSpaceAfterQuote(effectiveAfter[1]))
-                if (
-                  isEmptyTailForAssign &&
-                  precededByEqOrInComment &&
-                  (isEmptyAssignIdentifier ||
-                    isConfigFlagShape ||
-                    (keyWithinCap &&
-                      (CAMEL_CASE_VERSION_KEY_RE.test(rawKeyPart) ||
-                        UPPER_WORD_KEY_RE.test(rawKeyPart) ||
-                        isLowerWordKey ||
-                        LOWER_DOTTED_KEY_RE.test(rawKeyPart) ||
-                        LOWER_KEBAB_KEY_RE.test(rawKeyPart))))
-                ) {
+                if (isEmptyTailForAssign && precededByEqOrInComment && isRecognizedConfigKey) {
                   keepAndRewind()
                   continue
                 }

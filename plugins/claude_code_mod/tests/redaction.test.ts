@@ -2599,6 +2599,38 @@ test('cross-line Bearer/Basic prose and empty-assignment regressions redact in r
     ['Bearer\nCURRENT_WORK_DIR=', 'Bearer [REDACTED]', 'CURRENT_WORK_DIR='],
     ['Bearer\npublic_work_dirs=', 'Bearer [REDACTED]', 'public_work_dirs='],
     ['Bearer\n--config-file=', 'Bearer [REDACTED]', '--config-file='],
+    ['Bearer\nsecret_token_value=-', 'Bearer [REDACTED]', 'secret_token_value'],
+    ['Bearer\nreviewFixtureOnly=_', 'Bearer [REDACTED]', 'reviewFixtureOnly'],
+    ['Bearer\nreviewFixtureOnly=~', 'Bearer [REDACTED]', 'reviewFixtureOnly'],
+    ['Bearer\ncmV2aWV3Rml4dHVyZU9ubHk=~', 'Bearer [REDACTED]', 'cmV2aWV3Rml4dHVyZU9ubHk='],
+    ['Bearer\nlB79GsW66LvIcKaTzjh=x', 'Bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh=x'],
+    [
+      'Bearer\neyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0=.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+      'Bearer [REDACTED]',
+      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0=.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+    ],
+    ['Basic\nsecret_token_value=-', 'Basic [REDACTED]', 'secret_token_value'],
+    ['Basic\nreviewFixtureOnly=_', 'Basic [REDACTED]', 'reviewFixtureOnly'],
+    ['Basic\nlB79GsW66LvIcKaTzjh=x', 'Basic [REDACTED]', 'lB79GsW66LvIcKaTzjh=x'],
+    [
+      'Basic\neyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0=.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+      'Basic [REDACTED]',
+      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0=.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+    ],
+    ['MODE=bearer\nlB79GsW66LvIcKaTzjh=x', 'MODE=bearer [REDACTED]', 'lB79GsW66LvIcKaTzjh=x'],
+    [
+      'MODE=bearer\neyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0=.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+      'MODE=bearer [REDACTED]',
+      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0=.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+    ],
+    ['Bearer\nlB79GsW66LvIcKaTzjh="x"', 'Bearer [REDACTED]"x"', 'lB79GsW66LvIcKaTzjh='],
+    ["Bearer\nlB79GsW66LvIcKaTzjh='x'", "Bearer [REDACTED]'x'", 'lB79GsW66LvIcKaTzjh='],
+    ['Bearer\nlB79GsW66LvIcKaTzjh=$x', 'Bearer [REDACTED]$x', 'lB79GsW66LvIcKaTzjh='],
+    ['Basic\nlB79GsW66LvIcKaTzjh="x"', 'Basic [REDACTED]"x"', 'lB79GsW66LvIcKaTzjh='],
+    ['MODE=bearer\nlB79GsW66LvIcKaTzjh="x"', 'MODE=bearer [REDACTED]"x"', 'lB79GsW66LvIcKaTzjh='],
+    ['MODE=bearer\nlB79GsW66LvIcKaTzjh=$x', 'MODE=bearer [REDACTED]$x', 'lB79GsW66LvIcKaTzjh='],
+    ['Bearer\nabcdefghijklmg=="x"', 'Bearer [REDACTED]"x"', 'abcdefghijklmg=='],
+    ['Bearer\nsecret_token_value="x"', 'Bearer\nsecret_token_value=[REDACTED]', '"x"'],
   ]
 
   for (const [sample, expected, token] of redactFixtures) {
@@ -2678,6 +2710,13 @@ test('cross-line Bearer/Basic prose and empty-assignment regressions redact in r
     'Bearer\u00a0AuthenticationGuide',
     'Bearer\u00a0Configuration details follow',
     'Basic\nconfiguration guide',
+    'MODE=bearer\nARTIFACT_DIR=~',
+    'MODE=bearer\nPUBLIC_NAME="hello"',
+    'MODE=bearer\npublicvalue=hello',
+    'MODE=bearer\npublicvalue==hello',
+    "Users' guide to bearer\npublicvalue='hello'",
+    'MODE=basic\nPUBLIC_NAME="hello"',
+    'MODE=basic\nARTIFACT_DIR=~',
   ]
 
   for (const control of controlFixtures) {
