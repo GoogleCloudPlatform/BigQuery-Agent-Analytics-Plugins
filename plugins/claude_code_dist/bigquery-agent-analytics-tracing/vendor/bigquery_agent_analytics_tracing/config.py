@@ -17,14 +17,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import getpass
+import hashlib
+import json
+import math
 import os
+from pathlib import Path
+import tempfile
+from typing import Callable, TypeVar
 
 from ._writer_identity import DEFAULT_WRITER_LABEL
+
+_Number = TypeVar("_Number", int, float)
+
+
+class InvalidConfigError(ValueError):
+  """Raised when a BQAA_* environment setting cannot be parsed."""
+
 
 BQAA_EVENT_TYPES = frozenset(
     {
         "LLM_REQUEST",
         "LLM_RESPONSE",
+        "LLM_ERROR",
         "TOOL_STARTING",
         "TOOL_COMPLETED",
         "HITL_CREDENTIAL_REQUEST",
@@ -37,14 +52,110 @@ BQAA_EVENT_TYPES = frozenset(
     }
 )
 
-DEFAULT_SPOOL_DIR = "/tmp/bqaa-agent-tracing/spool"
-DEFAULT_STATE_DIR = "/tmp/bqaa-agent-tracing"
+
+def _temp_root() -> str:
+  """Return the active temp root, honoring env changes within a process."""
+  for var in ("TMPDIR", "TEMP", "TMP"):
+    val = os.environ.get(var)
+    if val:
+      return val
+  return tempfile.gettempdir()
+
+
+def _user_tag() -> str:
+  """Tells users' default dirs apart: the uid, else the login name."""
+  getuid = getattr(os, "getuid", None)  # POSIX only.
+  if getuid is not None:
+    return str(getuid())
+  try:
+    name = getpass.getuser()
+  except Exception:  # OSError; ImportError/KeyError before Python 3.13.
+    name = ""
+  tag = "".join(ch for ch in name if ch.isalnum() or ch in "._-")
+  # Never a constant shared by users: with no name, stay per process.
+  return tag or f"pid{os.getpid()}"
+
+
+# Per-user, owner-only base for spool/state/log. Fixed names in the shared
+# /tmp let other local users pre-create or read them; see
+# ``_utils.ensure_private_dir``.
+DEFAULT_STATE_DIR = os.path.join(
+    tempfile.gettempdir(), f"bqaa-agent-tracing-{_user_tag()}"
+)
+DEFAULT_SPOOL_DIR = os.path.join(DEFAULT_STATE_DIR, "spool")
 DEFAULT_TRANSCRIPT_MAX_BYTES = 256 * 1024  # 256 KB streamed cap per stop event.
 DEFAULT_STATE_TTL_HOURS = 24
 DEFAULT_DRAIN_IDLE_SECONDS = 8.0
 DEFAULT_DRAIN_BATCH_SIZE = 50
 DEFAULT_DRAIN_POLL_SECONDS = 0.5
-DEFAULT_LOG_FILE = "/tmp/bqaa-agent-tracing.log"
+DEFAULT_DRAIN_MAX_RETRY_AGE_SECONDS = 86400.0
+DEFAULT_MAX_LOG_BYTES = 1_048_576  # 1 MiB before rotation.
+DEFAULT_LOG_FILE = os.path.join(DEFAULT_STATE_DIR, "bqaa-agent-tracing.log")
+LEGACY_DEFAULT_STATE_DIR = os.path.join(
+    tempfile.gettempdir(), "bqaa-agent-tracing"
+)
+LEGACY_DEFAULT_SPOOL_DIR = os.path.join(LEGACY_DEFAULT_STATE_DIR, "spool")
+
+
+def default_state_dir() -> str:
+  return os.path.join(_temp_root(), f"bqaa-agent-tracing-{_user_tag()}")
+
+
+def default_spool_dir() -> str:
+  return os.path.join(default_state_dir(), "spool")
+
+
+def default_log_file() -> str:
+  return os.path.join(default_state_dir(), "bqaa-agent-tracing.log")
+
+
+def legacy_default_state_dir() -> str:
+  explicit = os.environ.get("BQAA_LEGACY_STATE_DIR", "").strip()
+  if explicit:
+    return explicit
+  return os.path.join(_temp_root(), "bqaa-agent-tracing")
+
+
+def legacy_default_spool_dir() -> str:
+  return os.path.join(legacy_default_state_dir(), "spool")
+
+
+def _norm_dest_component(value: object) -> str:
+  if value is None:
+    return ""
+  if isinstance(value, str):
+    return value.strip()
+  return str(value).strip()
+
+
+def destination_partition_id(
+    project_id: str, dataset: str, table: str = "agent_events"
+) -> str:
+  """Return a deterministic, collision-free partition dir name for a destination."""
+  p = _norm_dest_component(project_id)
+  d = _norm_dest_component(dataset)
+  t = _norm_dest_component(table) or "agent_events"
+  if not p or not d:
+    return ""
+  payload = json.dumps(
+      [p, d, t],
+      separators=(",", ":"),
+  ).encode("utf-8")
+  return f"dest-{hashlib.sha256(payload).hexdigest()[:16]}"
+
+
+def destination_spool_dir(
+    base_spool_dir: str | os.PathLike[str],
+    project_id: str,
+    dataset: str,
+    table: str = "agent_events",
+) -> str:
+  """Return the per-destination partition directory under ``base_spool_dir``."""
+  base = Path(base_spool_dir).expanduser()
+  part = destination_partition_id(project_id, dataset, table)
+  if not part or base.name == part:
+    return str(base)
+  return str(base / part)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -52,6 +163,74 @@ def _env_bool(name: str, default: bool) -> bool:
   if raw is None:
     return default
   return raw.lower() == "true"
+
+
+def _env_int(name: str, default: int) -> int:
+  return _env_number(name, default, int, "an integer")
+
+
+def _env_non_negative_int(name: str, default: int) -> int:
+  value = _env_int(name, default)
+  if value < 0:
+    raise InvalidConfigError(f"{name} must be a non-negative integer")
+  return value
+
+
+def _env_float(name: str, default: float) -> float:
+  return _env_number(name, default, float, "a number")
+
+
+def _env_positive_float(name: str, default: float) -> float:
+  """Like ``_env_float``, but the value must be finite and above zero.
+
+  For the drainer's timing knobs: a poll interval of 0 never advances the
+  idle clock (the drainer never exits), and NaN makes ``idle < limit``
+  false at once (it exits without draining).
+  """
+  value = _env_float(name, default)
+  if not (math.isfinite(value) and value > 0):
+    raise InvalidConfigError(f"{name} must be a positive number")
+  return value
+
+
+def _env_non_negative_float(name: str, default: float) -> float:
+  """Like ``_env_float``, requiring finite ``>= 0``."""
+  value = _env_float(name, default)
+  if not (math.isfinite(value) and value >= 0):
+    raise InvalidConfigError(f"{name} must be a non-negative number")
+  return value
+
+
+def _env_optional_non_negative_float(name: str) -> float | None:
+  """Return parsed finite ``>= 0`` float when env var is set, else None."""
+  raw = os.environ.get(name)
+  if raw is None or raw == "":
+    return None
+  return _env_non_negative_float(name, 0.0)
+
+
+def _env_number(
+    name: str,
+    default: _Number,
+    cast: Callable[[str], _Number],
+    kind: str,
+) -> _Number:
+  """``cast`` of the variable, or ``cast(default)`` when it is unset.
+
+  Parses exactly as ``cast(value)`` would; only the error changes, so it
+  names the variable instead of a bare "invalid literal". The error does
+  not include the value: a mis-pasted secret would otherwise reach hook
+  stderr, the hook log and ``/bqaa-setup`` output, which users share.
+  """
+  raw = os.environ.get(name)
+  if raw is None:
+    # Cast the default too, as before: DEFAULT_STATE_TTL_HOURS is the
+    # int 24, but state_ttl_hours has always been a float.
+    return cast(default)
+  try:
+    return cast(raw)
+  except ValueError:
+    raise InvalidConfigError(f"{name} must be {kind}") from None
 
 
 @dataclass
@@ -76,6 +255,7 @@ class BQAAConfig:
   location: str | None = None
   max_content_length: int = 5000
   log_file: str = DEFAULT_LOG_FILE
+  max_log_bytes: int = DEFAULT_MAX_LOG_BYTES
   spool_dir: str = DEFAULT_SPOOL_DIR
   state_dir: str = DEFAULT_STATE_DIR
   state_ttl_hours: float = DEFAULT_STATE_TTL_HOURS
@@ -83,6 +263,8 @@ class BQAAConfig:
   drain_idle_seconds: float = DEFAULT_DRAIN_IDLE_SECONDS
   drain_batch_size: int = DEFAULT_DRAIN_BATCH_SIZE
   drain_poll_seconds: float = DEFAULT_DRAIN_POLL_SECONDS
+  drain_retry_backoff_seconds: float | None = None
+  drain_max_retry_age_seconds: float = DEFAULT_DRAIN_MAX_RETRY_AGE_SECONDS
   writer_label: str = DEFAULT_WRITER_LABEL
 
   @classmethod
@@ -114,34 +296,34 @@ class BQAAConfig:
         auto_create_table=_env_bool("BQAA_AUTO_CREATE_TABLE", True),
         auto_create_dataset=_env_bool("BQAA_AUTO_CREATE_DATASET", False),
         location=os.environ.get("BQAA_LOCATION") or None,
-        max_content_length=int(
-            os.environ.get("BQAA_MAX_CONTENT_LENGTH", "5000")
+        max_content_length=_env_int("BQAA_MAX_CONTENT_LENGTH", 5000),
+        log_file=os.environ.get("BQAA_LOG_FILE", default_log_file()),
+        max_log_bytes=_env_non_negative_int(
+            "BQAA_MAX_LOG_BYTES", DEFAULT_MAX_LOG_BYTES
         ),
-        log_file=os.environ.get("BQAA_LOG_FILE", DEFAULT_LOG_FILE),
-        spool_dir=os.environ.get("BQAA_SPOOL_DIR", DEFAULT_SPOOL_DIR),
-        state_dir=os.environ.get("BQAA_STATE_DIR", DEFAULT_STATE_DIR),
-        state_ttl_hours=float(
-            os.environ.get("BQAA_STATE_TTL_HOURS", str(DEFAULT_STATE_TTL_HOURS))
+        spool_dir=os.environ.get("BQAA_SPOOL_DIR", default_spool_dir()),
+        state_dir=os.environ.get("BQAA_STATE_DIR", default_state_dir()),
+        state_ttl_hours=_env_float(
+            "BQAA_STATE_TTL_HOURS", DEFAULT_STATE_TTL_HOURS
         ),
-        transcript_max_bytes=int(
-            os.environ.get(
-                "BQAA_TRANSCRIPT_MAX_BYTES", str(DEFAULT_TRANSCRIPT_MAX_BYTES)
-            )
+        transcript_max_bytes=_env_int(
+            "BQAA_TRANSCRIPT_MAX_BYTES", DEFAULT_TRANSCRIPT_MAX_BYTES
         ),
-        drain_idle_seconds=float(
-            os.environ.get(
-                "BQAA_DRAIN_IDLE_SECONDS", str(DEFAULT_DRAIN_IDLE_SECONDS)
-            )
+        drain_idle_seconds=_env_positive_float(
+            "BQAA_DRAIN_IDLE_SECONDS", DEFAULT_DRAIN_IDLE_SECONDS
         ),
-        drain_batch_size=int(
-            os.environ.get(
-                "BQAA_DRAIN_BATCH_SIZE", str(DEFAULT_DRAIN_BATCH_SIZE)
-            )
+        drain_batch_size=_env_int(
+            "BQAA_DRAIN_BATCH_SIZE", DEFAULT_DRAIN_BATCH_SIZE
         ),
-        drain_poll_seconds=float(
-            os.environ.get(
-                "BQAA_DRAIN_POLL_SECONDS", str(DEFAULT_DRAIN_POLL_SECONDS)
-            )
+        drain_poll_seconds=_env_positive_float(
+            "BQAA_DRAIN_POLL_SECONDS", DEFAULT_DRAIN_POLL_SECONDS
+        ),
+        drain_retry_backoff_seconds=_env_optional_non_negative_float(
+            "BQAA_DRAIN_RETRY_BACKOFF_SECONDS"
+        ),
+        drain_max_retry_age_seconds=_env_non_negative_float(
+            "BQAA_DRAIN_MAX_RETRY_AGE_SECONDS",
+            DEFAULT_DRAIN_MAX_RETRY_AGE_SECONDS,
         ),
         writer_label=(
             os.environ.get("BQAA_WRITER_LABEL") or DEFAULT_WRITER_LABEL

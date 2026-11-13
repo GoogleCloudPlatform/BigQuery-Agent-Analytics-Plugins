@@ -64,22 +64,24 @@ trigger on `tracing-v*` tags from the SDK repository's
 `plugins/claude_code_dist/bigquery-agent-analytics-tracing/` is a verbatim
 copy of the released tarball, apart from:
 
-- The Apache license header that the nine per-event hook wrappers
+- The Apache license header that the eleven per-event hook wrappers
   (`hooks/<event>.sh`) carry here and in
   [`plugins/claude_code/hooks/`](../claude_code/hooks/); keep it when you sync
   a release.
 - The launcher hardening from SDK pull request
   [#557](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/557),
-  which keeps the working directory off `sys.path`, and the
-  `BQAA_TRACE_ENABLED` case-glob shell guard in `hooks/common.sh`
-  (only the word `true` in any letter case enables tracing; an unset
-  variable defaults to on; every other set value, including an empty
-  string, disables it). The `tracing-v0.1.0`
-  tarball predates these, so they are applied here by hand to `hooks/common.sh`,
-  `scripts/run_setup_check.sh`, `commands/bqaa-setup.md`, `README.md` and the
-  vendored `_utils.py`, `logger.py`, `setup_check.py` and `claude_code.py`
-  (docstring only). Sync only a release that includes #557, or re-apply it;
-  then drop this bullet.
+  which keeps the working directory off `sys.path`, the `BQAA_TRACE_ENABLED`
+  case-glob shell guard in `hooks/common.sh` (only the word `true` in any
+  letter case enables tracing; an unset variable defaults to on; every other
+  set value, including an empty string, disables it), and the `0.1.1`
+  fixes in `hooks/common.sh`, `scripts/run_setup_check.sh`,
+  `commands/bqaa-setup.md`, `README.md`, and the vendored `_utils.py`,
+  `config.py`, `logger.py`, `setup_check.py`, `claude_code.py`, and
+  `drain.py`. Run
+  `bash plugins/claude_code/build_dist.sh plugins/claude_code_dist/bigquery-agent-analytics-tracing`
+  to rebuild the served copy from [`plugins/claude_code/`](../claude_code/)
+  (and `bash plugins/claude_code/build_dist.sh --check` to verify it stays in
+  sync).
 
 Other edits there get overwritten on the next release sync. Send patches to:
 

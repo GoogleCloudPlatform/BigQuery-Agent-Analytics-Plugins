@@ -147,6 +147,7 @@ export function formatStatus(args: {
     lines.push(
       `last backfill (${b.trigger}, ${ago(now, b.finishedAt)}): ${b.files} file(s), ${b.rowsSent} rows sent, ${b.rowsLeft} left${b.rowsRefused ? `, ${b.rowsRefused} of them refused` : ''}${b.otherTableRows ? `, ${b.otherTableRows} of them for another table` : ''}${b.skippedFiles ? `, ${b.skippedFiles} skipped` : ''}${b.oversizedFiles.length ? `, ${b.oversizedFiles.length} too large to read` : ''}${b.incompleteFiles.length ? `, ${b.incompleteFiles.length} incomplete` : ''}${b.held ? `; left waiting: ${b.held.slice(0, 200)}` : ''}${b.error ? `; stopped: ${b.error.slice(0, 200)}` : ''}`,
     )
+    if (b.held) lines.push(`notice: ${b.held.slice(0, 200)}`)
     if (b.incompleteFiles.length > 0) {
       lines.push(`dead-letter: ${b.incompleteFiles.length} file(s) without a completion record (still being written, or left by a writer that stopped), kept, not replayed yet: ${names(b.incompleteFiles)}`)
     }

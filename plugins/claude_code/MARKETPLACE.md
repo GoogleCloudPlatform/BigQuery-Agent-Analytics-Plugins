@@ -19,13 +19,13 @@ Keep updated whenever metadata or install model changes.
   - [ ] `keywords` cover the discoverability terms users will search
         for: `bigquery`, `agent-analytics`, `observability`, `tracing`,
         `claude-code`
-  - [ ] All nine hooks declared with `${CLAUDE_PLUGIN_ROOT}/hooks/<name>.sh`
+  - [ ] All eleven hooks declared with `${CLAUDE_PLUGIN_ROOT}/hooks/<name>.sh`
 - [ ] `/bqaa-setup` slash command discoverable via `commands/bqaa-setup.md`
 - [ ] `hooks/common.sh` and `scripts/run_setup_check.sh` are executable
       (`chmod +x`) in source control
 - [ ] Plugin tarball produced by the release pipeline contains:
   - [ ] `.claude-plugin/plugin.json` (version stamped)
-  - [ ] `hooks/` — all nine `*.sh` files + `common.sh`
+  - [ ] `hooks/` — all eleven `*.sh` files + `common.sh`
   - [ ] `commands/bqaa-setup.md`
   - [ ] `scripts/run_setup_check.sh`
   - [ ] `vendor/bigquery_agent_analytics_tracing/` (full package source)
@@ -65,8 +65,9 @@ multiple producers writing to the same dataset.
 
 ## Install path (pre-marketplace)
 
-See [`README.md`](README.md#installing-the-plugin) for the curl-and-extract
-recipe. Until marketplace listing is live this is the official path.
+See [`README.md`](README.md#installing-the-plugin) for the marketplace
+and fallback manual install recipes. Until marketplace listing is live
+this is the official path.
 
 ## Manual verification before each marketplace bump
 
@@ -79,10 +80,13 @@ on `BQAA_PYTHON`):
    proceeding, or you'll see doubled hook rows in `agent_events` and
    not be able to attribute them cleanly. Running multiple BQAA
    tracing plugins at once duplicates every hook write.
-1. Download the release tarball for the version you're submitting:
+1. Download the release tarball for the version you're submitting (or
+   copy `plugins/claude_code_dist/bigquery-agent-analytics-tracing`
+   directly from a checkout of this repository when verifying before a
+   `tracing-v${VERSION}` release tag is cut):
    ```bash
    VERSION=X.Y.Z
-   curl -L \
+   curl -fsSL \
      "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/releases/download/tracing-v${VERSION}/bigquery-agent-analytics-tracing-claude-code-${VERSION}.tar.gz" \
      | tar -xz -C ~/.claude/plugins
    ```

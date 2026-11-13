@@ -1,8 +1,7 @@
 {
-  "extends": "./.claude-plugin/types/tsconfig.json",
+  "extends": "./tsconfig.ci.json",
   "compilerOptions": {
     "noEmit": true,
-    "allowImportingTsExtensions": true,
-    "types": ["claude-code", "claude-code-tools"]
+    "allowImportingTsExtensions": true
   }
 }

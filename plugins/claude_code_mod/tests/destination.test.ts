@@ -20,14 +20,16 @@
 // BigQuery finds it, with no /bqaa-backfill. Also: the refused count on the
 // status line counts every row refused since rows last landed.
 
+import type { EngineInterface, OnFunction } from 'claude-code'
 import { type Engine, expect, test } from 'claude-code/testing'
 
 import { type Config, PLUGIN_VERSION, resolveConfig } from '../hooks/lib/config.ts'
 import { packFiles, parseFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
+import { register } from '../hooks/register.ts'
 
-import { ACCESS_TOKEN, COMMAND, OK_INSERT, OPTIONS, PARTITION_DIR, SESSION_ID, TABLE_REF, type World, deadLetterFiles, setUp, startSession, utf8Bytes } from './helpers.ts'
+import { ACCESS_TOKEN, COMMAND, DEAD_LETTER_DIR, HOME, OK_INSERT, OPTIONS, PARTITION_DIR, SESSION_ID, TABLE_REF, type World, deadLetterFiles, setUp, startSession, utf8Bytes } from './helpers.ts'
 
 const PLUGIN = 'bigquery-agent-analytics-mod'
 
@@ -36,7 +38,7 @@ const BAND = {
   component: 'AbovePrompt',
   requestId: 'above-prompt',
   viewport: { columns: 120, rows: 40 },
-  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 115, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+  props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 10, bodyColumns: 115, scroll: { offset: 0, bodyRows: 10 }, view: {} },
 } as const
 
 const DATASET_MISSING = {
@@ -200,7 +202,7 @@ test('while BigQuery cannot find the dataset, the backoff before the next retry 
 test('session.start clears the status line an earlier load pinned: the host keeps it across a reload', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [DATASET_MISSING]
-  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.start({ surface: 'web', isInteractive: true, cwd: '/work/my-repo' })
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: BigQuery cannot find the dataset /)
@@ -409,7 +411,7 @@ test('a project the redaction mistakes for a credential name still gets the setu
   // BigQuery names the dataset project:dataset, which the redaction takes,
   // with the rest of the line, for a credential.
   world.replies = [{ status: 404, text: '{"error":{"code":404,"message":"Not found: Dataset auth-service-123:agent_analytics","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}' }]
-  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.start({ surface: 'web', isInteractive: true, cwd: '/work/my-repo' })
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   const command = /^bqaa: Run: BQAA_PROJECT_ID=auth-service-123 BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '\/[^']*\/setup\.sh'$/
@@ -604,32 +606,33 @@ test('headless /bqaa-status and interactive /bqaa-status check probe tables.get 
   expect(healed).not.toContain('BigQuery cannot find the dataset')
 })
 
-test('headless session.end writes a single redacted diagnostic line to stderr when rows could not be sent, and stays silent when healthy or interactive', { options: OPTIONS }, async ($, on) => {
+test('headless session.end writes a single redacted diagnostic line when rows could not be sent, and stays silent when healthy or interactive', { options: OPTIONS }, async ($, on) => {
   const secret = ['canary', 'stderr', 'secret', '9876543210'].join('-')
   const world = setUp(on, { BQAA_ACCESS_TOKEN_COMMAND: `my-token-helper --password=${secret}` })
   world.processReply = { exitCode: 1, stdout: '', stderr: `auth failed: password=${secret}\n` }
   await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
   await world.clock.advance(5000)
   await $.session.end({ reason: 'other', sessionId: 'headless-err', resume: { id: 'headless-err' } })
-  expect(world.stderr.length).toBe(1)
-  expect(world.stderr[0]).toBe('BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, check the token command `my-token-helper`).')
-  expect(world.stderr[0]?.includes(secret)).toBe(false)
+  const headlessNotices = () => world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))
+  expect(headlessNotices().length).toBe(1)
+  expect(headlessNotices()[0]).toBe('BigQuery Agent Analytics: rows could not be sent (no working Google credentials; to fix, check the token command `my-token-helper`).')
+  expect(headlessNotices()[0]?.includes(secret)).toBe(false)
 
-  // Healthy headless session writes 0 stderr lines.
-  world.stderr.length = 0
+  // Healthy headless session writes 0 headless diagnostic lines.
+  world.logs.length = 0
   world.processReply = { exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }
   world.replies = [OK_INSERT]
   await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
   await world.clock.settle()
   await $.session.end({ reason: 'other', sessionId: 'headless-ok', resume: { id: 'headless-ok' } })
-  expect(world.stderr).toEqual([])
+  expect(headlessNotices()).toEqual([])
 
-  // Interactive session with a problem writes 0 stderr lines (uses AbovePrompt/statusLine instead).
+  // Interactive session with a problem writes 0 headless diagnostic lines (uses AbovePrompt/statusLine instead).
   world.replies = [{ status: 403, text: '{"error":{"code":403,"message":"Access Denied","errors":[{"reason":"accessDenied"}]}}' }]
   await startSession($)
   await world.clock.advance(5000)
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'interactive-err', resume: { id: 'interactive-err' } })
-  expect(world.stderr).toEqual([])
+  expect(headlessNotices()).toEqual([])
 })
 
 // tables.get, which /bqaa-status check asks, proves the dataset, the table
@@ -731,7 +734,7 @@ test('/bqaa-status check that finds a dataset BigQuery could not find clears the
   await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
   // A surface that draws no band above the prompt: the notice is the
   // status line.
-  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.start({ surface: 'web', isInteractive: true, cwd: '/work/my-repo' })
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: BigQuery cannot find the dataset my-gcp-project\.agent_analytics\. /)
@@ -776,8 +779,9 @@ test('a headless run whose own rows all landed still writes the stderr line when
   // that alone makes the line.
   expect(deadLetterFiles(world)).toEqual([[earlier, file]])
   // One line, ending in the setup.sh command that makes the dataset.
-  expect(world.stderr.length).toBe(1)
-  const line = world.stderr[0] ?? ''
+  const notices = world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))
+  expect(notices.length).toBe(1)
+  const line = notices[0] ?? ''
   const head = `BigQuery Agent Analytics: rows could not be sent (${HEADLINE}; to fix, ${FIX}). Run: `
   expect(line.startsWith(head)).toBe(true)
   expect(line.slice(head.length)).toMatch(SETUP)
@@ -1184,14 +1188,9 @@ test('a destination check refused for a token another send has since replaced ke
 })
 
 test('/bqaa-status registers with the argument hint [check], as /bqaa-backfill does with its words', { options: OPTIONS }, async ($, on) => {
-  const hints = new Map<string, string | undefined>()
-  on('command.register', ($, e, next) => {
-    hints.set(e.name, e.argumentHint)
-    return next(e)
-  })
-  setUp(on)
+  const world = setUp(on)
   await startSession($)
-  expect(Object.fromEntries(hints)).toEqual({ 'bqaa-status': '[check]', 'bqaa-flush': undefined, 'bqaa-backfill': '[force] [wait]', 'bqaa-mod-setup': undefined, 'bqaa-setup': undefined })
+  expect(world.commandHints).toEqual({ 'bqaa-status': '[check]', 'bqaa-flush': undefined, 'bqaa-backfill': '[force] [wait]', 'bqaa-mod-setup': undefined, 'bqaa-setup': undefined })
 })
 
 const EXIT_TABLE_MISSING = {
@@ -1332,7 +1331,117 @@ test('sendAtExit spills without noisy missing-table stderr when retried insertAl
   await $.session.end({ reason: 'other', sessionId, resume: { id: sessionId } })
   expect(fetchOps(world)).toEqual(['POST insertAll', 'POST tables', 'POST insertAll'])
   expect(spillRowCount(world.files)).toBe(4)
-  expect(world.stderr).toEqual([])
+  expect(world.logs.filter(l => l.startsWith('BigQuery Agent Analytics: rows could not be sent'))).toEqual([])
+})
+
+test('/bqaa-status check stays within the 10 s command.run budget when the token helper hangs (15 s) and never sends a late tables.get after its deadline', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.processDelayMs = 15_000
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  const started = world.clock.now()
+  let finishedAt = -1
+  const checking = $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND }).then(res => {
+    finishedAt = world.clock.now()
+    return res
+  })
+  await world.clock.advance(8_000)
+  const text = (await checking).text ?? ''
+  expect(finishedAt - started).toBeLessThanOrEqual(8_000)
+  expect(text).toContain('destination check: no token within 5000 ms')
+  expect(world.fetches).toEqual([])
+
+  // Direct Writer check: clamped token timeout reaches runCommand and an exhausted deadline skips tables.get.
+  const fresh = ['ya29', 'budget-cap-token-0012'].join('.')
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/probe-cmd-budget' }, {})
+  const clock = probeClock()
+  const runTimeouts: number[] = []
+  const asked: string[] = []
+  const writer = new Writer(
+    makeProbeIo(
+      clock,
+      async (reqUrl, init) => {
+        asked.push(`${init.method} ${reqUrl}`)
+        return TABLE_FOUND
+      },
+      async (_argv, timeoutMs) => {
+        runTimeouts.push(timeoutMs)
+        return new Promise(resolve => {
+          clock.after(2_000, () => resolve({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' }))
+        })
+      },
+    ),
+    () => config,
+    () => 'probe-cmd-budget',
+  )
+  let answer: string | null | undefined
+  void writer.probeDestination(3000, true, 2000).then(v => { answer = v })
+  await clock.advance(2000)
+  expect(runTimeouts).toEqual([1000])
+  expect(answer).toBe('no token within 1000 ms')
+  expect(asked).toEqual([])
+
+  // Even if token resolves right at the deadline (no time left for tables.get), tables.get is skipped.
+  const clock2 = probeClock()
+  const asked2: string[] = []
+  const writer2 = new Writer(
+    makeProbeIo(
+      clock2,
+      async (reqUrl, init) => {
+        asked2.push(`${init.method} ${reqUrl}`)
+        return TABLE_FOUND
+      },
+      async () => new Promise(resolve => {
+        clock2.after(1500, () => resolve({ exitCode: 0, stdout: `${fresh}\n`, stderr: '' }))
+      }),
+    ),
+    () => config,
+    () => 'probe-deadline-expired',
+  )
+  // First seed an in-flight token fetch with long timeout; then call probeDestination with 1500 ms budget.
+  writer2.prefetchToken()
+  let answer2: string | null | undefined
+  void writer2.probeDestination(3000, true, 1500).then(v => { answer2 = v })
+  await clock2.advance(1500)
+  expect(answer2).not.toBeNull()
+  expect(asked2).toEqual([])
+})
+
+test('probeDestination retries once with a fresh token after 401 when 500 ms .. 3000 ms of a tight budget remains', { options: OPTIONS }, async () => {
+  const stale = ['ya29', 'tight-stale-token-0013'].join('.')
+  const fresh = ['ya29', 'tight-fresh-token-0014'].join('.')
+  const clock = probeClock()
+  const printed = [stale, fresh]
+  const asked: string[] = []
+  const writer = new Writer(
+    makeProbeIo(
+      clock,
+      async (_reqUrl, init) => {
+        const auth = init.headers.authorization ?? ''
+        asked.push(auth)
+        const delay = auth === `Bearer ${stale}` ? 2700 : 200
+        return new Promise(resolve => {
+          clock.after(delay, () => resolve(auth === `Bearer ${fresh}` ? TABLE_FOUND : UNAUTHENTICATED))
+        })
+      },
+      async () => {
+        const val = printed.shift() ?? fresh
+        const delay = val === stale ? 2800 : 300
+        return new Promise(resolve => {
+          clock.after(delay, () => resolve({ exitCode: 0, stdout: `${val}\n`, stderr: '' }))
+        })
+      },
+    ),
+    () => PROBE_CONFIG,
+    () => 'probe-tight-401-retry',
+  )
+  // attempt 0 consumes 2800 ms (token) + 2700 ms (401) = 5500 ms of an 8000 ms budget,
+  // leaving 2500 ms (within 500 ms .. 3000 ms) for attempt 1's 300 ms token + 200 ms tables.get.
+  let answer: string | null | undefined
+  void writer.probeDestination(3000, true, 8000).then(v => { answer = v })
+  await clock.advance(6100)
+  expect(answer).toBe(PROBE_FOUND)
+  expect(asked).toEqual([`Bearer ${stale}`, `Bearer ${fresh}`])
+  expect(clock.pending()).toBe(0)
 })
 
 // The exit-wait boundaries that follow the writer's own clock, on a writer
@@ -1436,4 +1545,995 @@ test('a token that runs out during the exit wait: no create without one, the bat
   expect(asked).toEqual(['POST insertAll'])
   expect(spillRowCount(files)).toBe(1)
   expect(writer.problem?.missing).toBe('table')
+})
+
+test('spillForExit ignores a 1 ms Io.now tick before raceUntil when waiting on in-flight batches (sendQueued: true)', { options: OPTIONS }, async () => {
+  const clock = probeClock()
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/exit-clock-tick-flights' }, {})
+  const files = new Map<string, string>()
+  let releaseFetch = (): void => undefined
+  let fetchCalled = false
+  let tickOnNextNow = false
+  let nowCallsAfterArmed = 0
+  const baseIo = makeProbeIo(
+    clock,
+    async () => {
+      fetchCalled = true
+      return new Promise(resolve => {
+        releaseFetch = () => resolve(OK_INSERT)
+      })
+    },
+    async () => ({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }),
+  )
+  const io: Io = {
+    ...baseIo,
+    now: () => {
+      if (!tickOnNextNow) return clock.now()
+      nowCallsAfterArmed += 1
+      return nowCallsAfterArmed === 1 ? clock.now() : clock.now() + 1
+    },
+    writeFile: async (p, text) => {
+      files.set(p, text)
+    },
+  }
+  const writer = new Writer(io, () => config, () => 'exit-clock-tick-flights')
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: '1'.repeat(32), agent: 'coding-agent', sessionId: 'exit-clock-tick-flights', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+  writer.requestFlush(0)
+  for (let i = 0; i < 20 && !fetchCalled; i += 1) await clock.advance(0)
+  expect(fetchCalled).toBe(true)
+
+  tickOnNextNow = true
+  let ended = false
+  let result: { spilled: number } | undefined
+  const ending = writer.spillForExit(800, { sendQueued: true }).then(v => {
+    ended = true
+    result = v
+    return v
+  })
+  await clock.advance(399)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(ended).toBe(false)
+  await clock.advance(1)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(ended).toBe(true)
+  await ending
+  expect(result).toEqual({ spilled: 1 })
+  expect(spillRowCount(files)).toBe(1)
+  releaseFetch()
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(clock.pending()).toBe(0)
+})
+
+test('spillForExit ignores a 1 ms Io.now tick before raceUntil when spilling queued rows with no in-flight batch (sendQueued: false)', { options: OPTIONS }, async () => {
+  const clock = probeClock()
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/exit-clock-tick-spill' }, {})
+  let releaseWrite = (): void => undefined
+  let writeStarted = false
+  let tickOnNextNow = false
+  let nowCallsAfterArmed = 0
+  const io: Io = {
+    ...makeProbeIo(
+      clock,
+      async () => OK_INSERT,
+      async () => ({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }),
+    ),
+    now: () => {
+      if (!tickOnNextNow) return clock.now()
+      nowCallsAfterArmed += 1
+      return nowCallsAfterArmed === 1 ? clock.now() : clock.now() + 1
+    },
+    writeFile: async () => {
+      writeStarted = true
+      await new Promise<void>(resolve => {
+        releaseWrite = resolve
+      })
+    },
+  }
+  const writer = new Writer(io, () => config, () => 'exit-clock-tick-spill')
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: '2'.repeat(32), agent: 'coding-agent', sessionId: 'exit-clock-tick-spill', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+
+  tickOnNextNow = true
+  let ended = false
+  let result: { spilled: number } | undefined
+  const ending = writer.spillForExit(800, { sendQueued: false }).then(v => {
+    ended = true
+    result = v
+    return v
+  })
+  await clock.advance(799)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(writeStarted).toBe(true)
+  expect(ended).toBe(false)
+  await clock.advance(1)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(ended).toBe(true)
+  await ending
+  expect(result).toEqual({ spilled: 1 })
+  expect(clock.pending()).toBe(0)
+  releaseWrite()
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+})
+
+test('spillForExit subtracts elapsed flight-wait time from pending-write raceUntil budget when sendQueued is false', { options: OPTIONS }, async () => {
+  const clock = probeClock()
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/tmp/exit-flight-elapsed' }, {})
+  let fetchCalled = false
+  let releaseWrite = (): void => undefined
+  let writeStarted = false
+  const io: Io = {
+    ...makeProbeIo(
+      clock,
+      async () => {
+        fetchCalled = true
+        return new Promise(resolve => {
+          clock.after(100, () => resolve(OK_INSERT))
+        })
+      },
+      async () => ({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }),
+    ),
+    writeFile: async () => {
+      writeStarted = true
+      await new Promise<void>(resolve => {
+        releaseWrite = resolve
+      })
+    },
+  }
+  const writer = new Writer(io, () => config, () => 'exit-flight-elapsed')
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: '3'.repeat(32), agent: 'coding-agent', sessionId: 'exit-flight-elapsed', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+  writer.requestFlush(0)
+  for (let i = 0; i < 20 && !fetchCalled; i += 1) await clock.advance(0)
+  expect(fetchCalled).toBe(true)
+
+  // Queue a second row after the first batch is in flight so park() starts a hanging spill write.
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: '4'.repeat(32), agent: 'coding-agent', sessionId: 'exit-flight-elapsed', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+
+  let ended = false
+  let result: { spilled: number } | undefined
+  const ending = writer.spillForExit(800, { sendQueued: false }).then(v => {
+    ended = true
+    result = v
+    return v
+  })
+  await clock.advance(100)
+  expect(writeStarted).toBe(true)
+  expect(ended).toBe(false)
+  await clock.advance(699)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(ended).toBe(false)
+  await clock.advance(1)
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+  expect(ended).toBe(true)
+  await ending
+  expect(result).toEqual({ spilled: 1 })
+  expect(clock.pending()).toBe(0)
+  releaseWrite()
+  for (let i = 0; i < 4; i += 1) await clock.advance(0)
+})
+
+test('probeDestination ignores a 1 ms Io.now tick before computing attempt 0 token timeout', { options: OPTIONS }, async () => {
+  const clock = probeClock()
+  let tickOnNextNow = false
+  let nowCallsAfterArmed = 0
+  let releaseToken = (): void => undefined
+  const io: Io = {
+    ...makeProbeIo(
+      clock,
+      async () => TABLE_FOUND,
+      async () => new Promise(resolve => {
+        releaseToken = () => resolve({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' })
+      }),
+    ),
+    now: () => {
+      if (!tickOnNextNow) return clock.now()
+      nowCallsAfterArmed += 1
+      return nowCallsAfterArmed === 1 ? clock.now() : clock.now() + 1
+    },
+  }
+  const writer = new Writer(io, () => PROBE_CONFIG, () => 'probe-clock-tick')
+  tickOnNextNow = true
+  let result: string | null | undefined
+  void writer.probeDestination(3000, true, 8000).then(v => {
+    result = v
+  })
+  await clock.advance(4999)
+  expect(result).toBeUndefined()
+  await clock.advance(1)
+  expect(result).toBe('no token within 5000 ms')
+  expect(writer.snapshot().lastError?.message).toBe('destination check: no token within 5000 ms')
+  expect(clock.pending()).toBe(0)
+  releaseToken()
+})
+
+test('/bqaa-status check and /bqaa-backfill stay within tight next.budget.remainingMs (0 ms, 200 ms, 1800 ms) without exceeding host command budget', { options: OPTIONS }, async ($, on) => {
+  // 1. /bqaa-status check with remainingMs=200 and remainingMs=0 against a hanging credential helper:
+  //    must return a structured timeout immediately without hitting the host 200ms/0ms rejection.
+  const world = setUp(on)
+  world.processDelayMs = 15_000
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+
+  for (const remainingMs of [200, 0] as const) {
+    const t0 = world.clock.now()
+    const res = await $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND }, { budgetMs: remainingMs })
+    const elapsed = world.clock.now() - t0
+    expect(elapsed).toBe(0)
+    expect(res.text ?? '').toContain('destination check: timed out (insufficient command budget)')
+    expect(world.fetches).toEqual([])
+  }
+
+  // 2. /bqaa-status check with remainingMs=1800 (commandBudgetMs = 300 -> tokenMs = 150) and hanging helper:
+  {
+    const t0 = world.clock.now()
+    let finishedAt = -1
+    const checking = $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND }, { budgetMs: 1_800 }).then(res => {
+      finishedAt = world.clock.now()
+      return res
+    })
+    await world.clock.advance(300)
+    const text = (await checking).text ?? ''
+    expect(finishedAt - t0).toBeLessThanOrEqual(300)
+    expect(text).toContain('destination check: no token within 150 ms')
+    expect(world.fetches).toEqual([])
+  }
+
+  // 3. /bqaa-backfill wait (interactive) and tight-budget boundaries (0, 200, 1500, 1501, 1749, 1800, 2000, NaN, Infinity):
+  const tightRow1 = buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'a'.repeat(32), agent: 'coding-agent', sessionId: SESSION_ID, invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+  world.files.set(
+    `${PARTITION_DIR}/spill-20261112T100000000Z-tight-1.jsonl`,
+    packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRow1 })])[0] as string,
+  )
+  const interactive200 = await $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: 200 })
+  expect(interactive200.text ?? '').toContain('timed out waiting (insufficient command budget); backfill started in background; /bqaa-status shows progress.')
+  const statusDuringTightBackfill = await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 200 })
+  expect(statusDuringTightBackfill.text ?? '').toContain('backfill: running')
+
+  // 4. Direct Writer.probeDestination(3000, true, 0), (3000, true, 1), and (3000, true, NaN)
+  //    never inflate above budgetMs and never set lastError.
+  const clock = probeClock()
+  const runTimeouts: number[] = []
+  let releaseTightToken = (): void => undefined
+  const writer = new Writer(
+    makeProbeIo(
+      clock,
+      async () => TABLE_FOUND,
+      async (_argv, timeoutMs) => {
+        runTimeouts.push(timeoutMs)
+        return new Promise(resolve => {
+          releaseTightToken = () => resolve({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' })
+        })
+      },
+    ),
+    () => PROBE_CONFIG,
+    () => 'probe-tight-budget',
+  )
+  expect(await writer.probeDestination(3000, true, 0)).toBe('timed out (insufficient command budget)')
+  expect(writer.snapshot().lastError).toBeNull()
+  expect(await writer.probeDestination(3000, true, 1)).toBe('timed out (insufficient command budget)')
+  expect(writer.snapshot().lastError).toBeNull()
+  expect(await writer.probeDestination(3000, true, -5)).toBe('timed out (insufficient command budget)')
+  expect(writer.snapshot().lastError).toBeNull()
+  expect(await writer.probeDestination(3000, true, Number.NEGATIVE_INFINITY)).toBe('timed out (insufficient command budget)')
+  expect(writer.snapshot().lastError).toBeNull()
+  expect(await writer.probeDestination(3000, true, Number.NaN)).toBe('timed out (insufficient command budget)')
+  expect(writer.snapshot().lastError).toBeNull()
+  expect(runTimeouts).toEqual([])
+  expect(clock.pending()).toBe(0)
+
+  let out50: string | null | undefined
+  void writer.probeDestination(3000, true, 50).then(v => {
+    out50 = v
+  })
+  await clock.advance(25)
+  expect(out50).toBe('no token within 25 ms')
+  expect(runTimeouts).toEqual([25])
+  expect(clock.pending()).toBe(0)
+  releaseTightToken()
+
+  let outInf: string | null | undefined
+  let releaseInfToken = (): void => undefined
+  const infTimeouts: number[] = []
+  const infWriter = new Writer(
+    makeProbeIo(
+      clock,
+      async () => TABLE_FOUND,
+      async (_argv, timeoutMs) => {
+        infTimeouts.push(timeoutMs)
+        return new Promise(resolve => {
+          releaseInfToken = () => resolve({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' })
+        })
+      },
+    ),
+    () => PROBE_CONFIG,
+    () => 'probe-inf-budget',
+  )
+  const infPromise = infWriter.probeDestination(3000, true, Number.POSITIVE_INFINITY).then(v => {
+    outInf = v
+  })
+  await Promise.resolve()
+  expect(infTimeouts).toEqual([PROBE_CONFIG.tokenCommandTimeoutMs])
+  releaseInfToken()
+  await infPromise
+  expect(outInf).toBe(`BigQuery found ${TABLE_REF}`)
+  expect(clock.pending()).toBe(0)
+})
+
+test('interactive /bqaa-backfill wait respects 1800 ms command budget against hanging helper', { options: OPTIONS }, async ($, on) => {
+  const worldWait = setUp(on)
+  worldWait.processDelayMs = 15_000
+  const tightRow1b = buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'a'.repeat(32), agent: 'coding-agent', sessionId: SESSION_ID, invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+  worldWait.files.set(
+    `${PARTITION_DIR}/spill-20261112T100000000Z-tight-1b.jsonl`,
+    packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRow1b })])[0] as string,
+  )
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  const t0 = worldWait.clock.now()
+  let finishedAt = -1
+  const running1800 = $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: 1_800 }).then(res => {
+    finishedAt = worldWait.clock.now()
+    return res
+  })
+  await worldWait.clock.advance(300)
+  const text = (await running1800).text ?? ''
+  expect(finishedAt - t0).toBeLessThanOrEqual(300)
+  const elapsedMatch = /still running after (\d+(?:\.\d+)?) s/.exec(text)
+  expect(elapsedMatch).not.toBeNull()
+  const elapsedSec = Number(elapsedMatch![1])
+  expect(elapsedSec).toBeGreaterThan(0)
+  expect(elapsedSec).toBeLessThanOrEqual(0.3)
+})
+
+const tightRowBoundary = buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'b'.repeat(32), agent: 'coding-agent', sessionId: SESSION_ID, invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+
+// Budgets yielding waitMs < 250 ms (-50, 0, 200, 1500, 1501, 1749, NaN) must return immediately without starting a doomed backfill or writing in-flight marks.
+for (const remainingMs of [-50, 0, 200, 1_500, 1_501, 1_749, Number.NaN] as const) {
+  test(`headless -p /bqaa-backfill and /bqaa-status check skip doomed backfill at remainingMs=${String(remainingMs)}`, { options: OPTIONS }, async ($, on) => {
+    const worldP = setUp(on)
+    worldP.processDelayMs = 15_000
+    worldP.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-tight-2.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+    const res = await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs: remainingMs })
+    expect(res.text ?? '').toContain('timed out (insufficient command budget) before this non-interactive run ended')
+    expect(worldP.files.has(`${PARTITION_DIR}/spill-20261112T100000000Z-tight-2.jsonl.mark`)).toBe(false)
+    expect(worldP.fetches).toEqual([])
+    if (remainingMs === 1_749) {
+      const checking = $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND }, { budgetMs: remainingMs })
+      await worldP.clock.advance(250)
+      const statusRes = await checking
+      const statusText = statusRes.text ?? ''
+      const noTokenMatch = /destination check: no token within (\d+) ms/.exec(statusText)
+      expect(noTokenMatch).not.toBeNull()
+      const noTokenMs = Number(noTokenMatch![1])
+      expect(noTokenMs).toBeGreaterThanOrEqual(1)
+      expect(noTokenMs).toBeLessThanOrEqual(125)
+      expect(statusText).not.toContain('backfill: running')
+    } else {
+      const statusRes = await $.command.run({ command: 'bqaa-status', args: 'check', ...COMMAND }, { budgetMs: remainingMs })
+      expect(statusRes.text ?? '').toContain('destination check: timed out (insufficient command budget)')
+      expect(statusRes.text ?? '').not.toContain('backfill: running')
+    }
+  })
+}
+
+// remainingMs = 1800 (waitMs ~300ms >= 250ms) and 2000 (waitMs ~500ms) run bounded wait.
+for (const [remainingMs, expectedWait] of [
+  [1_800, 300],
+  [2_000, 500],
+] as const) {
+  test(`headless -p /bqaa-backfill runs bounded wait at remainingMs=${remainingMs}`, { options: OPTIONS }, async ($, on) => {
+    const worldP = setUp(on)
+    worldP.processDelayMs = 15_000
+    worldP.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-tight-3.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+    const t0 = worldP.clock.now()
+    let finishedAt = -1
+    const running = $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs: remainingMs }).then(res => {
+      finishedAt = worldP.clock.now()
+      return res
+    })
+    await worldP.clock.advance(expectedWait)
+    const text = (await running).text ?? ''
+    expect(finishedAt - t0).toBeLessThanOrEqual(expectedWait)
+    expect(text).toContain('did not finish within')
+    expect(text).toContain('before this non-interactive run ended')
+  })
+}
+
+test('headless -p /bqaa-backfill caps remainingMs=Infinity at BACKFILL_WAIT_MS (8000 ms)', { options: OPTIONS }, async ($, on) => {
+  const worldInf = setUp(on)
+  worldInf.processDelayMs = 15_000
+  worldInf.files.set(
+    `${PARTITION_DIR}/spill-20261112T100000000Z-tight-inf.jsonl`,
+    packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+  )
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  const t0 = worldInf.clock.now()
+  let finishedAt = -1
+  const runningInf = $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs: Number.POSITIVE_INFINITY }).then(res => {
+    finishedAt = worldInf.clock.now()
+    return res
+  })
+  await worldInf.clock.advance(8_000)
+  const textInf = (await runningInf).text ?? ''
+  expect(finishedAt - t0).toBeLessThanOrEqual(8_000)
+  expect(textInf).toMatch(/did not finish within (?:7\.9\d+|8) s before this non-interactive run ended/)
+})
+
+for (const remainingMs of [Number.NaN, 1_500, 1_501] as const) {
+  test(`interactive /bqaa-backfill wait starts background backfill at remainingMs=${String(remainingMs)}`, { options: OPTIONS }, async ($, on) => {
+    const worldInt = setUp(on)
+    worldInt.processDelayMs = 15_000
+    worldInt.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-tight-int.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+    if (remainingMs === 1_501) {
+      const running = $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: remainingMs })
+      await worldInt.clock.advance(5)
+      const res = await running
+      expect(res.text ?? '').toContain('/bqaa-status shows progress.')
+    } else {
+      const res = await $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: remainingMs })
+      expect(res.text ?? '').toContain('backfill started in background; /bqaa-status shows progress.')
+    }
+    const status = await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 200 })
+    expect(status.text ?? '').toContain('backfill: running')
+  })
+}
+
+for (const mode of [
+  { label: 'interactive /bqaa-status', isInteractive: true, args: '', expectProbe: false },
+  { label: 'interactive /bqaa-status check', isInteractive: true, args: 'check', expectProbe: true },
+  { label: 'headless -p /bqaa-status', isInteractive: false, args: '', expectProbe: true },
+] as const) {
+  test(`${mode.label} shares a single 1800 ms command deadline across slow fs.list and destination probe`, { options: OPTIONS }, async ($, on) => {
+    const worldSlow = setUp(on)
+    worldSlow.processDelayMs = 15_000
+    worldSlow.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-slow-1.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    let listDelayMs = 2_000
+    const listCalls: string[] = []
+    for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+      on('fs.list', { path: dir }, async (_$, e, next) => {
+        listCalls.push(e.path)
+        if (listDelayMs > 0) await worldSlow.clock.sleep(listDelayMs)
+        return next(e)
+      })
+    }
+    await $.session.start({ surface: mode.isInteractive ? 'terminal' : null, isInteractive: mode.isInteractive, cwd: '/work/my-repo' })
+
+    const t0 = worldSlow.clock.now()
+    let finishedAt = -1
+    const running = $.command.run({ command: 'bqaa-status', args: mode.args, ...COMMAND }, { budgetMs: 1_800 }).then(res => {
+      finishedAt = worldSlow.clock.now()
+      return res
+    })
+    await worldSlow.clock.advance(1_350)
+    const res = await running
+    const text = res.text ?? ''
+    expect(finishedAt - t0).toBeLessThanOrEqual(1_350)
+    expect(finishedAt - t0).toBeLessThan(1_800)
+    expect(text).toContain('dead-letter: timed out listing dead-letter directory')
+    if (mode.expectProbe) expect(text).toContain('destination check: no token within')
+    expect(listCalls).toHaveLength(1)
+
+    await worldSlow.clock.advance(2_000)
+    expect(listCalls).toHaveLength(1)
+
+    listDelayMs = 0
+    worldSlow.processDelayMs = 0
+    const recovered = await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 1_800 })
+    expect(recovered.text ?? '').toContain(`dead-letter: 1 file(s)`)
+  })
+}
+
+for (const mode of [
+  { label: 'interactive /bqaa-backfill wait', isInteractive: true, args: 'wait' },
+  { label: 'headless -p /bqaa-backfill', isInteractive: false, args: '' },
+] as const) {
+  test(`${mode.label} bounds slow fs.list under 1800 ms command deadline`, { options: OPTIONS }, async ($, on) => {
+    const worldSlow = setUp(on)
+    worldSlow.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-slow-2.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    let listDelayMs = 2_000
+    const listCalls: string[] = []
+    for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+      on('fs.list', { path: dir }, async (_$, e, next) => {
+        listCalls.push(e.path)
+        if (listDelayMs > 0) await worldSlow.clock.sleep(listDelayMs)
+        return next(e)
+      })
+    }
+    await $.session.start({ surface: mode.isInteractive ? 'terminal' : null, isInteractive: mode.isInteractive, cwd: '/work/my-repo' })
+
+    const t0 = worldSlow.clock.now()
+    let finishedAt = -1
+    const running = $.command.run({ command: 'bqaa-backfill', args: mode.args, ...COMMAND }, { budgetMs: 1_800 }).then(res => {
+      finishedAt = worldSlow.clock.now()
+      return res
+    })
+    await worldSlow.clock.advance(1_350)
+    const res = await running
+    expect(finishedAt - t0).toBeLessThanOrEqual(1_350)
+    expect(finishedAt - t0).toBeLessThan(1_800)
+    expect(res.text ?? '').toContain('timed out listing dead-letter directory')
+    expect(listCalls).toHaveLength(1)
+
+    await worldSlow.clock.advance(2_000)
+    expect(listCalls).toHaveLength(1)
+
+    listDelayMs = 0
+    const statusAfter = await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 1_800 })
+    expect(statusAfter.text ?? '').toContain('dead-letter: 1 file(s)')
+  })
+}
+
+test('headless -p /bqaa-backfill skips doomed backfill when post-listing budget drops below 250 ms', { options: OPTIONS }, async ($, on) => {
+  const worldFloor = setUp(on)
+  worldFloor.processDelayMs = 15_000
+  worldFloor.files.set(
+    `${PARTITION_DIR}/spill-20261112T100000000Z-floor-1.jsonl`,
+    packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+  )
+  const listCalls: string[] = []
+  for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+    on('fs.list', { path: dir }, async (_$, e, next) => {
+      listCalls.push(e.path)
+      if (e.path === PARTITION_DIR) await worldFloor.clock.sleep(200)
+      return next(e)
+    })
+  }
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+
+  const running = $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs: 1_800 })
+  await worldFloor.clock.advance(200)
+  const res = await running
+  expect(res.text ?? '').toContain('timed out (insufficient command budget) before this non-interactive run ended')
+  expect(worldFloor.files.has(`${PARTITION_DIR}/spill-20261112T100000000Z-floor-1.jsonl.mark`)).toBe(false)
+  expect(worldFloor.fetches).toEqual([])
+  await worldFloor.clock.advance(200)
+  expect(listCalls).toHaveLength(2)
+  expect(worldFloor.fetches).toEqual([])
+})
+
+test('interactive /bqaa-backfill wait shares one 1800 ms deadline across 100 ms fs.list and hanging backfill', { options: OPTIONS }, async ($, on) => {
+  const worldShared = setUp(on)
+  worldShared.processDelayMs = 15_000
+  worldShared.files.set(
+    `${PARTITION_DIR}/spill-20261112T100000000Z-shared-1.jsonl`,
+    packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+  )
+  for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+    on('fs.list', { path: dir }, async (_$, e, next) => {
+      if (e.path === PARTITION_DIR) await worldShared.clock.sleep(100)
+      return next(e)
+    })
+  }
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+
+  const t0 = worldShared.clock.now()
+  let finishedAt = -1
+  const running = $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs: 1_800 }).then(res => {
+    finishedAt = worldShared.clock.now()
+    return res
+  })
+  await worldShared.clock.advance(300)
+  const res = await running
+  expect(finishedAt - t0).toBeLessThanOrEqual(300)
+  expect(res.text ?? '').toContain('still running after')
+  const statusRunning = $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 1_800 })
+  await worldShared.clock.advance(100)
+  const status = await statusRunning
+  expect(status.text ?? '').toContain('backfill: running')
+})
+
+for (const mode of [
+  { label: 'interactive /bqaa-backfill', args: '', expectText: 'backfill started for 1 file(s)' },
+  { label: 'interactive /bqaa-backfill wait', args: 'wait', expectText: 'backfill started in background; /bqaa-status shows progress.' },
+] as const) {
+  test(`${mode.label} succeeds on 10 ms async fs.list at budgetMs=1500 and starts background backfill`, { options: OPTIONS }, async ($, on) => {
+    const worldTight = setUp(on)
+    worldTight.processDelayMs = 15_000
+    worldTight.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-tight-async.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+      on('fs.list', { path: dir }, async (_$, e, next) => {
+        if (e.path === PARTITION_DIR) await worldTight.clock.sleep(10)
+        return next(e)
+      })
+    }
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+
+    const running = $.command.run({ command: 'bqaa-backfill', args: mode.args, ...COMMAND }, { budgetMs: 1_500 })
+    await worldTight.clock.advance(15)
+    const res = await running
+    expect(res.text ?? '').toContain(mode.expectText)
+
+    const statusRunning = $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 1_500 })
+    await worldTight.clock.advance(15)
+    const status = await statusRunning
+    expect(status.text ?? '').toContain('dead-letter: 1 file(s)')
+    expect(status.text ?? '').toContain('backfill: running')
+  })
+}
+
+for (const budgetMs of [1_501, 1_600, 1_800] as const) {
+  for (const listDelayMs of [50, 200, 400] as const) {
+    test(`interactive /bqaa-backfill wait with ${listDelayMs} ms async fs.list at budgetMs=${budgetMs} starts background backfill`, { options: OPTIONS }, async ($, on) => {
+      const worldAsync = setUp(on)
+      worldAsync.processDelayMs = 15_000
+      worldAsync.files.set(
+        `${PARTITION_DIR}/spill-20261112T100000000Z-async-${budgetMs}-${listDelayMs}.jsonl`,
+        packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+      )
+      for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+        on('fs.list', { path: dir }, async (_$, e, next) => {
+          if (e.path === PARTITION_DIR) await worldAsync.clock.sleep(listDelayMs)
+          return next(e)
+        })
+      }
+      await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+
+      const t0 = worldAsync.clock.now()
+      let finishedAt = -1
+      const running = $.command.run({ command: 'bqaa-backfill', args: 'wait', ...COMMAND }, { budgetMs }).then(res => {
+        finishedAt = worldAsync.clock.now()
+        return res
+      })
+      const waitMs = budgetMs - 1_500
+      const expectedBound = Math.max(listDelayMs, waitMs)
+      await worldAsync.clock.advance(expectedBound + 10)
+      const res = await running
+      const text = res.text ?? ''
+      expect(finishedAt - t0).toBeLessThanOrEqual(expectedBound)
+      expect(finishedAt - t0).toBeLessThan(budgetMs)
+      expect(text).not.toContain('timed out listing dead-letter directory')
+      if (listDelayMs >= waitMs) {
+        expect(text).toContain('backfill started in background; /bqaa-status shows progress.')
+      } else {
+        expect(text).toContain('still running after')
+      }
+
+      const statusRunning = $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs: 1_800 })
+      await worldAsync.clock.advance(listDelayMs + 10)
+      const status = await statusRunning
+      expect(status.text ?? '').toContain('backfill: running')
+    })
+  }
+}
+
+for (const [budgetMs, listDelayMs] of [
+  [1_501, 50],
+  [1_501, 200],
+  [1_501, 400],
+  [1_600, 50],
+  [1_600, 200],
+  [1_600, 400],
+  [1_800, 100],
+  [1_800, 200],
+  [1_800, 400],
+] as const) {
+  for (const hasFiles of [true, false] as const) {
+    test(`headless -p /bqaa-backfill with ${listDelayMs} ms async fs.list at budgetMs=${budgetMs} (${hasFiles ? 'files present' : 'empty'}) does not fail listing`, { options: OPTIONS }, async ($, on) => {
+      const worldHeadless = setUp(on)
+      worldHeadless.processDelayMs = 15_000
+      if (hasFiles) {
+        worldHeadless.files.set(
+          `${PARTITION_DIR}/spill-20261112T100000000Z-hl-${budgetMs}-${listDelayMs}.jsonl`,
+          packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+        )
+      }
+      for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+        on('fs.list', { path: dir }, async (_$, e, next) => {
+          if (e.path === PARTITION_DIR) await worldHeadless.clock.sleep(listDelayMs)
+          return next(e)
+        })
+      }
+      await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+
+      const t0 = worldHeadless.clock.now()
+      let finishedAt = -1
+      const running = $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND }, { budgetMs }).then(res => {
+        finishedAt = worldHeadless.clock.now()
+        return res
+      })
+      await worldHeadless.clock.advance(listDelayMs + 10)
+      const res = await running
+      const text = res.text ?? ''
+      expect(finishedAt - t0).toBeLessThanOrEqual(listDelayMs)
+      expect(finishedAt - t0).toBeLessThan(budgetMs)
+      expect(text).not.toContain('timed out listing dead-letter directory')
+      if (hasFiles) {
+        expect(text).toContain('timed out (insufficient command budget) before this non-interactive run ended')
+        expect(worldHeadless.files.has(`${PARTITION_DIR}/spill-20261112T100000000Z-hl-${budgetMs}-${listDelayMs}.jsonl.mark`)).toBe(false)
+        expect(worldHeadless.fetches).toEqual([])
+      } else {
+        expect(text).toContain('no dead-letter files for')
+      }
+    })
+  }
+}
+
+for (const budgetMs of [-50, 0, 200, 1_500, 1_501, 1_749, 1_800, 2_000, Number.NaN, Number.POSITIVE_INFINITY] as const) {
+  test(`/bqaa-status budget sweep at budgetMs=${String(budgetMs)} under slow fs.list delays never rejects`, { options: OPTIONS }, async ($, on) => {
+    const worldSweep = setUp(on, { BQAA_AUTO_BACKFILL: 'false' })
+    worldSweep.processDelayMs = 15_000
+    worldSweep.files.set(
+      `${PARTITION_DIR}/spill-20261112T100000000Z-sweep.jsonl`,
+      packFiles([JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })])[0] as string,
+    )
+    const delayMs = budgetMs === Number.POSITIVE_INFINITY ? 9_000 : 2_000
+    const listCalls: string[] = []
+    for (const dir of [PARTITION_DIR, DEAD_LETTER_DIR]) {
+      on('fs.list', { path: dir }, async (_$, e, next) => {
+        listCalls.push(e.path)
+        await worldSweep.clock.sleep(delayMs)
+        return next(e)
+      })
+    }
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+    const nodeProc = (globalThis as {
+      process?: { on?: (ev: string, fn: () => void) => void; off?: (ev: string, fn: () => void) => void }
+    }).process
+
+    let rejections = 0
+    const onUnhandled = (): void => {
+      rejections += 1
+    }
+    nodeProc?.on?.('unhandledRejection', onUnhandled)
+    try {
+      const running = $.command.run({ command: 'bqaa-status', args: '', ...COMMAND }, { budgetMs })
+      const maxAdvance = Number.isFinite(budgetMs) ? Math.max(0, budgetMs) : 8_000
+      await worldSweep.clock.advance(maxAdvance)
+      const res = await running
+      expect(res.text ?? '').toContain('dead-letter: timed out')
+      expect(listCalls).toHaveLength(1)
+      await worldSweep.clock.advance(delayMs)
+      expect(listCalls).toHaveLength(1)
+      expect(rejections).toBe(0)
+    } finally {
+      nodeProc?.off?.('unhandledRejection', onUnhandled)
+    }
+  })
+}
+
+for (const mode of [
+  { label: 'interactive /bqaa-backfill', isInteractive: true, args: '' },
+  { label: 'interactive /bqaa-backfill wait', isInteractive: true, args: 'wait' },
+  { label: 'headless -p /bqaa-backfill', isInteractive: false, args: '' },
+] as const) {
+  for (const listKind of ['slow', 'moderate'] as const) {
+    for (const budgetMs of [-50, 0, 200, 1_500, 1_501, 1_749, 1_800, 2_000, Number.NaN, Number.POSITIVE_INFINITY] as const) {
+      test(`${mode.label} budget sweep (${listKind} async fs.list) at budgetMs=${String(budgetMs)} complies with host budget, 0 rejections, 0 leaked timers`, { options: OPTIONS }, async () => {
+        const clock = probeClock()
+        let sessionStartHandler: ((...args: unknown[]) => Promise<unknown>) | null = null
+        const commandHandlers = new Map<string, (...args: unknown[]) => Promise<unknown>>()
+        const registerSpy = ((eventName: string, arg2: unknown, arg3?: unknown) => {
+          const handler = (typeof arg2 === 'function' ? arg2 : arg3) as (...args: unknown[]) => Promise<unknown>
+          if (eventName === 'session.start') sessionStartHandler = handler
+          if (eventName === 'command.run' && typeof arg2 === 'object' && arg2 !== null && 'command' in arg2) {
+            commandHandlers.set(String((arg2 as { command: string }).command), handler)
+          }
+          return { catch: () => undefined }
+        }) as unknown as OnFunction
+
+        register(registerSpy, { ...OPTIONS, autoBackfill: false, recordHostname: false })
+
+        let commandTimersOnly = false
+        let commandTimerHandles = 0
+        let commandTimersCancelledOrFired = 0
+        const wrapAfter = (ms: number, fn: () => void) => {
+          if (!commandTimersOnly) return { cancel: () => undefined }
+          commandTimerHandles += 1
+          let done = false
+          const inner = clock.after(ms, () => {
+            if (!done) {
+              done = true
+              commandTimersCancelledOrFired += 1
+            }
+            fn()
+          })
+          return {
+            cancel: () => {
+              if (!done) {
+                done = true
+                commandTimersCancelledOrFired += 1
+              }
+              inner.cancel()
+            },
+          }
+        }
+
+        const delayMs = listKind === 'slow' ? (budgetMs === Number.POSITIVE_INFINITY ? 9_000 : 2_000) : 200
+        const envMap: Record<string, string> = { HOME, USER: 'dev' }
+        const stub$: EngineInterface = {
+          plugin: { root: '/plugin' },
+          env: { get: async (name: string) => envMap[name] },
+          store: { get: async () => undefined, set: async () => undefined, delete: async () => undefined, keys: async () => [] },
+          state: { get: async () => ({ value: undefined, version: 0 }), set: async () => ({ version: 1, isSet: true }) },
+          session: { id: async () => SESSION_ID, version: async () => ({ version: '1.0.0' }) },
+          clock: {
+            after: wrapAfter,
+            every: () => ({ cancel: () => undefined }),
+            sleep: (ms: number) => new Promise<void>(resolve => { clock.after(ms, () => resolve()) }),
+          },
+          http: { fetch: async () => ({ status: 200, text: '{}' }) },
+          process: { run: async () => ({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }) },
+          fs: {
+            write: async () => undefined,
+            read: async () => `${JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-11-12T10:00:00.000Z', table: TABLE_REF, row: tightRowBoundary })}\n`,
+            exists: async (path: string) => path === DEAD_LETTER_DIR || path === PARTITION_DIR,
+            list: async (path: string) => {
+              if (path === PARTITION_DIR) await new Promise<void>(resolve => clock.after(delayMs, resolve))
+              return path === PARTITION_DIR ? [{ name: 'spill-20261112T100000000Z-sweep.jsonl', kind: 'file', size: 128 }] : []
+            },
+          },
+          ui: {
+            status: () => undefined,
+            log: () => undefined,
+            toast: () => undefined,
+            invalidate: () => undefined,
+            resolve: () => ({ Box: () => ({}), Text: () => ({}), Button: () => ({}) }),
+          },
+          command: { register: async () => undefined },
+        } as unknown as EngineInterface
+
+        await sessionStartHandler!(stub$, { surface: mode.isInteractive ? 'terminal' : null, isInteractive: mode.isInteractive, cwd: '/work/my-repo' }, async () => undefined)
+        await clock.advance(0)
+        expect(clock.pending()).toBe(0)
+        commandTimersOnly = true
+
+        const nodeProc = (globalThis as {
+          process?: { on?: (ev: string, fn: () => void) => void; off?: (ev: string, fn: () => void) => void }
+        }).process
+        let rejections = 0
+        const onUnhandled = (): void => {
+          rejections += 1
+        }
+        nodeProc?.on?.('unhandledRejection', onUnhandled)
+        try {
+          const origDateNow = Date.now
+          Date.now = clock.now
+          let res: { text?: string }
+          const t0 = clock.now()
+          let finishedAt = -1
+          try {
+            const backfillFn = commandHandlers.get('bqaa-backfill')!
+            const running = backfillFn(stub$, { command: 'bqaa-backfill', args: mode.args, ...COMMAND }, Object.assign(async () => undefined, { budget: { remainingMs: budgetMs } })).then(out => {
+              finishedAt = clock.now()
+              return out as { text?: string }
+            })
+            const maxAdvance = Number.isFinite(budgetMs) ? Math.max(0, budgetMs) : 8_000
+            await clock.advance(maxAdvance)
+            res = await running
+          } finally {
+            Date.now = origDateNow
+          }
+          const maxAdvance = Number.isFinite(budgetMs) ? Math.max(0, budgetMs) : 8_000
+          expect(finishedAt - t0).toBeLessThanOrEqual(maxAdvance)
+          if (Number.isFinite(budgetMs) && budgetMs > 0) expect(finishedAt - t0).toBeLessThan(budgetMs)
+          expect(typeof res.text).toBe('string')
+          if (listKind === 'slow') expect(res.text ?? '').toContain('timed out listing dead-letter directory')
+          await clock.advance(delayMs + 1_000)
+          expect(clock.pending()).toBe(0)
+          expect(commandTimersCancelledOrFired).toBe(commandTimerHandles)
+          expect(rejections).toBe(0)
+        } finally {
+          nodeProc?.off?.('unhandledRejection', onUnhandled)
+        }
+      })
+    }
+  }
+}
+
+test('/bqaa-status and /bqaa-backfill cancel all command timers (0 leaked timers on probeClock)', { options: OPTIONS }, async () => {
+  const clock = probeClock()
+  let sessionStartHandler: ((...args: unknown[]) => Promise<unknown>) | null = null
+  const commandHandlers = new Map<string, (...args: unknown[]) => Promise<unknown>>()
+  const registerSpy = ((eventName: string, arg2: unknown, arg3?: unknown) => {
+    const handler = (typeof arg2 === 'function' ? arg2 : arg3) as (...args: unknown[]) => Promise<unknown>
+    if (eventName === 'session.start') sessionStartHandler = handler
+    if (eventName === 'command.run' && typeof arg2 === 'object' && arg2 !== null && 'command' in arg2) {
+      commandHandlers.set(String((arg2 as { command: string }).command), handler)
+    }
+    return { catch: () => undefined }
+  }) as unknown as OnFunction
+
+  register(registerSpy, { ...OPTIONS, autoBackfill: false, recordHostname: false })
+
+  let commandTimersOnly = false
+  let commandTimerHandles = 0
+  let commandTimersCancelledOrFired = 0
+  const wrapAfter = (ms: number, fn: () => void) => {
+    if (!commandTimersOnly) return { cancel: () => undefined }
+    commandTimerHandles += 1
+    let done = false
+    const inner = clock.after(ms, () => {
+      if (!done) {
+        done = true
+        commandTimersCancelledOrFired += 1
+      }
+      fn()
+    })
+    return {
+      cancel: () => {
+        if (!done) {
+          done = true
+          commandTimersCancelledOrFired += 1
+        }
+        inner.cancel()
+      },
+    }
+  }
+
+  let listDelayMs = 0
+  const envMap: Record<string, string> = { HOME, USER: 'dev' }
+  const stub$: EngineInterface = {
+    plugin: { root: '/plugin' },
+    env: { get: async (name: string) => envMap[name] },
+    store: { get: async () => undefined, set: async () => undefined, delete: async () => undefined, keys: async () => [] },
+    state: { get: async () => ({ value: undefined, version: 0 }), set: async () => ({ version: 1, isSet: true }) },
+    session: { id: async () => SESSION_ID, version: async () => ({ version: '1.0.0' }) },
+    clock: {
+      after: wrapAfter,
+      every: () => ({ cancel: () => undefined }),
+      sleep: (ms: number) => new Promise<void>(resolve => { clock.after(ms, () => resolve()) }),
+    },
+    http: { fetch: async () => ({ status: 200, text: '{}' }) },
+    process: { run: async () => ({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }) },
+    fs: {
+      write: async () => undefined,
+      read: async () => '',
+      exists: async (path: string) => path === DEAD_LETTER_DIR || path === PARTITION_DIR,
+      list: async (path: string) => {
+        if (listDelayMs > 0 && path === PARTITION_DIR) await new Promise<void>(resolve => clock.after(listDelayMs, resolve))
+        return path === PARTITION_DIR ? [{ name: 'spill-20261112T100000000Z-t0.jsonl', kind: 'file', size: 128 }] : []
+      },
+    },
+    ui: {
+      status: () => undefined,
+      log: () => undefined,
+      toast: () => undefined,
+      invalidate: () => undefined,
+      resolve: () => ({ Box: () => ({}), Text: () => ({}), Button: () => ({}) }),
+    },
+    command: { register: async () => undefined },
+  } as unknown as EngineInterface
+
+  await sessionStartHandler!(stub$, { surface: null, isInteractive: false, cwd: '/work/my-repo' }, async () => undefined)
+  expect(clock.pending()).toBe(0)
+
+  commandTimersOnly = true
+
+  // 1. /bqaa-status with 2_000 ms slow fs.list at budgetMs = 1_800 cancels cleanly at 1_350 ms.
+  listDelayMs = 2_000
+  const statusFn = commandHandlers.get('bqaa-status')!
+  const statusRun = statusFn(stub$, { command: 'bqaa-status', args: '', ...COMMAND }, Object.assign(async () => undefined, { budget: { remainingMs: 1_800 } }))
+  await clock.advance(1_350)
+  const statusRes = (await statusRun) as { text?: string }
+  expect(statusRes.text ?? '').toContain('dead-letter: timed out')
+  await clock.advance(2_000)
+  expect(clock.pending()).toBe(0)
+
+  // 2. Headless -p /bqaa-backfill with 200 ms fs.list at budgetMs = 1_800 cancels floorTimer + waited timer + deadLetter timer.
+  listDelayMs = 200
+  const backfillFn = commandHandlers.get('bqaa-backfill')!
+  const backfillRun = backfillFn(stub$, { command: 'bqaa-backfill', args: '', ...COMMAND }, Object.assign(async () => undefined, { budget: { remainingMs: 1_800 } }))
+  await clock.advance(200)
+  const backfillRes = (await backfillRun) as { text?: string }
+  expect(backfillRes.text ?? '').toContain('timed out (insufficient command budget) before this non-interactive run ended')
+  expect(clock.pending()).toBe(0)
+  expect(commandTimerHandles).toBeGreaterThanOrEqual(4)
+  expect(commandTimersCancelledOrFired).toBe(commandTimerHandles)
 })

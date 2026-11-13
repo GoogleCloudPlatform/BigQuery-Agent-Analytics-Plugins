@@ -29,7 +29,7 @@ const BAND = {
   component: 'AbovePrompt',
   requestId: 'above-prompt',
   viewport: { columns: 120, rows: 40 },
-  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 115, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+  props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 10, bodyColumns: 115, scroll: { offset: 0, bodyRows: 10 }, view: {} },
 } as const
 
 // gcloud with no application-default sign-in: a WARNING line first, then
@@ -308,7 +308,7 @@ test("with gcloud's own account as the token command, the fix is gcloud auth log
 test('when the AbovePrompt band cannot show (non-terminal surface), the problem notice is written to the status line', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.processReply = GCLOUD_FAILS
-  await $.session.start({ surface: 'ide', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.start({ surface: 'web', isInteractive: true, cwd: '/work/my-repo' })
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   expect(world.statusLines.at(-1)).toBe(`BQAA: no working Google credentials. To fix, ${FIX} (2 row(s) waiting)`)

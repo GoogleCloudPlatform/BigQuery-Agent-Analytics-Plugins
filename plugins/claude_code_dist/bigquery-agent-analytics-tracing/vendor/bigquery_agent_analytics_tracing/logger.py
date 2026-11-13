@@ -15,41 +15,102 @@
 """Builds rows in the canonical BQAA ``agent_events`` shape and routes them
 to one of three sinks: dry-run log, synchronous direct insert, or async
 spool + drainer.
-
-Hook subprocess (hot path):
-  1. Build the BQAA row.
-  2. Append a JSONL line to ``config.spool_dir`` (sync, ~1 ms).
-  3. Spawn a detached drainer subprocess (idempotent via flock).
-  4. Exit. The host agent never blocks on BigQuery.
-
-The drainer subprocess (``drain.py``) holds an exclusive flock, batches
-spooled rows, writes through the BigQuery Storage Write API when
-available, and falls back to ``insert_rows_json`` otherwise.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 import fcntl
+import importlib.util
 import json
 import os
-from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
 from typing import Any
 import uuid
 
+from ._utils import ensure_private_dir
 from ._utils import hex_id
 from ._utils import iso_timestamp
 from ._utils import log_to_file
+from ._utils import open_destination_spool_dir
 from ._utils import PYTHON_C_RUN_MODULE
 from ._utils import truncate
 from ._writer_identity import __version__ as WRITER_VERSION
 from ._writer_identity import WRITER_PLUGIN_NAME
 from .config import BQAA_EVENT_TYPES
 from .config import BQAAConfig
+from .config import DEFAULT_WRITER_LABEL
+from .config import default_spool_dir
+from .config import default_state_dir
 from .schema import bq_schema
+
+_MISSING_BQ_LOGGED_KEYS: set[tuple[str, str]] = set()
+_MISSING_BQ_MARKER = ".missing_bq_logged"
+
+
+def _bigquery_spec_available() -> bool:
+  """Return True if ``google.cloud.bigquery`` can be resolved in this Python."""
+  if "google.cloud.bigquery" in sys.modules:
+    return True
+  try:
+    return importlib.util.find_spec("google.cloud.bigquery") is not None
+  except (ImportError, ModuleNotFoundError, ValueError):
+    return False
+
+
+def _resolve_python_executable(cmd: str) -> str:
+  """Resolve a Python interpreter command for same-interpreter checks."""
+  if not cmd:
+    resolved = sys.executable
+  elif os.path.sep in cmd or (os.path.altsep and os.path.altsep in cmd):
+    resolved = os.path.abspath(cmd)
+  else:
+    resolved = shutil.which(cmd) or os.path.abspath(cmd)
+  abs_resolved = os.path.abspath(resolved)
+  parent = os.path.dirname(abs_resolved)
+  grandparent = os.path.dirname(parent)
+  if (
+      os.path.isfile(os.path.join(parent, "pyvenv.cfg"))
+      or os.path.isfile(os.path.join(grandparent, "pyvenv.cfg"))
+  ):
+    return abs_resolved
+  try:
+    return os.path.realpath(resolved)
+  except OSError:
+    return abs_resolved
+
+
+def _log_missing_bigquery_once(config: BQAAConfig) -> None:
+  """Log a concise notice once per state_dir/process when bigquery is absent."""
+  key = (sys.prefix, str(config.state_dir))
+  if key in _MISSING_BQ_LOGGED_KEYS:
+    return
+  _MISSING_BQ_LOGGED_KEYS.add(key)
+  try:
+    with ensure_private_dir(config.state_dir) as state_dir:
+      try:
+        fd = state_dir.open(
+            _MISSING_BQ_MARKER,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        os.close(fd)
+      except FileExistsError:
+        return
+  except OSError:
+    pass
+  resolved_python = _resolve_python_executable(
+      os.environ.get("BQAA_PYTHON") or ""
+  )
+  log_to_file(
+      config,
+      f"DRAINER_SKIPPED google-cloud-bigquery is not installed on"
+      f" {resolved_python}; events remain in spool_dir until installed"
+      " (run /bqaa-setup).",
+  )
 
 
 def content_part(text: str, index: int) -> dict[str, Any]:
@@ -82,8 +143,6 @@ def _serialize_bq_json_fields(row: dict[str, Any]) -> dict[str, Any]:
         next_object_ref = dict(object_ref)
         next_object_ref["details"] = json.dumps(details, sort_keys=True)
         next_part["object_ref"] = next_object_ref
-    # part_attributes is STRING in the schema; serialize structured values
-    # so callers passing dicts/lists don't break the insert_rows_json path.
     part_attrs = next_part.get("part_attributes")
     if part_attrs is not None and not isinstance(part_attrs, str):
       next_part["part_attributes"] = json.dumps(part_attrs, sort_keys=True)
@@ -93,34 +152,89 @@ def _serialize_bq_json_fields(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ensure_drainer(config: BQAAConfig) -> None:
-  """Spawn the drainer in a detached subprocess if none is running.
+  """Spawn the drainer in a detached subprocess if none is running."""
+  if (
+      not (config.project_id or "").strip()
+      or not (config.dataset or "").strip()
+  ):
+    return
+  env_python = os.environ.get("BQAA_PYTHON") or ""
+  same_python = (
+      _resolve_python_executable(env_python)
+      == _resolve_python_executable(sys.executable)
+  )
+  if same_python and not _bigquery_spec_available():
+    _log_missing_bigquery_once(config)
+    return
 
-  Uses a non-blocking flock on a pidfile to dedupe; a running drainer holds
-  the lock for its entire lifetime. If we cannot take the lock, a drainer is
-  already running and will pick up our spool file.
-
-  Runs ``bigquery_agent_analytics_tracing.drain`` like ``python -m``,
-  but without the working directory on ``sys.path`` (see
-  ``PYTHON_C_RUN_MODULE``): it is the hook's, usually a checked-out
-  repository. For vendored plugin installs (no wheel on ``BQAA_PYTHON``),
-  set ``PYTHONPATH`` to the vendored package root before the hook fires,
-  or use a plugin-side wrapper script that performs the ``sys.path``
-  insert.
-  """
-  spool = Path(config.spool_dir).expanduser()
-  spool.mkdir(parents=True, exist_ok=True)
-  pidfile = spool / ".drainer.pid"
-  fd = os.open(str(pidfile), os.O_CREAT | os.O_RDWR, 0o600)
+  with open_destination_spool_dir(
+      config.spool_dir,
+      config.project_id,
+      config.dataset,
+      config.table,
+      create=True,
+  ) as spool:
+    fd = spool.open(".drainer.pid", os.O_CREAT | os.O_RDWR)
   try:
     try:
       fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-      return  # Another drainer is running.
+      return  # Another drainer for this destination is running.
     fcntl.flock(fd, fcntl.LOCK_UN)
   finally:
     os.close(fd)
 
-  python_bin = os.environ.get("BQAA_PYTHON") or sys.executable or "python3"
+  child_env = os.environ.copy()
+  child_env["BQAA_PROJECT_ID"] = config.project_id
+  child_env["BQAA_DATASET"] = config.dataset
+  child_env["BQAA_TABLE"] = (config.table or "").strip() or "agent_events"
+  child_env["BQAA_AGENT_NAME"] = config.agent_name or "coding-agent"
+  child_env["BQAA_USER_ID"] = config.user_id or "local-user"
+  child_env["BQAA_TRACE_ENABLED"] = "true" if config.enabled else "false"
+  child_env["BQAA_DRY_RUN"] = "true" if config.dry_run else "false"
+  child_env["BQAA_DIRECT_WRITE"] = "true" if config.direct_write else "false"
+  child_env["BQAA_AUTO_CREATE_TABLE"] = (
+      "true" if config.auto_create_table else "false"
+  )
+  child_env["BQAA_AUTO_CREATE_DATASET"] = (
+      "true" if config.auto_create_dataset else "false"
+  )
+  if config.location:
+    child_env["BQAA_LOCATION"] = config.location
+  else:
+    child_env.pop("BQAA_LOCATION", None)
+  child_env["BQAA_MAX_CONTENT_LENGTH"] = str(config.max_content_length)
+  child_env["BQAA_LOG_FILE"] = config.log_file
+  child_env["BQAA_MAX_LOG_BYTES"] = str(config.max_log_bytes)
+  if config.spool_dir != default_spool_dir() or (
+      os.environ.get("BQAA_SPOOL_DIR") or ""
+  ).strip():
+    child_env["BQAA_SPOOL_DIR"] = config.spool_dir
+  else:
+    child_env.pop("BQAA_SPOOL_DIR", None)
+  if config.state_dir != default_state_dir() or (
+      os.environ.get("BQAA_STATE_DIR") or ""
+  ).strip():
+    child_env["BQAA_STATE_DIR"] = config.state_dir
+  else:
+    child_env.pop("BQAA_STATE_DIR", None)
+  child_env["BQAA_STATE_TTL_HOURS"] = str(config.state_ttl_hours)
+  child_env["BQAA_TRANSCRIPT_MAX_BYTES"] = str(config.transcript_max_bytes)
+  child_env["BQAA_DRAIN_IDLE_SECONDS"] = str(config.drain_idle_seconds)
+  child_env["BQAA_DRAIN_POLL_SECONDS"] = str(config.drain_poll_seconds)
+  child_env["BQAA_DRAIN_BATCH_SIZE"] = str(config.drain_batch_size)
+  if config.drain_retry_backoff_seconds is not None:
+    child_env["BQAA_DRAIN_RETRY_BACKOFF_SECONDS"] = str(
+        config.drain_retry_backoff_seconds
+    )
+  else:
+    child_env.pop("BQAA_DRAIN_RETRY_BACKOFF_SECONDS", None)
+  child_env["BQAA_DRAIN_MAX_RETRY_AGE_SECONDS"] = str(
+      config.drain_max_retry_age_seconds
+  )
+  child_env["BQAA_WRITER_LABEL"] = config.writer_label or DEFAULT_WRITER_LABEL
+
+  python_bin = env_python or sys.executable or "python3"
   try:
     subprocess.Popen(
         [
@@ -134,21 +248,14 @@ def _ensure_drainer(config: BQAAConfig) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
-        env=os.environ.copy(),
+        env=child_env,
     )
   except OSError as exc:
     log_to_file(config, f"DRAINER_SPAWN_FAIL {exc}")
 
 
 class BigQueryAgentAnalyticsLogger:
-  """Builds BQAA rows and routes them to spool / dry-run / sync write.
-
-  Default emit mode is ``spool`` (writes a JSONL line and triggers the
-  async drainer subprocess). ``config.dry_run`` writes to
-  ``config.log_file`` only. ``config.direct_write`` falls back to a
-  synchronous ``insert_rows_json`` call, kept for debugging and parity
-  tests.
-  """
+  """Builds BQAA rows and routes them to spool / dry-run / sync write."""
 
   def __init__(self, config: BQAAConfig | None = None):
     self.config = config or BQAAConfig.from_env()
@@ -183,10 +290,6 @@ class BigQueryAgentAnalyticsLogger:
     clipped_content, content_truncated = truncate(
         content or {}, self.config.max_content_length
     )
-    # attributes.writer is reserved for package attribution so adoption
-    # queries on attributes.writer.{plugin,version,label,agent,mode} have a
-    # stable contract. A caller-supplied "writer" key is moved to
-    # attributes.writer_caller rather than silently dropping their data.
     merged_attributes = dict(attributes or {})
     caller_writer = merged_attributes.pop("writer", None)
     merged_attributes["writer"] = {
@@ -268,9 +371,10 @@ class BigQueryAgentAnalyticsLogger:
         attributes=attributes,
     )
 
-  def log_llm_response(
+  def _log_llm_outcome(
       self,
       *,
+      event_type: str,
       response: str,
       session_id: str,
       invocation_id: str,
@@ -299,7 +403,7 @@ class BigQueryAgentAnalyticsLogger:
     if attributes:
       attrs.update(attributes)
     return self.log_event(
-        event_type="LLM_RESPONSE",
+        event_type=event_type,
         agent=agent,
         user_id=user_id,
         session_id=session_id,
@@ -313,6 +417,82 @@ class BigQueryAgentAnalyticsLogger:
         latency_ms={"total_ms": total_ms} if total_ms is not None else {},
         status=status,
         error_message=error_message,
+        is_truncated=is_truncated,
+    )
+
+  def log_llm_response(
+      self,
+      *,
+      response: str,
+      session_id: str,
+      invocation_id: str,
+      trace_id: str,
+      span_id: str,
+      parent_span_id: str | None = None,
+      agent: str | None = None,
+      user_id: str | None = None,
+      model: str | None = None,
+      usage_metadata: dict[str, int] | None = None,
+      total_ms: int | None = None,
+      status: str = "OK",
+      error_message: str | None = None,
+      attributes: dict[str, Any] | None = None,
+      is_truncated: bool = False,
+  ) -> dict[str, Any]:
+    return self._log_llm_outcome(
+        event_type="LLM_RESPONSE",
+        response=response,
+        session_id=session_id,
+        invocation_id=invocation_id,
+        trace_id=trace_id,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
+        agent=agent,
+        user_id=user_id,
+        model=model,
+        usage_metadata=usage_metadata,
+        total_ms=total_ms,
+        status=status,
+        error_message=error_message,
+        attributes=attributes,
+        is_truncated=is_truncated,
+    )
+
+  def log_llm_error(
+      self,
+      *,
+      response: str = "",
+      session_id: str,
+      invocation_id: str,
+      trace_id: str,
+      span_id: str,
+      parent_span_id: str | None = None,
+      agent: str | None = None,
+      user_id: str | None = None,
+      model: str | None = None,
+      usage_metadata: dict[str, int] | None = None,
+      total_ms: int | None = None,
+      status: str = "ERROR",
+      error_message: str | None = None,
+      attributes: dict[str, Any] | None = None,
+      is_truncated: bool = False,
+  ) -> dict[str, Any]:
+    return self._log_llm_outcome(
+        event_type="LLM_ERROR",
+        response=response,
+        session_id=session_id,
+        invocation_id=invocation_id,
+        trace_id=trace_id,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
+        agent=agent,
+        user_id=user_id,
+        model=model,
+        usage_metadata=usage_metadata,
+        total_ms=total_ms,
+        status=status,
+        error_message=error_message,
+        attributes=attributes,
         is_truncated=is_truncated,
     )
 
@@ -386,7 +566,10 @@ class BigQueryAgentAnalyticsLogger:
           "DRY_RUN " + json.dumps(bq_row, sort_keys=True, default=str),
       )
       return
-    if not self.config.project_id or not self.config.dataset:
+    if (
+        not (self.config.project_id or "").strip()
+        or not (self.config.dataset or "").strip()
+    ):
       raise ValueError(
           "BQAA_PROJECT_ID/GCP_PROJECT_ID and BQAA_DATASET are required"
       )
@@ -396,8 +579,6 @@ class BigQueryAgentAnalyticsLogger:
     self._spool(bq_row)
 
   def _spool(self, bq_row: dict[str, Any]) -> None:
-    spool = Path(self.config.spool_dir).expanduser()
-    spool.mkdir(parents=True, exist_ok=True)
     envelope = {
         "config": {
             "project_id": self.config.project_id,
@@ -411,12 +592,17 @@ class BigQueryAgentAnalyticsLogger:
         "row": bq_row,
     }
     name = f"event-{time.time_ns()}-{os.getpid()}-{uuid.uuid4().hex[:8]}.json"
-    path = spool / name
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(envelope, sort_keys=True, default=str), encoding="utf-8"
-    )
-    os.replace(tmp, path)
+    with open_destination_spool_dir(
+        self.config.spool_dir,
+        self.config.project_id,
+        self.config.dataset,
+        self.config.table,
+        create=True,
+    ) as spool:
+      fd = spool.open(f"{name}.tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+      with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(envelope, sort_keys=True, default=str))
+      spool.replace(f"{name}.tmp", name)
     _ensure_drainer(self.config)
 
   def _direct_insert(self, bq_row: dict[str, Any]) -> None:

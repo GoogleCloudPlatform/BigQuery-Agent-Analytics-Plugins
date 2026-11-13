@@ -407,7 +407,54 @@ export const mock = {
 let currentTestClock = null
 let testCounter = 0
 
-function createTestHarness(pluginRoot) {
+const userConfigCache = new Map()
+
+function loadUserConfig(pluginRoot) {
+  if (!pluginRoot) return null
+  if (userConfigCache.has(pluginRoot)) return userConfigCache.get(pluginRoot)
+  const manifestPath = path.join(pluginRoot, '.claude-plugin', 'plugin.json')
+  let schema = null
+  if (fs.existsSync(manifestPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+      if (parsed && typeof parsed.userConfig === 'object' && parsed.userConfig !== null) {
+        schema = parsed.userConfig
+      }
+    } catch {
+      schema = null
+    }
+  }
+  userConfigCache.set(pluginRoot, schema)
+  return schema
+}
+
+export function validateUserConfigOptions(pluginRoot, opts) {
+  const schema = loadUserConfig(pluginRoot)
+  if (!schema || !opts) return
+  for (const [key, value] of Object.entries(opts)) {
+    if (value === undefined || !Object.prototype.hasOwnProperty.call(schema, key)) continue
+    const expected = schema[key]?.type
+    if (expected === 'boolean' && typeof value !== 'boolean') {
+      throw new Error(`invalid userConfig option "${key}": expected boolean, got ${typeof value}`)
+    }
+    if (expected === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) {
+      throw new Error(`invalid userConfig option "${key}": expected number, got ${typeof value}`)
+    }
+    if (expected === 'string' && typeof value !== 'string') {
+      throw new Error(`invalid userConfig option "${key}": expected string, got ${typeof value}`)
+    }
+  }
+}
+
+function canonicalFilter(filter) {
+  if (filter === null || filter === undefined) return 'null'
+  const keys = Object.keys(filter)
+    .filter(k => filter[k] !== undefined)
+    .sort()
+  return JSON.stringify(keys.map(k => [k, filter[k]]))
+}
+
+export function createTestHarness(pluginRoot) {
   const clock = createVirtualClock(0)
   const pluginHooks = []
   const testMiddlewareHooks = []
@@ -416,10 +463,16 @@ function createTestHarness(pluginRoot) {
   const stateStore = new Map()
   const mountedUis = new Set()
 
-  const registerHook = (bucket, eventName, arg2, arg3) => {
+  const registerHook = (bucket, conflictBuckets, eventName, arg2, arg3) => {
     const filter = typeof arg2 === 'function' ? null : arg2
     const handler = typeof arg2 === 'function' ? arg2 : arg3
-    const entry = { eventName, filter, handler, catchHandler: null }
+    const filterKey = canonicalFilter(filter)
+    for (const existingBucket of conflictBuckets) {
+      if (existingBucket.some(h => h.eventName === eventName && h.filterKey === filterKey)) {
+        throw new Error(`on("${eventName}") registered twice`)
+      }
+    }
+    const entry = { eventName, filter, filterKey, handler, catchHandler: null }
     bucket.push(entry)
     return {
       catch(fn) {
@@ -428,17 +481,18 @@ function createTestHarness(pluginRoot) {
     }
   }
 
-  const pluginOn = (eventName, arg2, arg3) => registerHook(pluginHooks, eventName, arg2, arg3)
+  const pluginOn = (eventName, arg2, arg3) => registerHook(pluginHooks, [pluginHooks], eventName, arg2, arg3)
   const testOn = (eventName, arg2, arg3) => {
     const hasFilter = typeof arg2 !== 'function' && arg2 !== null && arg2 !== undefined
     const handler = typeof arg2 === 'function' ? arg2 : arg3
+    const conflictBuckets = [testMiddlewareHooks, testFilteredHooks, testUnfilteredHooks]
     if (typeof handler === 'function' && handler.length >= 3) {
-      return registerHook(testMiddlewareHooks, eventName, arg2, arg3)
+      return registerHook(testMiddlewareHooks, conflictBuckets, eventName, arg2, arg3)
     }
     if (hasFilter) {
-      return registerHook(testFilteredHooks, eventName, arg2, arg3)
+      return registerHook(testFilteredHooks, conflictBuckets, eventName, arg2, arg3)
     }
-    return registerHook(testUnfilteredHooks, eventName, arg2, arg3)
+    return registerHook(testUnfilteredHooks, conflictBuckets, eventName, arg2, arg3)
   }
 
   const defaultTerminal = async (eventName, e) => {
@@ -637,7 +691,18 @@ function createTestHarness(pluginRoot) {
     },
     command: {
       register: spec => unwrapEnvelope('command.register', spec),
-      run: e => runTopDispatch('command.run', e),
+      run: async (e, opts) => {
+        const budgetMs = opts?.budgetMs ?? 10_000
+        const limitMs = Number.isNaN(budgetMs) || budgetMs < 0 ? 0 : budgetMs
+        const startNow = clock.now()
+        const result = await runTopDispatch('command.run', e, { budget: { remainingMs: budgetMs } })
+        const elapsed = clock.now() - startNow
+        if (elapsed > limitMs) {
+          const label = budgetMs === 10_000 ? '10s' : `${budgetMs}ms`
+          throw new Error(`command.run hook skipped: ran past its ${label} budget (elapsed ${elapsed} ms)`)
+        }
+        return result
+      },
     },
     clock: {
       after: (ms, fn) => clock.after(ms, fn),
@@ -732,7 +797,19 @@ function createTestHarness(pluginRoot) {
     },
   }
 
-  return { $, pluginOn, testOn, clock }
+  const testEngine = {
+    plugin: $.plugin,
+    session: $.session,
+    classic: $.classic,
+    prompt: $.prompt,
+    turn: $.turn,
+    tool: $.tool,
+    telemetry: $.telemetry,
+    command: { run: $.command.run },
+    ui: { mount: $.ui.mount },
+  }
+
+  return { $, testEngine, pluginOn, testOn, clock }
 }
 
 export function test(name, arg2, arg3) {
@@ -746,17 +823,19 @@ export function test(name, arg2, arg3) {
       await fn()
       return
     }
-    const { $, pluginOn, testOn, clock } = createTestHarness(root)
+    const { testEngine, pluginOn, testOn, clock } = createTestHarness(root)
     const prevClock = currentTestClock
     currentTestClock = clock
     try {
+      const modOptions = options.options ?? {}
+      validateUserConfigOptions(root, modOptions)
       const id = ++testCounter
       const mod = await import(`${registerUrl}?test=${id}`)
       if (typeof mod.register !== 'function') {
         throw new Error(`Expected ${registerUrl} to export a register(on, options) function`)
       }
-      mod.register(pluginOn, options.options ?? {})
-      await fn($, testOn)
+      mod.register(pluginOn, modOptions)
+      await fn(testEngine, testOn)
     } finally {
       clock.cancelAll()
       currentTestClock = prevClock

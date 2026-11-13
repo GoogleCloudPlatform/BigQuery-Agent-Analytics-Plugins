@@ -23,6 +23,7 @@ import { type Engine, type MockClock, mock } from 'claude-code/testing'
 import type { On, TurnStepChunk, TurnStepResult } from 'claude-code'
 
 import { PLUGIN_VERSION } from '../hooks/lib/config.ts'
+import type { Io } from '../hooks/lib/writer.ts'
 
 export type FetchCall = { url: string; method: string; headers: Record<string, string>; body: string; answered: number | 'reject' | 'hang' }
 export type FetchReply = { status: number; text: string } | { reject: string } | { hang: true }
@@ -81,13 +82,17 @@ export type World = {
   // Rows the mod sent with insertAll, oldest first.
   sentRows: () => Row[]
   insertCalls: () => FetchCall[]
-  // Lets every `{ hang: true }` request answer now, or a single one by index.
+  // Lets every `{ hang: true }` request answer now.
   releaseHung: (status: number, text: string) => void
-  releaseHungAt: (index: number, status: number, text: string) => void
+  // Lets one `{ hang: true }` request (0-based among hung requests) answer now.
+  releaseHungAt: (index: number, status?: number, text?: string) => void
   // The mod's `$.store`, each value read back as JSON, as the host keeps it.
   store: Map<string, unknown>
-  // The slash commands the mod registered.
+  // The slash commands the mod registered and their argument hints.
   registered: string[]
+  commandHints: Record<string, string | undefined>
+  // Builds a Writer `Io` backed by this world's state and virtual clock.
+  createIo: () => Io
   // Lines the mod wrote to standard error (a `-p` run's notice).
   stderr: string[]
 }
@@ -152,7 +157,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   const clock = mock.clock(on, { now: 0 })
   mock.env(on, { HOME, USER: 'dev', ...env })
   const asJson = (value: unknown): unknown => JSON.parse(JSON.stringify(value)) as unknown
-  const hung: (((answer: { value: { status: number; ok: boolean; headers: Record<string, string>; text: string } }) => void) | null)[] = []
+  const hung: (((answer: { value: { status: number; ok: boolean; headers: Record<string, string>; text: string } }) => void) | null | undefined)[] = []
   const heldWrites: { path: string; text: string; resolve: (answer: { value: undefined }) => void }[] = []
   const world: World = {
     clock,
@@ -199,27 +204,118 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     releaseHung: (status, text) => {
       for (const resolve of hung.splice(0)) resolve?.({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
     },
-    releaseHungAt: (index, status, text) => {
+    releaseHungAt: (index, status = 200, text = '{"saved":1}') => {
       const resolve = hung[index]
-      if (!resolve) throw new Error(`no pending hung request at index ${index}`)
+      if (resolve === undefined || resolve === null) throw new Error(`no pending hung request at index ${index}`)
       hung[index] = null
       resolve({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
     },
     store: new Map(Object.entries(store).map(([key, value]) => [key, asJson(value)])),
     registered: [],
+    commandHints: {},
+    createIo: () => createWorldIo(),
     stderr: [],
   }
   // Standard error, as the mod writes it, kept here rather than printed.
   ;(globalThis as { __bqaaStderr?: (line: string) => void }).__bqaaStderr = line => world.stderr.push(line)
 
+  const storeSet = (key: string, value: unknown): { value?: undefined; deny?: string } => {
+    const cloned = asJson(value)
+    if (utf8Bytes(JSON.stringify(Object.fromEntries(new Map(world.store).set(key, cloned)))) > HOST_FILE_BYTES) {
+      return { deny: 'the store would pass 4 MiB of JSON' }
+    }
+    world.store.set(key, cloned)
+    return { value: undefined }
+  }
+  const runProcess = async (argv: readonly string[]): Promise<{ exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean }> => {
+    world.commands.push([...argv])
+    const isHostname = argv[0] === 'hostname'
+    const printed = isHostname ? { exitCode: 0, stdout: `${world.hostname}\n`, stderr: '' } : world.processReply
+    if (!isHostname && world.processDelayMs > 0) await clock.sleep(world.processDelayMs)
+    return { ...printed, isStdoutTruncated: false, isStderrTruncated: false }
+  }
+  const nextReply = (): FetchReply => (world.replies.length > 1 ? world.replies.shift() : world.replies[0]) as FetchReply
+  const fetchHttp = async (
+    url: string,
+    init?: { method?: string; headers?: Record<string, string>; body?: string },
+  ): Promise<{ value?: { status: number; ok: boolean; headers: Record<string, string>; text: string }; deny?: string }> => {
+    const headers = { ...(init?.headers ?? {}) }
+    const reply = url === TOKEN_INFO_URL ? world.tokenInfo : nextReply()
+    const answered = 'reject' in reply ? 'reject' : 'hang' in reply ? 'hang' : reply.status
+    world.fetches.push({ url, method: init?.method ?? 'GET', headers, body: String(init?.body ?? ''), answered })
+    if ('reject' in reply) return { deny: reply.reject }
+    if ('hang' in reply) return new Promise(resolve => hung.push(resolve))
+    return { value: { status: reply.status, ok: reply.status >= 200 && reply.status < 300, headers: {}, text: reply.text } }
+  }
+  const writeFs = (filePath: string, text: string): Promise<{ value?: undefined; deny?: string }> | { value?: undefined; deny?: string } => {
+    if (world.failWrites || world.refuseWrite?.(filePath, text)) return { deny: `EACCES: ${filePath}` }
+    if (utf8Bytes(text) > HOST_FILE_BYTES) return { deny: `${filePath}: over the 4 MiB file limit` }
+    if (world.hangWrites || world.hangWrite?.(filePath, text)) return new Promise(resolve => heldWrites.push({ path: filePath, text, resolve }))
+    world.files.set(filePath, text)
+    return { value: undefined }
+  }
+  const readFs = (filePath: string): { value?: string; deny?: string } => {
+    const text = world.files.get(filePath)
+    if (text === undefined) return { deny: `ENOENT: ${filePath}` }
+    if (utf8Bytes(text) > HOST_FILE_BYTES) return { deny: `${filePath}: over the 4 MiB file limit` }
+    return { value: text }
+  }
+  const existsFs = (filePath: string): boolean => [...world.files.keys()].some(p => p === filePath || p.startsWith(`${filePath}/`))
+  const listFs = (dirPath: string): { name: string; kind: 'file' | 'dir'; size: number; mtimeMs: number; isLink: boolean }[] => {
+    const prefix = `${dirPath.replace(/\/$/, '')}/`
+    const entries = new Map<string, { name: string; kind: 'file' | 'dir'; size: number; mtimeMs: number; isLink: boolean }>()
+    for (const [p, text] of world.files) {
+      if (!p.startsWith(prefix)) continue
+      const rest = p.slice(prefix.length)
+      const slash = rest.indexOf('/')
+      if (slash === -1) entries.set(rest, { name: rest, kind: 'file', size: utf8Bytes(text), mtimeMs: world.mtimes.get(p) ?? 0, isLink: false })
+      else entries.set(rest.slice(0, slash), { name: rest.slice(0, slash), kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
+    }
+    return [...entries.values()]
+  }
+  const unwrap = async <T>(envRes: Promise<{ value?: T; deny?: string }> | { value?: T; deny?: string }): Promise<T> => {
+    const res = await envRes
+    if (res.deny !== undefined) throw new Error(res.deny)
+    return res.value as T
+  }
+  const createWorldIo = (): Io => ({
+    now: () => clock.now(),
+    after: (ms, fn) => {
+      let active = true
+      void clock.sleep(ms).then(() => {
+        if (active) fn()
+      })
+      return { cancel: () => { active = false } }
+    },
+    fetch: async (url, init) => {
+      const answer = await unwrap(fetchHttp(url, init))
+      return { status: answer.status, text: answer.text }
+    },
+    runCommand: async argv => {
+      const run = await runProcess(argv)
+      return { exitCode: run.exitCode, stdout: run.stdout, stderr: run.stderr }
+    },
+    envToken: async () => env.BQAA_ACCESS_TOKEN,
+    writeFile: (filePath, text) => unwrap(writeFs(filePath, text)),
+    readFile: filePath => unwrap(readFs(filePath)),
+    exists: async filePath => existsFs(filePath),
+    listDir: async dirPath => listFs(dirPath),
+    storeGet: async key => world.store.get(key),
+    storeSet: (key, value) => unwrap(storeSet(key, value)),
+    storeDelete: async key => {
+      world.store.delete(key)
+    },
+    status: text => {
+      world.statusLines.push(text)
+    },
+    debug: text => {
+      world.logs.push(text)
+    },
+  })
+
   on('store.get', ($, e) => ({ value: world.store.get(e.key) }))
   // As the host, a store of no more than 4 MiB of JSON in all.
-  on('store.set', ($, e) => {
-    const value = asJson(e.value)
-    if (utf8Bytes(JSON.stringify(Object.fromEntries(new Map(world.store).set(e.key, value)))) > HOST_FILE_BYTES) return { deny: 'the store would pass 4 MiB of JSON' }
-    world.store.set(e.key, value)
-    return { value: undefined }
-  })
+  on('store.set', ($, e) => storeSet(e.key, e.value))
   on('store.delete', ($, e) => {
     world.store.delete(e.key)
     return { value: undefined }
@@ -231,6 +327,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   on('session.version', () => ({ value: { version: '2.1.296', base: '2.1.296' } }))
   on('command.register', ($, e) => {
     world.registered.push(e.name)
+    world.commandHints[e.name] = e.argumentHint
     return { value: { command: e.name } }
   })
   on('ui.status', ($, e) => {
@@ -247,52 +344,15 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     return { value: undefined }
   })
   // What the mods after this one draw in a site this one draws in too.
-  on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn beneath'] }))
-  on('process.run', async ($, e) => {
-    world.commands.push([...e.argv])
-    const isHostname = e.argv[0] === 'hostname'
-    const printed = isHostname ? { exitCode: 0, stdout: `${world.hostname}\n`, stderr: '' } : world.processReply
-    if (!isHostname && world.processDelayMs > 0) await clock.sleep(world.processDelayMs)
-    return { value: { ...printed, isStdoutTruncated: false, isStderrTruncated: false } }
-  })
+  on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn beneath'] } as never))
+  on('process.run', async ($, e) => ({ value: await runProcess(e.argv) }))
   // The next scripted BigQuery answer; the last one repeats.
-  const nextReply = (): FetchReply => (world.replies.length > 1 ? world.replies.shift() : world.replies[0]) as FetchReply
-  on('http.fetch', ($, e) => {
-    const headers = { ...((e.init?.headers ?? {}) as Record<string, string>) }
-    const reply = e.url === TOKEN_INFO_URL ? world.tokenInfo : nextReply()
-    const answered = 'reject' in reply ? 'reject' : 'hang' in reply ? 'hang' : reply.status
-    world.fetches.push({ url: e.url, method: e.init?.method ?? 'GET', headers, body: String(e.init?.body ?? ''), answered })
-    if ('reject' in reply) return { deny: reply.reject }
-    if ('hang' in reply) return new Promise(resolve => hung.push(resolve))
-    return { value: { status: reply.status, ok: reply.status >= 200 && reply.status < 300, headers: {}, text: reply.text } }
-  })
-  on('fs.write', ($, e) => {
-    if (world.failWrites || world.refuseWrite?.(e.path, e.text)) return { deny: `EACCES: ${e.path}` }
-    if (utf8Bytes(e.text) > HOST_FILE_BYTES) return { deny: `${e.path}: over the 4 MiB file limit` }
-    if (world.hangWrites || world.hangWrite?.(e.path, e.text)) return new Promise(resolve => heldWrites.push({ path: e.path, text: e.text, resolve }))
-    world.files.set(e.path, e.text)
-    return { value: undefined }
-  })
-  on('fs.read', ($, e) => {
-    const text = world.files.get(e.path)
-    if (text === undefined) return { deny: `ENOENT: ${e.path}` }
-    if (utf8Bytes(text) > HOST_FILE_BYTES) return { deny: `${e.path}: over the 4 MiB file limit` }
-    return { value: text }
-  })
-  on('fs.exists', ($, e) => ({ value: [...world.files.keys()].some(p => p === e.path || p.startsWith(`${e.path}/`)) }))
+  on('http.fetch', ($, e) => fetchHttp(e.url, e.init))
+  on('fs.write', ($, e) => writeFs(e.path, e.text))
+  on('fs.read', ($, e) => readFs(e.path))
+  on('fs.exists', ($, e) => ({ value: existsFs(e.path) }))
   // Files with their size in bytes, and subdirectories, as the host lists them.
-  on('fs.list', ($, e) => {
-    const prefix = `${e.path.replace(/\/$/, '')}/`
-    const entries = new Map<string, { name: string; kind: 'file' | 'dir'; size: number; mtimeMs: number; isLink: boolean }>()
-    for (const [p, text] of world.files) {
-      if (!p.startsWith(prefix)) continue
-      const rest = p.slice(prefix.length)
-      const slash = rest.indexOf('/')
-      if (slash === -1) entries.set(rest, { name: rest, kind: 'file', size: utf8Bytes(text), mtimeMs: world.mtimes.get(p) ?? 0, isLink: false })
-      else entries.set(rest.slice(0, slash), { name: rest.slice(0, slash), kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
-    }
-    return { value: [...entries.values()] }
-  })
+  on('fs.list', ($, e) => ({ value: listFs(e.path) }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('prompt.submit', async ($, e) => {

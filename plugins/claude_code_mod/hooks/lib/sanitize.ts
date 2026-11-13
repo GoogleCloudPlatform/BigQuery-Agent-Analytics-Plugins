@@ -173,8 +173,10 @@ export const isSensitiveKey = (name: string): boolean => {
 
 // Recognized credential shapes. Timing tests exercise selected matching and
 // nonmatching inputs; those workloads do not establish a bound for all text.
+// Unclosed private keys, JWTs and Bearer/Basic tokens run in linear helpers
+// below so adversarial inputs stay O(N) and truncated headers set stats.truncated.
 const PATTERNS: readonly (readonly [RegExp, string])[] = [
-  [/-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----|$)/g, '[REDACTED:private-key]'],
+  [/\bAGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58,}\b/gi, '[REDACTED:private-key]'],
   [/\bsk-ant-[A-Za-z0-9_-]{16,}/g, '[REDACTED:api-key]'],
   [/\bsk-(?=[A-Za-z0-9_-]{0,200}\d)[A-Za-z0-9_-]{32,}/g, '[REDACTED:api-key]'],
   [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[REDACTED:aws-access-key-id]'],
@@ -185,14 +187,2171 @@ const PATTERNS: readonly (readonly [RegExp, string])[] = [
   [/\bnpm_[A-Za-z0-9]{36,}/g, '[REDACTED:npm-token]'],
   [/\bxox[abposr]-[A-Za-z0-9-]{10,}/g, '[REDACTED:slack-token]'],
   [/\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}/g, '[REDACTED:stripe-key]'],
-  [/\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, '[REDACTED:jwt]'],
-  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, '$1 [REDACTED]'],
 ]
 
-// A URL: scheme, `://`, then everything up to a space, a quote, a bracket or
-// a backslash (where a URL inside escaped JSON ends).
-const URL_IN_TEXT = /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s"'<>\\`]+/gi
-const URL_TRAILER = /[.,;:!?)\]}]+$/
+const PEM_PRIVATE_BEGIN = /-----BEGIN ([A-Z0-9 ]{0,40})PRIVATE KEY-----/g
+const PEM_PRIVATE_END = /-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----/g
+const PGP_PRIVATE_BEGIN = '-----BEGIN PGP PRIVATE KEY BLOCK-----'
+const PGP_PRIVATE_END = '-----END PGP PRIVATE KEY BLOCK-----'
+const PUTTY_HEADER = /PuTTY-User-Key-File-[23]:[ \t]*[^\r\n]*/g
+const PUTTY_NEXT_HDR = /\r?\nPuTTY-User-Key-File-\d+:/
+const PUTTY_PRIVATE_LINES_NL = /\r?\nPrivate-Lines:[ \t]*(\d+)[ \t]*\r?\n/
+const PUTTY_PRIVATE_LINES_EOF = /\r?\nPrivate-Lines:[ \t]*(\d+)[ \t]*(?:\r?\n|$)/
+const PUTTY_TRUNC_SUBHDR = /^\r?\n(?:Encryption|Comment|Public-Lines):/
+
+// Redacts PEM private keys, PGP private key blocks and PuTTY .ppk private
+// material before other passes. Unclosed PEM/PGP private blocks cut to EOF and
+// record truncation stats (`is_truncated` / `dropped_chars`).
+function redactPrivateKeys(text: string, stats: SanitizeStats): string {
+  let current = text
+  if (current.includes('-----BEGIN ')) {
+    // 1. PEM PRIVATE KEY blocks (closed and unclosed).
+    PEM_PRIVATE_BEGIN.lastIndex = 0
+    let out = ''
+    let copied = 0
+    for (let m = PEM_PRIVATE_BEGIN.exec(current); m !== null; m = PEM_PRIVATE_BEGIN.exec(current)) {
+      const start = m.index
+      const afterHdr = start + m[0].length
+      PEM_PRIVATE_END.lastIndex = afterHdr
+      const endMatch = PEM_PRIVATE_END.exec(current)
+      out += current.slice(copied, start) + '[REDACTED:private-key]'
+      stats.redactions += 1
+      if (endMatch !== null) {
+        copied = endMatch.index + endMatch[0].length
+        PEM_PRIVATE_BEGIN.lastIndex = copied
+      } else {
+        noteCut(current, start, afterHdr, current.length, stats)
+        copied = current.length
+        break
+      }
+    }
+    if (copied > 0) current = out + current.slice(copied)
+
+    // 2. PGP PRIVATE KEY BLOCK (closed and unclosed).
+    if (current.includes(PGP_PRIVATE_BEGIN)) {
+      let pgpOut = ''
+      let pgpCopied = 0
+      for (let pos = current.indexOf(PGP_PRIVATE_BEGIN); pos !== -1; pos = current.indexOf(PGP_PRIVATE_BEGIN, pgpCopied)) {
+        const afterHdr = pos + PGP_PRIVATE_BEGIN.length
+        const footer = current.indexOf(PGP_PRIVATE_END, afterHdr)
+        pgpOut += current.slice(pgpCopied, pos) + '[REDACTED:private-key]'
+        stats.redactions += 1
+        if (footer !== -1) {
+          pgpCopied = footer + PGP_PRIVATE_END.length
+        } else {
+          noteCut(current, pos, afterHdr, current.length, stats)
+          pgpCopied = current.length
+          break
+        }
+      }
+      if (pgpCopied > 0) current = pgpOut + current.slice(pgpCopied)
+    }
+  }
+
+  // 3. PuTTY .ppk files (`PuTTY-User-Key-File-2:` / `PuTTY-User-Key-File-3:`).
+  if (current.includes('PuTTY-User-Key-File-')) {
+    const hasPrivateLines = current.includes('Private-Lines:')
+    PUTTY_HEADER.lastIndex = 0
+    let ppkOut = ''
+    let ppkCopied = 0
+    for (let hm = PUTTY_HEADER.exec(current); hm !== null; hm = PUTTY_HEADER.exec(current)) {
+      if (hm.index < ppkCopied) continue
+      const headerEnd = hm.index + hm[0].length
+      let pm: RegExpExecArray | null = null
+      if (hasPrivateLines) {
+        const rawWindow = current.slice(headerEnd, headerEnd + 8256)
+        const nextHdrMatch = PUTTY_NEXT_HDR.exec(rawWindow)
+        const searchWindow =
+          nextHdrMatch === null
+            ? rawWindow
+            : rawWindow.slice(0, nextHdrMatch.index + (rawWindow[nextHdrMatch.index] === '\r' ? 2 : 1))
+        const atEof = nextHdrMatch === null && headerEnd + rawWindow.length >= current.length
+        pm = (atEof ? PUTTY_PRIVATE_LINES_EOF : PUTTY_PRIVATE_LINES_NL).exec(searchWindow)
+      }
+      if (pm !== null && pm.index <= 8192) {
+        const lineCount = Number(pm[1])
+        const bodyStart = headerEnd + pm.index + pm[0].length
+        if (lineCount > 0 && current.slice(bodyStart, bodyStart + 22) === '[REDACTED:private-key]') continue
+        if (lineCount <= 0) continue
+        let cursor = bodyStart
+        let remaining = lineCount
+        while (remaining > 0 && cursor < current.length) {
+          const nl = current.indexOf('\n', cursor)
+          if (nl === -1) {
+            cursor = current.length
+            remaining -= 1
+            break
+          }
+          cursor = nl + 1
+          remaining -= 1
+        }
+        if (remaining > 0) {
+          ppkOut += current.slice(ppkCopied, hm.index) + '[REDACTED:private-key]'
+          noteCut(current, hm.index, hm.index + hm[0].length, current.length, stats)
+          stats.redactions += 1
+          ppkCopied = current.length
+          break
+        }
+        // Consume optional trailing Private-MAC / Private-Hash line.
+        const macSlice = current.slice(cursor, cursor + 256)
+        const macMatch = /^Private-(?:MAC|Hash):[ \t]*[^\r\n]*/.exec(macSlice)
+        if (macMatch !== null) cursor += macMatch[0].length
+        ppkOut += current.slice(ppkCopied, hm.index) + '[REDACTED:private-key]'
+        stats.redactions += 1
+        ppkCopied = cursor
+        PUTTY_HEADER.lastIndex = cursor
+      } else {
+        // Multi-line .ppk header cut short before Private-Lines.
+        const nextLine = current.slice(headerEnd, headerEnd + 256)
+        if (PUTTY_TRUNC_SUBHDR.test(nextLine)) {
+          ppkOut += current.slice(ppkCopied, hm.index) + '[REDACTED:private-key]'
+          noteCut(current, hm.index, hm.index + hm[0].length, current.length, stats)
+          stats.redactions += 1
+          ppkCopied = current.length
+          break
+        }
+      }
+    }
+    if (ppkCopied > 0) current = ppkOut + current.slice(ppkCopied)
+  }
+  return current
+}
+
+const isB64UrlCharCode = (code: number): boolean =>
+  (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || (code >= 48 && code <= 57) || code === 95 || code === 45
+const isWordCharCode = (code: number): boolean =>
+  (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || (code >= 48 && code <= 57) || code === 95
+
+// O(N) JWT scanner anchored on `.eyJ` with a monotonic backward floor.
+function redactJwtsLinear(text: string, stats: SanitizeStats): string {
+  let dot1 = text.indexOf('.eyJ')
+  if (dot1 === -1) return text
+  let out = ''
+  let copied = 0
+  let floor = 0
+  let pos = dot1
+  while (pos !== -1) {
+    let pEnd = pos + 4
+    while (pEnd < text.length && isB64UrlCharCode(text.charCodeAt(pEnd))) pEnd += 1
+    if (pEnd - (pos + 1) < 11 || text.charCodeAt(pEnd) !== 46) {
+      floor = Math.max(floor, pEnd)
+      pos = text.indexOf('.eyJ', Math.max(pos + 4, floor))
+      continue
+    }
+    let sigEnd = pEnd + 1
+    while (sigEnd < text.length && isB64UrlCharCode(text.charCodeAt(sigEnd))) sigEnd += 1
+    if (sigEnd - (pEnd + 1) < 8) {
+      floor = Math.max(floor, pEnd + 1)
+      pos = text.indexOf('.eyJ', floor)
+      continue
+    }
+    // Valid payload and signature found; scan left up to `floor` for earliest valid `eyJ` header start.
+    let runStart = pos
+    while (runStart > floor && isB64UrlCharCode(text.charCodeAt(runStart - 1))) runStart -= 1
+    let hdrStart = -1
+    const maxStart = pos - 11
+    for (let k = runStart; k <= maxStart; k += 1) {
+      if (text.charCodeAt(k) !== 101 || text.charCodeAt(k + 1) !== 121 || text.charCodeAt(k + 2) !== 74) continue
+      const prevBoundary = k === 0 || !isWordCharCode(text.charCodeAt(k - 1))
+      if (prevBoundary) {
+        hdrStart = k
+        break
+      }
+    }
+    if (hdrStart === -1) {
+      floor = Math.max(floor, pos + 1)
+      pos = text.indexOf('.eyJ', pEnd)
+      continue
+    }
+    out += text.slice(copied, hdrStart) + '[REDACTED:jwt]'
+    stats.redactions += 1
+    copied = sigEnd
+    floor = sigEnd
+    pos = text.indexOf('.eyJ', floor)
+  }
+  return copied === 0 ? text : out + text.slice(copied)
+}
+
+const B64_LOOKUP = (() => {
+  const table = new Int8Array(128).fill(-1)
+  for (let i = 0; i < 26; i += 1) {
+    table[65 + i] = i
+    table[97 + i] = 26 + i
+  }
+  for (let i = 0; i < 10; i += 1) table[48 + i] = 52 + i
+  table[43] = 62 // '+'
+  table[45] = 62 // '-'
+  table[47] = 63 // '/'
+  table[95] = 63 // '_'
+  return table
+})()
+
+// Pure ES2023 Base64 validator (no Buffer/atob) returning true iff `token`
+// decodes to valid printable UTF-8 or RFC 7617 section 2 ISO-8859-1 (Latin-1)
+// (no C0/C1/DEL control chars) containing `:`.
+function isPrintableUtf8WithColon(bytes: number[]): boolean {
+  let hasColon = false
+  let hasNonColon = false
+  for (let idx = 0; idx < bytes.length; ) {
+    const b0 = bytes[idx] as number
+    if (b0 < 0x80) {
+      if (b0 < 0x20 || b0 === 0x7f) return false
+      if (b0 === 0x3a) hasColon = true
+      else hasNonColon = true
+      idx += 1
+      continue
+    }
+    let cp = 0
+    let seqLen = 0
+    if (b0 >= 0xc2 && b0 <= 0xdf) {
+      seqLen = 2
+      if (idx + 1 >= bytes.length) return false
+      const b1 = bytes[idx + 1] as number
+      if ((b1 & 0xc0) !== 0x80) return false
+      cp = ((b0 & 0x1f) << 6) | (b1 & 0x3f)
+    } else if (b0 >= 0xe0 && b0 <= 0xef) {
+      seqLen = 3
+      if (idx + 2 >= bytes.length) return false
+      const b1 = bytes[idx + 1] as number
+      const b2 = bytes[idx + 2] as number
+      if ((b1 & 0xc0) !== 0x80 || (b2 & 0xc0) !== 0x80) return false
+      if (b0 === 0xe0 && b1 < 0xa0) return false
+      if (b0 === 0xed && b1 >= 0xa0) return false
+      cp = ((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f)
+    } else if (b0 >= 0xf0 && b0 <= 0xf4) {
+      seqLen = 4
+      if (idx + 3 >= bytes.length) return false
+      const b1 = bytes[idx + 1] as number
+      const b2 = bytes[idx + 2] as number
+      const b3 = bytes[idx + 3] as number
+      if ((b1 & 0xc0) !== 0x80 || (b2 & 0xc0) !== 0x80 || (b3 & 0xc0) !== 0x80) return false
+      if (b0 === 0xf0 && b1 < 0x90) return false
+      if (b0 === 0xf4 && b1 >= 0x90) return false
+      cp = ((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f)
+    } else {
+      return false
+    }
+    if ((cp >= 0x80 && cp <= 0x9f) || cp > 0x10ffff) return false
+    hasNonColon = true
+    idx += seqLen
+  }
+  return hasColon && hasNonColon
+}
+
+function isPrintableLatin1WithColon(bytes: number[]): boolean {
+  let hasColon = false
+  let hasNonColon = false
+  for (let idx = 0; idx < bytes.length; idx += 1) {
+    const b = bytes[idx] as number
+    if (b < 0x20 || (b >= 0x7f && b <= 0x9f)) return false
+    if (b === 0x3a) hasColon = true
+    else hasNonColon = true
+  }
+  return hasColon && hasNonColon
+}
+
+// Accepts printable UTF-8 or Latin-1 (ISO-8859-1) `user:password` shapes per RFC 7617
+// without token-casing vetoes, so lowercase or mixed-case Latin-1 Basic secrets redact.
+// Trade-off: capitalized Base64-decodable tokens beginning with `O[i-n]` or `O[q-v]` whose
+// trailing groups also decode as printable (e.g. `Output`, `Okay`, `Outcome`, `Overview`,
+// `Ours`, `Ouch`, `Only`) decode to `:<password>` and are conservatively redacted, while
+// `Og`/`Oh` (C0 control `0x00`-`0x1f`) and `Oo`/`Op` (C1 control `0x80`-`0x9f`, e.g.
+// `Options`) are rejected and preserved.
+function decodeBase64PrintableColon(token: string): boolean {
+  let cleanLen = token.length
+  while (cleanLen > 0 && token.charCodeAt(cleanLen - 1) === 61) cleanLen -= 1
+  const pad = token.length - cleanLen
+  if (pad > 2 || cleanLen < 3 || (cleanLen === 3 && pad !== 1) || (pad > 0 && token.length % 4 !== 0) || cleanLen % 4 === 1) return false
+  const bytes: number[] = []
+  let i = 0
+  while (i + 4 <= cleanLen) {
+    const c0 = token.charCodeAt(i)
+    const c1 = token.charCodeAt(i + 1)
+    const c2 = token.charCodeAt(i + 2)
+    const c3 = token.charCodeAt(i + 3)
+    if (c0 > 127 || c1 > 127 || c2 > 127 || c3 > 127) return false
+    const v0 = B64_LOOKUP[c0] as number
+    const v1 = B64_LOOKUP[c1] as number
+    const v2 = B64_LOOKUP[c2] as number
+    const v3 = B64_LOOKUP[c3] as number
+    if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) return false
+    const n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3
+    bytes.push((n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff)
+    i += 4
+  }
+  const rem = cleanLen - i
+  if (rem === 2) {
+    const c0 = token.charCodeAt(i)
+    const c1 = token.charCodeAt(i + 1)
+    if (c0 > 127 || c1 > 127) return false
+    const v0 = B64_LOOKUP[c0] as number
+    const v1 = B64_LOOKUP[c1] as number
+    if (v0 < 0 || v1 < 0) return false
+    bytes.push(((v0 << 18) | (v1 << 12)) >>> 16)
+  } else if (rem === 3) {
+    const c0 = token.charCodeAt(i)
+    const c1 = token.charCodeAt(i + 1)
+    const c2 = token.charCodeAt(i + 2)
+    if (c0 > 127 || c1 > 127 || c2 > 127) return false
+    const v0 = B64_LOOKUP[c0] as number
+    const v1 = B64_LOOKUP[c1] as number
+    const v2 = B64_LOOKUP[c2] as number
+    if (v0 < 0 || v1 < 0 || v2 < 0) return false
+    const n = (v0 << 18) | (v1 << 12) | (v2 << 6)
+    bytes.push((n >>> 16) & 0xff, (n >>> 8) & 0xff)
+  }
+  if (bytes.length < 2) return false
+  return isPrintableUtf8WithColon(bytes) || isPrintableLatin1WithColon(bytes)
+}
+
+const PASCAL_CASE_WORD_RE = /^[A-Z][a-z]+(?:[A-Z][a-z]+)*$/
+const PASCAL_COMPONENT_RE = /[A-Z][a-z]+/g
+const PROSE_PASCAL_WORDS = new Set([
+  'configuration', 'word', 'words', 'authentication', 'authorization',
+  'documentation', 'description', 'specification', 'implementation',
+  'troubleshooting', 'information', 'overview', 'example', 'examples',
+  'details', 'section', 'format', 'scheme', 'header', 'headers',
+  'guide', 'reference', 'summary', 'introduction', 'quickstart',
+  'migration', 'options', 'settings', 'usage', 'notes',
+])
+
+const isDocumentationPascalPhrase = (token: string): boolean => {
+  PASCAL_COMPONENT_RE.lastIndex = 0
+  let count = 0
+  for (let m = PASCAL_COMPONENT_RE.exec(token); m !== null; m = PASCAL_COMPONENT_RE.exec(token)) {
+    if (!PROSE_PASCAL_WORDS.has(m[0].toLowerCase())) return false
+    count += 1
+  }
+  return count > 0
+}
+
+const isBase64Credential = (token: string): boolean => {
+  if (decodeBase64PrintableColon(token)) return true
+  let cleanEnd = token.length
+  while (cleanEnd > 0) {
+    const ch = token.charCodeAt(cleanEnd - 1)
+    if (ch === 46 || ch === 95 || ch === 126 || ch === 45) cleanEnd -= 1
+    else break
+  }
+  return cleanEnd >= 4 && cleanEnd < token.length && decodeBase64PrintableColon(token.slice(0, cleanEnd))
+}
+
+const isLikelyBasicCredentialToken = (token: string): boolean => {
+  if (isBase64Credential(token)) return true
+  if (token.length < 12) return false
+  if (/[0-9+/=_.-]/.test(token)) return true
+  if (/[a-z]/.test(token) && /[A-Z]/.test(token)) {
+    return !PASCAL_CASE_WORD_RE.test(token)
+  }
+  return false
+}
+
+const ALL_CAPS_SNAKE_KEY_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]*)+$/
+const LOWER_SNAKE_KEY_RE = /^[a-z][a-z0-9]*(?:_[a-z0-9]*)+$/
+const PYTHON_SINGLE_PREFIX_RE = /(?:^|[^A-Za-z0-9_])(?:[rbfu]|rf|fr|rb|br)$/i
+const RUST_LIFETIME_PREFIX_CHARS = new Set(['<', '&', ',', '+', ':'])
+const RUST_LIFETIME_TAIL_RE = /^'(?:[a-z_][a-z0-9_]*|static)(?=$|[\s,>:;)\]+])/
+const RUST_BOUND_LIFETIME_TAIL_RE = /^'(?:[a-z_][a-z0-9_]*|static)(?=$|[ \t]*[,>+;{)=])/
+const RUST_COMMA_PLUS_LIFETIME_TAIL_RE = /^'(?:[a-z_][a-z0-9_]*|static)(?=$|[ \t]*[,>+;{)=]|\r?\n)/
+
+const isBase64PaddedToken = (token: string): boolean => {
+  let cleanEnd = token.length
+  while (cleanEnd > 0) {
+    const ch = token.charCodeAt(cleanEnd - 1)
+    if (ch === 46 || ch === 95 || ch === 126 || ch === 45) cleanEnd -= 1
+    else break
+  }
+  if (cleanEnd < 12 || cleanEnd % 4 !== 0) return false
+  let pad = 0
+  while (pad < 2 && cleanEnd - pad > 0 && token.charCodeAt(cleanEnd - 1 - pad) === 61) pad += 1
+  if (pad === 0) return false
+  for (let i = 0; i < cleanEnd - pad; i += 1) {
+    const c = token.charCodeAt(i)
+    const ok =
+      (c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      (c >= 48 && c <= 57) ||
+      c === 43 ||
+      c === 47 ||
+      c === 95 ||
+      c === 45
+    if (!ok) return false
+  }
+  return true
+}
+
+const isLineBreakCode = (code: number): boolean =>
+  code === 10 || code === 13 || code === 0x2028 || code === 0x2029
+
+const lineEndIndex = (text: string, from: number): number => {
+  for (let i = from; i < text.length; i += 1) {
+    if (isLineBreakCode(text.charCodeAt(i))) return i
+  }
+  return text.length
+}
+
+const isHashCommentStart = (text: string, i: number): boolean =>
+  text[i] === '#' && (i === 0 || /[\s;|&(]/.test(text[i - 1] as string))
+
+const isSlashCommentStart = (text: string, i: number): boolean =>
+  text[i] === '/' &&
+  text[i + 1] === '/' &&
+  (i === 0 || /[\s;{}()[\],]/.test(text[i - 1] as string))
+
+const isNonQuoteSingleQuote = (text: string, i: number): boolean => {
+  const prev = i > 0 ? (text[i - 1] as string) : ''
+  const next = text[i + 1] ?? ''
+  if (/[A-Za-z0-9]/.test(prev) && /[A-Za-z]/.test(next)) {
+    return !PYTHON_SINGLE_PREFIX_RE.test(text.slice(Math.max(0, i - 3), i))
+  }
+  if (
+    (prev === 's' || prev === 'S') &&
+    i >= 2 &&
+    /[A-Za-z0-9]/.test(text[i - 2] as string) &&
+    (next === '' || /^[\s.,;:!?)\]}]/.test(next))
+  ) {
+    return true
+  }
+  const prevNonSpace = (prev === ' ' || prev === '\t') && i >= 2 ? (text[i - 2] as string) : prev
+  if (RUST_LIFETIME_PREFIX_CHARS.has(prevNonSpace)) {
+    const tail = text.slice(i, i + 32)
+    if (prevNonSpace === '<' || prevNonSpace === '&') return RUST_LIFETIME_TAIL_RE.test(tail)
+    if (prevNonSpace === ':') return RUST_BOUND_LIFETIME_TAIL_RE.test(tail)
+    return RUST_COMMA_PLUS_LIFETIME_TAIL_RE.test(tail)
+  }
+  return false
+}
+
+const addQuoteParity = (rem: number): number => (rem === 0 ? 1 : rem === 1 ? 2 : rem === 2 ? 3 : 2)
+
+const isDelimOrSpaceAfterQuote = (ch: string | undefined): boolean =>
+  ch === undefined || /^[\s.,;:!?)\]}'"`]/.test(ch)
+
+const hasSpacedSameQuoteOpen = (
+  text: string,
+  afterStart: number,
+  lineStop: number,
+  q: string,
+  escaped: boolean,
+): boolean => {
+  let p = afterStart
+  while (p < lineStop && (text[p] === ' ' || text[p] === '\t')) p += 1
+  if (p === afterStart) return false
+  if (escaped) {
+    return p + 2 < lineStop && text[p] === '\\' && text[p + 1] === q && !/[\s"'`,;)}\]]/.test(text[p + 2] as string)
+  }
+  return p + 1 < lineStop && text[p] === q && !/[\s"'`,;)}\]]/.test(text[p + 1] as string)
+}
+
+const evalQuoteRemainder = (
+  text: string,
+  afterStart: number,
+  lineStop: number,
+  q: string,
+  escaped: boolean,
+  rem: number,
+): boolean => {
+  if (rem === 0) return afterStart < lineStop && !isDelimOrSpaceAfterQuote(text[afterStart])
+  if (rem === 2) return false
+  if (rem === 3) return true
+  return !hasSpacedSameQuoteOpen(text, afterStart, lineStop, q, escaped)
+}
+
+const opensQuotedAssignmentValue = (
+  text: string,
+  quoteIdx: number,
+  q: string,
+  lineStop = lineEndIndex(text, quoteIdx + 1),
+): boolean => {
+  if (q === '`' && text[quoteIdx + 1] === '`') return false
+  let count = 1
+  let ansiSingle = false
+  let i = quoteIdx + 1
+  while (i < lineStop) {
+    const ch = text[i] as string
+    if (count % 2 === 1) {
+      if ((q !== "'" || ansiSingle) && ch === '\\') {
+        const next = text[i + 1]
+        if (next === '\\' || next === q) {
+          i += 2
+          continue
+        }
+      }
+      if (ch === q) {
+        count += 1
+        ansiSingle = false
+      }
+      i += 1
+      continue
+    }
+    if (isHashCommentStart(text, i) || isSlashCommentStart(text, i)) break
+    if (ch === '\\') {
+      const next = text[i + 1]
+      if (next === '\\' || next === '"' || next === "'" || next === '`' || next === '$') {
+        i += 2
+        continue
+      }
+      i += 1
+      continue
+    }
+    if (q === "'" && ch === '$' && text[i + 1] === "'") {
+      count += 1
+      ansiSingle = true
+      i += 2
+      continue
+    }
+    if (ch === q) {
+      if (q === "'" && isNonQuoteSingleQuote(text, i)) {
+        i += 1
+        continue
+      }
+      count += 1
+    }
+    i += 1
+  }
+  const rem = count === 1 ? 0 : count === 2 ? 1 : count % 2 === 1 ? 2 : 3
+  return evalQuoteRemainder(text, quoteIdx + 1, lineStop, q, false, rem)
+}
+
+const opensEscapedQuotedAssignmentValue = (
+  text: string,
+  quoteIdx: number,
+  q: string,
+  lineStop = lineEndIndex(text, quoteIdx + 2),
+): boolean => {
+  let count = 1
+  let i = quoteIdx + 2
+  while (i < lineStop) {
+    const ch = text[i] as string
+    if (ch === '\\') {
+      const next = text[i + 1]
+      if (next === q) {
+        count += 1
+        i += 2
+        continue
+      }
+      if (next === '\\') {
+        i += 2
+        continue
+      }
+    }
+    i += 1
+  }
+  const rem = count === 1 ? 0 : count === 2 ? 1 : count % 2 === 1 ? 2 : 3
+  return evalQuoteRemainder(text, quoteIdx + 2, lineStop, q, true, rem)
+}
+
+type LineQuoteTable = { lineStart: number; lineStop: number; s1: Uint8Array }
+
+function buildUnescapedLineTable(text: string, lineStart: number, lineStop: number, q: string): LineQuoteTable {
+  const len = lineStop - lineStart
+  const s0 = new Uint8Array(len + 1)
+  const s1 = new Uint8Array(len + 1)
+  const s2 = q === "'" ? new Uint8Array(len + 1) : undefined
+  for (let i = lineStop - 1; i >= lineStart; i -= 1) {
+    const idx = i - lineStart
+    const ch = text[i] as string
+    const next = i + 1 < lineStop ? (text[i + 1] as string) : ''
+    if (q !== "'" && ch === '\\' && (next === '\\' || next === q)) {
+      s1[idx] = s1[idx + 2] as number
+    } else if (ch === q) {
+      s1[idx] = addQuoteParity(s0[idx + 1] as number)
+    } else {
+      s1[idx] = s1[idx + 1] as number
+    }
+    if (s2 !== undefined) {
+      if (ch === '\\' && (next === '\\' || next === "'")) {
+        s2[idx] = s2[idx + 2] as number
+      } else if (ch === "'") {
+        s2[idx] = addQuoteParity(s0[idx + 1] as number)
+      } else {
+        s2[idx] = s2[idx + 1] as number
+      }
+    }
+    if (isHashCommentStart(text, i) || isSlashCommentStart(text, i)) {
+      s0[idx] = 0
+    } else if (ch === '\\' && (next === '\\' || next === '"' || next === "'" || next === '`' || next === '$')) {
+      s0[idx] = s0[idx + 2] as number
+    } else if (q === "'" && ch === '$' && next === "'") {
+      s0[idx] = addQuoteParity(s2![idx + 2] as number)
+    } else if (ch === q && !(q === "'" && isNonQuoteSingleQuote(text, i))) {
+      s0[idx] = addQuoteParity(s1[idx + 1] as number)
+    } else {
+      s0[idx] = s0[idx + 1] as number
+    }
+  }
+  return { lineStart, lineStop, s1 }
+}
+
+function buildEscapedLineTable(text: string, lineStart: number, lineStop: number, q: string): LineQuoteTable {
+  const len = lineStop - lineStart
+  const s1 = new Uint8Array(len + 1)
+  for (let i = lineStop - 1; i >= lineStart; i -= 1) {
+    const idx = i - lineStart
+    if (text[i] === '\\' && i + 1 < lineStop) {
+      const next = text[i + 1] as string
+      if (next === q) s1[idx] = addQuoteParity(s1[idx + 2] as number)
+      else if (next === '\\') s1[idx] = s1[idx + 2] as number
+      else s1[idx] = s1[idx + 1] as number
+    } else {
+      s1[idx] = s1[idx + 1] as number
+    }
+  }
+  return { lineStart, lineStop, s1 }
+}
+
+const AUTH_SCHEME_RE = /\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=-]{4,})/gi
+const CAMEL_CASE_KEY_RE = /^[a-z]+(?:[A-Z][a-z]+)+$/
+const CAMEL_CASE_VERSION_KEY_RE = /^(?:[a-z]{2,}[0-9]{0,3}|v[0-9]{1,2})(?:V[0-9]{1,2}|[A-Z][a-z]{2,}[0-9]{0,2})*[A-Z][a-z]{2,}$/
+const UPPER_WORD_KEY_RE = /^[A-Z]{2,}$/
+const LOWER_DOTTED_KEY_RE = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z_]*)+$/
+const LOWER_KEBAB_KEY_RE = /^[a-z]+(?:-[a-z]+)+$/
+const DOUBLE_DASH_LOWER_FLAG_RE = /^--[a-z][a-z0-9_-]*$/
+const SINGLE_DASH_SNAKE_OR_LOWER_FLAG_RE = /^-(?:[a-z][a-z0-9]*(?:_[a-z0-9]*)+|[a-z]+)$/
+const LOWER_WORD_KEY_RE = /^[a-z]+$/
+const STRUCTURED_CONFIG_KEY_RE = /^(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]*)+|[a-z]+(?:[_.-][a-z]+)+|[A-Z][a-z]+(?:[A-Z][a-z]+)+)$/
+const DIAGNOSTIC_SINGLE_WORD_RE =
+  /^(?:unauthorized|forbidden|expired|rejected|denied|failed|invalid|missing|revoked|malformed|unauthenticated|unavailable|blocked|disabled|error|invalid_token|invalid_request|invalid_grant|access_denied|unauthorized_client|insufficient_scope|server_error)(?=$|[\s.,;:!?)\]}'"])/i
+const DIAGNOSTIC_PROSE_RE = /^(?:[A-Za-z]{2,}(?:[ \t]+[A-Za-z]{2,})+|(?:HTTP(?:\/[\d.]+)?[ \t]+)?(?:4\d\d|5\d\d)(?:[ \t]+[A-Za-z]+)*)(?=$|[\s.,;:!?)\]}'"])/
+const ASSIGN_RHS_VAR_RE = /^\$(?:[A-Za-z_({$])/
+const ASSIGN_RHS_REDACTED_RE = /^\[REDACTED(?::[a-z-]+)?\](?:$|[\s,;:|)&'"`\].!?])/
+const ASSIGN_RHS_PUNCT_RE = /^(?:[@#%^*({[]|[!?:&](?!$|[\s'")\]},;!?])|\\(?:\\|\$|[^nrt"'\\]))/
+const UNICODE_WS_RE = /\s/
+const PLAIN_KEY_TOKEN_RE = /^[A-Za-z_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$/
+// Only placeholders of length >= 8 can reach the `shortHeaderToken` gate;
+// shorter placeholders (such as `none`, `null`, `token`, `n/a`) are already
+// excluded by the `coreToken.length >= 8` requirement.
+const HEADER_PLACEHOLDER_TOKENS = new Set([
+  'placeholder',
+  'redacted',
+  'undefined',
+])
+
+const isSameLineWsAt = (text: string, idx: number): boolean => {
+  const code = text.charCodeAt(idx)
+  return (
+    code === 32 ||
+    code === 9 ||
+    code === 160 ||
+    code === 11 ||
+    code === 12 ||
+    (code >= 0x1680 && code !== 0x2028 && code !== 0x2029 && UNICODE_WS_RE.test(text[idx] as string))
+  )
+}
+
+const isHeaderWsAt = (text: string, idx: number): boolean => {
+  const code = text.charCodeAt(idx)
+  return code === 10 || code === 13 || code === 0x2028 || code === 0x2029 || isSameLineWsAt(text, idx)
+}
+
+// Walks backward linearly from `idx` across arbitrary header/JSON whitespace,
+// optional YAML block indicators (`|`, `|-`, `|+`, `>`, `>-`, `>+`, `|2-`, `>2`),
+// and an optional opening quote (1 or 3 consecutive `"`/`'`, or single `` ` ``,
+// with optional string-literal prefixes) to detect `*authorization` headers
+// (`:`, `=`, `:=`, `::=`, `=>`, or quoted tuple `,`) without fixed-window
+// cutoff or backtracking. Total work across all calls is O(L) total across
+// disjoint inter-match gaps because each matched scheme starts with
+// non-whitespace letters. Returns 0 (not header), 1 (same-line), or 2
+// (cross-line after separator).
+function explicitAuthHeaderKind(text: string, idx: number): 0 | 1 | 2 {
+  if (idx < 14) return 0
+  let p = idx
+  let sawNewline = false
+  while (p > 0 && isHeaderWsAt(text, p - 1)) {
+    if (isLineBreakCode(text.charCodeAt(p - 1))) sawNewline = true
+    p -= 1
+  }
+  const openQ = p > 0 ? text.charCodeAt(p - 1) : 0
+  if (openQ === 34 || openQ === 39 || openQ === 96) {
+    let qCount = 1
+    while (p - qCount > 0 && text.charCodeAt(p - qCount - 1) === openQ && qCount < 4) {
+      qCount += 1
+    }
+    if (qCount !== 1 && !((openQ === 34 || openQ === 39) && qCount === 3)) return 0
+    p -= qCount
+    while (p > 0 && text.charCodeAt(p - 1) === 92) p -= 1
+    if (openQ === 34 || openQ === 39) {
+      if (p >= 2) {
+        const raw1 = text.charCodeAt(p - 1)
+        const raw2 = text.charCodeAt(p - 2)
+        const c1 = raw1 | 32
+        const c2 = raw2 | 32
+        const twoCharPrefix =
+          (raw2 === 36 && raw1 === 64) ||
+          (raw2 === 64 && raw1 === 36) ||
+          (c2 === 117 && raw1 === 56) ||
+          (c2 === 114 && (c1 === 102 || c1 === 98 || c1 === 117)) ||
+          (c1 === 114 && (c2 === 102 || c2 === 98 || c2 === 117))
+        if (twoCharPrefix) {
+          p -= 2
+        } else if (raw1 === 36 || raw1 === 64 || raw1 === 76 || c1 === 102 || c1 === 114 || c1 === 98 || c1 === 117) {
+          p -= 1
+        }
+      } else if (p >= 1) {
+        const raw1 = text.charCodeAt(p - 1)
+        const c1 = raw1 | 32
+        if (raw1 === 36 || raw1 === 64 || raw1 === 76 || c1 === 102 || c1 === 114 || c1 === 98 || c1 === 117) {
+          p -= 1
+        }
+      }
+    }
+    while (p > 0 && isHeaderWsAt(text, p - 1)) {
+      if (isLineBreakCode(text.charCodeAt(p - 1))) sawNewline = true
+      p -= 1
+    }
+  }
+  if (sawNewline && p > 0) {
+    let yp = p
+    while (yp > 0 && text.charCodeAt(yp - 1) >= 48 && text.charCodeAt(yp - 1) <= 57) yp -= 1
+    if (yp > 0 && (text.charCodeAt(yp - 1) === 43 || text.charCodeAt(yp - 1) === 45)) yp -= 1
+    while (yp > 0 && text.charCodeAt(yp - 1) >= 48 && text.charCodeAt(yp - 1) <= 57) yp -= 1
+    if (yp > 0 && (text.charCodeAt(yp - 1) === 124 || text.charCodeAt(yp - 1) === 62)) {
+      yp -= 1
+      while (yp > 0 && isSameLineWsAt(text, yp - 1)) yp -= 1
+      if (yp > 0 && text.charCodeAt(yp - 1) === 58 && (yp < 2 || text.charCodeAt(yp - 2) !== 58)) {
+        p = yp
+      }
+    }
+  }
+  if (p === 0) return 0
+  const sep = text.charCodeAt(p - 1)
+  if (sep === 58) {
+    p -= 1
+  } else if (sep === 61) {
+    p -= 1
+    if (p > 0 && text.charCodeAt(p - 1) === 58) {
+      p -= 1
+      if (p > 0 && text.charCodeAt(p - 1) === 58) p -= 1
+    }
+  } else if (sep === 62 && p >= 2 && text.charCodeAt(p - 2) === 61) {
+    p -= 2
+  } else if (sep === 44) {
+    p -= 1
+  } else {
+    return 0
+  }
+  while (p > 0 && isSameLineWsAt(text, p - 1)) p -= 1
+  const hasKeyQuote = p > 0 && (text.charCodeAt(p - 1) === 34 || text.charCodeAt(p - 1) === 39 || text.charCodeAt(p - 1) === 96)
+  if (sep === 44 && !hasKeyQuote) return 0
+  if (hasKeyQuote) {
+    p -= 1
+    while (p > 0 && text.charCodeAt(p - 1) === 92) p -= 1
+  }
+  if (p < 13) return 0
+  const z = text.charCodeAt(p - 6)
+  if (z !== 122 && z !== 90) return 0
+  if (text.slice(p - 13, p).toLowerCase() !== 'authorization') return 0
+  return sawNewline ? 2 : 1
+}
+
+type BearerKeyInfo = {
+  keyCand: string
+  isPlainKey: boolean
+  isDoubleFlag: boolean
+  sensitive: boolean
+}
+
+function classifyBearerKeyToken(token: string): BearerKeyInfo | null {
+  const isPlainKey = token.length <= 100 && PLAIN_KEY_TOKEN_RE.test(token)
+  const isDoubleFlag = !isPlainKey && token.length <= 102 && DOUBLE_DASH_LOWER_FLAG_RE.test(token)
+  const isSensDoubleFlag =
+    !isPlainKey &&
+    !isDoubleFlag &&
+    token.startsWith('--') &&
+    token.length <= 102 &&
+    PLAIN_KEY_TOKEN_RE.test(token.slice(2)) &&
+    isSensitiveKey(token.slice(2))
+  const isSensSingleFlag =
+    !isPlainKey &&
+    !isDoubleFlag &&
+    !isSensDoubleFlag &&
+    token.startsWith('-') &&
+    !token.startsWith('--') &&
+    token.length <= 101 &&
+    PLAIN_KEY_TOKEN_RE.test(token.slice(1)) &&
+    isSensitiveKey(token.slice(1))
+  const keyCand = isPlainKey
+    ? token
+    : isDoubleFlag || isSensDoubleFlag
+      ? token.slice(2)
+      : isSensSingleFlag
+        ? token.slice(1)
+        : ''
+  if (keyCand === '') return null
+  return {
+    keyCand,
+    isPlainKey,
+    isDoubleFlag: isDoubleFlag || isSensDoubleFlag,
+    sensitive: isSensitiveKey(keyCand),
+  }
+}
+
+type SameLineSep = {
+  sepKind: ':' | '='
+  rhsStart: number
+  lineStop: number
+}
+
+function scanSameLineColonOrSpacedEq(text: string, from: number, lineStop: number): SameLineSep | null {
+  let p = from
+  while (p < lineStop && isSameLineWsAt(text, p)) p += 1
+  if (p >= lineStop) return null
+  const sepCode = text.charCodeAt(p)
+  let sepKind: ':' | '='
+  let rhsStart: number
+  if (sepCode === 58) {
+    const next = text.charCodeAt(p + 1)
+    if (next === 61) {
+      if (text.charCodeAt(p + 2) === 61) return null
+      sepKind = '='
+      rhsStart = p + 2
+    } else if (next === 58) {
+      if (text.charCodeAt(p + 2) !== 61 || text.charCodeAt(p + 3) === 61) return null
+      sepKind = '='
+      rhsStart = p + 3
+    } else {
+      sepKind = ':'
+      rhsStart = p + 1
+    }
+  } else if (p > from && sepCode === 61) {
+    if (text.charCodeAt(p + 1) === 61) return null
+    sepKind = '='
+    rhsStart = p + 1
+  } else {
+    return null
+  }
+  while (rhsStart < lineStop && isSameLineWsAt(text, rhsStart)) rhsStart += 1
+  return { sepKind, rhsStart, lineStop }
+}
+
+function isCrossLineNonSensitiveConfigColonOrSpacedEq(
+  keyCand: string,
+  isPlainKey: boolean,
+  isDoubleFlag: boolean,
+  sepKind: ':' | '=',
+  rhsHead: string,
+  precededByAssign: boolean,
+  validQuotedOrVarOrRedactedRhs: boolean,
+): boolean {
+  const isConfigKey =
+    isDoubleFlag ||
+    (precededByAssign &&
+      (STRUCTURED_CONFIG_KEY_RE.test(keyCand) ||
+        CAMEL_CASE_KEY_RE.test(keyCand) ||
+        CAMEL_CASE_VERSION_KEY_RE.test(keyCand) ||
+        UPPER_WORD_KEY_RE.test(keyCand) ||
+        LOWER_WORD_KEY_RE.test(keyCand)))
+  if (!isConfigKey) return false
+  if (sepKind === ':') {
+    if (!isPlainKey) return false
+    if (rhsHead === '') return true
+    if (validQuotedOrVarOrRedactedRhs) return true
+    if (DIAGNOSTIC_PROSE_RE.test(rhsHead) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhsHead)) return false
+    if (
+      !STRUCTURED_CONFIG_KEY_RE.test(keyCand) &&
+      !(CAMEL_CASE_KEY_RE.test(keyCand) || CAMEL_CASE_VERSION_KEY_RE.test(keyCand)) &&
+      /^[a-z]{3,}(?=$|[\s.,;:!?)\]}'"])/.test(rhsHead)
+    ) {
+      return false
+    }
+    return true
+  }
+  if (
+    !precededByAssign &&
+    (validQuotedOrVarOrRedactedRhs ||
+      (rhsHead !== '' && (DIAGNOSTIC_PROSE_RE.test(rhsHead) || DIAGNOSTIC_SINGLE_WORD_RE.test(rhsHead))))
+  ) {
+    return false
+  }
+  return true
+}
+
+type QuoteContext = {
+  activeQuote: string
+  ansiSingle: boolean
+  innerQuote: string
+  activeEscapedQuote: string
+  inComment: boolean
+  commentQuote: string
+  commentEscapedQuote: string
+  lineActiveQuote: string
+  lineAnsiSingle: boolean
+  lineInnerQuote: string
+  lineActiveEscapedQuote: string
+  lineInComment: boolean
+  lineCommentQuote: string
+  lineCommentEscapedQuote: string
+  parenDepth: number
+  bracketDepth: number
+  braceDepth: number
+}
+
+type QuoteScanCursor = {
+  pos: number
+  activeQuote: string
+  ansiSingle: boolean
+  activeEscapedQuote: string
+  innerQuote: string
+  innerAnsiSingle: boolean
+  inComment: boolean
+  commentLineBreak: number
+  commentQuote: string
+  commentAnsiSingle: boolean
+  commentEscapedQuote: string
+  parenDepth: number
+  bracketDepth: number
+  braceDepth: number
+  cachedNl: number
+  cachedCr: number
+  cachedLs: number
+  cachedPs: number
+  crossedQuotedBreak: boolean
+}
+
+const toggleEscapedQuote = (cur: string, q: string): string => (cur === q ? '' : cur === '' ? q : cur)
+
+const effectiveQuoteState = (qState: QuoteContext, hasNewline: boolean): QuoteContext => {
+  if (!hasNewline) return qState
+  if (
+    !qState.inComment &&
+    !qState.lineInComment &&
+    qState.activeEscapedQuote === '' &&
+    qState.lineActiveEscapedQuote === '' &&
+    qState.parenDepth === 0 &&
+    qState.bracketDepth === 0 &&
+    qState.braceDepth === 0
+  ) {
+    return qState
+  }
+  return {
+    ...(qState.inComment
+      ? {
+          activeQuote: '',
+          ansiSingle: false,
+          innerQuote: '',
+          activeEscapedQuote: '',
+          inComment: false,
+          commentQuote: '',
+          commentEscapedQuote: '',
+        }
+      : {
+          activeQuote: qState.activeQuote,
+          ansiSingle: qState.ansiSingle,
+          innerQuote: qState.innerQuote,
+          activeEscapedQuote: '',
+          inComment: false,
+          commentQuote: '',
+          commentEscapedQuote: '',
+        }),
+    ...(qState.lineInComment
+      ? {
+          lineActiveQuote: '',
+          lineAnsiSingle: false,
+          lineInnerQuote: '',
+          lineActiveEscapedQuote: '',
+          lineInComment: false,
+          lineCommentQuote: '',
+          lineCommentEscapedQuote: '',
+        }
+      : {
+          lineActiveQuote: qState.lineActiveQuote,
+          lineAnsiSingle: qState.lineAnsiSingle,
+          lineInnerQuote: qState.lineInnerQuote,
+          lineActiveEscapedQuote: '',
+          lineInComment: false,
+          lineCommentQuote: '',
+          lineCommentEscapedQuote: '',
+        }),
+    parenDepth: 0,
+    bracketDepth: 0,
+    braceDepth: 0,
+  }
+}
+
+function redactBasicBearerAuth(text: string, stats: SanitizeStats): string {
+  if (!/bearer|basic/i.test(text)) return text
+  AUTH_SCHEME_RE.lastIndex = 0
+  let out = ''
+  let copied = 0
+  let lastKeptMatchEnd = 0
+  let prevKeptMatchEnd = 0
+  const hasNl = text.includes('\n')
+  const hasCr = text.includes('\r')
+  const hasLs = text.includes('\u2028')
+  const hasPs = text.includes('\u2029')
+  const minPos = (a: number, b: number): number => (a === -1 ? b : b === -1 ? a : Math.min(a, b))
+  const makeQuoteCursor = (): QuoteScanCursor => ({
+    pos: 0,
+    activeQuote: '',
+    ansiSingle: false,
+    activeEscapedQuote: '',
+    innerQuote: '',
+    innerAnsiSingle: false,
+    inComment: false,
+    commentLineBreak: -1,
+    commentQuote: '',
+    commentAnsiSingle: false,
+    commentEscapedQuote: '',
+    parenDepth: 0,
+    bracketDepth: 0,
+    braceDepth: 0,
+    cachedNl: hasNl ? -2 : -1,
+    cachedCr: hasCr ? -2 : -1,
+    cachedLs: hasLs ? -2 : -1,
+    cachedPs: hasPs ? -2 : -1,
+    crossedQuotedBreak: false,
+  })
+  const copyCursorState = (src: QuoteScanCursor, dst: QuoteScanCursor): void => {
+    dst.pos = src.pos
+    dst.activeQuote = src.activeQuote
+    dst.ansiSingle = src.ansiSingle
+    dst.activeEscapedQuote = src.activeEscapedQuote
+    dst.innerQuote = src.innerQuote
+    dst.innerAnsiSingle = src.innerAnsiSingle
+    dst.inComment = src.inComment
+    dst.commentLineBreak = src.commentLineBreak
+    dst.commentQuote = src.commentQuote
+    dst.commentAnsiSingle = src.commentAnsiSingle
+    dst.commentEscapedQuote = src.commentEscapedQuote
+    dst.parenDepth = src.parenDepth
+    dst.bracketDepth = src.bracketDepth
+    dst.braceDepth = src.braceDepth
+    dst.cachedNl = src.cachedNl
+    dst.cachedCr = src.cachedCr
+    dst.cachedLs = src.cachedLs
+    dst.cachedPs = src.cachedPs
+  }
+  const cursorsSynced = (a: QuoteScanCursor, b: QuoteScanCursor): boolean =>
+    a.pos === b.pos &&
+    a.activeQuote === b.activeQuote &&
+    a.ansiSingle === b.ansiSingle &&
+    a.activeEscapedQuote === b.activeEscapedQuote &&
+    a.innerQuote === b.innerQuote &&
+    a.innerAnsiSingle === b.innerAnsiSingle &&
+    a.inComment === b.inComment &&
+    (!a.inComment ||
+      (a.commentLineBreak === b.commentLineBreak &&
+        a.commentQuote === b.commentQuote &&
+        a.commentAnsiSingle === b.commentAnsiSingle &&
+        a.commentEscapedQuote === b.commentEscapedQuote)) &&
+    a.parenDepth === b.parenDepth &&
+    a.bracketDepth === b.bracketDepth &&
+    a.braceDepth === b.braceDepth
+  // Strictly monotonic per-cursor helper (cur.pos never rewinds).
+  const cursorNextLineBreakAfter = (cur: QuoteScanCursor, pos: number): number => {
+    if (cur.cachedNl !== -1 && cur.cachedNl < pos) cur.cachedNl = text.indexOf('\n', pos)
+    if (cur.cachedCr !== -1 && cur.cachedCr < pos) cur.cachedCr = text.indexOf('\r', pos)
+    if (cur.cachedLs !== -1 && cur.cachedLs < pos) cur.cachedLs = text.indexOf('\u2028', pos)
+    if (cur.cachedPs !== -1 && cur.cachedPs < pos) cur.cachedPs = text.indexOf('\u2029', pos)
+    return minPos(minPos(cur.cachedNl, cur.cachedCr), minPos(cur.cachedLs, cur.cachedPs))
+  }
+  const lineTables = new Map<string, LineQuoteTable>()
+  let cachedLineStart = -1
+  let cachedLineQueryStop = -1
+  let cachedLineNl = hasNl ? -2 : -1
+  let cachedLineCr = hasCr ? -2 : -1
+  let cachedLineLs = hasLs ? -2 : -1
+  let cachedLinePs = hasPs ? -2 : -1
+  let lastLineStopQuery = -1
+  let cachedBoundsLineStop = -1
+  let cachedBoundsLineStart = -1
+  const lineStartFor = (pos: number): number => {
+    let i = pos
+    while (i > 0) {
+      if (isLineBreakCode(text.charCodeAt(i - 1))) break
+      i -= 1
+    }
+    return i
+  }
+  const lineStopFor = (pos: number): number => {
+    if (cachedLineQueryStop !== -1 && pos >= cachedLineStart && pos <= cachedLineQueryStop) {
+      return cachedLineQueryStop
+    }
+    if (pos < lastLineStopQuery) {
+      cachedLineNl = hasNl ? -2 : -1
+      cachedLineCr = hasCr ? -2 : -1
+      cachedLineLs = hasLs ? -2 : -1
+      cachedLinePs = hasPs ? -2 : -1
+    }
+    lastLineStopQuery = pos
+    if (cachedLineNl !== -1 && cachedLineNl < pos) {
+      cachedLineNl = text.indexOf('\n', pos)
+      if (cachedLineNl === -1) cachedLineNl = text.length
+    }
+    if (cachedLineCr !== -1 && cachedLineCr < pos) {
+      cachedLineCr = text.indexOf('\r', pos)
+      if (cachedLineCr === -1) cachedLineCr = text.length
+    }
+    if (cachedLineLs !== -1 && cachedLineLs < pos) {
+      cachedLineLs = text.indexOf('\u2028', pos)
+      if (cachedLineLs === -1) cachedLineLs = text.length
+    }
+    if (cachedLinePs !== -1 && cachedLinePs < pos) {
+      cachedLinePs = text.indexOf('\u2029', pos)
+      if (cachedLinePs === -1) cachedLinePs = text.length
+    }
+    let lb = text.length
+    if (cachedLineNl !== -1 && cachedLineNl < lb) lb = cachedLineNl
+    if (cachedLineCr !== -1 && cachedLineCr < lb) lb = cachedLineCr
+    if (cachedLineLs !== -1 && cachedLineLs < lb) lb = cachedLineLs
+    if (cachedLinePs !== -1 && cachedLinePs < lb) lb = cachedLinePs
+    cachedLineStart = pos
+    cachedLineQueryStop = lb
+    return lb
+  }
+  const opensUnescapedFast = (quoteIdx: number, q: string): boolean => {
+    const afterStart = quoteIdx + 1
+    if (q === '`' && text[afterStart] === '`') return false
+    const lineStop = lineStopFor(afterStart)
+    if (lineStop - quoteIdx <= 256) return opensQuotedAssignmentValue(text, quoteIdx, q, lineStop)
+    const cacheKey = `u:${q}`
+    let tbl = lineTables.get(cacheKey)
+    if (tbl === undefined || tbl.lineStop !== lineStop) {
+      if (cachedBoundsLineStop !== lineStop) {
+        cachedBoundsLineStop = lineStop
+        cachedBoundsLineStart = lineStartFor(quoteIdx)
+      }
+      tbl = buildUnescapedLineTable(text, cachedBoundsLineStart, lineStop, q)
+      lineTables.set(cacheKey, tbl)
+    }
+    const rem = afterStart >= lineStop ? 0 : (tbl.s1[afterStart - tbl.lineStart] as number)
+    return evalQuoteRemainder(text, afterStart, lineStop, q, false, rem)
+  }
+  const opensEscapedFast = (quoteIdx: number, q: string): boolean => {
+    const afterStart = quoteIdx + 2
+    const lineStop = lineStopFor(afterStart)
+    if (lineStop - quoteIdx <= 256) return opensEscapedQuotedAssignmentValue(text, quoteIdx, q, lineStop)
+    const cacheKey = `e:${q}`
+    let tbl = lineTables.get(cacheKey)
+    if (tbl === undefined || tbl.lineStop !== lineStop) {
+      if (cachedBoundsLineStop !== lineStop) {
+        cachedBoundsLineStop = lineStop
+        cachedBoundsLineStart = lineStartFor(quoteIdx)
+      }
+      tbl = buildEscapedLineTable(text, cachedBoundsLineStart, lineStop, q)
+      lineTables.set(cacheKey, tbl)
+    }
+    const rem = afterStart >= lineStop ? 0 : (tbl.s1[afterStart - tbl.lineStart] as number)
+    return evalQuoteRemainder(text, afterStart, lineStop, q, true, rem)
+  }
+  const resetCursorLineState = (cur: QuoteScanCursor, resetQuotes: boolean): void => {
+    if (resetQuotes) {
+      cur.activeQuote = ''
+      cur.ansiSingle = false
+      cur.innerQuote = ''
+      cur.innerAnsiSingle = false
+    }
+    cur.activeEscapedQuote = ''
+    cur.parenDepth = 0
+    cur.bracketDepth = 0
+    cur.braceDepth = 0
+  }
+  const advanceQuoteCursor = (cur: QuoteScanCursor, target: number, resetQuotesOnLineBreak: boolean): void => {
+    while (cur.pos < target) {
+      const ch = text[cur.pos] as string
+      if (cur.inComment) {
+        if (cur.commentLineBreak !== -1 && cur.commentLineBreak < target) {
+          cur.pos =
+            text[cur.commentLineBreak] === '\r' && text[cur.commentLineBreak + 1] === '\n'
+              ? cur.commentLineBreak + 2
+              : cur.commentLineBreak + 1
+          cur.inComment = false
+          cur.commentLineBreak = -1
+          cur.commentQuote = ''
+          cur.commentAnsiSingle = false
+          cur.commentEscapedQuote = ''
+          resetCursorLineState(cur, resetQuotesOnLineBreak)
+          continue
+        }
+        const next = text[cur.pos + 1]
+        if (cur.commentQuote !== '') {
+          if ((cur.commentQuote !== "'" || cur.commentAnsiSingle) && ch === '\\') {
+            if (next === '"' || next === "'") {
+              cur.commentEscapedQuote = toggleEscapedQuote(cur.commentEscapedQuote, next)
+              cur.pos += 2
+              continue
+            }
+            if (next === '\\' || next === cur.commentQuote || next === '`' || next === '$') {
+              cur.pos += 2
+              continue
+            }
+          } else if (cur.commentQuote === "'" && !cur.commentAnsiSingle && ch === '\\' && next === '"') {
+            cur.commentEscapedQuote = toggleEscapedQuote(cur.commentEscapedQuote, '"')
+            cur.pos += 2
+            continue
+          }
+          if (ch === cur.commentQuote) {
+            cur.commentQuote = ''
+            cur.commentAnsiSingle = false
+            cur.commentEscapedQuote = ''
+          }
+          cur.pos += 1
+          continue
+        }
+        if (ch === '\\') {
+          if (next === '"' || next === "'") {
+            cur.commentEscapedQuote = toggleEscapedQuote(cur.commentEscapedQuote, next)
+            cur.pos += 2
+            continue
+          }
+          if (cur.pos + 1 < target && (next === '\\' || next === '`' || next === '$')) {
+            cur.pos += 2
+            continue
+          }
+          cur.pos += 1
+          continue
+        }
+        if (ch === '$' && next === "'") {
+          cur.commentQuote = "'"
+          cur.commentAnsiSingle = true
+          cur.commentEscapedQuote = ''
+          cur.pos += 2
+          continue
+        }
+        if (ch === '"') {
+          cur.commentQuote = '"'
+          cur.commentEscapedQuote = ''
+          cur.pos += 1
+          continue
+        }
+        if (ch === "'") {
+          if (!isNonQuoteSingleQuote(text, cur.pos)) {
+            cur.commentQuote = "'"
+            cur.commentEscapedQuote = ''
+          }
+          cur.pos += 1
+          continue
+        }
+        if (ch === '`') {
+          let runLen = 1
+          while (cur.pos + runLen < target && text[cur.pos + runLen] === '`') runLen += 1
+          if (runLen === 1) {
+            cur.commentQuote = '`'
+            cur.commentEscapedQuote = ''
+          }
+          cur.pos += runLen
+          continue
+        }
+        cur.pos += 1
+        continue
+      }
+      if (cur.activeQuote !== '') {
+        if (isLineBreakCode(text.charCodeAt(cur.pos))) {
+          if (!resetQuotesOnLineBreak) cur.crossedQuotedBreak = true
+          resetCursorLineState(cur, resetQuotesOnLineBreak)
+          cur.pos += 1
+          continue
+        }
+        const next = text[cur.pos + 1]
+        if (cur.innerQuote !== '') {
+          if ((cur.innerQuote !== "'" || cur.innerAnsiSingle) && ch === '\\') {
+            if ((next === '"' || next === "'") && !(cur.activeQuote === "'" && !cur.ansiSingle && next === "'")) {
+              cur.activeEscapedQuote = toggleEscapedQuote(cur.activeEscapedQuote, next)
+              cur.pos += 2
+              continue
+            }
+            if ((next === '\\' || next === cur.innerQuote || next === '`' || next === '$') && !(cur.activeQuote === "'" && !cur.ansiSingle && next === "'")) {
+              cur.pos += 2
+              continue
+            }
+          } else if (cur.innerQuote === "'" && !cur.innerAnsiSingle && ch === '\\' && next === '"') {
+            cur.activeEscapedQuote = toggleEscapedQuote(cur.activeEscapedQuote, '"')
+            cur.pos += 2
+            continue
+          }
+          if (ch === cur.activeQuote) {
+            cur.activeQuote = ''
+            cur.ansiSingle = false
+            cur.activeEscapedQuote = ''
+            cur.innerQuote = ''
+            cur.innerAnsiSingle = false
+            cur.pos += 1
+            continue
+          }
+          if (ch === cur.innerQuote) {
+            cur.innerQuote = ''
+            cur.innerAnsiSingle = false
+            cur.activeEscapedQuote = ''
+            cur.pos += 1
+            continue
+          }
+          cur.pos += 1
+          continue
+        }
+        if ((cur.activeQuote !== "'" || cur.ansiSingle) && ch === '\\') {
+          if (next === '"' || next === "'") {
+            cur.activeEscapedQuote = toggleEscapedQuote(cur.activeEscapedQuote, next)
+            cur.pos += 2
+            continue
+          }
+          if (next === '\\' || next === cur.activeQuote || next === '`' || next === '$') {
+            cur.pos += 2
+            continue
+          }
+        } else if (cur.activeQuote === "'" && !cur.ansiSingle && ch === '\\' && next === '"') {
+          cur.activeEscapedQuote = toggleEscapedQuote(cur.activeEscapedQuote, '"')
+          cur.pos += 2
+          continue
+        }
+        if (ch === cur.activeQuote) {
+          cur.activeQuote = ''
+          cur.ansiSingle = false
+          cur.activeEscapedQuote = ''
+          cur.innerQuote = ''
+          cur.innerAnsiSingle = false
+          cur.pos += 1
+          continue
+        }
+        if (cur.activeEscapedQuote === '') {
+          if (ch === '$' && next === "'" && cur.activeQuote !== "'") {
+            cur.innerQuote = "'"
+            cur.innerAnsiSingle = true
+            cur.pos += 2
+            continue
+          }
+          if (ch === '"' && cur.activeQuote !== '"') {
+            cur.innerQuote = '"'
+            cur.pos += 1
+            continue
+          }
+          if (ch === "'" && cur.activeQuote !== "'") {
+            if (!isNonQuoteSingleQuote(text, cur.pos)) {
+              cur.innerQuote = "'"
+            }
+            cur.pos += 1
+            continue
+          }
+          if (ch === '`' && cur.activeQuote !== '`') {
+            let runLen = 1
+            while (cur.pos + runLen < target && text[cur.pos + runLen] === '`') runLen += 1
+            if (runLen === 1) {
+              cur.innerQuote = '`'
+            }
+            cur.pos += runLen
+            continue
+          }
+        }
+        cur.pos += 1
+        continue
+      }
+      if (isLineBreakCode(text.charCodeAt(cur.pos))) {
+        resetCursorLineState(cur, resetQuotesOnLineBreak)
+        cur.pos += 1
+        continue
+      }
+      if (isHashCommentStart(text, cur.pos)) {
+        const lb = cursorNextLineBreakAfter(cur, cur.pos + 1)
+        if (lb !== -1 && lb < target) {
+          cur.pos = text[lb] === '\r' && text[lb + 1] === '\n' ? lb + 2 : lb + 1
+          resetCursorLineState(cur, resetQuotesOnLineBreak)
+          continue
+        }
+        cur.inComment = true
+        cur.commentLineBreak = lb
+        cur.commentQuote = ''
+        cur.commentAnsiSingle = false
+        cur.commentEscapedQuote = ''
+        cur.pos += 1
+        continue
+      }
+      if (isSlashCommentStart(text, cur.pos)) {
+        const lb = cursorNextLineBreakAfter(cur, cur.pos + 2)
+        if (lb !== -1 && lb < target) {
+          cur.pos = text[lb] === '\r' && text[lb + 1] === '\n' ? lb + 2 : lb + 1
+          resetCursorLineState(cur, resetQuotesOnLineBreak)
+          continue
+        }
+        cur.inComment = true
+        cur.commentLineBreak = lb
+        cur.commentQuote = ''
+        cur.commentAnsiSingle = false
+        cur.commentEscapedQuote = ''
+        cur.pos += 2
+        continue
+      }
+      if (ch === '\\') {
+        const next = text[cur.pos + 1]
+        if (cur.pos + 1 < target && (next === '"' || next === "'")) {
+          cur.activeEscapedQuote = toggleEscapedQuote(cur.activeEscapedQuote, next)
+          cur.pos += 2
+          continue
+        }
+        if (
+          cur.pos + 1 < target &&
+          (next === '\\' ||
+            next === '`' ||
+            next === '$' ||
+            next === '#' ||
+            next === '/' ||
+            next === '(' ||
+            next === ')' ||
+            next === '[' ||
+            next === ']' ||
+            next === '{' ||
+            next === '}')
+        ) {
+          cur.pos += 2
+          continue
+        }
+        cur.pos += 1
+        continue
+      }
+      if (ch === '$' && text[cur.pos + 1] === "'") {
+        cur.activeQuote = "'"
+        cur.ansiSingle = true
+        cur.activeEscapedQuote = ''
+        cur.innerQuote = ''
+        cur.innerAnsiSingle = false
+        cur.pos += 2
+        continue
+      }
+      if (ch === '"') {
+        cur.activeQuote = '"'
+        cur.activeEscapedQuote = ''
+        cur.innerQuote = ''
+        cur.innerAnsiSingle = false
+        cur.pos += 1
+        continue
+      }
+      if (ch === "'") {
+        if (!isNonQuoteSingleQuote(text, cur.pos)) {
+          cur.activeQuote = "'"
+          cur.activeEscapedQuote = ''
+          cur.innerQuote = ''
+          cur.innerAnsiSingle = false
+        }
+        cur.pos += 1
+        continue
+      }
+      if (ch === '`') {
+        let runLen = 1
+        while (cur.pos + runLen < target && text[cur.pos + runLen] === '`') runLen += 1
+        if (runLen === 1) {
+          cur.activeQuote = '`'
+          cur.activeEscapedQuote = ''
+          cur.innerQuote = ''
+          cur.innerAnsiSingle = false
+        }
+        cur.pos += runLen
+        continue
+      }
+      if (ch === '(') cur.parenDepth += 1
+      else if (ch === ')' && cur.parenDepth > 0) cur.parenDepth -= 1
+      else if (ch === '[') cur.bracketDepth += 1
+      else if (ch === ']' && cur.bracketDepth > 0) cur.bracketDepth -= 1
+      else if (ch === '{') cur.braceDepth += 1
+      else if (ch === '}' && cur.braceDepth > 0) cur.braceDepth -= 1
+      cur.pos += 1
+    }
+  }
+  const crossCursor = makeQuoteCursor()
+  const lineCursor = makeQuoteCursor()
+  let cursorsAreSynced = true
+  const baseQuoteCtx: QuoteContext = {
+    activeQuote: '',
+    ansiSingle: false,
+    innerQuote: '',
+    activeEscapedQuote: '',
+    inComment: false,
+    commentQuote: '',
+    commentEscapedQuote: '',
+    lineActiveQuote: '',
+    lineAnsiSingle: false,
+    lineInnerQuote: '',
+    lineActiveEscapedQuote: '',
+    lineInComment: false,
+    lineCommentQuote: '',
+    lineCommentEscapedQuote: '',
+    parenDepth: 0,
+    bracketDepth: 0,
+    braceDepth: 0,
+  }
+  const quoteAt = (target: number): QuoteContext => {
+    if (cursorsAreSynced) {
+      copyCursorState(crossCursor, lineCursor)
+      crossCursor.crossedQuotedBreak = false
+      advanceQuoteCursor(crossCursor, target, false)
+      if (crossCursor.crossedQuotedBreak) {
+        advanceQuoteCursor(lineCursor, target, true)
+        cursorsAreSynced = cursorsSynced(crossCursor, lineCursor)
+      }
+    } else {
+      advanceQuoteCursor(crossCursor, target, false)
+      advanceQuoteCursor(lineCursor, target, true)
+      if (cursorsSynced(crossCursor, lineCursor)) cursorsAreSynced = true
+    }
+    const effectiveLine = cursorsAreSynced ? crossCursor : lineCursor
+    baseQuoteCtx.activeQuote = crossCursor.activeQuote
+    baseQuoteCtx.ansiSingle = crossCursor.ansiSingle
+    baseQuoteCtx.innerQuote = crossCursor.innerQuote
+    baseQuoteCtx.activeEscapedQuote = crossCursor.activeEscapedQuote
+    baseQuoteCtx.inComment = crossCursor.inComment
+    baseQuoteCtx.commentQuote = crossCursor.commentQuote
+    baseQuoteCtx.commentEscapedQuote = crossCursor.commentEscapedQuote
+    baseQuoteCtx.lineActiveQuote = effectiveLine.activeQuote
+    baseQuoteCtx.lineAnsiSingle = effectiveLine.ansiSingle
+    baseQuoteCtx.lineInnerQuote = effectiveLine.innerQuote
+    baseQuoteCtx.lineActiveEscapedQuote = effectiveLine.activeEscapedQuote
+    baseQuoteCtx.lineInComment = effectiveLine.inComment
+    baseQuoteCtx.lineCommentQuote = effectiveLine.commentQuote
+    baseQuoteCtx.lineCommentEscapedQuote = effectiveLine.commentEscapedQuote
+    baseQuoteCtx.parenDepth = effectiveLine.parenDepth
+    baseQuoteCtx.bracketDepth = effectiveLine.bracketDepth
+    baseQuoteCtx.braceDepth = effectiveLine.braceDepth
+    return baseQuoteCtx
+  }
+  const isOpeningUnescapedQuote = (
+    quoteIdx: number,
+    q: string,
+    qState: QuoteContext,
+    token: string,
+    allowPaddedLowerQuoteRhs: boolean,
+  ): boolean => {
+    const outerQuote = qState.inComment ? '' : qState.activeQuote
+    if (outerQuote === q) return false
+    const nextAfter = text[quoteIdx + 1]
+    if (isBase64PaddedToken(token) && !allowPaddedLowerQuoteRhs && isDelimOrSpaceAfterQuote(nextAfter)) return false
+    const openSameOrInner = qState.inComment ? qState.commentQuote : qState.innerQuote
+    if (openSameOrInner === q && isDelimOrSpaceAfterQuote(nextAfter)) return false
+    return opensUnescapedFast(quoteIdx, q)
+  }
+  const isOpeningEscapedQuote = (
+    quoteIdx: number,
+    q: string,
+    qState: QuoteContext,
+    token: string,
+    allowPaddedLowerQuoteRhs: boolean,
+  ): boolean => {
+    const nextAfter = text[quoteIdx + 2]
+    if (isBase64PaddedToken(token) && !allowPaddedLowerQuoteRhs && isDelimOrSpaceAfterQuote(nextAfter)) return false
+    const openEsc = qState.inComment ? qState.commentEscapedQuote : qState.activeEscapedQuote
+    if (openEsc === q) {
+      const outer = qState.inComment ? '' : qState.activeQuote
+      if (isDelimOrSpaceAfterQuote(nextAfter) || (outer === '' && nextAfter === '\\')) return false
+    }
+    return opensEscapedFast(quoteIdx, q)
+  }
+  const isValidVarRhsAt = (
+    rhsIdx: number,
+    rhsText: string,
+    qState: QuoteContext,
+    coreToken: string,
+    allowPaddedLowerQuoteRhs: boolean,
+  ): boolean => {
+    if (rhsText.length < 2) return false
+    const c1 = rhsText[1] as string
+    if (c1 === '"' || c1 === "'") {
+      return (
+        !qState.inComment &&
+        qState.activeQuote === '' &&
+        isOpeningUnescapedQuote(rhsIdx + 1, c1, qState, coreToken, allowPaddedLowerQuoteRhs)
+      )
+    }
+    return ASSIGN_RHS_VAR_RE.test(rhsText)
+  }
+  const hasAssignRhsAt = (
+    rhsIdx: number,
+    rhsText: string,
+    qState: QuoteContext,
+    coreToken: string,
+    allowPaddedLowerQuoteRhs: boolean,
+    allowPunctRhs: boolean,
+  ): boolean => {
+    if (rhsText === '') return false
+    const c0 = rhsText.charCodeAt(0)
+    if (c0 === 36) return isValidVarRhsAt(rhsIdx, rhsText, qState, coreToken, allowPaddedLowerQuoteRhs)
+    if (c0 === 91) return ASSIGN_RHS_REDACTED_RE.test(rhsText) || (allowPunctRhs && ASSIGN_RHS_PUNCT_RE.test(rhsText))
+    if (c0 === 34 || c0 === 39 || c0 === 96) {
+      return isOpeningUnescapedQuote(rhsIdx, rhsText[0] as string, qState, coreToken, allowPaddedLowerQuoteRhs)
+    }
+    if (c0 === 92) {
+      const c1 = rhsText.charCodeAt(1)
+      if (c1 === 34 || c1 === 39) return isOpeningEscapedQuote(rhsIdx, rhsText[1] as string, qState, coreToken, allowPaddedLowerQuoteRhs)
+    }
+    return allowPunctRhs && ASSIGN_RHS_PUNCT_RE.test(rhsText)
+  }
+  const assignPrefixContext = (matchIndex: number): { precededByEq: boolean; precededByColon: boolean } => {
+    const keptFloor = lastKeptMatchEnd <= matchIndex ? lastKeptMatchEnd : prevKeptMatchEnd
+    const floor = Math.max(copied, keptFloor)
+    let p = matchIndex
+    while (p > floor && isSameLineWsAt(text, p - 1)) p -= 1
+    if (p <= floor) return { precededByEq: false, precededByColon: false }
+    const sep = text.charCodeAt(p - 1)
+    if (sep === 61) {
+      return {
+        precededByEq: p - 1 === 0 || !/[=!<>]/.test(text[p - 2] as string),
+        precededByColon: false,
+      }
+    }
+    if (sep === 58) {
+      return {
+        precededByEq: false,
+        precededByColon: p - 1 === 0 || text.charCodeAt(p - 2) !== 58,
+      }
+    }
+    return { precededByEq: false, precededByColon: false }
+  }
+  const computeDualStop = (
+    rhsStart: number,
+    lineStop: number,
+    tokQState: QuoteContext,
+    requireDelimAfterQuote = false,
+  ): number => {
+    const outerQ = tokQState.lineInComment ? tokQState.lineCommentQuote : tokQState.lineActiveQuote
+    const innerQ = tokQState.lineInComment ? '' : tokQState.lineInnerQuote
+    const escQ = tokQState.lineInComment ? tokQState.lineCommentEscapedQuote : tokQState.lineActiveEscapedQuote
+    const checkDelims =
+      !tokQState.lineInComment &&
+      tokQState.lineActiveQuote === '' &&
+      (tokQState.parenDepth > 0 || tokQState.bracketDepth > 0 || tokQState.braceDepth > 0)
+    if (outerQ === '' && innerQ === '' && escQ === '' && !checkDelims) return lineStop
+    let localParen = 0
+    let localBracket = 0
+    let localBrace = 0
+    let rhsQuote = ''
+    let i = rhsStart
+    while (i < lineStop) {
+      const ch = text[i] as string
+      if (escQ !== '' && ch === '\\' && i + 1 < lineStop && text[i + 1] === escQ) {
+        return i
+      }
+      if (ch === '\\') {
+        if (outerQ === "'" && !tokQState.lineAnsiSingle) {
+          if (innerQ === '"' && i + 1 < lineStop && (text[i + 1] === '"' || text[i + 1] === '\\')) {
+            i += 2
+            continue
+          }
+        } else if (rhsQuote !== "'" && i + 1 < lineStop) {
+          i += 2
+          continue
+        }
+      }
+      if (outerQ !== '' && ch === outerQ && (!requireDelimAfterQuote || isDelimOrSpaceAfterQuote(text[i + 1]))) {
+        return i
+      }
+      if (innerQ !== '' && ch === innerQ && (!requireDelimAfterQuote || isDelimOrSpaceAfterQuote(text[i + 1]))) {
+        return i
+      }
+      if (checkDelims) {
+        if (rhsQuote !== '') {
+          if (ch === rhsQuote) rhsQuote = ''
+        } else if (ch === '"' || (ch === "'" && !isNonQuoteSingleQuote(text, i))) {
+          rhsQuote = ch
+        } else if (ch === '(') {
+          localParen += 1
+        } else if (ch === ')') {
+          if (localParen > 0) localParen -= 1
+          else if (tokQState.parenDepth > 0) return i
+        } else if (ch === '[') {
+          localBracket += 1
+        } else if (ch === ']') {
+          if (localBracket > 0) localBracket -= 1
+          else if (tokQState.bracketDepth > 0) return i
+        } else if (ch === '{') {
+          localBrace += 1
+        } else if (ch === '}') {
+          if (localBrace > 0) localBrace -= 1
+          else if (tokQState.braceDepth > 0) return i
+        }
+      }
+      i += 1
+    }
+    return lineStop
+  }
+  let curMatchIndex = 0
+  let curScheme = ''
+  let curMatchEnd = 0
+  let curEffectiveMatchEnd = 0
+  let curHasNewline = false
+  let cachedRawTokQState: QuoteContext | undefined
+  let cachedTokQState: QuoteContext | undefined
+  let cachedPrefix: { precededByEq: boolean; precededByColon: boolean } | undefined
+  const rewind = (): void => {
+    AUTH_SCHEME_RE.lastIndex = Math.max(curMatchIndex + curScheme.length, curMatchEnd - 6)
+  }
+  const keepAndRewind = (): void => {
+    if (curEffectiveMatchEnd > lastKeptMatchEnd) {
+      prevKeptMatchEnd = lastKeptMatchEnd
+      lastKeptMatchEnd = curEffectiveMatchEnd
+    }
+    rewind()
+  }
+  const getRawTokQState = (): QuoteContext => {
+    if (cachedRawTokQState === undefined) cachedRawTokQState = quoteAt(curMatchIndex)
+    return cachedRawTokQState
+  }
+  const getTokQState = (): QuoteContext => {
+    if (cachedTokQState === undefined) cachedTokQState = effectiveQuoteState(getRawTokQState(), curHasNewline)
+    return cachedTokQState
+  }
+  const getPrefix = (): { precededByEq: boolean; precededByColon: boolean } => {
+    if (cachedPrefix === undefined) cachedPrefix = assignPrefixContext(curMatchIndex)
+    return cachedPrefix
+  }
+  const emitSpanRedaction = (replacementTail: string, stopIdx: number): void => {
+    out += text.slice(copied, curMatchIndex) + curScheme + ' ' + MARKER + replacementTail
+    stats.redactions += 1
+    copied = stopIdx
+    AUTH_SCHEME_RE.lastIndex = stopIdx
+  }
+  const trySpacedSensitiveEqRhs = (
+    hasCtx: boolean,
+    coreToken: string,
+    eqIdx: number,
+    tokQState: QuoteContext,
+  ): boolean => {
+    const eqLineStop = lineStopFor(curEffectiveMatchEnd)
+    let spEnd = curEffectiveMatchEnd
+    while (spEnd < eqLineStop && isSameLineWsAt(text, spEnd)) spEnd += 1
+    if (spEnd <= curEffectiveMatchEnd || spEnd >= eqLineStop) return false
+    const boundedStop = Math.min(eqLineStop, spEnd + 64)
+    const dualHeadStop = computeDualStop(spEnd, boundedStop, tokQState, curHasNewline)
+    if (spEnd >= dualHeadStop) return false
+    const spaceBeforeQuoteRhs = (() => {
+      const ch = text[spEnd]
+      if (ch === '"' || ch === "'" || ch === '`') {
+        return isOpeningUnescapedQuote(spEnd, ch, tokQState, coreToken, true)
+      }
+      if (ch === '\\' && (text[spEnd + 1] === '"' || text[spEnd + 1] === "'")) {
+        return isOpeningEscapedQuote(spEnd, text[spEnd + 1] as string, tokQState, coreToken, true)
+      }
+      if (ch === '$') {
+        return isValidVarRhsAt(
+          spEnd,
+          text.slice(spEnd, dualHeadStop),
+          tokQState,
+          coreToken,
+          true,
+        )
+      }
+      return false
+    })()
+    const spaceBeforeValueRhs =
+      /^(?!(?:#(?:$|[\s])|[;)|&"'`$\\\]},]))(?!(?:bearer|basic)(?:[\s]|$))\S/i.test(
+        text.slice(spEnd, Math.min(dualHeadStop, spEnd + 8)),
+      )
+    if (!spaceBeforeQuoteRhs && !spaceBeforeValueRhs) return false
+    if (hasCtx) {
+      keepAndRewind()
+      return true
+    }
+    const dualStop =
+      dualHeadStop < boundedStop ? dualHeadStop : computeDualStop(spEnd, eqLineStop, tokQState, curHasNewline)
+    emitSpanRedaction(coreToken.slice(eqIdx) + text.slice(curEffectiveMatchEnd, spEnd) + MARKER, dualStop)
+    return true
+  }
+  for (let m = AUTH_SCHEME_RE.exec(text); m !== null; m = AUTH_SCHEME_RE.exec(text)) {
+    const scheme = m[1] as string
+    const space = m[2] as string
+    const token = m[3] as string
+    const matchEnd = m.index + m[0].length
+    const headerKind = explicitAuthHeaderKind(text, m.index)
+    const inHeader = headerKind !== 0
+    const hasNewline =
+      space.length === 1
+        ? isLineBreakCode(space.charCodeAt(0))
+        : space.includes('\n') ||
+          space.includes('\r') ||
+          (hasLs && space.includes('\u2028')) ||
+          (hasPs && space.includes('\u2029'))
+    const after = text.slice(matchEnd, matchEnd + 64)
+    const isBasic = scheme.length === 5 && (scheme === 'Basic' || scheme === 'basic' || scheme.toLowerCase() === 'basic')
+    const basicB64 = isBasic && isBase64Credential(token)
+    const eqIdx = token.indexOf('=')
+    let coreToken = token
+    let trailingDots = ''
+    if (eqIdx > 0 && token.charCodeAt(token.length - 1) === 46) {
+      const eqCount = token[eqIdx + 1] === '=' ? 2 : 1
+      if (eqIdx + eqCount < token.length) {
+        let allDots = true
+        for (let d = eqIdx + eqCount; d < token.length; d += 1) {
+          if (token.charCodeAt(d) !== 46) {
+            allDots = false
+            break
+          }
+        }
+        if (allDots) {
+          coreToken = token.slice(0, eqIdx + eqCount)
+          trailingDots = token.slice(eqIdx + eqCount)
+        }
+      }
+    }
+    const effectiveAfter =
+      trailingDots === ''
+        ? after
+        : trailingDots.length >= 64
+          ? trailingDots.slice(0, 64)
+          : trailingDots + after.slice(0, 64 - trailingDots.length)
+    const effectiveMatchEnd = trailingDots === '' ? matchEnd : m.index + scheme.length + space.length + coreToken.length
+    curMatchIndex = m.index
+    curScheme = scheme
+    curMatchEnd = matchEnd
+    curEffectiveMatchEnd = effectiveMatchEnd
+    curHasNewline = hasNewline
+    cachedRawTokQState = undefined
+    cachedTokQState = undefined
+    cachedPrefix = undefined
+    let forceHeaderTokenRedact = false
+    if (eqIdx === -1 && !basicB64) {
+      const keyInfo = classifyBearerKeyToken(token)
+      if (keyInfo !== null && (keyInfo.sensitive || (hasNewline && !isBasic && !inHeader && coreToken.length >= 12))) {
+        const ac0 = after.charCodeAt(0)
+        if (ac0 === 58 || ac0 === 61 || isSameLineWsAt(text, matchEnd)) {
+          const sep = scanSameLineColonOrSpacedEq(text, matchEnd, lineStopFor(matchEnd))
+          if (sep !== null) {
+            if (keyInfo.sensitive) {
+              const tokQState = getTokQState()
+              const boundedStop = Math.min(sep.lineStop, sep.rhsStart + 64)
+              const dualHeadStop = computeDualStop(sep.rhsStart, boundedStop, tokQState, hasNewline)
+              if (sep.rhsStart >= dualHeadStop) {
+                if (!inHeader && hasNewline) {
+                  const { precededByEq } = getPrefix()
+                  if (precededByEq || tokQState.inComment) {
+                    keepAndRewind()
+                    continue
+                  }
+                }
+                if (inHeader) forceHeaderTokenRedact = true
+              } else {
+                if (!inHeader) {
+                  const { precededByEq, precededByColon } = getPrefix()
+                  const hasAssignOrCommentCtx = precededByEq || tokQState.inComment || (!hasNewline && precededByColon)
+                  if (hasAssignOrCommentCtx) {
+                    const rhsHead = text.slice(sep.rhsStart, dualHeadStop)
+                    if (hasAssignRhsAt(sep.rhsStart, rhsHead, tokQState, coreToken, true, false)) {
+                      keepAndRewind()
+                      continue
+                    }
+                  }
+                }
+                // Ambiguous or header-scoped sensitive key-shaped token with non-empty RHS:
+                // fail closed on both sides up to enclosing quote/delimiter or EOL.
+                const dualStop =
+                  dualHeadStop < boundedStop
+                    ? dualHeadStop
+                    : computeDualStop(sep.rhsStart, sep.lineStop, tokQState, hasNewline)
+                emitSpanRedaction(text.slice(matchEnd, sep.rhsStart) + MARKER, dualStop)
+                continue
+              }
+            } else {
+              const tokQState = getTokQState()
+              const { precededByEq } = getPrefix()
+              const rhsHead = text.slice(sep.rhsStart, Math.min(sep.lineStop, sep.rhsStart + 256))
+              const validQuotedVarOrRedacted = hasAssignRhsAt(
+                sep.rhsStart,
+                rhsHead.slice(0, 64),
+                tokQState,
+                coreToken,
+                true,
+                false,
+              )
+              if (
+                isCrossLineNonSensitiveConfigColonOrSpacedEq(
+                  keyInfo.keyCand,
+                  keyInfo.isPlainKey,
+                  keyInfo.isDoubleFlag,
+                  sep.sepKind,
+                  rhsHead,
+                  precededByEq || tokQState.inComment,
+                  validQuotedVarOrRedacted,
+                )
+              ) {
+                keepAndRewind()
+                continue
+              }
+            }
+          }
+        }
+      }
+    }
+    let isPaddedBasicCandidate = false
+    if (!basicB64 && eqIdx > 0) {
+      const rawKeyPart = coreToken.slice(0, eqIdx)
+      const keyWithinCap = rawKeyPart.length <= 100
+      const isPlainAssignKey = /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(rawKeyPart)
+      const isDashPrefixed = !isPlainAssignKey && rawKeyPart.charCodeAt(0) === 45
+      const flagStripped = isDashPrefixed ? (rawKeyPart.charCodeAt(1) === 45 ? rawKeyPart.slice(2) : rawKeyPart.slice(1)) : ''
+      const isDoubleFlag = isDashPrefixed && rawKeyPart.charCodeAt(1) === 45
+      const isConfigFlagShape =
+        isDashPrefixed &&
+        keyWithinCap &&
+        (isDoubleFlag ? DOUBLE_DASH_LOWER_FLAG_RE.test(rawKeyPart) : SINGLE_DASH_SNAKE_OR_LOWER_FLAG_RE.test(rawKeyPart))
+      const isFlagAssignKey =
+        isDashPrefixed &&
+        flagStripped !== '' &&
+        /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(flagStripped) &&
+        (isConfigFlagShape || (flagStripped.length <= 100 && isSensitiveKey(flagStripped)))
+      const isAssignKey = isPlainAssignKey || isFlagAssignKey
+      const assignKey = isFlagAssignKey ? flagStripped : rawKeyPart
+      const isLowerWordKey = isPlainAssignKey && keyWithinCap && LOWER_WORD_KEY_RE.test(rawKeyPart)
+      const isEmptyAssignIdentifier =
+        isAssignKey &&
+        keyWithinCap &&
+        !isLowerWordKey &&
+        ((isFlagAssignKey && isDoubleFlag) ||
+          ALL_CAPS_SNAKE_KEY_RE.test(assignKey) ||
+          LOWER_SNAKE_KEY_RE.test(assignKey) ||
+          CAMEL_CASE_KEY_RE.test(assignKey))
+      const isRecognizedConfigKey =
+        isEmptyAssignIdentifier ||
+        isConfigFlagShape ||
+        (keyWithinCap &&
+          (CAMEL_CASE_VERSION_KEY_RE.test(rawKeyPart) ||
+            UPPER_WORD_KEY_RE.test(rawKeyPart) ||
+            isLowerWordKey ||
+            LOWER_DOTTED_KEY_RE.test(rawKeyPart) ||
+            LOWER_KEBAB_KEY_RE.test(rawKeyPart)))
+      const endsWithEq = isAssignKey && eqIdx === coreToken.length - 1
+      const endsWithDoubleEq = isAssignKey && eqIdx === coreToken.length - 2 && coreToken[eqIdx + 1] === '='
+      const isEqPaddedEnd = endsWithEq || endsWithDoubleEq
+      isPaddedBasicCandidate = !inHeader && coreToken.length >= 12
+
+      if (inHeader) {
+        if (isAssignKey && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
+          const tokQState = getTokQState()
+          const eqLineStop = lineStopFor(effectiveMatchEnd)
+          if (!isEqPaddedEnd) {
+            const rhsAt = m.index + scheme.length + space.length + eqIdx + 1
+            const dualStop = computeDualStop(rhsAt, eqLineStop, tokQState, hasNewline)
+            emitSpanRedaction('', dualStop)
+            continue
+          }
+          let spEnd = effectiveMatchEnd
+          while (spEnd < eqLineStop && isSameLineWsAt(text, spEnd)) spEnd += 1
+          const immediateStop =
+            spEnd >= eqLineStop ||
+            computeDualStop(spEnd, Math.min(eqLineStop, spEnd + 2), tokQState, hasNewline) <= spEnd
+          const hasNonEmptyHeaderRhs =
+            !immediateStop &&
+            (spEnd > effectiveMatchEnd
+              ? !/^[;)|&,\]}]/.test(text[spEnd] as string)
+              : hasAssignRhsAt(effectiveMatchEnd, effectiveAfter, tokQState, coreToken, false, true) ||
+                !/^[;)|&,\]}]/.test(text[spEnd] as string))
+          if (hasNonEmptyHeaderRhs) {
+            const dualStop = computeDualStop(effectiveMatchEnd, eqLineStop, tokQState, hasNewline)
+            emitSpanRedaction('', dualStop)
+            continue
+          }
+          forceHeaderTokenRedact = true
+        }
+      } else if (hasNewline) {
+        if (isAssignKey) {
+          const tokQState = getTokQState()
+          const { precededByEq } = getPrefix()
+          const precededByEqOrInComment = precededByEq || tokQState.inComment
+          if (!isEqPaddedEnd) {
+            const safeAfter =
+              effectiveAfter === '' ||
+              /^(?:[\s),;}\]"'`]|[:.!?](?:$|[\s'")\]},;])|\$(?:$|[\s),;}\]"'`]))/.test(effectiveAfter) ||
+              ((effectiveAfter.startsWith('\\"') || effectiveAfter.startsWith("\\'"))
+                ? !opensEscapedFast(effectiveMatchEnd, effectiveAfter[1] as string)
+                : /^\\[nrt]/.test(effectiveAfter))
+            if (
+              precededByEqOrInComment &&
+              isRecognizedConfigKey &&
+              (!isBase64PaddedToken(coreToken) || isEmptyAssignIdentifier || coreToken[eqIdx + 1] === '~' || !safeAfter)
+            ) {
+              keepAndRewind()
+              continue
+            }
+            if (
+              !precededByEqOrInComment &&
+              assignKey.length <= 100 &&
+              isSensitiveKey(assignKey) &&
+              !isBase64PaddedToken(coreToken) &&
+              (coreToken.length < 12 || (effectiveAfter !== '' && !/^[\s#;)|&]/.test(effectiveAfter)))
+            ) {
+              const eqLineStop = lineStopFor(effectiveMatchEnd)
+              const rhsAt = m.index + scheme.length + space.length + eqIdx + 1
+              const dualStop = computeDualStop(rhsAt, eqLineStop, tokQState, hasNewline)
+              emitSpanRedaction('=' + MARKER, dualStop)
+              continue
+            }
+          } else {
+            const hasAssignOrLineCommentCtx = precededByEqOrInComment
+            const isSensitiveAssignKey = assignKey.length <= 100 && isSensitiveKey(assignKey)
+            const allowPaddedQuoteRhs =
+              hasAssignOrLineCommentCtx &&
+              (isSensitiveAssignKey ||
+                isEmptyAssignIdentifier ||
+                ((isLowerWordKey || isRecognizedConfigKey) && !endsWithDoubleEq))
+            const allowPunctRhs =
+              hasAssignOrLineCommentCtx && (!endsWithDoubleEq || isSensitiveAssignKey)
+            const isEmptyQuotedRhs =
+              ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`') &&
+                effectiveAfter[1] === effectiveAfter[0] &&
+                isDelimOrSpaceAfterQuote(effectiveAfter[2])) ||
+              (effectiveAfter[0] === '\\' &&
+                (effectiveAfter[1] === '"' || effectiveAfter[1] === "'") &&
+                effectiveAfter[2] === '\\' &&
+                effectiveAfter[3] === effectiveAfter[1] &&
+                isDelimOrSpaceAfterQuote(effectiveAfter[4]))
+            const canKeepAssignRhs =
+              hasAssignOrLineCommentCtx &&
+              (isRecognizedConfigKey || isSensitiveAssignKey)
+            const assignRhs =
+              canKeepAssignRhs &&
+              !isEmptyQuotedRhs &&
+              hasAssignRhsAt(
+                effectiveMatchEnd,
+                effectiveAfter,
+                tokQState,
+                coreToken,
+                allowPaddedQuoteRhs,
+                allowPunctRhs,
+              )
+            if (assignRhs) {
+              keepAndRewind()
+              continue
+            }
+            if (!hasAssignOrLineCommentCtx && isSensitiveAssignKey) {
+              if (
+                !isEmptyQuotedRhs &&
+                hasAssignRhsAt(
+                  effectiveMatchEnd,
+                  effectiveAfter,
+                  tokQState,
+                  coreToken,
+                  true,
+                  true,
+                )
+              ) {
+                const eqLineStop = lineStopFor(effectiveMatchEnd)
+                const dualStop = computeDualStop(effectiveMatchEnd, eqLineStop, tokQState, hasNewline)
+                emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
+                continue
+              }
+              if (trySpacedSensitiveEqRhs(false, coreToken, eqIdx, tokQState)) {
+                continue
+              }
+              if (isEmptyQuotedRhs) {
+                emitSpanRedaction('', effectiveMatchEnd)
+                continue
+              }
+            }
+            if (
+              hasAssignOrLineCommentCtx &&
+              isSensitiveAssignKey &&
+              trySpacedSensitiveEqRhs(true, coreToken, eqIdx, tokQState)
+            ) {
+              continue
+            }
+            if (!endsWithDoubleEq) {
+              const closedByEnclosingQuote =
+                isBase64PaddedToken(coreToken) &&
+                !precededByEq &&
+                ((!tokQState.inComment && tokQState.activeQuote !== '' && effectiveAfter[0] === tokQState.activeQuote) ||
+                  (!tokQState.inComment &&
+                    tokQState.innerQuote !== '' &&
+                    effectiveAfter[0] === tokQState.innerQuote &&
+                    isDelimOrSpaceAfterQuote(effectiveAfter[1])) ||
+                  ((tokQState.inComment ? tokQState.commentEscapedQuote : tokQState.activeEscapedQuote) !== '' &&
+                    effectiveAfter.startsWith('\\' + (tokQState.inComment ? tokQState.commentEscapedQuote : tokQState.activeEscapedQuote)) &&
+                    (isDelimOrSpaceAfterQuote(effectiveAfter[2]) ||
+                      (!tokQState.inComment && tokQState.activeQuote === '' && effectiveAfter[2] === '\\'))))
+              if (!closedByEnclosingQuote) {
+                const isEmptyTailForAssign =
+                  effectiveAfter === '' ||
+                  /^[\s#;)|&]/.test(effectiveAfter) ||
+                  ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`') &&
+                    effectiveAfter[1] === effectiveAfter[0] &&
+                    isDelimOrSpaceAfterQuote(effectiveAfter[2])) ||
+                  trailingDots !== '' ||
+                  ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'") &&
+                    isDelimOrSpaceAfterQuote(effectiveAfter[1]))
+                if (isEmptyTailForAssign && precededByEqOrInComment && isRecognizedConfigKey) {
+                  keepAndRewind()
+                  continue
+                }
+              }
+            }
+          }
+        }
+      } else if (isAssignKey && assignKey.length <= 100 && isSensitiveKey(assignKey)) {
+        const tokQState = getTokQState()
+        const { precededByEq, precededByColon } = getPrefix()
+        const hasAssignOrCommentCtx = precededByEq || precededByColon || tokQState.inComment
+        if (isEqPaddedEnd) {
+          const singleAssignRhs = hasAssignRhsAt(
+            effectiveMatchEnd,
+            effectiveAfter,
+            tokQState,
+            coreToken,
+            true,
+            true,
+          )
+          if (singleAssignRhs) {
+            const quotedDelimOnPadded =
+              isBase64PaddedToken(coreToken) &&
+              ((effectiveAfter[0] === '"' || effectiveAfter[0] === "'" || effectiveAfter[0] === '`')
+                ? isDelimOrSpaceAfterQuote(effectiveAfter[1])
+                : effectiveAfter[0] === '\\' && (effectiveAfter[1] === '"' || effectiveAfter[1] === "'")
+                  ? isDelimOrSpaceAfterQuote(effectiveAfter[2])
+                  : false)
+            if (precededByEq || precededByColon || (tokQState.inComment && !quotedDelimOnPadded)) {
+              keepAndRewind()
+              continue
+            }
+            const eqLineStop = lineStopFor(effectiveMatchEnd)
+            const dualStop = computeDualStop(effectiveMatchEnd, eqLineStop, tokQState, hasNewline)
+            emitSpanRedaction(coreToken.slice(eqIdx) + MARKER, dualStop)
+            continue
+          }
+          if (trySpacedSensitiveEqRhs(hasAssignOrCommentCtx, coreToken, eqIdx, tokQState)) {
+            continue
+          }
+        } else if (!isBase64PaddedToken(coreToken)) {
+          if (hasAssignOrCommentCtx) {
+            keepAndRewind()
+            continue
+          }
+          const eqLineStop = lineStopFor(effectiveMatchEnd)
+          const rhsAt = m.index + scheme.length + space.length + eqIdx + 1
+          const dualStop = computeDualStop(rhsAt, eqLineStop, tokQState, hasNewline)
+          emitSpanRedaction('=' + MARKER, dualStop)
+          continue
+        }
+      }
+    }
+    if (!isBasic) {
+      const shortHeaderToken =
+        inHeader &&
+        coreToken.length >= 8 &&
+        !HEADER_PLACEHOLDER_TOKENS.has(coreToken.toLowerCase()) &&
+        /[A-Za-z]/.test(coreToken) &&
+        /[A-Z0-9._~+/=-]/.test(coreToken)
+      if (!forceHeaderTokenRedact && coreToken.length < 12 && !shortHeaderToken) {
+        keepAndRewind()
+        continue
+      }
+      if (!inHeader && PASCAL_CASE_WORD_RE.test(coreToken) && isDocumentationPascalPhrase(coreToken)) {
+        const hasProseFollow = (hasNewline || space.includes('\u00a0')) && /^[ \t\u00a0]+[a-z]{2,}\b/.test(effectiveAfter)
+        if (hasProseFollow || space.includes('\u00a0')) {
+          keepAndRewind()
+          continue
+        }
+      }
+    } else {
+      if (
+        hasNewline
+          ? !inHeader && !basicB64 && !isBase64PaddedToken(coreToken) && !isPaddedBasicCandidate
+          : !inHeader && !isLikelyBasicCredentialToken(coreToken)
+      ) {
+        keepAndRewind()
+        continue
+      }
+      if (inHeader && coreToken.length < 4) {
+        keepAndRewind()
+        continue
+      }
+    }
+    out += text.slice(copied, m.index) + scheme + ' ' + MARKER
+    stats.redactions += 1
+    copied = matchEnd
+  }
+  return copied === 0 ? text : out + text.slice(copied)
+}
+
 // Incoming-webhook URLs, whose path is the credential: removed whole.
 const WEBHOOK_URLS: readonly RegExp[] = [
   /^https?:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\//i,
@@ -200,6 +2359,7 @@ const WEBHOOK_URLS: readonly RegExp[] = [
   /^https?:\/\/[a-z0-9-]+\.webhook\.office\.com\//i,
   /^https?:\/\/outlook\.office(?:365)?\.com\/webhook\//i,
 ]
+const WEBHOOK_QUICK = /hooks\.slack\.com|discord(?:app)?\.com\/api\/|webhook\.office\.com|outlook\.office(?:365)?\.com\/webhook\//i
 
 const decodeName = (name: string): string => {
   try {
@@ -209,16 +2369,80 @@ const decodeName = (name: string): string => {
   }
 }
 
+const isSchemeChar = (c: number): boolean =>
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46
+const isAsciiLetter = (c: number): boolean => (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+const isUrlStop = (c: number): boolean =>
+  c <= 32 || c === 34 || c === 39 || c === 60 || c === 62 || c === 92 || c === 96 || c === 127 || /\s/.test(String.fromCharCode(c))
+const isUrlTrailer = (c: number): boolean =>
+  c === 46 || c === 44 || c === 59 || c === 58 || c === 33 || c === 63 || c === 41 || c === 93 || c === 125
+
+function trimUrlTrailerLinear(text: string, start: number, end: number): number {
+  while (end > start && isUrlTrailer(text.charCodeAt(end - 1))) {
+    // Preserve closing `]` of an IPv6 bracketed literal host (`[::1]`).
+    if (text.charCodeAt(end - 1) === 93) {
+      const slice = text.slice(Math.max(start, end - 64), end - 1)
+      const openIdx = slice.lastIndexOf('[')
+      if (openIdx !== -1 && (openIdx === 0 || slice[openIdx - 1] === '/' || slice[openIdx - 1] === '@') && /^[0-9a-fA-F:.]+$/.test(slice.slice(openIdx + 1))) break
+    }
+    end -= 1
+  }
+  return end
+}
+
+const VALID_HOST_AFTER_AT = /^(?:\[[0-9a-fA-F:.]+\](?::\d+)?|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*(?::\d+)?)(?:[/?#]|$)/
+
 function redactUrl(url: string, stats: SanitizeStats): string {
-  if (WEBHOOK_URLS.some(pattern => pattern.test(url))) {
+  if (WEBHOOK_QUICK.test(url) && WEBHOOK_URLS.some(pattern => pattern.test(url))) {
     stats.redactions += 1
     return '[REDACTED:webhook-url]'
   }
-  // `user:password@` (or a bare token) before the host.
-  const out = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]+@/i, (_: string, scheme: string) => {
-    stats.redactions += 1
-    return `${scheme}${MARKER}@`
-  })
+  let out = url
+  const schemeSep = out.indexOf('://')
+  if (schemeSep !== -1 && out.includes('@')) {
+    const authStart = schemeSep + 3
+    let firstDelim = out.length
+    for (let k = authStart; k < out.length; k += 1) {
+      const c = out.charCodeAt(k)
+      if (c === 47 || c === 63 || c === 35) {
+        firstDelim = k
+        break
+      }
+    }
+    const lastAt = firstDelim > authStart ? out.lastIndexOf('@', firstDelim - 1) : -1
+    if (lastAt >= authStart) {
+      const userInfo = out.slice(authStart, lastAt)
+      if (userInfo !== '') {
+        if (userInfo !== MARKER) stats.redactions += 1
+        out = `${out.slice(0, authStart)}${MARKER}${out.slice(lastAt)}`
+      }
+    } else if (firstDelim < out.length) {
+      const firstAt = out.indexOf('@', firstDelim + 1)
+      if (firstAt !== -1) {
+        // Check for `/`, `?` or `#` inside URL password (`https://user:p/a/s/s@host`,
+        // `https://user:/s3cr3t@host`, or `https://user:p?a=1#b@host`). Do NOT touch
+        // benign URLs whose host has a numeric port or no `:`
+        // (`npmjs.com/package/@types/node`, `example.com:8443?email=a@b`).
+        const preDelim = out.slice(authStart, firstDelim)
+        const colonIdx = preDelim.indexOf(':')
+        if (colonIdx > 0 && !preDelim.startsWith('[')) {
+          const afterColon = preDelim.slice(colonIdx + 1)
+          if (!/^\d+$/.test(afterColon)) {
+            let candidate = firstAt
+            for (let tries = 0; candidate !== -1 && tries < 32; tries += 1) {
+              if (VALID_HOST_AFTER_AT.test(out.slice(candidate + 1))) {
+                out = `${out.slice(0, authStart)}${MARKER}${out.slice(candidate)}`
+                stats.redactions += 1
+                break
+              }
+              candidate = out.indexOf('@', candidate + 1)
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!/[?&#;]/.test(out)) return out
   // Query and fragment parameters with a credential's name.
   return out.replace(/([?&#;])([^=&#;?/]+)=([^&#;]*)/g, (whole: string, separator: string, name: string, value: string) => {
     if (value === '' || !isSensitiveKey(decodeName(name))) return whole
@@ -227,24 +2451,43 @@ function redactUrl(url: string, stats: SanitizeStats): string {
   })
 }
 
-function redactUrls(text: string, stats: SanitizeStats): string {
-  URL_IN_TEXT.lastIndex = 0
-  if (!URL_IN_TEXT.test(text)) return text
-  URL_IN_TEXT.lastIndex = 0
-  return text.replace(URL_IN_TEXT, (match: string) => {
-    const trailer = URL_TRAILER.exec(match)?.[0] ?? ''
-    return redactUrl(match.slice(0, match.length - trailer.length), stats) + trailer
-  })
+function nextUrlAt(text: string, from: number): { start: number; rawEnd: number } | null {
+  let pos = text.indexOf('://', from)
+  while (pos !== -1) {
+    let s = pos
+    while (s > 0 && pos - s <= 22 && isSchemeChar(text.charCodeAt(s - 1))) s -= 1
+    const len = pos - s
+    if (len >= 2 && len <= 21 && isAsciiLetter(text.charCodeAt(s)) && (s === 0 || !isWordCharCode(text.charCodeAt(s - 1)))) {
+      let e = pos + 3
+      while (e < text.length && !isUrlStop(text.charCodeAt(e))) e += 1
+      if (e > pos + 3) return { start: s, rawEnd: e }
+    }
+    pos = text.indexOf('://', pos + 3)
+  }
+  return null
 }
 
-const URL_SPANS = new RegExp(URL_IN_TEXT.source, 'gi')
+function redactUrls(text: string, stats: SanitizeStats): string {
+  if (!text.includes('://')) return text
+  let out = ''
+  let copied = 0
+  for (let u = nextUrlAt(text, 0); u !== null; u = nextUrlAt(text, u.rawEnd)) {
+    const end = trimUrlTrailerLinear(text, u.start, u.rawEnd)
+    const rawUrl = text.slice(u.start, end)
+    const redacted = redactUrl(rawUrl, stats)
+    if (redacted !== rawUrl) {
+      out += text.slice(copied, u.start) + redacted
+      copied = end
+    }
+  }
+  return copied === 0 ? text : out + text.slice(copied)
+}
 
-// Where the URLs in a text are (see URL_IN_TEXT): each one's start and end,
-// in order. Their query and fragment parameters are redactUrl's.
+// Where the URLs in a text are: each one's start and end, in order.
 function urlSpans(text: string): number[] {
   const spans: number[] = []
-  URL_SPANS.lastIndex = 0
-  for (let m = URL_SPANS.exec(text); m !== null; m = URL_SPANS.exec(text)) spans.push(m.index, m.index + m[0].length)
+  if (!text.includes('://')) return spans
+  for (let u = nextUrlAt(text, 0); u !== null; u = nextUrlAt(text, u.rawEnd)) spans.push(u.start, u.rawEnd)
   return spans
 }
 
@@ -381,13 +2624,16 @@ function namedAt(text: string, p: number, boundary: string, runs: NameRuns): Nam
 // The end of the line at or after `from`, run on through each line that ends
 // in a continuation; `start` is where the value starts.
 function lineEnd(text: string, start: number, from: number): number {
-  for (;;) {
-    const nl = text.indexOf('\n', from)
-    if (nl === -1) return text.length
-    const stop = text[nl - 1] === '\r' ? nl - 1 : nl
-    if (stop <= start || text[stop - 1] !== '\\') return stop
-    from = nl + 1
+  for (let i = from; i < text.length; ) {
+    const code = text.charCodeAt(i)
+    if (code === 10 || code === 13 || code === 0x2028 || code === 0x2029) {
+      if (i <= start || text.charCodeAt(i - 1) !== 92) return i
+      i += code === 13 && text.charCodeAt(i + 1) === 10 ? 2 : 1
+      continue
+    }
+    i += 1
   }
+  return text.length
 }
 
 // Where a `name:` or `name = ` value ends.
@@ -755,30 +3001,35 @@ function readQuotes(text: string, from: number, to: number, states?: Uint8Array,
       // Text, not a quote (see proseApostrophe).
     } else if (c === "'" || c === '"') {
       after = c === "'" ? SINGLE : DOUBLE
-    } else {
+    } else if (c === '$') {
       const n = afterContinuations(text, i + 1)
       const d = text[n] ?? ''
-      if (c === '$' && d === "'") {
+      if (d === "'") {
         after = ANSI
         next = n + 1
-      } else if (states === undefined) {
-        if (c === '`' || (c === '$' && (d === '(' || d === '{'))) after = UNKNOWN
-      } else if (comment) {
-        // A comment's text holds no code.
-      } else if (c === '`') {
-        let runLen = 0
-        while (i + runLen < to && text[i + runLen] === '`') runLen += 1
-        if (unclosedTick === -1 && (lineRuns === undefined || lineRuns.length === 0) && isFenceStart(text, from, to, i, runLen)) {
-          const nl = text.indexOf('\n', i + runLen)
-          next = nl === -1 ? to : nl + 1
-        } else {
-          ;(lineRuns ??= []).push({ start: i, len: runLen })
-          next = i + runLen
-        }
-      } else if (c === '#' && (i === 0 || /[\s;&|()<>]/.test(text[i - 1] as string))) {
-        if (i === 0 || /\s/.test(text[i - 1] as string)) comment = true
-        else after = UNKNOWN
-      } else if (c === '<' && d === '<') {
+      } else if (states === undefined && (d === '(' || d === '{')) {
+        after = UNKNOWN
+      }
+    } else if (states === undefined) {
+      if (c === '`') after = UNKNOWN
+    } else if (comment) {
+      // A comment's text holds no code.
+    } else if (c === '`') {
+      let runLen = 0
+      while (i + runLen < to && text[i + runLen] === '`') runLen += 1
+      if (unclosedTick === -1 && (lineRuns === undefined || lineRuns.length === 0) && isFenceStart(text, from, to, i, runLen)) {
+        const nl = text.indexOf('\n', i + runLen)
+        next = nl === -1 ? to : nl + 1
+      } else {
+        ;(lineRuns ??= []).push({ start: i, len: runLen })
+        next = i + runLen
+      }
+    } else if (c === '#' && (i === 0 || /[\s;&|()<>]/.test(text[i - 1] as string))) {
+      if (i === 0 || /\s/.test(text[i - 1] as string)) comment = true
+      else after = UNKNOWN
+    } else if (c === '<') {
+      const n = afterContinuations(text, i + 1)
+      if (text[n] === '<') {
         const e = afterContinuations(text, n + 1)
         if (text[e] === '<') next = e + 1
         else after = UNKNOWN
@@ -1079,11 +3330,23 @@ function redactNamedValues(text: string, stats: SanitizeStats): string {
       valueEnd = namedTokenEnd(text, start, end, outerQuoteOf((states ??= quoteStates(text))[start], m.boundary, open))
     }
     const value = text.slice(start, end)
-    if (value.trim() === '') continue
+    const trimmed = value.trim()
+    if (trimmed === '') continue
+    // Preserve values already replaced with a single redaction marker (e.g.,
+    // `[REDACTED:jwt]`, `[REDACTED:private-key]`, `` `[REDACTED]` ``, or a
+    // `-u token:[REDACTED] ...` credential whose username happens to match a
+    // sensitive word), while keeping glued tails like ` [REDACTED]:glued`.
+    if (
+      /^(?:(?:\*\*|__|[*_])[ \t]+)?`?\[REDACTED(?::[a-z-]+)?\]`?$/.test(trimmed) ||
+      (/(?:^|\s)(?:-u|--(?:proxy-)?user)[ \t=]+$/.test(text.slice(Math.max(0, m.index - 24), m.index + m.boundary.length)) && /^\[REDACTED(?::[a-z-]+)?\](?:[ \t'"]|$)/.test(trimmed))
+    ) {
+      continue
+    }
     // An auth scheme whose token a pattern already redacted (and counted),
-    // quoted or not (`"Bearer [REDACTED]"` in JSON, escaped in a log line).
+    // quoted or not (`"Bearer [REDACTED]"` in JSON, escaped in a log line),
+    // including any trailing sentence/diagnostic punctuation.
     const alreadyRedactedScheme =
-      /^\\?['"]?(?:Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|Bot)\s+\[REDACTED(?::[a-z-]+)?\]\\?['"]?$/i.test(text.slice(start, valueEnd).trim())
+      /^\\?['"]?(?:Bearer|Basic|Token|Digest|Negotiate|AWS4-HMAC-SHA256|Bot)\s+\[REDACTED(?::[a-z-]+)?\](?:\\?['"]|[:,.!?])?$/i.test(text.slice(start, valueEnd).trim())
     noteCut(text, start, valueEnd, end, stats)
     out += text.slice(copied, start) + MARKER + close
     copied = end
@@ -1097,7 +3360,8 @@ function redactNamedValues(text: string, stats: SanitizeStats): string {
 // `--api-key "VALUE"`, `--pass -VALUE`, `"--password" VALUE`), or after line
 // continuations (`--password \` and the value on the next line): the whole
 // shell argument (see readValue). The option's name is a credential's and
-// its last part a credential word, so `--password-stdin host`,
+// its last part a credential word (or a credential value noun such as
+// `--secret-string`), so `--password-stdin host`, `--secret-id prod/db`,
 // `--token-file path` and `--max-tokens 1024` keep theirs. A value that
 // starts with `--` is the next option, not a value. Line continuations (JOIN)
 // in the name are read through (`--pass\` and `word VALUE`). A continuation
@@ -1110,20 +3374,41 @@ const FLAG_VALUE = new RegExp(String.raw`(^|[^A-Za-z0-9_.-])-${JOIN}*-${JOIN}*([
 // A value that is one redaction marker and nothing else.
 const WHOLE_MARKER = /^\[REDACTED(?::[a-z-]+)?\]$/
 
+let _contText = ''
+let _contFrom = -1
+let _contTo = -1
+
 // The first index at or after `i` that a line continuation (a backslash and
 // a newline, which the shell removes) does not cover.
 function afterContinuations(text: string, i: number): number {
+  if (text[i] !== '\\') return i
+  if (text === _contText && i >= _contFrom && i < _contTo) return _contTo
+  const start = i
   for (;;) {
     if (text[i] === '\\' && text[i + 1] === '\n') i += 2
     else if (text[i] === '\\' && text[i + 1] === '\r' && text[i + 2] === '\n') i += 3
-    else return i
+    else {
+      if (i > start) {
+        _contText = text
+        _contFrom = start
+        _contTo = i
+      }
+      return i
+    }
   }
 }
 
+const CREDENTIAL_VALUE_NOUNS = new Set(['string', 'value', 'values', 'data', 'text', 'raw', 'hex', 'b64', 'base64', 'pem', 'json', 'payload', 'blob'])
+
 // Whether a long option's name is a credential's: one with a credential word
-// for its last part.
-const credentialOption = (name: string): boolean =>
-  isSensitiveKey(name) && forms(nameParts(name).pop() ?? '').some(isCredentialWord)
+// for its last part, or a compound value noun (`--secret-string`, `--token-value`).
+const credentialOption = (name: string): boolean => {
+  if (!isSensitiveKey(name)) return false
+  const parts = nameParts(name)
+  const last = parts.pop() ?? ''
+  if (forms(last).some(isCredentialWord)) return true
+  return CREDENTIAL_VALUE_NOUNS.has(last) && parts.length > 0 && forms(parts[parts.length - 1] as string).some(isCredentialWord)
+}
 
 function redactFlagValues(text: string, stats: SanitizeStats): string {
   FLAG_VALUE.lastIndex = 0
@@ -2300,12 +4585,907 @@ function redactListNames(text: string, stats: SanitizeStats): string {
   return copied === 0 ? text : out + text.slice(copied)
 }
 
-// The free-text rules: credential shapes, URLs, credential-named values, then
-// credential-named command-line options (long ones, then the listed
-// single-dash password options), then option words the shell reads in
-// pieces, then the heuristic list-name fallback.
-export function redactText(input: string, stats: SanitizeStats): string {
-  let out = input
+const WHOLE_OR_TICKED_MARKER = /^`?\[REDACTED(?::[a-z-]+)?\]`?$/
+
+function isMarkerLike(raw: string): boolean {
+  const trimmed = raw.trim()
+  return trimmed === '' || WHOLE_OR_TICKED_MARKER.test(trimmed)
+}
+
+type LineRow = { line: string; eol: string }
+
+function splitLinesPreserveEol(text: string): LineRow[] {
+  const rows: LineRow[] = []
+  let start = 0
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) {
+      const cr = i > start && text.charCodeAt(i - 1) === 13
+      rows.push({ line: text.slice(start, cr ? i - 1 : i), eol: cr ? '\r\n' : '\n' })
+      start = i + 1
+    }
+  }
+  rows.push({ line: text.slice(start), eol: '' })
+  return rows
+}
+
+function indentCols(line: string): number {
+  let c = 0
+  while (c < line.length && (line[c] === ' ' || line[c] === '\t')) c += 1
+  return c
+}
+
+const isLabelTrimChar = (raw: string, i: number): boolean => {
+  const c = raw.charCodeAt(i)
+  return (
+    c === 42 || // *
+    c === 34 || // "
+    c === 39 || // '
+    c === 96 || // `
+    c === 95 || // _
+    c === 32 || // space
+    (c >= 9 && c <= 13) ||
+    (c >= 127 && /\s/.test(raw[i] as string))
+  )
+}
+
+function cleanLabelKey(raw: string): string {
+  let start = 0
+  let end = raw.length
+  while (start < end && isLabelTrimChar(raw, start)) start += 1
+  while (end > start && isLabelTrimChar(raw, end - 1)) end -= 1
+  return raw.slice(start, end)
+}
+
+function stripTrailingParenQualifier(s: string, withSep: boolean): string {
+  let end = s.length
+  if (withSep) {
+    while (end > 0 && (s.charCodeAt(end - 1) === 32 || s.charCodeAt(end - 1) === 9)) end -= 1
+    if (end === 0) return s
+    const sep = s.charCodeAt(end - 1)
+    if (sep !== 58 && sep !== 61) return s
+    end -= 1
+    while (end > 0 && (s.charCodeAt(end - 1) === 32 || s.charCodeAt(end - 1) === 9)) end -= 1
+  }
+  // Cap at 8 consecutive trailing paren groups (each <= 40 inner chars) for O(1) bounded work.
+  for (let pass = 0; pass < 8; pass += 1) {
+    if (end === 0 || s.charCodeAt(end - 1) !== 41) break
+    const closeIdx = end - 1
+    const minOpen = Math.max(0, closeIdx - 41)
+    let openIdx = -1
+    let depth = 1
+    for (let i = closeIdx - 1; i >= minOpen; i -= 1) {
+      const c = s.charCodeAt(i)
+      if (c === 10) break
+      if (c === 41) {
+        if (depth <= 0) break
+        depth += 1
+      } else if (c === 40) {
+        depth -= 1
+        if (depth <= 0) openIdx = i
+      }
+    }
+    if (openIdx === -1) break
+    const innerLen = closeIdx - openIdx - 1
+    if (innerLen < 1 || innerLen > 40) break
+    let labelEnd = openIdx
+    while (labelEnd > 0 && (s.charCodeAt(labelEnd - 1) === 32 || s.charCodeAt(labelEnd - 1) === 9)) labelEnd -= 1
+    end = labelEnd
+  }
+  return end === s.length ? s : s.slice(0, end)
+}
+
+const YAML_BLOCK_HEADER = /^([ \t]*(?:-[ \t]+)?)([A-Za-z0-9_.*"`'-]+(?:[ \t]*\([^\n]{1,40}?\))?)[ \t]*:[ \t]*(?:[|>][+-]?\d*|\d*[|>][+-]?)[ \t]*(?:#[^\n]*)?$/
+const K8S_NAME_LINE = /^([ \t]*-[ \t]+)name[ \t]*:[ \t]*(?:"([^"\n]+)"|'([^'\n]+)'|([^\s#]+))[ \t]*(?:#.*)?$/
+const K8S_VALUE_LINE = /^([ \t]+)value[ \t]*:[ \t]*(.*)$/
+
+// Redacts K8s/Actions `- name: SENSITIVE\n  value: ...` pairs and multi-line
+// YAML block scalars (`|`, `>`, `|-`, `>-`, `|+`, `>+`) under sensitive keys.
+function redactK8sAndYamlBlocks(text: string, stats: SanitizeStats): string {
+  if (!text.includes(':') || (!text.includes('|') && !text.includes('>') && !text.includes('name:'))) return text
+  const rows = splitLinesPreserveEol(text)
+  const out: LineRow[] = []
+  let changed = false
+  let i = 0
+  while (i < rows.length) {
+    const row = rows[i]!
+    const line = row.line
+    // 1. Kubernetes / GitHub Actions env `- name: <SENSITIVE>\n  value: <VAL>`
+    const nm = K8S_NAME_LINE.exec(line)
+    if (nm !== null && i + 1 < rows.length) {
+      const keyName = (nm[2] ?? nm[3] ?? nm[4] ?? '').trim()
+      if (keyName !== '' && isSensitiveKey(keyName)) {
+        const prefixLen = (nm[1] as string).length
+        const nextRow = rows[i + 1]!
+        const vm = K8S_VALUE_LINE.exec(nextRow.line)
+        if (vm !== null && (vm[1] as string).length >= prefixLen) {
+          const valRaw = (vm[2] as string).trim()
+          if (/^(?:[|>][+-]?\d*|\d*[|>][+-]?)(?:[ \t]*(?:#.*)?)?$/.test(valRaw)) {
+            const keyCol = (vm[1] as string).length
+            let lastBody = -1
+            for (let j = i + 2; j < rows.length; j += 1) {
+              const cand = rows[j]!.line
+              if (cand.trim() === '') continue
+              if (indentCols(cand) > keyCol) lastBody = j
+              else break
+            }
+            if (lastBody !== -1) {
+              out.push(row, { line: `${vm[1]}value: ${MARKER}`, eol: nextRow.eol })
+              stats.redactions += 1
+              changed = true
+              i = lastBody + 1
+              continue
+            }
+          } else if (valRaw !== '' && !isMarkerLike(valRaw) && !valRaw.startsWith('#')) {
+            out.push(row, { line: `${vm[1]}value: ${MARKER}`, eol: nextRow.eol })
+            stats.redactions += 1
+            changed = true
+            i += 2
+            continue
+          }
+        }
+      }
+    }
+
+    // 2. General YAML block scalar (`password: |\n  secret...`)
+    const ym = YAML_BLOCK_HEADER.exec(line)
+    if (ym !== null) {
+      const lead = ym[1] as string
+      const rawKey = stripTrailingParenQualifier(ym[2] as string, false)
+      const cleaned = cleanLabelKey(rawKey)
+      if (cleaned !== '' && (isSensitiveKey(cleaned) || isSensitiveKey(cleaned.replace(/\s+/g, '_')))) {
+        const keyCol = lead.length
+        let lastBody = -1
+        for (let j = i + 1; j < rows.length; j += 1) {
+          const cand = rows[j]!.line
+          if (cand.trim() === '') continue
+          if (indentCols(cand) > keyCol) lastBody = j
+          else break
+        }
+        if (lastBody !== -1) {
+          out.push({ line: `${lead}${ym[2]}: ${MARKER}`, eol: row.eol })
+          stats.redactions += 1
+          changed = true
+          i = lastBody + 1
+          continue
+        }
+      }
+    }
+    out.push(row)
+    i += 1
+  }
+  if (!changed) return text
+  return out.map(r => r.line + r.eol).join('')
+}
+
+const MD_WRAP_CLOSED = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_`])([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,79}[A-Za-z0-9_.-])?(?:[ \t]*\([^\n]{1,40}?\))?)\2([ \t]*(?:\([^\n]{1,40}?\)[ \t]*)?[:=][ \t]*)(.+)$/
+const MD_WRAP_AROUND_SEP = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)(\*\*|__|[*_])([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,79}[A-Za-z0-9_.-])?(?:[ \t]*\([^\n]{1,40}?\))?)([:=])\2([ \t]*)(.+)$/
+const MD_PAREN_LABEL = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?)([A-Za-z_](?:[A-Za-z0-9_.\t -]{0,59}[A-Za-z0-9_.-])?[ \t]*\([^\n]{1,40}?\)[ \t]*[:=][ \t]*)(.+)$/
+const MD_SEPARATOR_ROW = /^\|(?:\s*:?-{2,}:?\s*\|)+\s*$/
+const GENERIC_KEY_COL_HEADERS = new Set([
+  'key', 'keys', 'name', 'names', 'field', 'fields', 'setting', 'settings',
+  'property', 'properties', 'variable', 'variables', 'var', 'vars', 'env',
+  'param', 'params', 'parameter', 'parameters', 'option', 'options',
+  'flag', 'flags', 'header', 'headers', 'item', 'items', 'attribute', 'attributes',
+  'secret name', 'key name', 'token name', 'credential name', 'config key',
+])
+
+const isSensitiveLabel = (raw: string): boolean => {
+  const cleaned = cleanLabelKey(raw)
+  if (cleaned === '' || cleaned.length > 80) return false
+  return isSensitiveKey(cleaned) || (cleaned.includes(' ') && isSensitiveKey(cleaned.replace(/[ \t]+/g, '_')))
+}
+
+const isMdWrapperChar = (c: number): boolean =>
+  c === 42 || c === 34 || c === 39 || c === 95 || c === 96
+
+function stripMarkdownWrappers(s: string): string {
+  let start = 0
+  let end = s.length
+  while (start < end && isMdWrapperChar(s.charCodeAt(start))) start += 1
+  while (end > start && isMdWrapperChar(s.charCodeAt(end - 1))) end -= 1
+  return s.slice(start, end)
+}
+
+const isSkippedCellOrVal = (raw: string): boolean => {
+  const t = raw.trim()
+  if (t === '' || /^:?-{2,}:?$/.test(t) || /^(?:n\/a|none|null|unset|empty|tbd)$/i.test(t)) return true
+  return isMarkerLike(t) || isMarkerLike(stripMarkdownWrappers(t))
+}
+
+function redactCellText(rawCell: string, stats: SanitizeStats): string {
+  let leadEnd = 0
+  while (leadEnd < rawCell.length) {
+    const c = rawCell.charCodeAt(leadEnd)
+    if (c !== 32 && c !== 9) break
+    leadEnd += 1
+  }
+  let trailStart = rawCell.length
+  while (trailStart > leadEnd) {
+    const c = rawCell.charCodeAt(trailStart - 1)
+    if (c !== 32 && c !== 9) break
+    trailStart -= 1
+  }
+  const lead = rawCell.slice(0, leadEnd)
+  const trail = rawCell.slice(trailStart)
+  const inner = rawCell.slice(leadEnd, trailStart)
+  if (isSkippedCellOrVal(inner)) return rawCell
+  stats.redactions += 1
+  if (inner.startsWith('`') && inner.endsWith('`') && inner.length >= 2) return `${lead}\`${MARKER}\`${trail}`
+  return `${lead}${MARKER}${trail}`
+}
+
+function splitPipeRow(line: string): { prefix: string; cells: string[]; suffix: string } | null {
+  const firstPipe = line.indexOf('|')
+  const lastPipe = line.lastIndexOf('|')
+  if (firstPipe === -1 || lastPipe <= firstPipe) return null
+  if (line.slice(0, firstPipe).trim() !== '' || line.slice(lastPipe + 1).trim() !== '') return null
+  const cells: string[] = []
+  let cur = ''
+  for (let i = firstPipe + 1; i < lastPipe; i += 1) {
+    if (line[i] === '\\' && i + 1 < lastPipe && line[i + 1] === '|') {
+      cur += '\\|'
+      i += 1
+      continue
+    }
+    if (line[i] === '|') {
+      cells.push(cur)
+      cur = ''
+    } else {
+      cur += line[i]
+    }
+  }
+  cells.push(cur)
+  return { prefix: line.slice(0, firstPipe + 1), cells, suffix: line.slice(lastPipe) }
+}
+
+// Redacts formatted Markdown labels (`**Password**: v`, `` `password`: `v` ``,
+// `Password (staging): v`) and Markdown pipe tables (`| `DB_PASSWORD` | `v` |`).
+function redactMarkdownLabelsAndTables(text: string, stats: SanitizeStats): string {
+  const hasColonEq = text.includes(':') || text.includes('=')
+  const hasPipe = text.includes('|')
+  if (!hasColonEq && !hasPipe) return text
+  const rows = splitLinesPreserveEol(text)
+  let changed = false
+
+  // 1. Formatted labels & parenthetical qualifiers.
+  if (hasColonEq) {
+    for (let i = 0; i < rows.length; i += 1) {
+      const line = rows[i]!.line
+      let matched = false
+      let prefix = ''
+      let val = ''
+      const m1 = MD_WRAP_CLOSED.exec(line)
+      if (m1 !== null && isSensitiveLabel(stripTrailingParenQualifier(m1[3] as string, false))) {
+        prefix = `${m1[1]}${m1[2]}${m1[3]}${m1[2]}${m1[4]}`
+        val = m1[5] as string
+        matched = true
+      } else {
+        const m2 = MD_WRAP_AROUND_SEP.exec(line)
+        if (m2 !== null && isSensitiveLabel(stripTrailingParenQualifier(m2[3] as string, false))) {
+          prefix = `${m2[1]}${m2[2]}${m2[3]}${m2[4]}${m2[2]}${m2[5]}`
+          val = m2[6] as string
+          matched = true
+        } else {
+          const m3 = MD_PAREN_LABEL.exec(line)
+          if (m3 !== null) {
+            const labelNoParen = stripTrailingParenQualifier(m3[2] as string, true)
+            if (isSensitiveLabel(labelNoParen)) {
+              prefix = `${m3[1]}${m3[2]}`
+              val = m3[3] as string
+              matched = true
+            }
+          }
+        }
+      }
+      if (!matched) continue
+      const trimmedVal = val.trim()
+      if (isSkippedCellOrVal(trimmedVal)) continue
+      const tickWrapped = trimmedVal.startsWith('`') && trimmedVal.endsWith('`') && trimmedVal.length >= 2 && !trimmedVal.slice(1, -1).includes('`')
+      rows[i]!.line = prefix + (tickWrapped ? `\`${MARKER}\`` : MARKER)
+      stats.redactions += 1
+      changed = true
+    }
+  }
+
+  // 2. Markdown pipe tables (`| ... |`).
+  if (hasPipe) {
+    let i = 0
+    while (i < rows.length) {
+      const parsed0 = splitPipeRow(rows[i]!.line)
+      if (parsed0 === null || parsed0.cells.length < 2) {
+        i += 1
+        continue
+      }
+      let end = i + 1
+      while (end < rows.length) {
+        const p = splitPipeRow(rows[end]!.line)
+        if (p === null || p.cells.length < 2) break
+        end += 1
+      }
+      const hasSep = i + 1 < end && MD_SEPARATOR_ROW.test(rows[i + 1]!.line.trim())
+      if (hasSep) {
+        const hdrCells = parsed0.cells
+        const sensitiveCols = new Set<number>()
+        const genericCols = new Set<number>()
+        for (let c = 0; c < hdrCells.length; c += 1) {
+          const clean = cleanLabelKey(hdrCells[c] as string)
+          const lower = clean.toLowerCase()
+          if (GENERIC_KEY_COL_HEADERS.has(lower)) genericCols.add(c)
+          else if (isSensitiveLabel(clean)) sensitiveCols.add(c)
+        }
+        for (let r = i + 2; r < end; r += 1) {
+          if (MD_SEPARATOR_ROW.test(rows[r]!.line.trim())) continue
+          const row = splitPipeRow(rows[r]!.line)
+          if (row === null) continue
+          let rowChanged = false
+          for (let c = 0; c < row.cells.length; c += 1) {
+            if (sensitiveCols.has(c)) {
+              const nextCell = redactCellText(row.cells[c] as string, stats)
+              if (nextCell !== row.cells[c]) {
+                row.cells[c] = nextCell
+                rowChanged = true
+              }
+            } else if (c + 1 < row.cells.length && (genericCols.has(c) || c === 0 || row.cells.length === 2)) {
+              const keyClean = cleanLabelKey(row.cells[c] as string)
+              if (keyClean !== '' && isSensitiveLabel(keyClean)) {
+                const nextCell = redactCellText(row.cells[c + 1] as string, stats)
+                if (nextCell !== row.cells[c + 1]) {
+                  row.cells[c + 1] = nextCell
+                  rowChanged = true
+                }
+              }
+            }
+          }
+          if (rowChanged) {
+            rows[r]!.line = `${row.prefix}${row.cells.join('|')}${row.suffix}`
+            changed = true
+          }
+        }
+      } else {
+        for (let r = i; r < end; r += 1) {
+          if (MD_SEPARATOR_ROW.test(rows[r]!.line.trim())) continue
+          const row = splitPipeRow(rows[r]!.line)
+          if (row === null || row.cells.length < 2) continue
+          let rowChanged = false
+          for (let c = 0; c < row.cells.length - 1; c += 1) {
+            const keyClean = cleanLabelKey(row.cells[c] as string)
+            if (keyClean !== '' && isSensitiveLabel(keyClean)) {
+              const nextCell = redactCellText(row.cells[c + 1] as string, stats)
+              if (nextCell !== row.cells[c + 1]) {
+                row.cells[c + 1] = nextCell
+                rowChanged = true
+              }
+            }
+          }
+          if (rowChanged) {
+            rows[r]!.line = `${row.prefix}${row.cells.join('|')}${row.suffix}`
+            changed = true
+          }
+        }
+      }
+      i = end
+    }
+  }
+
+  if (!changed) return text
+  return rows.map(r => r.line + r.eol).join('')
+}
+
+const ENV_INDEX_RE = /\b((?:os\.environ(?:\.setdefault)?|process\.env|ENV|System\.getenv|setenv))([ \t]*)(?:\[[ \t]*(['"])([^'"\n]{1,100})\3[ \t]*\][ \t]*=[ \t]*|\([ \t]*(['"])([^'"\n]{1,100})\5[ \t]*,[ \t]*)("(?:\\.|[^"\n\\])*"|'(?:\\.|[^'\n\\])*'|`[^`\n]*`|[^;\n,)]+)/g
+const SETTER_ONE_ARG_RE = /\b((?:set|with)_?([A-Za-z][A-Za-z0-9_]{1,80}))([ \t]*\([ \t]*)("(?:\\.|[^"\n\\])*"|'(?:\\.|[^'\n\\])*')/g
+const SETTER_TWO_ARG_RE = /\b((?:set|with|put|add|setenv)_?[A-Za-z0-9_]{0,40})([ \t]*\([ \t]*)(['"])([^'"\n]{1,80})\3([ \t]*,[ \t]*)("(?:\\.|[^"\n\\])*"|'(?:\\.|[^'\n\\])*')/g
+const XML_TAG_RE = /<([A-Za-z_][A-Za-z0-9_.:-]{0,80})>([^<\r\n]{1,4096})<\/\1>/g
+const SQL_IDENT_RE = /\b(IDENTIFIED(?:\s+WITH\s+[A-Za-z0-9_]+)?\s+BY|WITH(?:\s+(?:ENCRYPTED|UNENCRYPTED))?\s+PASSWORD)([ \t]+)("(?:""|\\[^\r\n]|[^"\\\r\n])*(?:"|\\?(?=\r|\n|$))|'(?:''|\\[^\r\n]|[^'\\\r\n])*(?:'|\\?(?=\r|\n|$))|[^\s;]+)/gi
+const DOCKER_ENV_RE = /^([ \t]*(?:ENV|ARG)[ \t]+)([A-Za-z_][A-Za-z0-9_]{0,80})([ \t]+)(?![=\s])([^\r\n]+)$/gm
+const NETRC_LINE_HDR = /\b(?:machine[ \t]+\S+|default)\b/
+const NETRC_PW_RE = /\b(password)([ \t]+)(\S+)/g
+
+function redactQuotedOrBare(raw: string, stats: SanitizeStats): string {
+  const trimmed = raw.trim()
+  if (trimmed === '' || trimmed === '""' || trimmed === "''" || isMarkerLike(trimmed)) return raw
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith('`') && trimmed.endsWith('`'))) {
+    const q = trimmed[0] as string
+    const inner = trimmed.slice(1, -1)
+    if (isMarkerLike(inner)) return raw
+    stats.redactions += 1
+    return `${q}${MARKER}${q}`
+  }
+  stats.redactions += 1
+  return MARKER
+}
+
+// Redacts common code & config secret forms: env dictionary lookups, setter
+// methods, XML config tags, SQL `IDENTIFIED BY`, `.netrc`, and Dockerfile `ENV`.
+function redactCodeAndConfigForms(text: string, stats: SanitizeStats): string {
+  let out = text
+
+  if (out.includes('os.environ') || out.includes('process.env') || out.includes('ENV[') || out.includes('setenv')) {
+    ENV_INDEX_RE.lastIndex = 0
+    out = out.replace(ENV_INDEX_RE, (whole: string, obj: string, sp: string, q1: string, k1: string, q2: string, k2: string, val: string) => {
+      const key = k1 ?? k2
+      if (!isSensitiveKey(key)) return whole
+      const rep = redactQuotedOrBare(val, stats)
+      if (rep === val) return whole
+      return q1 !== undefined ? `${obj}${sp}[${q1}${k1}${q1}] = ${rep}` : `${obj}${sp}(${q2}${k2}${q2}, ${rep}`
+    })
+  }
+
+  if (out.includes('(') && (/set|with|put|add/i.test(out))) {
+    SETTER_ONE_ARG_RE.lastIndex = 0
+    out = out.replace(SETTER_ONE_ARG_RE, (whole: string, fn: string, suffix: string, open: string, arg: string) => {
+      const cleanSuffix = suffix.replace(/^_+/, '')
+      if (cleanSuffix === '' || !isSensitiveKey(cleanSuffix)) return whole
+      const rep = redactQuotedOrBare(arg, stats)
+      return rep === arg ? whole : `${fn}${open}${rep}`
+    })
+    SETTER_TWO_ARG_RE.lastIndex = 0
+    out = out.replace(SETTER_TWO_ARG_RE, (whole: string, fn: string, open: string, q: string, key: string, comma: string, val: string) => {
+      if (!isSensitiveKey(key)) return whole
+      const rep = redactQuotedOrBare(val, stats)
+      return rep === val ? whole : `${fn}${open}${q}${key}${q}${comma}${rep}`
+    })
+  }
+
+  if (out.includes('<') && out.includes('</')) {
+    XML_TAG_RE.lastIndex = 0
+    out = out.replace(XML_TAG_RE, (whole: string, tag: string, inner: string) => {
+      const colon = tag.indexOf(':')
+      const local = colon === -1 ? tag : tag.slice(colon + 1)
+      if (!isSensitiveKey(local)) return whole
+      const trimmed = inner.trim()
+      if (trimmed === '' || isMarkerLike(trimmed) || /^\$\{[^}]+\}$/.test(trimmed)) return whole
+      stats.redactions += 1
+      return `<${tag}>${MARKER}</${tag}>`
+    })
+  }
+
+  if (/identified|password/i.test(out) && /identified\s+|with\s+(?:encrypted\s+|unencrypted\s+)?password\s+/i.test(out)) {
+    SQL_IDENT_RE.lastIndex = 0
+    out = out.replace(SQL_IDENT_RE, (whole: string, clause: string, sp: string, val: string) => {
+      if (/^null$/i.test(val)) return whole
+      const rep = redactQuotedOrBare(val, stats)
+      return rep === val ? whole : `${clause}${sp}${rep}`
+    })
+  }
+
+  if (out.includes('password') && (out.includes('machine') || out.includes('default'))) {
+    const rows = splitLinesPreserveEol(out)
+    let stanzaLinesLeft = 0
+    let changed = false
+    for (let i = 0; i < rows.length; i += 1) {
+      const line = rows[i]!.line
+      const hasHdr = NETRC_LINE_HDR.test(line)
+      if (hasHdr) stanzaLinesLeft = 6
+      else if (line.trim() === '' || /^#/.test(line.trim())) stanzaLinesLeft = 0
+      if (stanzaLinesLeft > 0) {
+        const isValidStanzaLine = hasHdr || /^[ \t]*(?:login|account|macdef|password)[ \t]+/.test(line)
+        if (isValidStanzaLine) {
+          NETRC_PW_RE.lastIndex = 0
+          const updated = line.replace(NETRC_PW_RE, (whole: string, kw: string, sp: string, secret: string) => {
+            if (isMarkerLike(secret)) return whole
+            stats.redactions += 1
+            return `${kw}${sp}${MARKER}`
+          })
+          if (updated !== line) {
+            rows[i]!.line = updated
+            changed = true
+          }
+          stanzaLinesLeft -= 1
+        } else {
+          stanzaLinesLeft = 0
+        }
+      }
+    }
+    if (changed) out = rows.map(r => r.line + r.eol).join('')
+  }
+
+  if (/^[ \t]*(?:ENV|ARG)[ \t]+/m.test(out)) {
+    DOCKER_ENV_RE.lastIndex = 0
+    out = out.replace(DOCKER_ENV_RE, (whole: string, kw: string, key: string, sp: string, val: string) => {
+      if (!isSensitiveKey(key)) return whole
+      const trimmed = val.trim()
+      if (trimmed === '' || isMarkerLike(trimmed) || /^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})$/.test(trimmed)) return whole
+      stats.redactions += 1
+      return `${kw}${key}${sp}${MARKER}`
+    })
+  }
+
+  return out
+}
+
+const SHELL_WRAPPERS = new Set(['sudo', 'env', 'command', 'nohup', 'time', 'timeout', 'gtimeout', 'builtin', 'exec'])
+const SUDO_ARG_OPTS = new Set(['-u', '--user', '-g', '--group', '-h', '--host', '-p', '--prompt', '-r', '--role', '-t', '--type', '-U', '--other-user', '-C', '--close-from', '-D', '--chdir', '-R', '--chroot', '-T', '--command-timeout'])
+const ENV_ARG_OPTS = new Set(['-u', '--unset', '-C', '--chdir', '-S', '--split-string'])
+const ATTACHED_P_CMDS = new Set(['mysql', 'mysqldump', 'mariadb', 'mariadb-dump', 'mongosh', 'mongo', 'sshpass', 'twine', '7z', '7za', '7zr', 'psql', 'redis-cli', 'valkey-cli'])
+const ATTACHED_P_PORT_CMDS = new Set(['psql', 'redis-cli', 'valkey-cli'])
+const SPACED_P_PASS_CMDS = new Set(['mysql', 'mysqldump', 'mariadb', 'mariadb-dump', 'mongosh', 'mongo', 'sshpass', 'twine', 'htpasswd', 'htdigest', 'smbclient', 'rpcclient', 'net', 'mosquitto_passwd', 'kadmin'])
+const LOGIN_SUBCMD_CMDS = new Set(['docker', 'podman', 'nerdctl', 'skopeo', 'oras', 'crane', 'helm', 'npm', 'yarn', 'pnpm', 'poetry', 'pipenv'])
+// Where a login sits one level down: `helm registry login`, `crane auth login`.
+const LOGIN_PARENT_SUBCMDS = new Set(['registry', 'auth'])
+const SPACED_P_EXCLUDED = new Set(['claude', 'mkdir', 'cp', 'mv', 'rm', 'ln', 'install', 'tar', 'git', 'ssh', 'scp', 'rsync', 'psql', 'redis-cli', 'valkey-cli', 'grep', 'rg', 'sed', 'awk', 'python', 'python3', 'node', 'sh', 'bash', 'zsh'])
+const POSTGRES_W_CMDS = new Set(['psql', 'pg_dump', 'pg_dumpall', 'pg_restore', 'createdb', 'dropdb', 'createuser', 'dropuser', 'clusterdb', 'reindexdb', 'vacuumdb'])
+const REDIS_A_CMDS = new Set(['redis-cli', 'valkey-cli'])
+const P_UPPER_PASS_CMDS = new Set(['sqlcmd', 'zip', 'unzip', '7z', '7za', '7zr'])
+const SECRET_VALUE_CMDS = new Set(['aws', 'gcloud', 'vault', 'az', 'gh', 'doppler', 'infisical'])
+const GIT_NONSECRET_KEYS = new Set(['credential.helper', 'credential.username', 'credential.usehttppath', 'credential.modalprompt', 'user.signingkey'])
+const ENV_ASSIGN_TOK = /^[A-Za-z_][A-Za-z0-9_]*=/
+const SHELL_VAR_LITERAL = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})$/
+
+type CliToken = { start: number; end: number; raw: string; unquoted: string; quote: string }
+type CliEdit = { start: number; end: number; replacement: string }
+
+function unquoteCliToken(raw: string): { unquoted: string; quote: string } {
+  if (raw.length >= 2 && ((raw[0] === '"' && raw[raw.length - 1] === '"') || (raw[0] === "'" && raw[raw.length - 1] === "'"))) {
+    return { unquoted: raw.slice(1, -1), quote: raw[0] as string }
+  }
+  return { unquoted: raw, quote: '' }
+}
+
+// No value of its own: empty, another option, a shell variable or a marker.
+const isCliNonValue = (tok: CliToken): boolean => {
+  const s = tok.unquoted
+  return s === '' || s.startsWith('-') || isMarkerLike(s) || SHELL_VAR_LITERAL.test(s)
+}
+
+const isCliPathOrPort = (tok: CliToken): boolean => {
+  const s = tok.unquoted
+  if (isCliNonValue(tok)) return true
+  if (/^\d+(?::\d+)?$/.test(s)) return true
+  if (tok.quote === '' && (/^[./~]/.test(s) || s.includes('/'))) return true
+  return false
+}
+
+const cmdBaseName = (raw: string): string => {
+  const slash = raw.lastIndexOf('/')
+  return (slash === -1 ? raw : raw.slice(slash + 1)).toLowerCase()
+}
+
+function scanCliSegment(text: string, tokens: CliToken[], edits: CliEdit[], stats: SanitizeStats, depth: number): void {
+  if (tokens.length === 0) return
+  let idx = 0
+  while (idx < tokens.length) {
+    const t = tokens[idx]!.unquoted
+    if (ENV_ASSIGN_TOK.test(t)) {
+      idx += 1
+      continue
+    }
+    const base = cmdBaseName(t)
+    if (SHELL_WRAPPERS.has(base)) {
+      idx += 1
+      if (base === 'timeout' || base === 'gtimeout') {
+        while (idx < tokens.length && tokens[idx]!.unquoted.startsWith('-')) {
+          const opt = tokens[idx]!.unquoted
+          idx += 1
+          if (opt === '--') break
+          if ((opt === '-k' || opt === '--kill-after' || opt === '-s' || opt === '--signal') && idx < tokens.length) {
+            idx += 1
+          }
+        }
+        if (idx < tokens.length && /^(?:\d+(?:\.\d+)?|\.\d+)[smhd]?$/i.test(tokens[idx]!.unquoted)) idx += 1
+      } else if (base === 'env' || base === 'sudo' || base === 'command' || base === 'time') {
+        while (idx < tokens.length && (tokens[idx]!.unquoted.startsWith('-') || ENV_ASSIGN_TOK.test(tokens[idx]!.unquoted))) {
+          const opt = tokens[idx]!.unquoted
+          idx += 1
+          if (opt === '--') break
+          if (base === 'sudo' && SUDO_ARG_OPTS.has(opt) && idx < tokens.length) idx += 1
+          else if (base === 'env' && ENV_ARG_OPTS.has(opt) && idx < tokens.length) idx += 1
+        }
+      }
+      continue
+    }
+    break
+  }
+  if (idx >= tokens.length) return
+
+  const cmd = cmdBaseName(tokens[idx]!.unquoted)
+  if ((cmd === 'sh' || cmd === 'bash' || cmd === 'zsh' || cmd === 'dash' || cmd === 'ksh') && depth < 3) {
+    for (let j = idx + 1; j < tokens.length - 1; j += 1) {
+      const f = tokens[j]!.unquoted
+      if (f === '-c' || f === '-lc') {
+        const scriptTok = tokens[j + 1]!
+        if (scriptTok.quote !== '' && !scriptTok.unquoted.includes('\\')) {
+          const innerOut = redactCliFlagsAndPositionalImpl(scriptTok.unquoted, stats, depth + 1)
+          if (innerOut !== scriptTok.unquoted) {
+            edits.push({ start: scriptTok.start + 1, end: scriptTok.end - 1, replacement: innerOut })
+          }
+        }
+        return
+      }
+    }
+  }
+
+  let hasLoginSubcmd = false
+  let sawUserFlag = false
+  let hasSecretSubcmd = false
+  for (let j = idx + 1; j < tokens.length; j += 1) {
+    const u = tokens[j]!.unquoted
+    const low = u.toLowerCase()
+    if (low === 'login' && (j === idx + 1 || (j === idx + 2 && LOGIN_PARENT_SUBCMDS.has(tokens[idx + 1]!.unquoted.toLowerCase())))) hasLoginSubcmd = true
+    if (u === '-u' || u === '--user' || u === '--proxy-user' || u.startsWith('--user=') || u.startsWith('--proxy-user=')) sawUserFlag = true
+    if (j <= idx + 2 && (low === 'secretsmanager' || low === 'ssm' || low === 'secrets' || low === 'secret' || low === 'kv' || low === 'keyvault')) {
+      hasSecretSubcmd = true
+    }
+  }
+
+  // `aws configure set [--profile P] <sensitive_key> <val>`
+  if (cmd === 'aws' && tokens[idx + 1]?.unquoted === 'configure' && tokens[idx + 2]?.unquoted === 'set') {
+    const positional: CliToken[] = []
+    for (let j = idx + 3; j < tokens.length; j += 1) {
+      const u = tokens[j]!.unquoted
+      if (u === '--profile' || u === '-p') {
+        j += 1
+        continue
+      }
+      if (u.startsWith('-')) continue
+      positional.push(tokens[j]!)
+    }
+    if (positional.length >= 2) {
+      const keyTok = positional[0]!
+      const valTok = positional[1]!
+      if (isSensitiveKey(keyTok.unquoted) && !isMarkerLike(valTok.unquoted) && !SHELL_VAR_LITERAL.test(valTok.unquoted)) {
+        edits.push({ start: valTok.start, end: valTok.end, replacement: MARKER })
+        stats.redactions += 1
+        return
+      }
+    }
+  }
+
+  // `git config ... <sensitive_key> <val>`
+  if (cmd === 'git' && tokens[idx + 1]?.unquoted === 'config') {
+    let readOnly = false
+    const positional: CliToken[] = []
+    for (let j = idx + 2; j < tokens.length; j += 1) {
+      const u = tokens[j]!.unquoted
+      if (u === '--get' || u === '--get-all' || u === '--get-regexp' || u === '--unset' || u === '--unset-all' || u === '--list' || u === '-l' || u === '-e' || u === '--edit') {
+        readOnly = true
+        break
+      }
+      if (u === '--file' || u === '-f' || u === '--blob' || u === '--type' || u === '-t' || u === '--default' || u === '--value') {
+        j += 1
+        continue
+      }
+      if (u.startsWith('-')) continue
+      positional.push(tokens[j]!)
+    }
+    if (!readOnly && positional.length >= 2) {
+      const keyTok = positional[0]!
+      const valTok = positional[1]!
+      const lowKey = keyTok.unquoted.toLowerCase()
+      if (!GIT_NONSECRET_KEYS.has(lowKey) && isSensitiveKey(keyTok.unquoted) && !isMarkerLike(valTok.unquoted) && !SHELL_VAR_LITERAL.test(valTok.unquoted)) {
+        edits.push({ start: valTok.start, end: valTok.end, replacement: MARKER })
+        stats.redactions += 1
+        return
+      }
+    }
+  }
+
+  for (let j = idx + 1; j < tokens.length; j += 1) {
+    const tok = tokens[j]!
+    const u = tok.unquoted
+    // `-u user:pass` / `--user user:pass` / `--proxy-user=user:pass`
+    if (u === '-u' || u === '--user' || u === '--proxy-user') {
+      const nextTok = tokens[j + 1]
+      if (nextTok !== undefined) {
+        const inner = nextTok.unquoted
+        const colon = inner.indexOf(':')
+        if (colon > 0 && !inner.includes('://')) {
+          const passPart = inner.slice(colon + 1)
+          if (passPart !== '' && !isMarkerLike(passPart) && !SHELL_VAR_LITERAL.test(passPart)) {
+            const offsetInRaw = nextTok.quote !== '' ? 1 + colon + 1 : colon + 1
+            const endOffsetInRaw = nextTok.quote !== '' ? nextTok.raw.length - 1 : nextTok.raw.length
+            edits.push({ start: nextTok.start + offsetInRaw, end: nextTok.start + endOffsetInRaw, replacement: MARKER })
+            stats.redactions += 1
+            j += 1
+            continue
+          }
+        }
+      }
+      continue
+    }
+    if (u.startsWith('-u') && u.length > 2 && u[2] !== '=') {
+      const val = u.slice(2)
+      const colon = val.indexOf(':')
+      if (colon > 0 && !val.includes('://')) {
+        const passPart = val.slice(colon + 1)
+        if (passPart !== '' && !isMarkerLike(passPart) && !SHELL_VAR_LITERAL.test(passPart)) {
+          edits.push({ start: tok.start + 2 + colon + 1, end: tok.end, replacement: MARKER })
+          stats.redactions += 1
+          continue
+        }
+      }
+    }
+    const eqUser = /^(?:--(?:proxy-)?user|-u)=(.+)$/.exec(u)
+    if (eqUser !== null) {
+      const eqPos = u.indexOf('=')
+      const val = eqUser[1] as string
+      const colon = val.indexOf(':')
+      if (colon > 0 && !val.includes('://')) {
+        const passPart = val.slice(colon + 1)
+        if (passPart !== '' && !isMarkerLike(passPart) && !SHELL_VAR_LITERAL.test(passPart)) {
+          const offsetInRaw = (tok.quote !== '' ? 1 : 0) + eqPos + 1 + colon + 1
+          const endOffset = tok.quote !== '' ? tok.end - 1 : tok.end
+          edits.push({ start: tok.start + offsetInRaw, end: endOffset, replacement: MARKER })
+          stats.redactions += 1
+          continue
+        }
+      }
+    }
+
+    // Attached `-p<pass>` on DB / password CLIs
+    if (ATTACHED_P_CMDS.has(cmd) && u.startsWith('-p') && u.length > 2) {
+      const pass = u.slice(2)
+      const skipPort = ATTACHED_P_PORT_CMDS.has(cmd) && /^\d{1,5}$/.test(pass)
+      if (!skipPort && !isMarkerLike(pass) && !SHELL_VAR_LITERAL.test(pass)) {
+        const qOff = tok.quote !== '' ? 1 : 0
+        edits.push({ start: tok.start + qOff + 2, end: tok.end - qOff, replacement: MARKER })
+        stats.redactions += 1
+        continue
+      }
+    }
+
+    // Attached `-P<pass>` on DB / archive CLIs (`sqlcmd`, `zip`, `unzip`, `7z*`)
+    if (P_UPPER_PASS_CMDS.has(cmd) && u.startsWith('-P') && u.length > 2) {
+      const pass = u.slice(2)
+      if (!isMarkerLike(pass) && !SHELL_VAR_LITERAL.test(pass)) {
+        const qOff = tok.quote !== '' ? 1 : 0
+        edits.push({ start: tok.start + qOff + 2, end: tok.end - qOff, replacement: MARKER })
+        stats.redactions += 1
+        continue
+      }
+    }
+
+    // Attached `-a<pass>` on Redis / Valkey CLIs
+    if (REDIS_A_CMDS.has(cmd) && u.startsWith('-a') && u.length > 2) {
+      const pass = u.slice(2)
+      if (!isMarkerLike(pass) && !SHELL_VAR_LITERAL.test(pass)) {
+        const qOff = tok.quote !== '' ? 1 : 0
+        edits.push({ start: tok.start + qOff + 2, end: tok.end - qOff, replacement: MARKER })
+        stats.redactions += 1
+        continue
+      }
+    }
+
+    // Spaced `-p <pass>`. On a password-only CLI or a registry login, `-p`
+    // takes nothing but the password, so a value that reads like a port or a
+    // path is one too. Elsewhere a user flag alone marks `-p` as a password,
+    // and a port or path after it stays (`docker run -u 1000 -p 8080:80`).
+    if (u === '-p' && !SPACED_P_EXCLUDED.has(cmd)) {
+      const passOnly = SPACED_P_PASS_CMDS.has(cmd) || (LOGIN_SUBCMD_CMDS.has(cmd) && hasLoginSubcmd)
+      const nextTok = tokens[j + 1]
+      if (nextTok !== undefined && (passOnly ? !isCliNonValue(nextTok) : sawUserFlag && !isCliPathOrPort(nextTok))) {
+        edits.push({ start: nextTok.start, end: nextTok.end, replacement: MARKER })
+        stats.redactions += 1
+        j += 1
+        continue
+      }
+    }
+
+    // Scoped `-W <pass>`, `-a <pass>`, `-P <pass>`
+    if ((u === '-W' && POSTGRES_W_CMDS.has(cmd)) || (u === '-a' && REDIS_A_CMDS.has(cmd)) || (u === '-P' && P_UPPER_PASS_CMDS.has(cmd))) {
+      const nextTok = tokens[j + 1]
+      if (nextTok !== undefined && !nextTok.unquoted.startsWith('-') && !isMarkerLike(nextTok.unquoted) && !SHELL_VAR_LITERAL.test(nextTok.unquoted)) {
+        edits.push({ start: nextTok.start, end: nextTok.end, replacement: MARKER })
+        stats.redactions += 1
+        j += 1
+        continue
+      }
+    }
+
+    // `--value` / `--body` in secret management CLIs
+    if (SECRET_VALUE_CMDS.has(cmd) && (hasSecretSubcmd || cmd === 'vault' || cmd === 'doppler' || cmd === 'infisical')) {
+      if (u === '--value' || u === '--body') {
+        const nextTok = tokens[j + 1]
+        if (nextTok !== undefined && !nextTok.unquoted.startsWith('-') && !isMarkerLike(nextTok.unquoted) && !SHELL_VAR_LITERAL.test(nextTok.unquoted)) {
+          edits.push({ start: nextTok.start, end: nextTok.end, replacement: MARKER })
+          stats.redactions += 1
+          j += 1
+          continue
+        }
+      } else if (u.startsWith('--value=') || u.startsWith('--body=')) {
+        const eqPos = u.indexOf('=')
+        const val = u.slice(eqPos + 1)
+        if (val !== '' && !isMarkerLike(val) && !SHELL_VAR_LITERAL.test(val)) {
+          const qOff = tok.quote !== '' ? 1 : 0
+          edits.push({ start: tok.start + qOff + eqPos + 1, end: tok.end - qOff, replacement: MARKER })
+          stats.redactions += 1
+          continue
+        }
+      } else if ((cmd === 'vault' || cmd === 'doppler' || cmd === 'infisical') && (u.startsWith('value=') || u.startsWith('data=') || u.startsWith('VALUE='))) {
+        const eqPos = u.indexOf('=')
+        const val = u.slice(eqPos + 1)
+        if (val !== '' && !val.startsWith('@') && !isMarkerLike(val) && !SHELL_VAR_LITERAL.test(val)) {
+          const qOff = tok.quote !== '' ? 1 : 0
+          edits.push({ start: tok.start + qOff + eqPos + 1, end: tok.end - qOff, replacement: MARKER })
+          stats.redactions += 1
+          continue
+        }
+      }
+    }
+  }
+}
+
+function redactCliFlagsAndPositionalImpl(text: string, stats: SanitizeStats, depth: number): string {
+  const edits: CliEdit[] = []
+  let tokens: CliToken[] = []
+  const n = text.length
+  let i = 0
+  const flush = (): void => {
+    if (tokens.length > 0) {
+      scanCliSegment(text, tokens, edits, stats, depth)
+      tokens = []
+    }
+  }
+  while (i < n) {
+    const c = text[i] as string
+    if (c === ' ' || c === '\t') {
+      i += 1
+      continue
+    }
+    if (c === '\n' || c === '\r' || c === ';' || c === '|' || c === '&' || c === '(' || c === ')' || c === '`') {
+      flush()
+      if (c === '|' && text[i + 1] === '|') i += 2
+      else if (c === '&' && text[i + 1] === '&') i += 2
+      else i += 1
+      continue
+    }
+    if (c === '$' && text[i + 1] === '(') {
+      flush()
+      i += 2
+      continue
+    }
+    if (c === '\\' && (text[i + 1] === '\n' || (text[i + 1] === '\r' && text[i + 2] === '\n'))) {
+      i += text[i + 1] === '\r' ? 3 : 2
+      continue
+    }
+    const start = i
+    let inQuote = ''
+    while (i < n) {
+      const ch = text[i] as string
+      if (inQuote !== '') {
+        if (inQuote === '"' && ch === '\\' && i + 1 < n) {
+          i += 2
+          continue
+        }
+        if (ch === inQuote) inQuote = ''
+        i += 1
+        continue
+      }
+      if (ch === '"' || ch === "'") {
+        inQuote = ch
+        i += 1
+        continue
+      }
+      if (ch === '\\' && i + 1 < n) {
+        if (text[i + 1] === '\n' || (text[i + 1] === '\r' && text[i + 2] === '\n')) break
+        i += 2
+        continue
+      }
+      if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === ';' || ch === '|' || ch === '&' || ch === '(' || ch === ')' || ch === '`') break
+      i += 1
+    }
+    const raw = text.slice(start, i)
+    const { unquoted, quote } = unquoteCliToken(raw)
+    tokens.push({ start, end: i, raw, unquoted, quote })
+  }
+  flush()
+  if (edits.length === 0) return text
+  edits.sort((a, b) => a.start - b.start)
+  let out = ''
+  let copied = 0
+  for (const e of edits) {
+    if (e.start < copied) continue
+    out += text.slice(copied, e.start) + e.replacement
+    copied = e.end
+  }
+  return out + text.slice(copied)
+}
+
+function redactCliFlagsAndPositional(text: string, stats: SanitizeStats): string {
+  return redactCliFlagsAndPositionalImpl(text, stats, 0)
+}
+
+function redactTextPasses(text: string, stats: SanitizeStats): string {
+  let out = redactPrivateKeys(text, stats)
   for (const [pattern, replacement] of PATTERNS) {
     pattern.lastIndex = 0
     if (!pattern.test(out)) continue
@@ -2316,8 +5496,414 @@ export function redactText(input: string, stats: SanitizeStats): string {
       return replacement.replace(/\$(\d)/g, (_, n: string) => groups[Number(n) - 1] ?? '')
     })
   }
+  out = redactJwtsLinear(out, stats)
+  out = redactBasicBearerAuth(out, stats)
   out = redactUrls(out, stats)
+  out = redactK8sAndYamlBlocks(out, stats)
+  out = redactMarkdownLabelsAndTables(out, stats)
+  out = redactCodeAndConfigForms(out, stats)
+  out = redactCliFlagsAndPositional(out, stats)
   return redactListNames(redactOptionWords(redactSingleDashSecrets(redactFlagValues(redactNamedValues(out, stats), stats), stats), stats), stats)
+}
+
+const PROSE_SENSITIVE_ASSIGN_BEFORE = /(?:^|[^A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]{0,99})["']?[ \t]*[:=](?:[ \t]*(?:[|>][+-]?\d*)?)?[ \t]*(?:\r?\n[ \t]*)?$/
+const PROSE_SENSITIVE_FLAG_BEFORE = /(?:^|[\s;|&(])--([A-Za-z][A-Za-z0-9_.-]{0,99})[ \t]*(?:\r?\n[ \t]*)?$/
+const PROSE_JSON_MAX_SPAN = 65_536
+const PROSE_JSON_MAX_PARSE_TRIES = 64
+
+function hasNestedContainer(val: unknown): boolean {
+  if (val === null || typeof val !== 'object') return false
+  if (Array.isArray(val)) return true
+  for (const k of Object.keys(val as Record<string, unknown>)) {
+    const v = (val as Record<string, unknown>)[k]
+    if (v !== null && typeof v === 'object') return true
+  }
+  return false
+}
+
+function estimateDroppedJsonChars(root: unknown, maxNodes = 512): number {
+  const stack: unknown[] = [root]
+  let chars = 0
+  let visited = 0
+  while (stack.length > 0 && visited < maxNodes) {
+    const cur = stack.pop()
+    visited += 1
+    if (cur === null || cur === undefined) {
+      chars += 4
+    } else if (typeof cur === 'string') {
+      chars += cur.length + 2
+    } else if (typeof cur === 'number' || typeof cur === 'boolean') {
+      chars += String(cur).length
+    } else if (Array.isArray(cur)) {
+      chars += 2 + Math.max(0, cur.length - 1)
+      const limit = Math.min(cur.length, maxNodes - visited)
+      for (let idx = limit - 1; idx >= 0; idx -= 1) stack.push(cur[idx])
+    } else if (typeof cur === 'object') {
+      const obj = cur as Record<string, unknown>
+      const keys = Object.keys(obj)
+      chars += 2 + Math.max(0, keys.length - 1)
+      const limit = Math.min(keys.length, maxNodes - visited)
+      for (let idx = limit - 1; idx >= 0; idx -= 1) {
+        const k = keys[idx] as string
+        chars += k.length + 3
+        stack.push(obj[k])
+      }
+    } else {
+      chars += 4
+    }
+  }
+  if (stack.length > 0) chars += stack.length * 4
+  return Math.max(2, chars)
+}
+
+function droppedCharsAtDepthLimit(val: unknown): number {
+  if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+    const obj = val as Record<string, unknown>
+    const keys = Object.keys(obj)
+    const cut = obj.__bqaa_depth_cut__
+    if (keys.length === 1 && keys[0] === '__bqaa_depth_cut__' && typeof cut === 'number' && Number.isFinite(cut) && cut >= 0) {
+      return cut
+    }
+  }
+  return estimateDroppedJsonChars(val)
+}
+
+function sanitizeProseJsonString(val: string, stats: SanitizeStats, keyDepth: number): string {
+  if (JSON_LOOKING.test(val)) {
+    if (keyDepth >= 3) {
+      stats.redactions += 1
+      stats.truncated = true
+      stats.droppedChars += val.length
+      return '[TRUNCATED: nested too deep]'
+    }
+    if (val.length > PROSE_JSON_MAX_SPAN) {
+      stats.redactions += 1
+      stats.truncated = true
+      stats.droppedChars += val.length
+      return `[TRUNCATED: ${val.length} chars of JSON text that could not be parsed and checked]`
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(clipDeepJsonSlice(val.trim()))
+    } catch {
+      stats.redactions += 1
+      stats.truncated = true
+      stats.droppedChars += val.length
+      return `[TRUNCATED: ${val.length} chars of JSON text that could not be parsed and checked]`
+    }
+    const subStats = newStats()
+    const walked = typeof parsed === 'string'
+      ? sanitizeProseJsonString(parsed, subStats, keyDepth + 1)
+      : walkProseJsonValue(parsed, subStats, 0, keyDepth + 1)
+    stats.redactions += subStats.redactions
+    stats.droppedChars += subStats.droppedChars
+    if (subStats.truncated) stats.truncated = true
+    if (subStats.redactions === 0 && !subStats.truncated) return val
+    return JSON.stringify(walked, null, typeof parsed !== 'string' && val.includes('\n') ? 2 : undefined)
+  }
+  if (keyDepth >= 3) {
+    if (findBalancedProseJsonSpans(val).length > 0) {
+      stats.redactions += 1
+      stats.truncated = true
+      stats.droppedChars += val.length
+      return '[TRUNCATED: nested too deep]'
+    }
+    return redactTextPasses(val, stats)
+  }
+  return splitAndRedactProseJson(val, stats, keyDepth + 1)
+}
+
+function sanitizeJsonObjectKey(
+  key: string,
+  own: Set<string>,
+  state: { placeholders: number },
+  stats: SanitizeStats,
+  inSensitiveSubtree = false,
+  keyDepth = 0,
+): string {
+  if (isListedKey(key)) return key
+  if (!inSensitiveSubtree && keyDepth < 3 && key.length <= PROSE_JSON_MAX_SPAN) {
+    const kStats = newStats()
+    if (sanitizeProseJsonString(key, kStats, keyDepth) === key && !kStats.truncated && kStats.redactions === 0) return key
+  }
+  let outKey: string
+  do {
+    state.placeholders += 1
+    outKey = `[REDACTED_KEY:${state.placeholders}]`
+  } while (own.has(outKey))
+  own.add(outKey)
+  stats.redactions += 1
+  return outKey
+}
+
+function redactSensitiveSubtree(val: unknown, stats: SanitizeStats, depth = 0, keyDepth = 0): unknown {
+  if (val === null) return null
+  if (typeof val === 'string') {
+    if (isMarkerLike(val)) return val
+    stats.redactions += 1
+    return MARKER
+  }
+  if (typeof val === 'number' || typeof val === 'boolean') {
+    stats.redactions += 1
+    return MARKER
+  }
+  if (depth > 20) {
+    stats.truncated = true
+    stats.redactions += 1
+    stats.droppedChars += droppedCharsAtDepthLimit(val)
+    return MARKER
+  }
+  if (Array.isArray(val)) return val.map(item => redactSensitiveSubtree(item, stats, depth + 1, keyDepth))
+  if (typeof val === 'object') {
+    const obj = val as Record<string, unknown>
+    const out: Record<string, unknown> = {}
+    const keys = Object.keys(obj)
+    const own = new Set(keys)
+    const state = { placeholders: 0 }
+    for (const key of keys) {
+      const outKey = sanitizeJsonObjectKey(key, own, state, stats, true, keyDepth)
+      out[outKey] = redactSensitiveSubtree(obj[key], stats, depth + 1, keyDepth)
+    }
+    return out
+  }
+  return MARKER
+}
+
+function walkProseJsonValue(val: unknown, stats: SanitizeStats, depth = 0, keyDepth = 0): unknown {
+  if (val === null) return null
+  if (typeof val === 'string') return sanitizeProseJsonString(val, stats, keyDepth)
+  if (typeof val !== 'object') return val
+  if (depth > 20) {
+    stats.truncated = true
+    stats.redactions += 1
+    stats.droppedChars += droppedCharsAtDepthLimit(val)
+    return '[TRUNCATED: nested too deep]'
+  }
+  if (Array.isArray(val)) return val.map(item => walkProseJsonValue(item, stats, depth + 1, keyDepth))
+  const obj = val as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  const keys = Object.keys(obj)
+  const own = new Set(keys)
+  const state = { placeholders: 0 }
+  for (const key of keys) {
+    const outKey = sanitizeJsonObjectKey(key, own, state, stats, false, keyDepth)
+    const raw = obj[key]
+    if (isSensitiveKey(key)) {
+      out[outKey] = redactSensitiveSubtree(raw, stats, depth + 1, keyDepth)
+    } else {
+      out[outKey] = walkProseJsonValue(raw, stats, depth + 1, keyDepth)
+    }
+  }
+  return out
+}
+
+function hasSensitiveAssignmentOrFlag(before: string): boolean {
+  const am = PROSE_SENSITIVE_ASSIGN_BEFORE.exec(before)
+  if (am !== null && isSensitiveKey(am[1] as string)) return true
+  const fm = PROSE_SENSITIVE_FLAG_BEFORE.exec(before)
+  return fm !== null && credentialOption(fm[1] as string)
+}
+
+function precededBySensitiveAssignment(text: string, braceIdx: number, qStates: Uint8Array): boolean {
+  const start = Math.max(0, braceIdx - 512)
+  const prefix = text.slice(start, braceIdx)
+  if (hasSensitiveAssignmentOrFlag(prefix)) return true
+  // Also catch nested JSON inside an unclosed non-JSON outer `{` or `[`
+  // opened immediately after a sensitive assignment or CLI flag, e.g.
+  // `export APP_SECRET={\n  payload: {\n    "nested": ...\n  }\n}`.
+  const unclosed: { rel: number; ch: number }[] = []
+  for (let k = 0; k < prefix.length; k += 1) {
+    if (qStates[start + k] !== NONE) continue
+    const ch = prefix.charCodeAt(k)
+    if (ch === 123 || ch === 91) {
+      unclosed.push({ rel: k, ch })
+    } else if (ch === 125 || ch === 93) {
+      const want = ch === 125 ? 123 : 91
+      for (let s = unclosed.length - 1; s >= 0; s -= 1) {
+        if (unclosed[s]!.ch === want) {
+          unclosed.length = s
+          break
+        }
+      }
+    }
+  }
+  for (let s = unclosed.length - 1; s >= 0; s -= 1) {
+    const absOpen = start + unclosed[s]!.rel
+    const beforeOpen = text.slice(Math.max(0, absOpen - 256), absOpen)
+    if (hasSensitiveAssignmentOrFlag(beforeOpen)) return true
+  }
+  return false
+}
+
+function clipDeepJsonSlice(slice: string, maxDepth = 21): string {
+  const containers: number[] = []
+  const parts: string[] = []
+  let inStr = false
+  let esc = false
+  let cutStart = -1
+  let copied = 0
+  for (let i = 0; i < slice.length; i += 1) {
+    const ch = slice.charCodeAt(i)
+    if (inStr) {
+      if (esc) esc = false
+      else if (ch === 92) esc = true
+      else if (ch === 34) inStr = false
+      continue
+    }
+    if (ch === 34) {
+      inStr = true
+      continue
+    }
+    if (ch === 123 || ch === 91) {
+      containers.push(ch)
+      if (containers.length === maxDepth + 1) cutStart = i
+    } else if (ch === 125 || ch === 93) {
+      const want = ch === 125 ? 123 : 91
+      if (containers.length === 0 || containers[containers.length - 1] !== want) return slice
+      containers.pop()
+      if (cutStart !== -1 && containers.length === maxDepth) {
+        parts.push(slice.slice(copied, cutStart), `{"__bqaa_depth_cut__":${i + 1 - cutStart}}`)
+        copied = i + 1
+        cutStart = -1
+      }
+    }
+  }
+  if (inStr || containers.length !== 0 || cutStart !== -1 || copied === 0) return slice
+  parts.push(slice.slice(copied))
+  return parts.join('')
+}
+
+type JsonCandidateSpan = { start: number; end: number; parsed: unknown; sensitiveContext: boolean; multiline: boolean }
+
+function findBalancedProseJsonSpans(text: string): JsonCandidateSpan[] {
+  if (!text.includes('{') || !text.includes('}')) return []
+  const qStates = quoteStates(text)
+  const spans: JsonCandidateSpan[] = []
+  const stack: number[] = []
+  let inStr = false
+  let esc = false
+  let wsCursor = -1
+  let parseTries = 0
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text.charCodeAt(i)
+    if (inStr) {
+      if (esc) {
+        esc = false
+      } else if (ch === 92) {
+        esc = true
+      } else if (ch === 34) {
+        inStr = false
+      } else if (ch === 10) {
+        // Broken string across raw newline: invalidates open frames cleanly.
+        inStr = false
+        stack.length = 0
+      }
+      continue
+    }
+    // Leave text inside shell quotes, ANSI-C quotes, or unknown quote states
+    // intact so enclosing assignment/flag redactors consume the whole string,
+    // and invalidate partially open candidate frames if non-NONE quotes intervene.
+    if (qStates[i] !== NONE) {
+      stack.length = 0
+      continue
+    }
+    if (stack.length > 0 && ch === 34) {
+      inStr = true
+      continue
+    }
+    if (ch === 123) {
+      // Only push `{` if next non-whitespace character is `"` or `}` (checked via monotonic wsCursor).
+      let k = wsCursor > i + 1 ? wsCursor : i + 1
+      if (k === i + 1) {
+        while (k < text.length) {
+          const w = text.charCodeAt(k)
+          if (w === 32 || w === 9 || w === 10 || w === 13) k += 1
+          else break
+        }
+        wsCursor = k
+      }
+      const nextCh = k < text.length ? text.charCodeAt(k) : -1
+      if (nextCh === 34 || nextCh === 125) {
+        stack.push(i)
+      } else if (stack.length > 0 && (i === 0 || text.charCodeAt(i - 1) === 123)) {
+        // Unquoted `{` directly inside malformed `{` resets candidate stack.
+        stack.length = 0
+      }
+      continue
+    }
+    if (ch === 125 && stack.length > 0) {
+      const open = stack.pop() as number
+      if (stack.length === 0) {
+        const len = i + 1 - open
+        if (len <= PROSE_JSON_MAX_SPAN && parseTries < PROSE_JSON_MAX_PARSE_TRIES) {
+          const slice = text.slice(open, i + 1)
+          const multiline = slice.includes('\n')
+          const maybeNested = multiline || slice.includes('[') || slice.indexOf('{', 1) !== -1
+          if (maybeNested) {
+            parseTries += 1
+            try {
+              const parsed = JSON.parse(clipDeepJsonSlice(slice)) as unknown
+              if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) && (multiline || hasNestedContainer(parsed))) {
+                spans.push({ start: open, end: i + 1, parsed, sensitiveContext: precededBySensitiveAssignment(text, open, qStates), multiline })
+              }
+            } catch {
+              // Not valid JSON; leave for free-text passes.
+            }
+          }
+        }
+      }
+    }
+  }
+  return spans
+}
+
+const PROSE_JSON_SUFFIX_RE = /q(\d+)z/g
+
+function proseJsonTokenSuffix(text: string): number {
+  if (!text.includes('pjspan')) return 1
+  const used = new Set<string>()
+  PROSE_JSON_SUFFIX_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = PROSE_JSON_SUFFIX_RE.exec(text)) !== null) {
+    used.add(m[1] as string)
+  }
+  let suffix = 1
+  while (used.has(String(suffix))) suffix += 1
+  return suffix
+}
+
+function splitAndRedactProseJson(text: string, stats: SanitizeStats, keyDepth = 0): string {
+  const spans = findBalancedProseJsonSpans(text)
+  if (spans.length === 0) return redactTextPasses(text, stats)
+  const suffix = proseJsonTokenSuffix(text)
+  let masked = ''
+  let copied = 0
+  for (let idx = 0; idx < spans.length; idx += 1) {
+    const span = spans[idx]!
+    masked += text.slice(copied, span.start) + `pjspan${idx}q${suffix}z`
+    copied = span.end
+  }
+  masked += text.slice(copied)
+  const redactedMasked = redactTextPasses(masked, stats)
+  const tokenRe = new RegExp(`pjspan(\\d+)q${suffix}z`, 'g')
+  return redactedMasked.replace(tokenRe, (whole: string, rawIdx: string) => {
+    const span = spans[Number(rawIdx)]
+    if (span === undefined) return whole
+    if (span.sensitiveContext) {
+      stats.redactions += 1
+      return MARKER
+    }
+    const sanitized = walkProseJsonValue(span.parsed, stats, 0, keyDepth)
+    return JSON.stringify(sanitized, null, span.multiline ? 2 : undefined)
+  })
+}
+
+// The free-text rules: prose-embedded multi-line/nested JSON objects first,
+// then credential shapes, URLs, YAML/K8s blocks, Markdown labels/tables, code
+// and CLI credential forms, credential-named values, command-line options,
+// option words the shell reads in pieces, and the heuristic list-name fallback.
+export function redactText(input: string, stats: SanitizeStats): string {
+  return splitAndRedactProseJson(input, stats)
 }
 
 // Error text, dead-letter reasons and status lines: redacted first, then held
