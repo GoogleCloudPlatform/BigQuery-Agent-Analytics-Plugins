@@ -471,6 +471,95 @@ test('CLI flags, positional secrets, Markdown labels/tables, code configs, armor
   }
 })
 
+// A command whose `-p` only ever takes the password (`mysql`, `sshpass`, ...),
+// and a registry login, take whatever follows a spaced `-p` as the password:
+// digits, a slash, a leading dot or tilde, other punctuation, quoted or not,
+// behind a wrapper or an absolute path. It goes whole, quotes and all, as
+// the other spaced flags' values do, and counts once.
+test('a spaced -p value on a password-only CLI or a registry login redacts even when it reads as a port or a path', () => {
+  const cases: [string, string][] = [
+    ['mysql -u root -p 12345 app', 'mysql -u root -p [REDACTED] app'],
+    ['mysql -u root -p s3cr/et app', 'mysql -u root -p [REDACTED] app'],
+    ['sshpass -p 12345 ssh root@db', 'sshpass -p [REDACTED] ssh root@db'],
+    ['docker login -u ci -p 12345 registry', 'docker login -u ci -p [REDACTED] registry'],
+    // Quoted, the quotes go with the value.
+    ['mysql -u root -p "12345" app', 'mysql -u root -p [REDACTED] app'],
+    ["mysql -u root -p '12345' app", 'mysql -u root -p [REDACTED] app'],
+    ['sshpass -p "2024:11" ssh root@db', 'sshpass -p [REDACTED] ssh root@db'],
+    ["docker login -u ci -p '4242' registry", 'docker login -u ci -p [REDACTED] registry'],
+    // Path-like and punctuated.
+    ['mongosh -u admin -p /s3cr3t/pw', 'mongosh -u admin -p [REDACTED]'],
+    ['mariadb -u root -p .dotPass app', 'mariadb -u root -p [REDACTED] app'],
+    ['mysqldump -u root -p ~tildePass db', 'mysqldump -u root -p [REDACTED] db'],
+    ['mysql -u root -p 12:34 app', 'mysql -u root -p [REDACTED] app'],
+    ['mysql -u root -p P@ss/w0rd!%=:.x app', 'mysql -u root -p [REDACTED] app'],
+    ['mysql -u root -p .Pa$$w0rd!@#%^*+=: app', 'mysql -u root -p [REDACTED] app'],
+    ['twine upload -u __token__ -p pypi/AgEI-x dist/*', 'twine upload -u __token__ -p [REDACTED] dist/*'],
+    // Wrappers, absolute paths and an inline shell script.
+    ['sudo mysql -u root -p 12345 app', 'sudo mysql -u root -p [REDACTED] app'],
+    ['sudo -u app env LANG=C mysql -u root -p 12345 app', 'sudo -u app env LANG=C mysql -u root -p [REDACTED] app'],
+    ['/usr/bin/mysql -u root -p 12345 app', '/usr/bin/mysql -u root -p [REDACTED] app'],
+    ['timeout 5 sshpass -p 12345 ssh root@db', 'timeout 5 sshpass -p [REDACTED] ssh root@db'],
+    ['nohup /usr/local/bin/mysqldump -u root -p 12345 db', 'nohup /usr/local/bin/mysqldump -u root -p [REDACTED] db'],
+    ['command docker login -u ci -p 12345 registry', 'command docker login -u ci -p [REDACTED] registry'],
+    ['sudo /usr/bin/docker login -u ci -p 1234/5678 registry.example.com', 'sudo /usr/bin/docker login -u ci -p [REDACTED] registry.example.com'],
+    ["bash -c 'mysql -u root -p 12345 app'", "bash -c 'mysql -u root -p [REDACTED] app'"],
+    // Registry logins, with or without a user flag.
+    ['docker login -p 12345 registry', 'docker login -p [REDACTED] registry'],
+    ['podman login -u ci -p 1234/56 quay.io', 'podman login -u ci -p [REDACTED] quay.io'],
+    ['nerdctl login -u ci -p "8080:80" registry', 'nerdctl login -u ci -p [REDACTED] registry'],
+    ['helm registry login registry.example.com -u ci -p 12345', 'helm registry login registry.example.com -u ci -p [REDACTED]'],
+    ['crane auth login registry.example.com -u ci -p 1234/5678', 'crane auth login registry.example.com -u ci -p [REDACTED]'],
+  ]
+  const once = cases.map(([input]) => {
+    const stats = newStats()
+    return { input, out: redactText(input, stats), redactions: stats.redactions }
+  })
+  expect(once).toEqual(cases.map(([input, out]) => ({ input, out, redactions: 1 })))
+  const twice = once.map(({ input, out }) => {
+    const stats = newStats()
+    return { input, out: redactText(out, stats), redactions: stats.redactions }
+  })
+  expect(twice).toEqual(once.map(({ input, out }) => ({ input, out, redactions: 0 })))
+})
+
+// Where `-p` takes a port, a path or nothing at all (`psql`, `redis-cli`,
+// `docker run`, `mkdir`, `cp`, any other command that only shows a user
+// flag), or what follows it is no password (another option, a shell
+// variable, a marker, an empty string, nothing), the text stays as it is.
+test('a spaced -p port, path or flag, and a -p with no password after it, stay untouched', () => {
+  const keepUntouched = [
+    'psql -p 5432 -U postgres',
+    '/usr/bin/psql -p 5432 -U postgres',
+    'sudo -u postgres psql -p 5432',
+    'timeout 5 psql -p 5432 -U postgres',
+    'redis-cli -p 6379',
+    'valkey-cli -h cache -p 6379 ping',
+    'docker run -p 8080 nginx',
+    'docker run -p 8080:80 nginx',
+    'docker run -u 1000 -p 8080:80 nginx',
+    'docker run -u 1000 -p 8080:80/udp nginx',
+    'podman run --user 1000 -p 8443:443 nginx',
+    'lftp -u bob -p 2121 ftp.example.com',
+    'mkdir -p /tmp/foo/bar',
+    'claude -p hello',
+    'cp -p a b',
+    'mysql -u root -p $DB_PASS app',
+    'mysql -u root -p ${DB_PASS} app',
+    'docker login -u ci -p "$REGISTRY_TOKEN" registry',
+    'mysql -u root -p [REDACTED] app',
+    'sshpass -p [REDACTED] ssh root@db',
+    'mysql -u root -p -h db app',
+    'mysql -u root -p "" app',
+    'mysql -u root -p',
+  ]
+  const shown = keepUntouched.map(input => {
+    const stats = newStats()
+    return { input, out: redactText(input, stats), redactions: stats.redactions }
+  })
+  expect(shown).toEqual(keepUntouched.map(input => ({ input, out: input, redactions: 0 })))
+})
+
 test('multi-line YAML block scalars, K8s name/value pairs, and prose-embedded multi-line JSON redact nested secrets whole while preserving siblings', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)

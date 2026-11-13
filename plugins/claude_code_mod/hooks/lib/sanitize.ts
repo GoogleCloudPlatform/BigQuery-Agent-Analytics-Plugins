@@ -5100,6 +5100,8 @@ const ATTACHED_P_CMDS = new Set(['mysql', 'mysqldump', 'mariadb', 'mariadb-dump'
 const ATTACHED_P_PORT_CMDS = new Set(['psql', 'redis-cli', 'valkey-cli'])
 const SPACED_P_PASS_CMDS = new Set(['mysql', 'mysqldump', 'mariadb', 'mariadb-dump', 'mongosh', 'mongo', 'sshpass', 'twine', 'htpasswd', 'htdigest', 'smbclient', 'rpcclient', 'net', 'mosquitto_passwd', 'kadmin'])
 const LOGIN_SUBCMD_CMDS = new Set(['docker', 'podman', 'nerdctl', 'skopeo', 'oras', 'crane', 'helm', 'npm', 'yarn', 'pnpm', 'poetry', 'pipenv'])
+// Where a login sits one level down: `helm registry login`, `crane auth login`.
+const LOGIN_PARENT_SUBCMDS = new Set(['registry', 'auth'])
 const SPACED_P_EXCLUDED = new Set(['claude', 'mkdir', 'cp', 'mv', 'rm', 'ln', 'install', 'tar', 'git', 'ssh', 'scp', 'rsync', 'psql', 'redis-cli', 'valkey-cli', 'grep', 'rg', 'sed', 'awk', 'python', 'python3', 'node', 'sh', 'bash', 'zsh'])
 const POSTGRES_W_CMDS = new Set(['psql', 'pg_dump', 'pg_dumpall', 'pg_restore', 'createdb', 'dropdb', 'createuser', 'dropuser', 'clusterdb', 'reindexdb', 'vacuumdb'])
 const REDIS_A_CMDS = new Set(['redis-cli', 'valkey-cli'])
@@ -5119,10 +5121,15 @@ function unquoteCliToken(raw: string): { unquoted: string; quote: string } {
   return { unquoted: raw, quote: '' }
 }
 
+// No value of its own: empty, another option, a shell variable or a marker.
+const isCliNonValue = (tok: CliToken): boolean => {
+  const s = tok.unquoted
+  return s === '' || s.startsWith('-') || isMarkerLike(s) || SHELL_VAR_LITERAL.test(s)
+}
+
 const isCliPathOrPort = (tok: CliToken): boolean => {
   const s = tok.unquoted
-  if (s === '' || s.startsWith('-')) return true
-  if (isMarkerLike(s) || SHELL_VAR_LITERAL.test(s)) return true
+  if (isCliNonValue(tok)) return true
   if (/^\d+(?::\d+)?$/.test(s)) return true
   if (tok.quote === '' && (/^[./~]/.test(s) || s.includes('/'))) return true
   return false
@@ -5193,7 +5200,7 @@ function scanCliSegment(text: string, tokens: CliToken[], edits: CliEdit[], stat
   for (let j = idx + 1; j < tokens.length; j += 1) {
     const u = tokens[j]!.unquoted
     const low = u.toLowerCase()
-    if (low === 'login' && j === idx + 1) hasLoginSubcmd = true
+    if (low === 'login' && (j === idx + 1 || (j === idx + 2 && LOGIN_PARENT_SUBCMDS.has(tokens[idx + 1]!.unquoted.toLowerCase())))) hasLoginSubcmd = true
     if (u === '-u' || u === '--user' || u === '--proxy-user' || u.startsWith('--user=') || u.startsWith('--proxy-user=')) sawUserFlag = true
     if (j <= idx + 2 && (low === 'secretsmanager' || low === 'ssm' || low === 'secrets' || low === 'secret' || low === 'kv' || low === 'keyvault')) {
       hasSecretSubcmd = true
@@ -5338,11 +5345,14 @@ function scanCliSegment(text: string, tokens: CliToken[], edits: CliEdit[], stat
       }
     }
 
-    // Spaced `-p <pass>`
+    // Spaced `-p <pass>`. On a password-only CLI or a registry login, `-p`
+    // takes nothing but the password, so a value that reads like a port or a
+    // path is one too. Elsewhere a user flag alone marks `-p` as a password,
+    // and a port or path after it stays (`docker run -u 1000 -p 8080:80`).
     if (u === '-p' && !SPACED_P_EXCLUDED.has(cmd)) {
-      const allow = SPACED_P_PASS_CMDS.has(cmd) || (LOGIN_SUBCMD_CMDS.has(cmd) && hasLoginSubcmd) || sawUserFlag
+      const passOnly = SPACED_P_PASS_CMDS.has(cmd) || (LOGIN_SUBCMD_CMDS.has(cmd) && hasLoginSubcmd)
       const nextTok = tokens[j + 1]
-      if (allow && nextTok !== undefined && !isCliPathOrPort(nextTok)) {
+      if (nextTok !== undefined && (passOnly ? !isCliNonValue(nextTok) : sawUserFlag && !isCliPathOrPort(nextTok))) {
         edits.push({ start: nextTok.start, end: nextTok.end, replacement: MARKER })
         stats.redactions += 1
         j += 1
