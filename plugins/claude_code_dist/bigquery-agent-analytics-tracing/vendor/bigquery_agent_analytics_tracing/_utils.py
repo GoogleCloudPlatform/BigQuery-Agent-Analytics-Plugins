@@ -1487,39 +1487,41 @@ def retire_duplicate_source_entry(
       mode="dedup_withhold",
   )
   _write_atomic_private_bytes(dst, stage_meta, meta_bytes)
-  moved_dst_retry = False
   copied_src_retry = False
-  try:
-    if dst_has_retry:
-      try:
-        dst.replace(dst_retry_name, stage_rty)
-        moved_dst_retry = True
-      except FileNotFoundError:
-        if source_retry_bytes is not None:
-          _write_atomic_private_bytes(dst, stage_rty, source_retry_bytes)
-          copied_src_retry = True
-    elif source_retry_bytes is not None:
+  if not dst_has_retry and source_retry_bytes is not None:
+    try:
       _write_atomic_private_bytes(dst, stage_rty, source_retry_bytes)
       copied_src_retry = True
-  except OSError:
-    _cleanup_stage_files(dst, stage_rty if copied_src_retry else "", stage_meta)
-    raise
+    except OSError:
+      _cleanup_stage_files(dst, stage_meta)
+      raise
 
   try:
     dst.replace(dst_name, stage_env)
   except OSError:
-    rollback_ok = True
-    if moved_dst_retry and not dst.exists(dst_retry_name):
+    _cleanup_stage_files(dst, stage_rty if copied_src_retry else "", stage_meta)
+    raise
+
+  if dst_has_retry:
+    try:
       try:
-        dst.replace(stage_rty, dst_retry_name)
+        dst.replace(dst_retry_name, stage_rty)
+      except FileNotFoundError:
+        if source_retry_bytes is not None:
+          _write_atomic_private_bytes(dst, stage_rty, source_retry_bytes)
+          copied_src_retry = True
+    except OSError:
+      rollback_ok = True
+      try:
+        dst.replace(stage_env, dst_name)
       except OSError:
         rollback_ok = False
-    _cleanup_stage_files(
-        dst,
-        stage_rty if copied_src_retry else "",
-        stage_meta if rollback_ok else "",
-    )
-    raise
+      _cleanup_stage_files(
+          dst,
+          stage_rty if copied_src_retry else "",
+          stage_meta if rollback_ok else "",
+      )
+      raise
 
   if not src_locked:
     raise lock_exc
@@ -1611,9 +1613,28 @@ def recover_staged_transfers(
         on_error(meta_name, ValueError("malformed staged transfer metadata"))
       continue
 
+    if mode == "dedup_withhold" and not dst.exists(stage_env):
+      if (
+          has_retry
+          and dst.exists(stage_rty)
+          and dst.exists(dst_name)
+          and not dst.exists(dst_retry_name)
+      ):
+        try:
+          dst.replace(stage_rty, dst_retry_name)
+        except OSError as exc:
+          if blocked_tombstones is not None:
+            blocked_tombstones.add(source)
+          if blocked_sources is not None:
+            blocked_sources.add(source)
+          if on_error is not None:
+            on_error(source, exc)
+          continue
+      mode = "dedup_tombstone"
+
     if mode == "dedup_tombstone":
       if src is None:
-        _cleanup_stage_files(dst, meta_name)
+        _cleanup_stage_files(dst, stage_rty, meta_name)
         continue
       if not src_locked:
         if blocked_tombstones is not None:
@@ -1639,10 +1660,18 @@ def recover_staged_transfers(
             src.unlink(source_retry)
           except (FileNotFoundError, OSError):
             pass
-        _cleanup_stage_files(dst, meta_name)
+        _cleanup_stage_files(dst, stage_rty, meta_name)
         continue
       try:
         src_bytes = _read_verified_legacy_file(src, source)
+      except FileNotFoundError:
+        if source_retry:
+          try:
+            src.unlink(source_retry)
+          except (FileNotFoundError, OSError):
+            pass
+        _cleanup_stage_files(dst, stage_rty, meta_name)
+        continue
       except OSError as exc:
         if blocked_tombstones is not None:
           blocked_tombstones.add(source)
@@ -1652,7 +1681,7 @@ def recover_staged_transfers(
           on_error(source, exc)
         continue
       if not sha256_hex or hashlib.sha256(src_bytes).hexdigest() != sha256_hex:
-        _cleanup_stage_files(dst, meta_name)
+        _cleanup_stage_files(dst, stage_rty, meta_name)
         continue
       try:
         src.unlink(source)
@@ -1671,26 +1700,11 @@ def recover_staged_transfers(
           src.unlink(source_retry)
         except (FileNotFoundError, OSError):
           pass
-      _cleanup_stage_files(dst, meta_name)
+      _cleanup_stage_files(dst, stage_rty, meta_name)
       continue
 
     retire_source_retry = source_retry
     if mode == "dedup_withhold":
-      if not dst.exists(stage_env):
-        if (
-            has_retry
-            and dst.exists(stage_rty)
-            and dst.exists(dst_name)
-            and not dst.exists(dst_retry_name)
-        ):
-          try:
-            dst.replace(stage_rty, dst_retry_name)
-          except OSError as exc:
-            if on_error is not None:
-              on_error(source, exc)
-            continue
-        _cleanup_stage_files(dst, stage_rty, meta_name)
-        continue
       if src is not None:
         if not src_locked:
           if blocked_sources is not None:
