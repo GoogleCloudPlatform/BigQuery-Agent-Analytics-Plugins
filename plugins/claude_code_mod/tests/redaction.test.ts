@@ -433,6 +433,7 @@ test('CLI flags, positional secrets, Markdown labels/tables, code configs, armor
     ['https://alice:pAssw0rd/secretPath@intranet', 'https://[REDACTED]@intranet', ['pAssw0rd', 'secretPath']],
     ['https://alice:pAssw0rd?a=secretVal@intranet', 'https://[REDACTED]@intranet', ['pAssw0rd', 'secretVal']],
     ['https://alice:pAssw0rd#secretFrag@intranet', 'https://[REDACTED]@intranet', ['pAssw0rd', 'secretFrag']],
+    ['https://alice:@example.com', 'https://[REDACTED]@example.com', ['alice']],
   ] as const) {
     const stats = newStats()
     const out = redactText(input, stats)
@@ -455,6 +456,7 @@ test('CLI flags, positional secrets, Markdown labels/tables, code configs, armor
     'https://intranet/package/@types/node',
     'https://intranet/users/@alice',
     'https://intranet:8080/users/@alice',
+    'https://example.com:/users/@alice',
     'https://intranet:8080?email=alice@intranet',
     'https://medium.com/@username/post',
     'https://api.example.com:8443/v1?email=alice@example.com',

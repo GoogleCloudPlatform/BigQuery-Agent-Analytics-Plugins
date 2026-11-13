@@ -2550,6 +2550,8 @@ test('r5/r6/r7 fixtures redact in the listed wrappers and paths; known gaps are 
     `${G}^${'q'.repeat(256)}^VERSION=v${'q'.repeat(256)}pass=CanaryValue`,
     // r6 P1-3: a $ opener in a URL query value.
     'curl https://example.test/?token=$(printf %s CanaryValue)',
+    // Password containing both '@' and '/', '?', or '#'.
+    'curl https://u:p@ss/CanaryValue@example.test/path',
     // A locale-quoted option name with a separate value remains best effort.
     'cli --pass$"word" CanaryValue',
   ]

@@ -2426,7 +2426,7 @@ function redactUrl(url: string, stats: SanitizeStats): string {
         const colonIdx = preDelim.indexOf(':')
         if (colonIdx > 0 && !preDelim.startsWith('[')) {
           const afterColon = preDelim.slice(colonIdx + 1)
-          if (!/^\d+$/.test(afterColon)) {
+          if (!/^\d*$/.test(afterColon)) {
             let candidate = firstAt
             for (let tries = 0; candidate !== -1 && tries < 32; tries += 1) {
               if (VALID_HOST_AFTER_AT.test(out.slice(candidate + 1))) {

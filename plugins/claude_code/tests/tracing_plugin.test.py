@@ -8453,6 +8453,98 @@ class TestDestinationPartitionedSpool(unittest.TestCase):
         self.assertEqual(resolved_done, 1)
         self.assertEqual(len(delivered["proj-a.ds_a.agent_events"]), 1)
 
+    def test_migrate_legacy_spool_enospc_rollback_allows_drain_to_deliver(self):
+        import errno
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import _utils, drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r8b_enospc_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        legacy_dir = Path(tmp_root) / "legacy"
+        legacy_spool = legacy_dir / "spool"
+        legacy_spool.mkdir(parents=True, mode=0o700)
+        os.chmod(legacy_dir, 0o700)
+        os.chmod(legacy_spool, 0o700)
+        new_spool = Path(tmp_root) / "new_spool"
+        new_spool.mkdir(mode=0o700)
+        os.chmod(new_spool, 0o700)
+
+        env_bytes = json.dumps({
+            "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+            "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "legacy"}},
+        }).encode("utf-8")
+        retry_bytes = b'{"attempts": 2, "first_failed_at": 1000.0}'
+        leg_env = legacy_spool / "event-001.json"
+        leg_retry = legacy_spool / "event-001.json.retry"
+        leg_env.write_bytes(env_bytes)
+        leg_retry.write_bytes(retry_bytes)
+        os.chmod(leg_env, 0o600)
+        os.chmod(leg_retry, 0o600)
+
+        part_a = Path(destination_spool_dir(new_spool, "proj-a", "ds_a", "agent_events"))
+        part_a.mkdir(mode=0o700)
+        os.chmod(part_a, 0o700)
+        queued_env = part_a / "event-queued.json"
+        queued_env.write_text(
+            json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:01Z", "event_type": "LLM_REQUEST", "content": {"k": "queued"}},
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(queued_env, 0o600)
+
+        delivered: dict[str, list[dict]] = {}
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda tid, rows: delivered.setdefault(tid, []).extend(rows) or [],
+            get_table_fn=lambda tid: object(),
+        )
+        cfg_a = BQAAConfig(
+            project_id="proj-a",
+            dataset="ds_a",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(new_spool),
+            state_dir=os.path.join(tmp_root, "state_a"),
+            log_file=os.path.join(tmp_root, "a.log"),
+        )
+
+        orig_write_atomic = _utils._write_atomic_private_bytes
+
+        def _fail_env_enospc(directory, name, data):
+            if name == "event-001.json":
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return orig_write_atomic(directory, name, data)
+
+        with mock.patch.object(_utils, "_write_atomic_private_bytes", side_effect=_fail_env_enospc):
+            mig = _utils.migrate_legacy_spool(
+                new_spool,
+                legacy_spool_dir=legacy_spool,
+                destination=("proj-a", "ds_a", "agent_events"),
+            )
+            self.assertEqual(mig["migrated"], 0)
+            self.assertTrue(mig["error"])
+            self.assertIn("event-001.json", mig["skipped_reasons"])
+            self.assertEqual(list(part_a.glob("*.retry")), [])
+            self.assertFalse((part_a / "event-001.json").exists())
+            self.assertEqual(leg_env.read_bytes(), env_bytes)
+            self.assertEqual(leg_retry.read_bytes(), retry_bytes)
+
+            with mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+                resolved = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+
+        self.assertEqual(resolved, 1)
+        self.assertEqual(len(delivered["proj-a.ds_a.agent_events"]), 1)
+        self.assertEqual(
+            delivered["proj-a.ds_a.agent_events"][0]["content"],
+            {"k": "queued"},
+        )
+        self.assertEqual(list(part_a.glob("*.retry")), [])
+        self.assertEqual(leg_env.read_bytes(), env_bytes)
+        self.assertEqual(leg_retry.read_bytes(), retry_bytes)
+
 
 if __name__ == "__main__":
     unittest.main()

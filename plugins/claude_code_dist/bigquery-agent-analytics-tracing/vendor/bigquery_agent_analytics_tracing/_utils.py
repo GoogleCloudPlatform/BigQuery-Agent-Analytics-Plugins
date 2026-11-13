@@ -1244,124 +1244,142 @@ def migrate_legacy_spool(
         if not event_names:
           return result
 
-        with open_destination_spool_dir(
-            spool_dir, dest_proj, dest_ds, dest_tbl, create=True
-        ) as dst:
-          if _same_private_dir(legacy, dst):
-            return result
-          lock_fd = dst.open(".migrate.lock", os.O_CREAT | os.O_RDWR, 0o600)
-          try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            for name in event_names:
-              if not legacy.exists(name):
-                continue
-              try:
-                raw = _read_verified_legacy_file(legacy, name)
-                parsed = safe_json_loads(raw.decode("utf-8", "strict"), None)
-              except (OSError, UnicodeDecodeError) as exc:
-                result["unsafe_skipped"] += 1
-                reason = str(exc)
-                result["skipped_reasons"][name] = reason
-                if len(result["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
-                  result["unsafe_entries"].append(
-                      f"{legacy_path / name}: {reason}"
-                  )
-                continue
-              if not isinstance(parsed, dict):
-                result["unsafe_skipped"] += 1
-                reason = "not a JSON object envelope"
-                result["skipped_reasons"][name] = reason
-                if len(result["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
-                  result["unsafe_entries"].append(
-                      f"{legacy_path / name}: {reason}"
-                  )
-                continue
-              if has_dest and is_destination_mismatch_for(
-                  extract_envelope_config(parsed), dest_proj, dest_ds, dest_tbl
-              ):
-                continue
-
-              retry_name = f"{name}.retry"
-              retry_bytes: bytes | None = None
-              if legacy.exists(retry_name):
+        try:
+          with open_destination_spool_dir(
+              spool_dir, dest_proj, dest_ds, dest_tbl, create=True
+          ) as dst:
+            if _same_private_dir(legacy, dst):
+              return result
+            lock_fd = dst.open(".migrate.lock", os.O_CREAT | os.O_RDWR, 0o600)
+            locked = False
+            try:
+              fcntl.flock(lock_fd, fcntl.LOCK_EX)
+              locked = True
+              for name in event_names:
+                if not legacy.exists(name):
+                  continue
                 try:
-                  retry_bytes = _read_verified_legacy_file(legacy, retry_name)
-                except OSError as exc:
+                  raw = _read_verified_legacy_file(legacy, name)
+                  parsed = safe_json_loads(raw.decode("utf-8", "strict"), None)
+                except (OSError, UnicodeDecodeError) as exc:
                   result["unsafe_skipped"] += 1
-                  reason = f"unsafe retry sidecar: {exc}"
+                  reason = str(exc)
                   result["skipped_reasons"][name] = reason
-                  if (
-                      len(result["unsafe_entries"])
-                      < _MAX_LEGACY_UNSAFE_ENTRIES
-                  ):
+                  if len(result["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
                     result["unsafe_entries"].append(
-                        f"{legacy_path / retry_name}: {reason}"
+                        f"{legacy_path / name}: {reason}"
                     )
                   continue
-
-              dst_name = name
-              if dst.exists(dst_name):
-                existing = _read_private_bytes(dst, dst_name)
-                if existing == raw:
-                  try:
-                    legacy.unlink(name)
-                  except FileNotFoundError:
-                    pass
-                  if retry_bytes is not None:
-                    try:
-                      legacy.unlink(retry_name)
-                    except (FileNotFoundError, OSError):
-                      pass
+                if not isinstance(parsed, dict):
+                  result["unsafe_skipped"] += 1
+                  reason = "not a JSON object envelope"
+                  result["skipped_reasons"][name] = reason
+                  if len(result["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
+                    result["unsafe_entries"].append(
+                        f"{legacy_path / name}: {reason}"
+                    )
                   continue
-                digest = hashlib.sha256(raw).hexdigest()[:12]
-                dst_name = f"event-legacy-{digest}-{name[len('event-'):]}"
-                if dst.exists(dst_name):
-                  existing_dedup = _read_private_bytes(dst, dst_name)
-                  if existing_dedup == raw:
-                    try:
-                      legacy.unlink(name)
-                    except FileNotFoundError:
-                      pass
-                    if retry_bytes is not None:
-                      try:
-                        legacy.unlink(retry_name)
-                      except (FileNotFoundError, OSError):
-                        pass
+                if has_dest and is_destination_mismatch_for(
+                    extract_envelope_config(parsed),
+                    dest_proj,
+                    dest_ds,
+                    dest_tbl,
+                ):
+                  continue
+
+                retry_name = f"{name}.retry"
+                retry_bytes: bytes | None = None
+                if legacy.exists(retry_name):
+                  try:
+                    retry_bytes = _read_verified_legacy_file(
+                        legacy, retry_name
+                    )
+                  except OSError as exc:
+                    result["unsafe_skipped"] += 1
+                    reason = f"unsafe retry sidecar: {exc}"
+                    result["skipped_reasons"][name] = reason
+                    if (
+                        len(result["unsafe_entries"])
+                        < _MAX_LEGACY_UNSAFE_ENTRIES
+                    ):
+                      result["unsafe_entries"].append(
+                          f"{legacy_path / retry_name}: {reason}"
+                      )
                     continue
 
-              dst_retry_name = f"{dst_name}.retry"
-              wrote_retry = False
-              if retry_bytes is not None and not dst.exists(dst_retry_name):
-                _write_atomic_private_bytes(dst, dst_retry_name, retry_bytes)
-                wrote_retry = True
-              try:
-                _write_atomic_private_bytes(dst, dst_name, raw)
-              except OSError:
-                if wrote_retry:
-                  try:
-                    dst.unlink(dst_retry_name)
-                  except OSError:
-                    pass
-                raise
-              try:
-                legacy.unlink(name)
-              except FileNotFoundError:
-                pass
-              if retry_bytes is not None:
+                dst_name = name
+                dst_retry_name = f"{dst_name}.retry"
+                wrote_retry = False
                 try:
-                  legacy.unlink(retry_name)
-                except (FileNotFoundError, OSError):
+                  if dst.exists(dst_name):
+                    existing = _read_private_bytes(dst, dst_name)
+                    if existing == raw:
+                      try:
+                        legacy.unlink(name)
+                      except FileNotFoundError:
+                        pass
+                      if retry_bytes is not None:
+                        try:
+                          legacy.unlink(retry_name)
+                        except (FileNotFoundError, OSError):
+                          pass
+                      continue
+                    digest = hashlib.sha256(raw).hexdigest()[:12]
+                    dst_name = f"event-legacy-{digest}-{name[len('event-'):]}"
+                    dst_retry_name = f"{dst_name}.retry"
+                    if dst.exists(dst_name):
+                      existing_dedup = _read_private_bytes(dst, dst_name)
+                      if existing_dedup == raw:
+                        try:
+                          legacy.unlink(name)
+                        except FileNotFoundError:
+                          pass
+                        if retry_bytes is not None:
+                          try:
+                            legacy.unlink(retry_name)
+                          except (FileNotFoundError, OSError):
+                            pass
+                        continue
+
+                  if retry_bytes is not None and not dst.exists(dst_retry_name):
+                    _write_atomic_private_bytes(
+                        dst, dst_retry_name, retry_bytes
+                    )
+                    wrote_retry = True
+                  _write_atomic_private_bytes(dst, dst_name, raw)
+                except OSError as exc:
+                  if wrote_retry:
+                    try:
+                      dst.unlink(dst_retry_name)
+                    except OSError:
+                      pass
+                  if result["error"] is None:
+                    result["error"] = str(exc)
+                  result["skipped_reasons"][name] = str(exc)
+                  continue
+                try:
+                  legacy.unlink(name)
+                except FileNotFoundError:
                   pass
-              result["migrated"] += 1
-          finally:
-            try:
-              fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except OSError:
-              pass
-            try:
-              os.close(lock_fd)
-            except OSError:
-              pass
+                if retry_bytes is not None:
+                  try:
+                    legacy.unlink(retry_name)
+                  except (FileNotFoundError, OSError):
+                    pass
+                result["migrated"] += 1
+            finally:
+              if locked:
+                try:
+                  fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                  pass
+              try:
+                os.close(lock_fd)
+              except OSError:
+                pass
+        except (OSError, RuntimeError) as exc:
+          result["error"] = str(exc)
+          return result
       finally:
         try:
           fcntl.flock(legacy_pid_fd, fcntl.LOCK_UN)
