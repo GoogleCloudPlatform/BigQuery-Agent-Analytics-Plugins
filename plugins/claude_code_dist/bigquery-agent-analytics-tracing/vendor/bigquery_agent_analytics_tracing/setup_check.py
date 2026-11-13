@@ -98,7 +98,9 @@ class _SetupReport:
 
   @property
   def env_ok(self) -> bool:
-    return bool(self.project_id) and bool(self.dataset)
+    return bool((self.project_id or "").strip()) and bool(
+        (self.dataset or "").strip()
+    )
 
   @property
   def config_ok(self) -> bool:
@@ -264,8 +266,8 @@ def collect_report(python_bin: str | None = None) -> _SetupReport:
       or os.environ.get("BQ_TABLE")
       or "agent_events"
   )
-  proj = (project_id or "").strip()
-  ds = (dataset or "").strip()
+  proj = (project_id or "").strip() or None
+  ds = (dataset or "").strip() or None
   tbl = (table or "").strip() or "agent_events"
   destination = (proj, ds, tbl) if (proj and ds) else None
   legacy_mig = migrate_legacy_spool(spool_dir, destination=destination)
@@ -276,8 +278,8 @@ def collect_report(python_bin: str | None = None) -> _SetupReport:
       python_bin=resolved,
       interpreter_error=interpreter_error,
       config_error=_probe_config(),
-      project_id=project_id,
-      dataset=dataset,
+      project_id=proj,
+      dataset=ds,
       trace_enabled=(
           os.environ.get("BQAA_TRACE_ENABLED", "true").lower() == "true"
       ),
@@ -405,21 +407,23 @@ def _format_report(report: _SetupReport) -> str:
     lines.append("Status: ACTION NEEDED")
     return "\n".join(lines) + "\n"
 
+  proj = (report.project_id or "").strip()
+  ds = (report.dataset or "").strip()
   lines.append("Required env vars:")
   lines.append(
-      f"  [{ok_mark if report.project_id else miss_mark}]"
-      f" BQAA_PROJECT_ID = {report.project_id or '(unset)'}"
+      f"  [{ok_mark if proj else miss_mark}]"
+      f" BQAA_PROJECT_ID = {proj or '(unset)'}"
   )
   lines.append(
-      f"  [{ok_mark if report.dataset else miss_mark}]"
-      f" BQAA_DATASET    = {report.dataset or '(unset)'}"
+      f"  [{ok_mark if ds else miss_mark}]"
+      f" BQAA_DATASET    = {ds or '(unset)'}"
   )
   if not report.env_ok:
     lines.append("")
     lines.append("Fix: export the missing variables, e.g.")
-    if not report.project_id:
+    if not proj:
       lines.append("  export BQAA_PROJECT_ID=your-gcp-project")
-    if not report.dataset:
+    if not ds:
       lines.append("  export BQAA_DATASET=agent_analytics")
   if report.config_error:
     lines.append("")

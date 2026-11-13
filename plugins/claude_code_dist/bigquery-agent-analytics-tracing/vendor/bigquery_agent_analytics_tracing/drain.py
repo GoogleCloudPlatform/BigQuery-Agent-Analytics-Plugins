@@ -1305,6 +1305,7 @@ def _adopt_matching_root_under_lock(
       n for n in root_spool.names() if fnmatch.fnmatchcase(n, "event-*.json")
   )
   skip_cap = max(1, int(_IN_MEMORY_RETRY_META_CAP))
+  stage_idx = 0
   for name in root_names:
     try:
       raw = _read_verified_legacy_file(root_spool, name)
@@ -1359,6 +1360,13 @@ def _adopt_matching_root_under_lock(
           root_spool.unlink(name)
         except FileNotFoundError:
           pass
+        except OSError as exc:
+          _log_diagnostic_once(
+              config,
+              f"root_adopt_failed:{root_spool.path / name}",
+              f"DRAINER root_adopt_failed file={name}: {exc}",
+          )
+          continue
         if retry_bytes is not None:
           try:
             root_spool.unlink(retry_name)
@@ -1374,6 +1382,13 @@ def _adopt_matching_root_under_lock(
             root_spool.unlink(name)
           except FileNotFoundError:
             pass
+          except OSError as exc:
+            _log_diagnostic_once(
+                config,
+                f"root_adopt_failed:{root_spool.path / name}",
+                f"DRAINER root_adopt_failed file={name}: {exc}",
+            )
+            continue
           if retry_bytes is not None:
             try:
               root_spool.unlink(retry_name)
@@ -1396,19 +1411,32 @@ def _adopt_matching_root_under_lock(
         )
         continue
 
+    stage_idx += 1
+    staged_env = f".adopt-stage-{os.getpid()}-{stage_idx}.env"
+    source_unlinked = False
     try:
       try:
         root_spool.replace(name, dst_name, part_spool)
+        source_unlinked = True
       except OSError as exc:
         if exc.errno != errno.EXDEV:
           raise
-        _write_atomic_private_bytes(part_spool, dst_name, raw)
+        _write_atomic_private_bytes(part_spool, staged_env, raw)
         try:
-          root_spool.unlink(name)
-        except (FileNotFoundError, OSError):
-          pass
+          try:
+            root_spool.unlink(name)
+          except FileNotFoundError:
+            pass
+          source_unlinked = True
+        except OSError:
+          try:
+            part_spool.unlink(staged_env)
+          except OSError:
+            pass
+          raise
+        part_spool.replace(staged_env, dst_name)
     except OSError as exc:
-      if wrote_retry:
+      if wrote_retry and not source_unlinked:
         try:
           part_spool.unlink(dst_retry_name)
         except OSError:

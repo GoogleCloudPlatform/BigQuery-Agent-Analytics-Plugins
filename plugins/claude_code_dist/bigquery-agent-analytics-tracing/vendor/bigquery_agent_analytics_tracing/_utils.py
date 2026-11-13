@@ -1255,6 +1255,7 @@ def migrate_legacy_spool(
             try:
               fcntl.flock(lock_fd, fcntl.LOCK_EX)
               locked = True
+              stage_idx = 0
               for name in event_names:
                 if not legacy.exists(name):
                   continue
@@ -1309,7 +1310,12 @@ def migrate_legacy_spool(
 
                 dst_name = name
                 dst_retry_name = f"{dst_name}.retry"
-                wrote_retry = False
+                stage_idx += 1
+                staged_env = f".migrate-stage-{os.getpid()}-{stage_idx}.env"
+                staged_retry = f".migrate-stage-{os.getpid()}-{stage_idx}.rty"
+                wrote_staged_retry = False
+                wrote_staged_env = False
+                source_unlinked = False
                 try:
                   if dst.exists(dst_name):
                     existing = _read_private_bytes(dst, dst_name)
@@ -1341,26 +1347,39 @@ def migrate_legacy_spool(
                             pass
                         continue
 
+                  # Stage into hidden non-deliverable files first so a failed
+                  # legacy.unlink() never leaves a deliverable envelope in dst.
                   if retry_bytes is not None and not dst.exists(dst_retry_name):
                     _write_atomic_private_bytes(
-                        dst, dst_retry_name, retry_bytes
+                        dst, staged_retry, retry_bytes
                     )
-                    wrote_retry = True
-                  _write_atomic_private_bytes(dst, dst_name, raw)
+                    wrote_staged_retry = True
+                  _write_atomic_private_bytes(dst, staged_env, raw)
+                  wrote_staged_env = True
+                  try:
+                    legacy.unlink(name)
+                  except FileNotFoundError:
+                    pass
+                  source_unlinked = True
+                  if wrote_staged_retry:
+                    dst.replace(staged_retry, dst_retry_name)
+                  dst.replace(staged_env, dst_name)
                 except OSError as exc:
-                  if wrote_retry:
-                    try:
-                      dst.unlink(dst_retry_name)
-                    except OSError:
-                      pass
+                  if not source_unlinked:
+                    if wrote_staged_env:
+                      try:
+                        dst.unlink(staged_env)
+                      except OSError:
+                        pass
+                    if wrote_staged_retry:
+                      try:
+                        dst.unlink(staged_retry)
+                      except OSError:
+                        pass
                   if result["error"] is None:
                     result["error"] = str(exc)
                   result["skipped_reasons"][name] = str(exc)
                   continue
-                try:
-                  legacy.unlink(name)
-                except FileNotFoundError:
-                  pass
                 if retry_bytes is not None:
                   try:
                     legacy.unlink(retry_name)
