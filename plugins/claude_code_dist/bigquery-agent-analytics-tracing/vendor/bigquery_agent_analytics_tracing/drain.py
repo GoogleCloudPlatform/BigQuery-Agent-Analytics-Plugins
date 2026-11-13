@@ -50,6 +50,7 @@ from ._utils import ensure_private_dir  # noqa: E402
 from ._utils import extract_envelope_config  # noqa: E402
 from ._utils import has_envelope_destination  # noqa: E402
 from ._utils import is_destination_mismatch_for  # noqa: E402
+from ._utils import lock_spool_inflight  # noqa: E402
 from ._utils import lock_spool_migrate  # noqa: E402
 from ._utils import log_to_file  # noqa: E402
 from ._utils import migrate_legacy_spool  # noqa: E402
@@ -1308,7 +1309,12 @@ def _clear_spool_tracking_state(spool_path: Path) -> None:
 
 
 def _adopt_matching_root_under_lock(
-    root_spool: PrivateDir, part_spool: PrivateDir, config: BQAAConfig
+    root_spool: PrivateDir,
+    part_spool: PrivateDir,
+    config: BQAAConfig,
+    *,
+    src_locked: bool = True,
+    src_lock_error: OSError | None = None,
 ) -> None:
   """Move matching or destination-less root envelopes (and .retry) into ``part_spool``."""
   def _log_adopt_recovery_error(entry_name: str, exc: Exception) -> None:
@@ -1319,201 +1325,231 @@ def _adopt_matching_root_under_lock(
     )
 
   with lock_spool_migrate(part_spool):
-    blocked_sources: set[str] = set()
-    recover_staged_transfers(
-        root_spool,
-        part_spool,
-        stage_prefix=".adopt-stage-",
-        collision_prefix="event-root-",
-        on_error=_log_adopt_recovery_error,
-        blocked_sources=blocked_sources,
-    )
+    with lock_spool_inflight(
+        part_spool, blocking=False, optional=True
+    ) as inflight_locked:
+      blocked_sources: set[str] = set()
+      blocked_tombstones: set[str] = set()
+      recover_staged_transfers(
+          root_spool,
+          part_spool,
+          stage_prefix=".adopt-stage-",
+          collision_prefix="event-root-",
+          on_error=_log_adopt_recovery_error,
+          blocked_sources=blocked_sources,
+          blocked_tombstones=blocked_tombstones,
+          src_locked=src_locked,
+          src_lock_error=src_lock_error,
+      )
 
-    root_names = sorted(
-        n for n in root_spool.names() if fnmatch.fnmatchcase(n, "event-*.json")
-    )
-    skip_cap = max(1, int(_IN_MEMORY_RETRY_META_CAP))
-    for name in root_names:
-      try:
-        raw = _read_verified_legacy_file(root_spool, name)
-      except FileNotFoundError:
-        continue
-      except OSError as exc:
-        _log_bounded_once(
-            config,
-            _reported_skips,
-            skip_cap,
-            f"{root_spool.path / name}: {exc}",
-            f"DRAINER skipped {root_spool.path / name}: {exc}",
-        )
-        continue
-      try:
-        parsed = json.loads(raw.decode("utf-8", "strict"))
-      except (UnicodeDecodeError, json.JSONDecodeError):
-        _quarantine(root_spool, name, reason="corrupt-json", config=config)
-        continue
-      if not isinstance(parsed, dict):
-        _quarantine(root_spool, name, reason="corrupt-json", config=config)
-        continue
-
-      env_cfg = _extract_envelope_config(parsed)
-      if has_envelope_destination(env_cfg) and is_destination_mismatch(
-          env_cfg, config
-      ):
-        continue
-
-      retry_name = _retry_sidecar_name(name)
-      retry_bytes: bytes | None = None
-      if root_spool.exists(retry_name):
+      root_names = sorted(
+          n
+          for n in root_spool.names()
+          if fnmatch.fnmatchcase(n, "event-*.json")
+      )
+      skip_cap = max(1, int(_IN_MEMORY_RETRY_META_CAP))
+      for name in root_names:
+        if name in blocked_tombstones:
+          continue
         try:
-          retry_bytes = _read_verified_legacy_file(root_spool, retry_name)
+          raw = _read_verified_legacy_file(root_spool, name)
         except FileNotFoundError:
-          retry_bytes = None
+          continue
         except OSError as exc:
           _log_bounded_once(
               config,
               _reported_skips,
               skip_cap,
-              f"{root_spool.path / retry_name}: {exc}",
-              f"DRAINER skipped {root_spool.path / retry_name}: {exc}",
+              f"{root_spool.path / name}: {exc}",
+              f"DRAINER skipped {root_spool.path / name}: {exc}",
           )
           continue
+        try:
+          parsed = json.loads(raw.decode("utf-8", "strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+          if src_locked:
+            _quarantine(root_spool, name, reason="corrupt-json", config=config)
+          continue
+        if not isinstance(parsed, dict):
+          if src_locked:
+            _quarantine(root_spool, name, reason="corrupt-json", config=config)
+          continue
 
-      sha256_hex = hashlib.sha256(raw).hexdigest()
-      dst_name = name
-      if len(dst_name.encode("utf-8")) > _MAX_STAGED_EVENT_NAME_BYTES:
-        dst_name = bounded_collision_event_name(
-            name, sha256_hex, "event-root-"
-        )
+        env_cfg = _extract_envelope_config(parsed)
+        if has_envelope_destination(env_cfg) and is_destination_mismatch(
+            env_cfg, config
+        ):
+          continue
 
-      dedup_target: str | None = None
-      collision_blocked = False
-      if part_spool.exists(dst_name):
-        existing = _read_private_bytes(part_spool, dst_name)
-        if existing == raw:
-          dedup_target = dst_name
-        else:
-          collision_name = bounded_collision_event_name(
+        retry_name = _retry_sidecar_name(name)
+        retry_bytes: bytes | None = None
+        if root_spool.exists(retry_name):
+          try:
+            retry_bytes = _read_verified_legacy_file(root_spool, retry_name)
+          except FileNotFoundError:
+            retry_bytes = None
+          except OSError as exc:
+            _log_bounded_once(
+                config,
+                _reported_skips,
+                skip_cap,
+                f"{root_spool.path / retry_name}: {exc}",
+                f"DRAINER skipped {root_spool.path / retry_name}: {exc}",
+            )
+            continue
+
+        sha256_hex = hashlib.sha256(raw).hexdigest()
+        dst_name = name
+        if len(dst_name.encode("utf-8")) > _MAX_STAGED_EVENT_NAME_BYTES:
+          dst_name = bounded_collision_event_name(
               name, sha256_hex, "event-root-"
           )
-          if collision_name == dst_name:
-            collision_blocked = True
-          elif part_spool.exists(collision_name):
-            existing_dedup = _read_private_bytes(part_spool, collision_name)
-            if existing_dedup == raw:
-              dedup_target = collision_name
-            else:
-              collision_blocked = True
-          else:
-            dst_name = collision_name
 
-      if dedup_target is not None:
-        try:
-          retire_duplicate_source_entry(
-              root_spool,
-              part_spool,
-              source_name=name,
-              source_retry_name=retry_name,
-              source_retry_bytes=retry_bytes,
-              dst_name=dedup_target,
-              stage_prefix=".adopt-stage-",
-              sha256_hex=sha256_hex,
+        dedup_target: str | None = None
+        collision_blocked = False
+        if part_spool.exists(dst_name):
+          existing = _read_private_bytes(part_spool, dst_name)
+          if existing == raw:
+            dedup_target = dst_name
+          else:
+            collision_name = bounded_collision_event_name(
+                name, sha256_hex, "event-root-"
+            )
+            if collision_name == dst_name:
+              collision_blocked = True
+            elif part_spool.exists(collision_name):
+              existing_dedup = _read_private_bytes(part_spool, collision_name)
+              if existing_dedup == raw:
+                dedup_target = collision_name
+              else:
+                collision_blocked = True
+            else:
+              dst_name = collision_name
+
+        if dedup_target is not None:
+          try:
+            retire_duplicate_source_entry(
+                root_spool,
+                part_spool,
+                source_name=name,
+                source_retry_name=retry_name,
+                source_retry_bytes=retry_bytes,
+                dst_name=dedup_target,
+                stage_prefix=".adopt-stage-",
+                sha256_hex=sha256_hex,
+                inflight_locked=inflight_locked,
+                src_locked=src_locked,
+                src_lock_error=src_lock_error,
+            )
+          except OSError as exc:
+            _log_diagnostic_once(
+                config,
+                f"root_adopt_failed:{root_spool.path / name}",
+                f"DRAINER root_adopt_failed file={name}: {exc}",
+            )
+          continue
+
+        if collision_blocked or name in blocked_sources:
+          continue
+
+        if not src_locked:
+          lock_exc = src_lock_error or PermissionError(
+              errno.EACCES,
+              f"Source directory {root_spool.path} is not locked",
           )
-        except OSError as exc:
           _log_diagnostic_once(
               config,
               f"root_adopt_failed:{root_spool.path / name}",
-              f"DRAINER root_adopt_failed file={name}: {exc}",
+              f"DRAINER root_adopt_failed file={name}: {lock_exc}",
           )
-        continue
+          continue
 
-      if collision_blocked or name in blocked_sources:
-        continue
+        dst_retry_name = _retry_sidecar_name(dst_name)
+        stage_meta, stage_env, stage_rty = _make_stage_names(".adopt-stage-")
+        staged_retry_written = False
+        promoted_retry = False
+        wrote_staged_env = False
+        wrote_staged_meta = False
+        source_unlinked = False
+        if retry_bytes is not None and not part_spool.exists(dst_retry_name):
+          try:
+            _write_atomic_private_bytes(part_spool, stage_rty, retry_bytes)
+            staged_retry_written = True
+          except OSError as exc:
+            _log_diagnostic_once(
+                config,
+                f"root_adopt_failed:{root_spool.path / name}",
+                f"DRAINER root_adopt_failed file={name}: {exc}",
+            )
+            continue
 
-      dst_retry_name = _retry_sidecar_name(dst_name)
-      stage_meta, stage_env, stage_rty = _make_stage_names(".adopt-stage-")
-      staged_retry_written = False
-      promoted_retry = False
-      wrote_staged_env = False
-      wrote_staged_meta = False
-      source_unlinked = False
-      if retry_bytes is not None and not part_spool.exists(dst_retry_name):
         try:
-          _write_atomic_private_bytes(part_spool, stage_rty, retry_bytes)
-          staged_retry_written = True
+          try:
+            if staged_retry_written:
+              part_spool.replace(stage_rty, dst_retry_name)
+              promoted_retry = True
+            root_spool.replace(name, dst_name, part_spool)
+            source_unlinked = True
+            if retry_bytes is not None:
+              try:
+                root_spool.unlink(retry_name)
+              except (FileNotFoundError, OSError):
+                pass
+          except OSError as exc:
+            if exc.errno != errno.EXDEV:
+              raise
+            if promoted_retry:
+              part_spool.replace(dst_retry_name, stage_rty)
+              promoted_retry = False
+            _write_atomic_private_bytes(part_spool, stage_env, raw)
+            wrote_staged_env = True
+            meta_bytes = _build_stage_meta_bytes(
+                source=name,
+                source_retry=retry_name if retry_bytes is not None else "",
+                dst_name=dst_name,
+                dst_retry_name=dst_retry_name,
+                has_retry=staged_retry_written,
+                sha256_hex=sha256_hex,
+            )
+            _write_atomic_private_bytes(part_spool, stage_meta, meta_bytes)
+            wrote_staged_meta = True
+            try:
+              root_spool.unlink(name)
+            except FileNotFoundError:
+              pass
+            source_unlinked = True
+            _promote_staged_entry(
+                root_spool,
+                part_spool,
+                stage_meta,
+                stage_env,
+                stage_rty,
+                dst_name,
+                dst_retry_name,
+                retry_name if retry_bytes is not None else "",
+                staged_retry_written,
+            )
         except OSError as exc:
+          if not source_unlinked:
+            if promoted_retry:
+              try:
+                part_spool.unlink(dst_retry_name)
+              except OSError:
+                pass
+            _cleanup_stage_files(
+                part_spool,
+                stage_meta if wrote_staged_meta else "",
+                stage_env if wrote_staged_env else "",
+                stage_rty
+                if staged_retry_written and not promoted_retry
+                else "",
+            )
           _log_diagnostic_once(
               config,
               f"root_adopt_failed:{root_spool.path / name}",
               f"DRAINER root_adopt_failed file={name}: {exc}",
           )
           continue
-
-      try:
-        try:
-          if staged_retry_written:
-            part_spool.replace(stage_rty, dst_retry_name)
-            promoted_retry = True
-          root_spool.replace(name, dst_name, part_spool)
-          source_unlinked = True
-          if retry_bytes is not None:
-            try:
-              root_spool.unlink(retry_name)
-            except (FileNotFoundError, OSError):
-              pass
-        except OSError as exc:
-          if exc.errno != errno.EXDEV:
-            raise
-          if promoted_retry:
-            part_spool.replace(dst_retry_name, stage_rty)
-            promoted_retry = False
-          _write_atomic_private_bytes(part_spool, stage_env, raw)
-          wrote_staged_env = True
-          meta_bytes = _build_stage_meta_bytes(
-              source=name,
-              source_retry=retry_name if retry_bytes is not None else "",
-              dst_name=dst_name,
-              dst_retry_name=dst_retry_name,
-              has_retry=staged_retry_written,
-              sha256_hex=sha256_hex,
-          )
-          _write_atomic_private_bytes(part_spool, stage_meta, meta_bytes)
-          wrote_staged_meta = True
-          try:
-            root_spool.unlink(name)
-          except FileNotFoundError:
-            pass
-          source_unlinked = True
-          _promote_staged_entry(
-              root_spool,
-              part_spool,
-              stage_meta,
-              stage_env,
-              stage_rty,
-              dst_name,
-              dst_retry_name,
-              retry_name if retry_bytes is not None else "",
-              staged_retry_written,
-          )
-      except OSError as exc:
-        if not source_unlinked:
-          if promoted_retry:
-            try:
-              part_spool.unlink(dst_retry_name)
-            except OSError:
-              pass
-          _cleanup_stage_files(
-              part_spool,
-              stage_meta if wrote_staged_meta else "",
-              stage_env if wrote_staged_env else "",
-              stage_rty if staged_retry_written and not promoted_retry else "",
-          )
-        _log_diagnostic_once(
-            config,
-            f"root_adopt_failed:{root_spool.path / name}",
-            f"DRAINER root_adopt_failed file={name}: {exc}",
-        )
-        continue
 
 
 def _adopt_matching_root_spool_files(
@@ -1532,17 +1568,18 @@ def _adopt_matching_root_spool_files(
       return
     try:
       with lock_spool_migrate(part_spool):
-        recover_staged_transfers(
-            None,
-            part_spool,
-            stage_prefix=".adopt-stage-",
-            collision_prefix="event-root-",
-            on_error=lambda entry_name, exc: _log_diagnostic_once(
-                config,
-                f"root_adopt_failed:{root_path / entry_name}",
-                f"DRAINER root_adopt_failed file={entry_name}: {exc}",
-            ),
-        )
+        with lock_spool_inflight(part_spool, blocking=False, optional=True):
+          recover_staged_transfers(
+              None,
+              part_spool,
+              stage_prefix=".adopt-stage-",
+              collision_prefix="event-root-",
+              on_error=lambda entry_name, exc: _log_diagnostic_once(
+                  config,
+                  f"root_adopt_failed:{root_path / entry_name}",
+                  f"DRAINER root_adopt_failed file={entry_name}: {exc}",
+              ),
+          )
     except OSError:
       return
     return
@@ -1566,14 +1603,26 @@ def _adopt_matching_root_spool_files(
           if root_spool.exists(".drainer.pid"):
             lock_fd = root_spool.open(".drainer.pid", os.O_RDONLY)
           else:
-            _adopt_matching_root_under_lock(root_spool, part_spool, config)
+            _adopt_matching_root_under_lock(
+                root_spool,
+                part_spool,
+                config,
+                src_locked=False,
+                src_lock_error=exc,
+            )
             return
         else:
           return
       with _flock_pidfile_fd(lock_fd) as acquired:
         if acquired is None:
           return
-        _adopt_matching_root_under_lock(root_spool, part_spool, config)
+        _adopt_matching_root_under_lock(
+            root_spool,
+            part_spool,
+            config,
+            src_locked=True,
+            src_lock_error=None,
+        )
   except (OSError, RuntimeError):
     return
 
@@ -1584,141 +1633,146 @@ async def _drain_single_spool(
   resolved = 0
   skip_cap = max(1, int(_IN_MEMORY_RETRY_META_CAP))
   envelopes: list[_Envelope] = []
-  with lock_spool_migrate(spool, optional=True):
-    pending_names = _list_pending(spool)
-    pending_set = set(pending_names)
-    staged_retries = staged_dst_retry_names(spool)
-    for extra in spool.names():
-      if extra.endswith(".retry"):
-        if extra in staged_retries:
-          continue
-        event_name = extra[: -len(".retry")]
-        if event_name not in pending_set:
-          _unlink_retry(spool, event_name)
-    for mem_key in list(_in_memory_retry_meta):
-      mem_path = Path(mem_key)
-      if mem_path.parent == spool.path and mem_path.name not in pending_set:
-        del _in_memory_retry_meta[mem_key]
-    for skip_key in list(_skipped_paths):
-      skip_path = Path(skip_key)
-      if skip_path.parent == spool.path and skip_path.name not in pending_set:
-        _skipped_paths.discard(skip_key)
-    for retry_skip_key in list(_retry_skipped_paths):
-      retry_skip_path = Path(retry_skip_key)
-      if (
-          retry_skip_path.parent == spool.path
-          and retry_skip_path.name not in pending_set
-      ):
-        _retry_skipped_paths.discard(retry_skip_key)
-    cap = max(0, int(_IN_MEMORY_RETRY_META_CAP))
-    if not pending_set or (cap > 0 and len(_in_memory_retry_meta) < cap):
-      _release_retry_saturation(spool)
-    if not pending_set or len(_skipped_paths) < skip_cap:
-      _skip_cap_saturated.discard(str(spool.path))
+  with lock_spool_inflight(spool, blocking=True, optional=True):
+    with lock_spool_migrate(spool, optional=True):
+      pending_names = _list_pending(spool)
+      pending_set = set(pending_names)
+      staged_retries = staged_dst_retry_names(spool)
+      for extra in spool.names():
+        if extra.endswith(".retry"):
+          if extra in staged_retries:
+            continue
+          event_name = extra[: -len(".retry")]
+          if event_name not in pending_set:
+            _unlink_retry(spool, event_name)
+      for mem_key in list(_in_memory_retry_meta):
+        mem_path = Path(mem_key)
+        if mem_path.parent == spool.path and mem_path.name not in pending_set:
+          del _in_memory_retry_meta[mem_key]
+      for skip_key in list(_skipped_paths):
+        skip_path = Path(skip_key)
+        if skip_path.parent == spool.path and skip_path.name not in pending_set:
+          _skipped_paths.discard(skip_key)
+      for retry_skip_key in list(_retry_skipped_paths):
+        retry_skip_path = Path(retry_skip_key)
+        if (
+            retry_skip_path.parent == spool.path
+            and retry_skip_path.name not in pending_set
+        ):
+          _retry_skipped_paths.discard(retry_skip_key)
+      cap = max(0, int(_IN_MEMORY_RETRY_META_CAP))
+      if not pending_set or (cap > 0 and len(_in_memory_retry_meta) < cap):
+        _release_retry_saturation(spool)
+      if not pending_set or len(_skipped_paths) < skip_cap:
+        _skip_cap_saturated.discard(str(spool.path))
 
-    now = time.time()
-    max_age = float(getattr(config, "drain_max_retry_age_seconds", 86400.0))
+      now = time.time()
+      max_age = float(getattr(config, "drain_max_retry_age_seconds", 86400.0))
 
-    for name in pending_names:
-      if len(envelopes) >= max(1, config.drain_batch_size):
-        break
-      skip_key = _retry_mem_key(spool, name)
-      if _is_skipped_envelope(spool, name):
-        continue
-      retry_meta = _read_retry_meta(spool, name)
-      if retry_meta is not None:
-        if retry_meta.get("quarantine_pending"):
-          q_reason = str(retry_meta.get("quarantine_reason") or "write-failed")
-          raw_subdir = retry_meta.get("quarantine_subdir")
-          q_subdir = (
-              str(raw_subdir)
-              if isinstance(raw_subdir, str) and raw_subdir
-              else None
-          )
-          if _attempt_quarantine(
-              spool,
-              name,
-              reason=q_reason,
-              subdir=q_subdir,
-              config=config,
-              track_untracked_permanent=True,
-          ):
-            resolved += 1
+      for name in pending_names:
+        if len(envelopes) >= max(1, config.drain_batch_size):
+          break
+        skip_key = _retry_mem_key(spool, name)
+        if _is_skipped_envelope(spool, name):
           continue
-        parsed_meta = _parse_retry_meta(retry_meta, now)
-        if parsed_meta is not None:
-          first_failed_at, next_retry_at, attempts = parsed_meta
-          if now - first_failed_at >= max_age and attempts >= 1:
-            _log_diagnostic_once(
-                config,
-                f"retry_expired:{skip_key}",
-                f"DRAINER retry_expired file={name}"
-                f" age={now - first_failed_at:.1f}s"
-                f" max_age={max_age:.1f}s"
-                f" last_error={retry_meta.get('last_error', '')}",
+        retry_meta = _read_retry_meta(spool, name)
+        if retry_meta is not None:
+          if retry_meta.get("quarantine_pending"):
+            q_reason = str(
+                retry_meta.get("quarantine_reason") or "write-failed"
+            )
+            raw_subdir = retry_meta.get("quarantine_subdir")
+            q_subdir = (
+                str(raw_subdir)
+                if isinstance(raw_subdir, str) and raw_subdir
+                else None
             )
             if _attempt_quarantine(
                 spool,
                 name,
-                reason="write-failed",
+                reason=q_reason,
+                subdir=q_subdir,
                 config=config,
-                diag_event="retry_expiry_quarantine_failed",
                 track_untracked_permanent=True,
             ):
               resolved += 1
             continue
-          if config.drain_retry_backoff_seconds != 0.0 and next_retry_at > now:
-            continue
+          parsed_meta = _parse_retry_meta(retry_meta, now)
+          if parsed_meta is not None:
+            first_failed_at, next_retry_at, attempts = parsed_meta
+            if now - first_failed_at >= max_age and attempts >= 1:
+              _log_diagnostic_once(
+                  config,
+                  f"retry_expired:{skip_key}",
+                  f"DRAINER retry_expired file={name}"
+                  f" age={now - first_failed_at:.1f}s"
+                  f" max_age={max_age:.1f}s"
+                  f" last_error={retry_meta.get('last_error', '')}",
+              )
+              if _attempt_quarantine(
+                  spool,
+                  name,
+                  reason="write-failed",
+                  config=config,
+                  diag_event="retry_expiry_quarantine_failed",
+                  track_untracked_permanent=True,
+              ):
+                resolved += 1
+              continue
+            if config.drain_retry_backoff_seconds != 0.0 and next_retry_at > now:
+              continue
 
-      try:
-        env = _read_envelope(spool, name, config)
-      except _SkippedEnvelope as skipped:
-        _in_memory_retry_meta.pop(skip_key, None)
-        _record_overflow_skip(spool, name, config=config, retry_overflow=False)
-        _log_bounded_once(
-            config,
-            _reported_skips,
-            skip_cap,
-            str(skipped),
-            f"DRAINER skipped {skipped}",
-        )
-        continue
-      if env is None:
-        pending_quarantine = bool(
-            (_in_memory_retry_meta.get(skip_key) or {}).get(
-                "quarantine_pending"
-            )
-        )
-        if (
-            not pending_quarantine
-            and not _is_skipped_envelope(
-                spool, name, include_skip_saturation=True
-            )
-        ) or not _spool_entry_exists(spool, name):
-          resolved += 1
-        continue
-      _skipped_paths.discard(skip_key)
-      _retry_skipped_paths.discard(skip_key)
-      envelopes.append(env)
-
-  if not envelopes:
-    return resolved
-  grouped = _group_envelopes(envelopes, config)
-  retry = _RetryConfig()
-  counts = await asyncio.gather(
-      *(
-          _drain_group_async(
-              key=key,
-              envelopes=batch,
-              retry=retry,
-              config=config,
-              use_storage_api=use_storage_api,
-              spool=spool,
+        try:
+          env = _read_envelope(spool, name, config)
+        except _SkippedEnvelope as skipped:
+          _in_memory_retry_meta.pop(skip_key, None)
+          _record_overflow_skip(
+              spool, name, config=config, retry_overflow=False
           )
-          for key, batch in grouped.items()
-      )
-  )
-  return resolved + sum(counts)
+          _log_bounded_once(
+              config,
+              _reported_skips,
+              skip_cap,
+              str(skipped),
+              f"DRAINER skipped {skipped}",
+          )
+          continue
+        if env is None:
+          pending_quarantine = bool(
+              (_in_memory_retry_meta.get(skip_key) or {}).get(
+                  "quarantine_pending"
+              )
+          )
+          if (
+              not pending_quarantine
+              and not _is_skipped_envelope(
+                  spool, name, include_skip_saturation=True
+              )
+          ) or not _spool_entry_exists(spool, name):
+            resolved += 1
+          continue
+        _skipped_paths.discard(skip_key)
+        _retry_skipped_paths.discard(skip_key)
+        envelopes.append(env)
+
+    if not envelopes:
+      return resolved
+    grouped = _group_envelopes(envelopes, config)
+    retry = _RetryConfig()
+    counts = await asyncio.gather(
+        *(
+            _drain_group_async(
+                key=key,
+                envelopes=batch,
+                retry=retry,
+                config=config,
+                use_storage_api=use_storage_api,
+                spool=spool,
+            )
+            for key, batch in grouped.items()
+        )
+    )
+    return resolved + sum(counts)
 
 
 async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:

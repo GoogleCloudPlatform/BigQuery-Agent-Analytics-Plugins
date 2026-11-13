@@ -1129,6 +1129,61 @@ def lock_spool_migrate(
       pass
 
 
+@contextlib.contextmanager
+def lock_spool_inflight(
+    dst: PrivateDir, *, blocking: bool = True, optional: bool = False
+) -> Iterator[bool]:
+  """Acquire exclusive lock on ``dst/.inflight.lock``.
+
+  Each invocation opens a fresh file descriptor so multi-threaded callers in
+  the same process also contend via BSD ``flock`` per-open-file-description
+  semantics. When ``blocking=False``, acquires with ``LOCK_EX | LOCK_NB`` and
+  yields ``False`` on contention (``EAGAIN``/``EACCES``/``EWOULDBLOCK``) or,
+  when ``optional=True``, on ``OSError``.
+  """
+  try:
+    lock_fd = dst.open(".inflight.lock", os.O_CREAT | os.O_RDWR, 0o600)
+  except OSError as exc:
+    if optional and exc.errno in (
+        errno.EACCES,
+        errno.EPERM,
+        errno.EROFS,
+        errno.ENOSPC,
+        errno.EDQUOT,
+    ):
+      yield False
+      return
+    raise
+  locked = False
+  try:
+    flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+      fcntl.flock(lock_fd, flags)
+    except OSError as exc:
+      if not blocking and (
+          exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK)
+          or optional
+      ):
+        yield False
+        return
+      if optional:
+        yield False
+        return
+      raise
+    locked = True
+    yield True
+  finally:
+    if locked:
+      try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+      except OSError:
+        pass
+    try:
+      os.close(lock_fd)
+    except OSError:
+      pass
+
+
 def migrate_legacy_session_state(
     dst_dir: PrivateDir,
     safe_key: str,
@@ -1289,6 +1344,8 @@ def staged_dst_retry_names(
       continue
     if not isinstance(meta, dict):
       continue
+    if meta.get("mode") == "dedup_tombstone":
+      continue
     dst_retry_name = meta.get("dst_retry_name")
     if _is_safe_stage_entry_name(dst_retry_name):
       protected.add(dst_retry_name)
@@ -1365,21 +1422,60 @@ def retire_duplicate_source_entry(
     dst_name: str,
     stage_prefix: str,
     sha256_hex: str,
+    inflight_locked: bool = True,
+    src_locked: bool = True,
+    src_lock_error: OSError | None = None,
 ) -> None:
-  """Withhold ``dst/dst_name`` while retiring an identical ``src/source_name``.
+  """Retire an identical ``src/source_name`` without racing in-flight delivery.
 
-  Moves any existing destination envelope (and retry sidecar) out of
-  deliverable view before attempting ``src.unlink(source_name)``. If
-  ``src.unlink(source_name)`` fails (for example on a ``0500`` directory),
-  the withheld stage files remain in ``dst`` so the event cannot be delivered
-  twice when ``src`` later becomes writable again.
+  When ``inflight_locked=True``, withholds any existing destination envelope
+  (and retry sidecar) out of deliverable view before attempting
+  ``src.unlink(source_name)``. When ``inflight_locked=False`` (an active
+  drainer holds ``.inflight.lock``), never moves live destination files and
+  instead writes a ``mode="dedup_tombstone"`` stage metadata file before
+  touching ``src``. When ``src_locked=False``, never calls ``src.unlink`` or
+  swallows ``FileNotFoundError``, leaving the withhold or tombstone intact
+  and raising ``src_lock_error``.
   """
   dst_retry_name = f"{dst_name}.retry"
-  dst_has_retry = dst.exists(dst_retry_name)
-  has_retry = dst_has_retry or (source_retry_bytes is not None)
   effective_source_retry = (
       source_retry_name if source_retry_bytes is not None else ""
   )
+  lock_exc = src_lock_error or PermissionError(
+      errno.EACCES, f"Source directory {src.path} is not writable/locked"
+  )
+
+  if not inflight_locked:
+    stage_meta, _, _ = _make_stage_names(stage_prefix)
+    meta_bytes = _build_stage_meta_bytes(
+        source=source_name,
+        source_retry=effective_source_retry,
+        dst_name=dst_name,
+        dst_retry_name=dst_retry_name,
+        has_retry=False,
+        sha256_hex=sha256_hex,
+        mode="dedup_tombstone",
+    )
+    _write_atomic_private_bytes(dst, stage_meta, meta_bytes)
+    if not src_locked:
+      raise lock_exc
+    try:
+      src.unlink(source_name)
+    except FileNotFoundError:
+      pass
+    if effective_source_retry:
+      try:
+        src.unlink(effective_source_retry)
+      except (FileNotFoundError, OSError):
+        pass
+    try:
+      dst.unlink(stage_meta)
+    except (FileNotFoundError, OSError):
+      pass
+    return
+
+  dst_has_retry = dst.exists(dst_retry_name)
+  has_retry = dst_has_retry or (source_retry_bytes is not None)
   stage_meta, stage_env, stage_rty = _make_stage_names(stage_prefix)
   meta_bytes = _build_stage_meta_bytes(
       source=source_name,
@@ -1425,6 +1521,9 @@ def retire_duplicate_source_entry(
     )
     raise
 
+  if not src_locked:
+    raise lock_exc
+
   try:
     src.unlink(source_name)
   except FileNotFoundError:
@@ -1450,15 +1549,21 @@ def recover_staged_transfers(
     collision_prefix: str,
     on_error: Any = None,
     blocked_sources: set[str] | None = None,
+    blocked_tombstones: set[str] | None = None,
+    src_locked: bool = True,
+    src_lock_error: Exception | None = None,
 ) -> int:
   """Recover interrupted or post-unlink failed staged transfers in ``dst``.
 
-  Must be called while holding exclusive locks over both ``src`` (when
-  ``src is not None``) and ``dst``. Any ``dedup_withhold`` entry whose
-  source still cannot be unlinked remains withheld and is recorded in
-  ``blocked_sources``.
+  Must be called while holding ``dst/.migrate.lock``. When ``src is not None``
+  and ``src_locked=False``, never calls ``src.unlink`` or promotes existing
+  stages based on missing source entries; leaves stages intact and records
+  affected source names in ``blocked_sources`` / ``blocked_tombstones``.
   """
   recovered = 0
+  lock_exc = src_lock_error or PermissionError(
+      errno.EACCES, "Source directory is not writable/locked"
+  )
   try:
     names = sorted(dst.names())
   except OSError as exc:
@@ -1500,10 +1605,73 @@ def recover_staged_transfers(
         or not _is_safe_stage_entry_name(source_retry, allow_empty=True)
         or not _is_safe_stage_entry_name(dst_retry_name, allow_empty=True)
         or not isinstance(sha256_hex, str)
-        or mode not in ("transfer", "dedup_withhold")
+        or mode not in ("transfer", "dedup_withhold", "dedup_tombstone")
     ):
       if on_error is not None:
         on_error(meta_name, ValueError("malformed staged transfer metadata"))
+      continue
+
+    if mode == "dedup_tombstone":
+      if src is None:
+        _cleanup_stage_files(dst, meta_name)
+        continue
+      if not src_locked:
+        if blocked_tombstones is not None:
+          blocked_tombstones.add(source)
+        if blocked_sources is not None:
+          blocked_sources.add(source)
+        if on_error is not None:
+          on_error(source, lock_exc)
+        continue
+      try:
+        src_still_exists = src.exists(source)
+      except OSError as exc:
+        if blocked_tombstones is not None:
+          blocked_tombstones.add(source)
+        if blocked_sources is not None:
+          blocked_sources.add(source)
+        if on_error is not None:
+          on_error(source, exc)
+        continue
+      if not src_still_exists:
+        if source_retry:
+          try:
+            src.unlink(source_retry)
+          except (FileNotFoundError, OSError):
+            pass
+        _cleanup_stage_files(dst, meta_name)
+        continue
+      try:
+        src_bytes = _read_verified_legacy_file(src, source)
+      except OSError as exc:
+        if blocked_tombstones is not None:
+          blocked_tombstones.add(source)
+        if blocked_sources is not None:
+          blocked_sources.add(source)
+        if on_error is not None:
+          on_error(source, exc)
+        continue
+      if not sha256_hex or hashlib.sha256(src_bytes).hexdigest() != sha256_hex:
+        _cleanup_stage_files(dst, meta_name)
+        continue
+      try:
+        src.unlink(source)
+      except FileNotFoundError:
+        pass
+      except OSError as exc:
+        if blocked_tombstones is not None:
+          blocked_tombstones.add(source)
+        if blocked_sources is not None:
+          blocked_sources.add(source)
+        if on_error is not None:
+          on_error(source, exc)
+        continue
+      if source_retry:
+        try:
+          src.unlink(source_retry)
+        except (FileNotFoundError, OSError):
+          pass
+      _cleanup_stage_files(dst, meta_name)
       continue
 
     if mode == "dedup_withhold":
@@ -1523,6 +1691,12 @@ def recover_staged_transfers(
         _cleanup_stage_files(dst, stage_rty, meta_name)
         continue
       if src is not None:
+        if not src_locked:
+          if blocked_sources is not None:
+            blocked_sources.add(source)
+          if on_error is not None:
+            on_error(source, lock_exc)
+          continue
         try:
           src_still_exists = src.exists(source)
         except OSError as exc:
@@ -1543,6 +1717,12 @@ def recover_staged_transfers(
               blocked_sources.add(source)
             continue
     elif src is not None:
+      if not src_locked:
+        if blocked_sources is not None:
+          blocked_sources.add(source)
+        if on_error is not None:
+          on_error(source, lock_exc)
+        continue
       try:
         src_still_exists = src.exists(source)
       except OSError as exc:
@@ -1750,13 +1930,14 @@ def migrate_legacy_spool(
       ) as dst:
         if any(n.startswith(".migrate-stage-") for n in dst.names()):
           with lock_spool_migrate(dst):
-            result["migrated"] += recover_staged_transfers(
-                None,
-                dst,
-                stage_prefix=".migrate-stage-",
-                collision_prefix="event-legacy-",
-                on_error=_record_stage_error,
-            )
+            with lock_spool_inflight(dst, blocking=False, optional=True):
+              result["migrated"] += recover_staged_transfers(
+                  None,
+                  dst,
+                  stage_prefix=".migrate-stage-",
+                  collision_prefix="event-legacy-",
+                  on_error=_record_stage_error,
+              )
     except FileNotFoundError:
       pass
     except (OSError, RuntimeError) as exc:
@@ -1791,6 +1972,8 @@ def migrate_legacy_spool(
       return result
 
     legacy_pid_fd: int | None = None
+    src_locked = True
+    src_lock_error: OSError | None = None
     try:
       legacy_pid_fd = legacy.open(
           ".drainer.pid", os.O_CREAT | os.O_RDWR, 0o600
@@ -1803,6 +1986,9 @@ def migrate_legacy_spool(
           except OSError as rd_exc:
             result["error"] = str(rd_exc)
             return result
+        else:
+          src_locked = False
+          src_lock_error = exc
       else:
         result["error"] = str(exc)
         return result
@@ -1841,169 +2027,202 @@ def migrate_legacy_spool(
             if _same_private_dir(legacy, dst):
               return result
             with lock_spool_migrate(dst):
-              blocked_sources: set[str] = set()
-              result["migrated"] += recover_staged_transfers(
-                  legacy,
-                  dst,
-                  stage_prefix=".migrate-stage-",
-                  collision_prefix="event-legacy-",
-                  on_error=_record_stage_error,
-                  blocked_sources=blocked_sources,
-              )
+              with lock_spool_inflight(
+                  dst, blocking=False, optional=True
+              ) as inflight_locked:
+                blocked_sources: set[str] = set()
+                blocked_tombstones: set[str] = set()
+                result["migrated"] += recover_staged_transfers(
+                    legacy,
+                    dst,
+                    stage_prefix=".migrate-stage-",
+                    collision_prefix="event-legacy-",
+                    on_error=_record_stage_error,
+                    blocked_sources=blocked_sources,
+                    blocked_tombstones=blocked_tombstones,
+                    src_locked=src_locked,
+                    src_lock_error=src_lock_error,
+                )
 
-              for name in event_names:
-                if not legacy.exists(name):
-                  continue
-                try:
-                  raw = _read_verified_legacy_file(legacy, name)
-                  parsed = safe_json_loads(raw.decode("utf-8", "strict"), None)
-                except (OSError, UnicodeDecodeError) as exc:
-                  result["unsafe_skipped"] += 1
-                  reason = str(exc)
-                  result["skipped_reasons"][name] = reason
-                  if len(result["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
-                    result["unsafe_entries"].append(
-                        f"{legacy_path / name}: {reason}"
-                    )
-                  continue
-                if not isinstance(parsed, dict):
-                  result["unsafe_skipped"] += 1
-                  reason = "not a JSON object envelope"
-                  result["skipped_reasons"][name] = reason
-                  if len(result["unsafe_entries"]) < _MAX_LEGACY_UNSAFE_ENTRIES:
-                    result["unsafe_entries"].append(
-                        f"{legacy_path / name}: {reason}"
-                    )
-                  continue
-                if has_dest and is_destination_mismatch_for(
-                    extract_envelope_config(parsed),
-                    dest_proj,
-                    dest_ds,
-                    dest_tbl,
-                ):
-                  continue
-
-                retry_name = f"{name}.retry"
-                retry_bytes: bytes | None = None
-                if legacy.exists(retry_name):
+                for name in event_names:
+                  if name in blocked_tombstones:
+                    continue
+                  if not legacy.exists(name):
+                    continue
                   try:
-                    retry_bytes = _read_verified_legacy_file(
-                        legacy, retry_name
-                    )
-                  except OSError as exc:
+                    raw = _read_verified_legacy_file(legacy, name)
+                    parsed = safe_json_loads(raw.decode("utf-8", "strict"), None)
+                  except (OSError, UnicodeDecodeError) as exc:
                     result["unsafe_skipped"] += 1
-                    reason = f"unsafe retry sidecar: {exc}"
+                    reason = str(exc)
                     result["skipped_reasons"][name] = reason
                     if (
                         len(result["unsafe_entries"])
                         < _MAX_LEGACY_UNSAFE_ENTRIES
                     ):
                       result["unsafe_entries"].append(
-                          f"{legacy_path / retry_name}: {reason}"
+                          f"{legacy_path / name}: {reason}"
                       )
                     continue
+                  if not isinstance(parsed, dict):
+                    result["unsafe_skipped"] += 1
+                    reason = "not a JSON object envelope"
+                    result["skipped_reasons"][name] = reason
+                    if (
+                        len(result["unsafe_entries"])
+                        < _MAX_LEGACY_UNSAFE_ENTRIES
+                    ):
+                      result["unsafe_entries"].append(
+                          f"{legacy_path / name}: {reason}"
+                      )
+                    continue
+                  if has_dest and is_destination_mismatch_for(
+                      extract_envelope_config(parsed),
+                      dest_proj,
+                      dest_ds,
+                      dest_tbl,
+                  ):
+                    continue
 
-                sha256_hex = hashlib.sha256(raw).hexdigest()
-                dst_name = name
-                if len(dst_name.encode("utf-8")) > _MAX_STAGED_EVENT_NAME_BYTES:
-                  dst_name = bounded_collision_event_name(
-                      name, sha256_hex, "event-legacy-"
-                  )
+                  retry_name = f"{name}.retry"
+                  retry_bytes: bytes | None = None
+                  if legacy.exists(retry_name):
+                    try:
+                      retry_bytes = _read_verified_legacy_file(
+                          legacy, retry_name
+                      )
+                    except OSError as exc:
+                      result["unsafe_skipped"] += 1
+                      reason = f"unsafe retry sidecar: {exc}"
+                      result["skipped_reasons"][name] = reason
+                      if (
+                          len(result["unsafe_entries"])
+                          < _MAX_LEGACY_UNSAFE_ENTRIES
+                      ):
+                        result["unsafe_entries"].append(
+                            f"{legacy_path / retry_name}: {reason}"
+                        )
+                      continue
 
-                dedup_target: str | None = None
-                collision_blocked = False
-                if dst.exists(dst_name):
-                  existing = _read_private_bytes(dst, dst_name)
-                  if existing == raw:
-                    dedup_target = dst_name
-                  else:
-                    collision_name = bounded_collision_event_name(
+                  sha256_hex = hashlib.sha256(raw).hexdigest()
+                  dst_name = name
+                  if len(dst_name.encode("utf-8")) > _MAX_STAGED_EVENT_NAME_BYTES:
+                    dst_name = bounded_collision_event_name(
                         name, sha256_hex, "event-legacy-"
                     )
-                    if collision_name == dst_name:
-                      collision_blocked = True
-                    elif dst.exists(collision_name):
-                      existing_dedup = _read_private_bytes(dst, collision_name)
-                      if existing_dedup == raw:
-                        dedup_target = collision_name
-                      else:
-                        collision_blocked = True
-                    else:
-                      dst_name = collision_name
 
-                if dedup_target is not None:
+                  dedup_target: str | None = None
+                  collision_blocked = False
+                  if dst.exists(dst_name):
+                    existing = _read_private_bytes(dst, dst_name)
+                    if existing == raw:
+                      dedup_target = dst_name
+                    else:
+                      collision_name = bounded_collision_event_name(
+                          name, sha256_hex, "event-legacy-"
+                      )
+                      if collision_name == dst_name:
+                        collision_blocked = True
+                      elif dst.exists(collision_name):
+                        existing_dedup = _read_private_bytes(
+                            dst, collision_name
+                        )
+                        if existing_dedup == raw:
+                          dedup_target = collision_name
+                        else:
+                          collision_blocked = True
+                      else:
+                        dst_name = collision_name
+
+                  if dedup_target is not None:
+                    try:
+                      retire_duplicate_source_entry(
+                          legacy,
+                          dst,
+                          source_name=name,
+                          source_retry_name=retry_name,
+                          source_retry_bytes=retry_bytes,
+                          dst_name=dedup_target,
+                          stage_prefix=".migrate-stage-",
+                          sha256_hex=sha256_hex,
+                          inflight_locked=inflight_locked,
+                          src_locked=src_locked,
+                          src_lock_error=src_lock_error,
+                      )
+                    except OSError as exc:
+                      _record_stage_error(name, exc)
+                    continue
+
+                  if collision_blocked or name in blocked_sources:
+                    continue
+
+                  if not src_locked:
+                    _record_stage_error(
+                        name,
+                        src_lock_error
+                        or PermissionError(
+                            errno.EACCES,
+                            f"Source directory {legacy.path} is not locked",
+                        ),
+                    )
+                    continue
+
+                  dst_retry_name = f"{dst_name}.retry"
+                  stage_meta, stage_env, stage_rty = _make_stage_names(
+                      ".migrate-stage-"
+                  )
+                  wrote_staged_retry = False
+                  wrote_staged_env = False
+                  wrote_staged_meta = False
+                  source_unlinked = False
                   try:
-                    retire_duplicate_source_entry(
-                        legacy,
-                        dst,
-                        source_name=name,
-                        source_retry_name=retry_name,
-                        source_retry_bytes=retry_bytes,
-                        dst_name=dedup_target,
-                        stage_prefix=".migrate-stage-",
+                    # Stage sidecar, envelope, and recovery metadata BEFORE
+                    # unlinking the source so neither pre-unlink failures nor
+                    # post-unlink crashes/failures can duplicate or lose events.
+                    if retry_bytes is not None and not dst.exists(dst_retry_name):
+                      _write_atomic_private_bytes(dst, stage_rty, retry_bytes)
+                      wrote_staged_retry = True
+                    _write_atomic_private_bytes(dst, stage_env, raw)
+                    wrote_staged_env = True
+                    meta_bytes = _build_stage_meta_bytes(
+                        source=name,
+                        source_retry=(
+                            retry_name if retry_bytes is not None else ""
+                        ),
+                        dst_name=dst_name,
+                        dst_retry_name=dst_retry_name,
+                        has_retry=wrote_staged_retry,
                         sha256_hex=sha256_hex,
                     )
-                  except OSError as exc:
-                    _record_stage_error(name, exc)
-                  continue
-
-                if collision_blocked or name in blocked_sources:
-                  continue
-
-                dst_retry_name = f"{dst_name}.retry"
-                stage_meta, stage_env, stage_rty = _make_stage_names(
-                    ".migrate-stage-"
-                )
-                wrote_staged_retry = False
-                wrote_staged_env = False
-                wrote_staged_meta = False
-                source_unlinked = False
-                try:
-                  # Stage sidecar, envelope, and recovery metadata BEFORE
-                  # unlinking the source so neither pre-unlink failures nor
-                  # post-unlink crashes/failures can duplicate or lose events.
-                  if retry_bytes is not None and not dst.exists(dst_retry_name):
-                    _write_atomic_private_bytes(dst, stage_rty, retry_bytes)
-                    wrote_staged_retry = True
-                  _write_atomic_private_bytes(dst, stage_env, raw)
-                  wrote_staged_env = True
-                  meta_bytes = _build_stage_meta_bytes(
-                      source=name,
-                      source_retry=retry_name if retry_bytes is not None else "",
-                      dst_name=dst_name,
-                      dst_retry_name=dst_retry_name,
-                      has_retry=wrote_staged_retry,
-                      sha256_hex=sha256_hex,
-                  )
-                  _write_atomic_private_bytes(dst, stage_meta, meta_bytes)
-                  wrote_staged_meta = True
-                  try:
-                    legacy.unlink(name)
-                  except FileNotFoundError:
-                    pass
-                  source_unlinked = True
-                  _promote_staged_entry(
-                      legacy,
-                      dst,
-                      stage_meta,
-                      stage_env,
-                      stage_rty,
-                      dst_name,
-                      dst_retry_name,
-                      retry_name if retry_bytes is not None else "",
-                      wrote_staged_retry,
-                  )
-                except OSError as exc:
-                  if not source_unlinked:
-                    _cleanup_stage_files(
+                    _write_atomic_private_bytes(dst, stage_meta, meta_bytes)
+                    wrote_staged_meta = True
+                    try:
+                      legacy.unlink(name)
+                    except FileNotFoundError:
+                      pass
+                    source_unlinked = True
+                    _promote_staged_entry(
+                        legacy,
                         dst,
-                        stage_meta if wrote_staged_meta else "",
-                        stage_env if wrote_staged_env else "",
-                        stage_rty if wrote_staged_retry else "",
+                        stage_meta,
+                        stage_env,
+                        stage_rty,
+                        dst_name,
+                        dst_retry_name,
+                        retry_name if retry_bytes is not None else "",
+                        wrote_staged_retry,
                     )
-                  _record_stage_error(name, exc)
-                  continue
-                result["migrated"] += 1
+                  except OSError as exc:
+                    if not source_unlinked:
+                      _cleanup_stage_files(
+                          dst,
+                          stage_meta if wrote_staged_meta else "",
+                          stage_env if wrote_staged_env else "",
+                          stage_rty if wrote_staged_retry else "",
+                      )
+                    _record_stage_error(name, exc)
+                    continue
+                  result["migrated"] += 1
         except (OSError, RuntimeError) as exc:
           result["error"] = str(exc)
           return result
