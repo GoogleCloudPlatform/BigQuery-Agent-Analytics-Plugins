@@ -10461,16 +10461,61 @@ class TestDestinationPartitionedSpool(unittest.TestCase):
 
         reg_file = Path(tmp_root) / "not_a_dir"
         reg_file.write_text("x", encoding="utf-8")
+        st_leaf_file, err_leaf_file = _utils.classify_source_dir_state(reg_file)
+        self.assertEqual(st_leaf_file, "unreachable")
+        self.assertIsNotNone(err_leaf_file)
+        self.assertEqual(err_leaf_file.errno, errno.ENOTDIR)
+
         st_enotdir, err_enotdir = _utils.classify_source_dir_state(reg_file / "spool")
         self.assertEqual(st_enotdir, "unreachable")
         self.assertIsNotNone(err_enotdir)
         self.assertEqual(err_enotdir.errno, errno.ENOTDIR)
 
+        valid_link_dir = Path(tmp_root) / "valid_link_dir"
+        os.symlink(existing_dir, valid_link_dir)
+        st_leaf_valid_link, err_leaf_valid_link = _utils.classify_source_dir_state(valid_link_dir)
+        self.assertEqual(st_leaf_valid_link, "unreachable")
+        self.assertIsNotNone(err_leaf_valid_link)
+        self.assertEqual(err_leaf_valid_link.errno, errno.ELOOP)
+
+        self.assertEqual(
+            _utils.classify_source_dir_state(valid_link_dir / "gone" / "spool"),
+            ("deleted", None),
+        )
+
         dangling_link = Path(tmp_root) / "dangling_anc"
         os.symlink(str(Path(tmp_root) / "nonexistent_target"), dangling_link)
+        for dangling_leaf in (dangling_link, Path(str(dangling_link) + "/")):
+            st_leaf_dangling, err_leaf_dangling = _utils.classify_source_dir_state(dangling_leaf)
+            self.assertEqual(st_leaf_dangling, "unreachable")
+            self.assertIsNotNone(err_leaf_dangling)
+            self.assertEqual(err_leaf_dangling.errno, errno.ELOOP)
+
         st_dangling, err_dangling = _utils.classify_source_dir_state(dangling_link / "spool")
         self.assertEqual(st_dangling, "unreachable")
         self.assertIsInstance(err_dangling, FileNotFoundError)
+
+        dir_0000 = Path(tmp_root) / "dir_0000"
+        dir_0000.mkdir(mode=0o700)
+        self.addCleanup(lambda p=dir_0000: os.path.exists(p) and os.chmod(p, 0o700))
+        link_to_0000 = Path(tmp_root) / "link_to_0000"
+        os.symlink(dir_0000, link_to_0000)
+        os.chmod(dir_0000, 0o000)
+        try:
+            st_link_0000, err_link_0000 = _utils.classify_source_dir_state(
+                link_to_0000 / "gone" / "spool"
+            )
+            self.assertEqual(st_link_0000, "unreachable")
+            self.assertIsInstance(err_link_0000, PermissionError)
+        finally:
+            os.chmod(dir_0000, 0o700)
+
+        link_to_file = Path(tmp_root) / "link_to_file"
+        os.symlink(reg_file, link_to_file)
+        st_link_file, err_link_file = _utils.classify_source_dir_state(link_to_file / "spool")
+        self.assertEqual(st_link_file, "unreachable")
+        self.assertIsInstance(err_link_file, OSError)
+        self.assertEqual(err_link_file.errno, errno.ENOTDIR)
 
         loop_a = Path(tmp_root) / "loop_a"
         loop_b = Path(tmp_root) / "loop_b"
@@ -10688,6 +10733,270 @@ class TestDestinationPartitionedSpool(unittest.TestCase):
             [{"k": "root-tombstone"}, {"k": "root-withhold"}],
         )
         self.assertEqual(list(part_a.glob(".adopt-stage-*")), [])
+        self.assertEqual(list(part_a.glob("event-*.json")), [])
+        self.assertEqual(list(part_a.glob("*.retry")), [])
+
+    def test_withheld_legacy_recovers_after_deletion_under_valid_symlink_ancestor(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import _utils, drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("0500 directory permission test requires non-root euid")
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_sym_anc_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        p_real = Path(tmp_root) / "real_parent"
+        p_real.mkdir(mode=0o700)
+        os.chmod(p_real, 0o700)
+        p_link = Path(tmp_root) / "link_parent"
+        os.symlink(p_real, p_link)
+
+        legacy_real = p_real / "legacy"
+        legacy_real_spool = legacy_real / "spool"
+        legacy_real_spool.mkdir(parents=True, mode=0o700)
+        os.chmod(legacy_real, 0o700)
+        os.chmod(legacy_real_spool, 0o700)
+        self.addCleanup(lambda p=legacy_real: os.path.exists(p) and os.chmod(p, 0o700))
+        self.addCleanup(
+            lambda p=legacy_real_spool: os.path.exists(p) and os.chmod(p, 0o700)
+        )
+
+        legacy_dir = p_link / "legacy"
+        legacy_spool = legacy_dir / "spool"
+        pid_file = legacy_real_spool / ".drainer.pid"
+        pid_file.write_text("", encoding="utf-8")
+        os.chmod(pid_file, 0o600)
+
+        withhold_bytes = json.dumps({
+            "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+            "row": {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "event_type": "LLM_REQUEST",
+                "content": json.dumps({"k": "sym-withhold"}),
+            },
+        }).encode("utf-8")
+        withhold_retry = json.dumps({
+            "attempts": 1,
+            "first_failed_at": 1000.0,
+            "next_retry_at": 1070.0,
+            "last_error": "prior 503",
+        }).encode("utf-8")
+
+        new_spool = Path(tmp_root) / "new_spool"
+        new_spool.mkdir(mode=0o700)
+        os.chmod(new_spool, 0o700)
+        part_a = Path(destination_spool_dir(new_spool, "proj-a", "ds_a", "agent_events"))
+        part_a.mkdir(mode=0o700)
+        os.chmod(part_a, 0o700)
+
+        (legacy_real_spool / "event-sym.json").write_bytes(withhold_bytes)
+        (legacy_real_spool / "event-sym.json.retry").write_bytes(withhold_retry)
+        os.chmod(legacy_real_spool / "event-sym.json", 0o600)
+        os.chmod(legacy_real_spool / "event-sym.json.retry", 0o600)
+
+        dst_env = part_a / "event-sym.json"
+        dst_rty = part_a / "event-sym.json.retry"
+        dst_env.write_bytes(withhold_bytes)
+        dst_rty.write_bytes(withhold_retry)
+        os.chmod(dst_env, 0o600)
+        os.chmod(dst_rty, 0o600)
+
+        # Create dedup_withhold stage while legacy_real_spool is 0500.
+        os.chmod(legacy_real_spool, 0o500)
+        try:
+            mig = _utils.migrate_legacy_spool(
+                new_spool,
+                legacy_spool_dir=legacy_spool,
+                destination=("proj-a", "ds_a", "agent_events"),
+            )
+            self.assertIsNotNone(mig["error"])
+            self.assertFalse(dst_env.exists())
+            self.assertEqual(len(list(part_a.glob(".migrate-stage-*.meta"))), 1)
+        finally:
+            os.chmod(legacy_real_spool, 0o700)
+
+        # Genuinely delete the legacy directory under the valid symlink ancestor.
+        shutil.rmtree(legacy_real)
+        self.assertEqual(_utils.classify_source_dir_state(legacy_spool), ("deleted", None))
+
+        delivered: list[dict] = []
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda tid, rows: (delivered.extend(rows), [])[1],
+            get_table_fn=lambda tid: object(),
+        )
+        cfg_a = BQAAConfig(
+            project_id="proj-a",
+            dataset="ds_a",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(new_spool),
+            state_dir=os.path.join(tmp_root, "state_a"),
+            log_file=os.path.join(tmp_root, "a.log"),
+            drain_retry_backoff_seconds=10.0,
+            drain_max_retry_age_seconds=1000.0,
+        )
+
+        # Next drain pass recovers withheld row + .retry and honors next_retry_at.
+        with mock.patch.object(drain.time, "time", return_value=1065.0), \
+             mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+            drained_deferred = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+        self.assertEqual(drained_deferred, 0)
+        self.assertTrue(dst_env.is_file())
+        self.assertTrue(dst_rty.is_file())
+        self.assertEqual(list(part_a.glob(".migrate-stage-*")), [])
+
+        with mock.patch.object(drain.time, "time", return_value=1080.0), \
+             mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+            drained_due = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+        self.assertEqual(drained_due, 1)
+        self.assertEqual([json.loads(r["content"]) for r in delivered], [{"k": "sym-withhold"}])
+        self.assertEqual(list(part_a.glob(".migrate-stage-*")), [])
+        self.assertEqual(list(part_a.glob("event-*.json")), [])
+        self.assertEqual(list(part_a.glob("*.retry")), [])
+
+    def test_dedup_withhold_recovery_preserves_distinct_replacement_source_and_retry(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import _utils, drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("0500 directory permission test requires non-root euid")
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_withhold_sha_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+
+        legacy_dir = Path(tmp_root) / "legacy"
+        legacy_spool = legacy_dir / "spool"
+        legacy_spool.mkdir(parents=True, mode=0o700)
+        os.chmod(legacy_dir, 0o700)
+        os.chmod(legacy_spool, 0o700)
+        self.addCleanup(lambda p=legacy_dir: os.path.exists(p) and os.chmod(p, 0o700))
+        self.addCleanup(lambda p=legacy_spool: os.path.exists(p) and os.chmod(p, 0o700))
+
+        pid_file = legacy_spool / ".drainer.pid"
+        pid_file.write_text("", encoding="utf-8")
+        os.chmod(pid_file, 0o600)
+
+        aaa_bytes = json.dumps({
+            "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+            "row": {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "event_type": "LLM_REQUEST",
+                "content": json.dumps({"payload": "AAA"}),
+            },
+        }).encode("utf-8")
+        aaa_retry = json.dumps({
+            "attempts": 1,
+            "first_failed_at": 1000.0,
+            "next_retry_at": 1070.0,
+            "last_error": "aaa prior 503",
+        }).encode("utf-8")
+        bbb_bytes = json.dumps({
+            "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+            "row": {
+                "timestamp": "2026-01-01T00:00:01Z",
+                "event_type": "LLM_REQUEST",
+                "content": json.dumps({"payload": "BBB"}),
+            },
+        }).encode("utf-8")
+        bbb_retry = json.dumps({
+            "attempts": 1,
+            "first_failed_at": 1001.0,
+            "next_retry_at": 1075.0,
+            "last_error": "bbb prior 503",
+        }).encode("utf-8")
+
+        new_spool = Path(tmp_root) / "new_spool"
+        new_spool.mkdir(mode=0o700)
+        os.chmod(new_spool, 0o700)
+        part_a = Path(destination_spool_dir(new_spool, "proj-a", "ds_a", "agent_events"))
+        part_a.mkdir(mode=0o700)
+        os.chmod(part_a, 0o700)
+
+        leg_env = legacy_spool / "event-1.json"
+        leg_rty = legacy_spool / "event-1.json.retry"
+        leg_env.write_bytes(aaa_bytes)
+        leg_rty.write_bytes(aaa_retry)
+        os.chmod(leg_env, 0o600)
+        os.chmod(leg_rty, 0o600)
+
+        dst_env = part_a / "event-1.json"
+        dst_rty = part_a / "event-1.json.retry"
+        dst_env.write_bytes(aaa_bytes)
+        dst_rty.write_bytes(aaa_retry)
+        os.chmod(dst_env, 0o600)
+        os.chmod(dst_rty, 0o600)
+
+        # Create dedup_withhold stage for AAA under 0500 legacy_spool.
+        os.chmod(legacy_spool, 0o500)
+        try:
+            mig = _utils.migrate_legacy_spool(
+                new_spool,
+                legacy_spool_dir=legacy_spool,
+                destination=("proj-a", "ds_a", "agent_events"),
+            )
+            self.assertIsNotNone(mig["error"])
+            self.assertFalse(dst_env.exists())
+            self.assertEqual(len(list(part_a.glob(".migrate-stage-*.meta"))), 1)
+        finally:
+            os.chmod(legacy_spool, 0o700)
+
+        # Replace legacy/event-1.json and its .retry with distinct BBB before recovery.
+        leg_env.write_bytes(bbb_bytes)
+        leg_rty.write_bytes(bbb_retry)
+        os.chmod(leg_env, 0o600)
+        os.chmod(leg_rty, 0o600)
+
+        delivered: list[dict] = []
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda tid, rows: (delivered.extend(rows), [])[1],
+            get_table_fn=lambda tid: object(),
+        )
+        cfg_a = BQAAConfig(
+            project_id="proj-a",
+            dataset="ds_a",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(new_spool),
+            state_dir=os.path.join(tmp_root, "state_a"),
+            log_file=os.path.join(tmp_root, "a.log"),
+            drain_retry_backoff_seconds=10.0,
+            drain_max_retry_age_seconds=1000.0,
+        )
+
+        # At 1065.0 (< 1070.0 and < 1075.0): AAA is restored and BBB is migrated with its own .retry.
+        with mock.patch.object(drain.time, "time", return_value=1065.0), \
+             mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+            drained_1065 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+        self.assertEqual(drained_1065, 0)
+        self.assertEqual(len(delivered), 0)
+        self.assertFalse(leg_env.exists())
+        self.assertFalse(leg_rty.exists())
+        self.assertEqual(list(part_a.glob(".migrate-stage-*")), [])
+        self.assertEqual(len(list(part_a.glob("event-*.json"))), 2)
+        self.assertEqual(len(list(part_a.glob("*.retry"))), 2)
+
+        # At 1072.0: AAA is due (1070.0), BBB is still deferred (1075.0).
+        with mock.patch.object(drain.time, "time", return_value=1072.0), \
+             mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+            drained_1072 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+        self.assertEqual(drained_1072, 1)
+        self.assertEqual([json.loads(r["content"]) for r in delivered], [{"payload": "AAA"}])
+
+        # At 1080.0: BBB becomes due and delivers once; all spool & retry files are cleaned up.
+        with mock.patch.object(drain.time, "time", return_value=1080.0), \
+             mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+            drained_1080 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+        self.assertEqual(drained_1080, 1)
+        self.assertEqual(
+            [json.loads(r["content"]) for r in delivered],
+            [{"payload": "AAA"}, {"payload": "BBB"}],
+        )
+        self.assertEqual(list(part_a.glob(".migrate-stage-*")), [])
         self.assertEqual(list(part_a.glob("event-*.json")), [])
         self.assertEqual(list(part_a.glob("*.retry")), [])
 

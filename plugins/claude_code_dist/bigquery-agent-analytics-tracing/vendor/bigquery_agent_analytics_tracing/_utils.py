@@ -1674,6 +1674,7 @@ def recover_staged_transfers(
       _cleanup_stage_files(dst, meta_name)
       continue
 
+    retire_source_retry = source_retry
     if mode == "dedup_withhold":
       if not dst.exists(stage_env):
         if (
@@ -1707,7 +1708,7 @@ def recover_staged_transfers(
           continue
         if src_still_exists:
           try:
-            src.unlink(source)
+            src_bytes = _read_verified_legacy_file(src, source)
           except FileNotFoundError:
             pass
           except OSError as exc:
@@ -1716,6 +1717,23 @@ def recover_staged_transfers(
             if blocked_sources is not None:
               blocked_sources.add(source)
             continue
+          else:
+            if (
+                sha256_hex
+                and hashlib.sha256(src_bytes).hexdigest() == sha256_hex
+            ):
+              try:
+                src.unlink(source)
+              except FileNotFoundError:
+                pass
+              except OSError as exc:
+                if on_error is not None:
+                  on_error(source, exc)
+                if blocked_sources is not None:
+                  blocked_sources.add(source)
+                continue
+            else:
+              retire_source_retry = ""
     elif src is not None:
       if not src_locked:
         if blocked_sources is not None:
@@ -1780,9 +1798,9 @@ def recover_staged_transfers(
               if on_error is not None:
                 on_error(source, exc)
               continue
-          if source_retry and src is not None:
+          if retire_source_retry and src is not None:
             try:
-              src.unlink(source_retry)
+              src.unlink(retire_source_retry)
             except (FileNotFoundError, OSError):
               pass
           _cleanup_stage_files(dst, stage_env, stage_rty, meta_name)
@@ -1818,9 +1836,9 @@ def recover_staged_transfers(
                 if on_error is not None:
                   on_error(source, exc)
                 continue
-            if source_retry and src is not None:
+            if retire_source_retry and src is not None:
               try:
-                src.unlink(source_retry)
+                src.unlink(retire_source_retry)
               except (FileNotFoundError, OSError):
                 pass
             _cleanup_stage_files(dst, stage_env, stage_rty, meta_name)
@@ -1841,7 +1859,7 @@ def recover_staged_transfers(
             stage_rty,
             target_name,
             target_retry_name,
-            source_retry,
+            retire_source_retry,
             has_retry,
         )
       except OSError as exc:
@@ -1850,9 +1868,9 @@ def recover_staged_transfers(
         continue
       recovered += 1
     else:
-      if source_retry and src is not None:
+      if retire_source_retry and src is not None:
         try:
-          src.unlink(source_retry)
+          src.unlink(retire_source_retry)
         except (FileNotFoundError, OSError):
           pass
       _cleanup_stage_files(dst, stage_rty, meta_name)
@@ -1883,15 +1901,35 @@ def classify_source_dir_state(path: Path) -> tuple[str, OSError | None]:
   """Classify a source directory as ``exists``, ``deleted``, or ``unreachable``.
 
   Unlike ``os.path.lexists``, which conflates ``EACCES`` / ``ENOTDIR`` /
-  ``ELOOP`` with ``ENOENT``, this returns ``("deleted", None)`` ONLY when
-  ``os.lstat(path)`` raises ``FileNotFoundError`` and the nearest existing
-  ancestor is a real directory (not a symlink or inaccessible parent). Any
-  other ``OSError`` or non-directory ancestor returns ``("unreachable", exc)``.
+  ``ELOOP`` with ``ENOENT``, this returns ``("exists", None)`` only when
+  ``os.lstat(path)`` resolves to a real directory (not a symlink or non-dir),
+  and returns ``("deleted", None)`` only when ``os.lstat(path)`` raises
+  ``FileNotFoundError`` and the nearest existing ancestor is a real directory
+  or a valid symlink resolving to an existing directory (such as ``/var`` ->
+  ``/private/var`` or a symlinked home/config parent). Any other ``OSError``,
+  symlink leaf, dangling/looping/non-directory ancestor, or non-directory leaf
+  returns ``("unreachable", exc)``.
   """
   target = Path(path)
   try:
-    os.lstat(target)
-    return ("exists", None)
+    st = os.lstat(target)
+    if stat.S_ISDIR(st.st_mode):
+      return ("exists", None)
+    if stat.S_ISLNK(st.st_mode):
+      return (
+          "unreachable",
+          OSError(
+              errno.ELOOP,
+              f"Refusing BQAA tracing dir {target}: it is a symlink.",
+          ),
+      )
+    return (
+        "unreachable",
+        OSError(
+            errno.ENOTDIR,
+            f"Refusing BQAA tracing dir {target}: not a directory.",
+        ),
+    )
   except FileNotFoundError as exc:
     cur = target.parent
     while True:
@@ -1907,6 +1945,13 @@ def classify_source_dir_state(path: Path) -> tuple[str, OSError | None]:
         return ("unreachable", anc_exc)
       if stat.S_ISDIR(anc_stat.st_mode):
         return ("deleted", None)
+      if stat.S_ISLNK(anc_stat.st_mode):
+        try:
+          tgt_stat = os.stat(cur)
+        except OSError as tgt_exc:
+          return ("unreachable", tgt_exc)
+        if stat.S_ISDIR(tgt_stat.st_mode):
+          return ("deleted", None)
       return ("unreachable", exc)
   except OSError as exc:
     return ("unreachable", exc)
