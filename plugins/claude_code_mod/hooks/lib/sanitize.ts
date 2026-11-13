@@ -2419,14 +2419,15 @@ function redactUrl(url: string, stats: SanitizeStats): string {
     } else if (firstDelim < out.length) {
       const firstAt = out.indexOf('@', firstDelim + 1)
       if (firstAt !== -1) {
-        // Check for `/`, `?` or `#` inside URL password (`https://user:p/a/s/s@host`
-        // or `https://user:p?a=1#b@host`). Do NOT touch benign URLs whose host
-        // has no non-port `:` (`npmjs.com/package/@types/node`, `example.com:8443?email=a@b`).
+        // Check for `/`, `?` or `#` inside URL password (`https://user:p/a/s/s@host`,
+        // `https://user:/s3cr3t@host`, or `https://user:p?a=1#b@host`). Do NOT touch
+        // benign URLs whose host has a numeric port or no `:`
+        // (`npmjs.com/package/@types/node`, `example.com:8443?email=a@b`).
         const preDelim = out.slice(authStart, firstDelim)
         const colonIdx = preDelim.indexOf(':')
         if (colonIdx > 0 && !preDelim.startsWith('[')) {
           const afterColon = preDelim.slice(colonIdx + 1)
-          if (!/^\d*$/.test(afterColon)) {
+          if (!/^\d+$/.test(afterColon)) {
             let candidate = firstAt
             for (let tries = 0; candidate !== -1 && tries < 32; tries += 1) {
               if (VALID_HOST_AFTER_AT.test(out.slice(candidate + 1))) {

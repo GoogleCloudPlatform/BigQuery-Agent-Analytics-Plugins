@@ -2552,6 +2552,8 @@ test('r5/r6/r7 fixtures redact in the listed wrappers and paths; known gaps are 
     'curl https://example.test/?token=$(printf %s CanaryValue)',
     // Password containing both '@' and '/', '?', or '#'.
     'curl https://u:p@ss/CanaryValue@example.test/path',
+    // Digit-prefixed password before '/', '?', or '#' is ambiguous with host:port/path.
+    'curl https://u:123/CanaryValue@example.test/path',
     // A locale-quoted option name with a separate value remains best effort.
     'cli --pass$"word" CanaryValue',
   ]
