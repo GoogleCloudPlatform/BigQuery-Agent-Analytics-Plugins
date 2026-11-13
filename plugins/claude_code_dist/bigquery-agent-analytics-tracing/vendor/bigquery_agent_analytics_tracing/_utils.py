@@ -1879,6 +1879,39 @@ def recover_staged_transfers(
   return recovered
 
 
+def classify_source_dir_state(path: Path) -> tuple[str, OSError | None]:
+  """Classify a source directory as ``exists``, ``deleted``, or ``unreachable``.
+
+  Unlike ``os.path.lexists``, which conflates ``EACCES`` / ``ENOTDIR`` /
+  ``ELOOP`` with ``ENOENT``, this returns ``("deleted", None)`` ONLY when
+  ``os.lstat(path)`` raises ``FileNotFoundError`` and the nearest existing
+  ancestor is a real directory (not a symlink or inaccessible parent). Any
+  other ``OSError`` or non-directory ancestor returns ``("unreachable", exc)``.
+  """
+  target = Path(path)
+  try:
+    os.lstat(target)
+    return ("exists", None)
+  except FileNotFoundError as exc:
+    cur = target.parent
+    while True:
+      try:
+        anc_stat = os.lstat(cur)
+      except FileNotFoundError:
+        parent = cur.parent
+        if parent == cur:
+          return ("unreachable", exc)
+        cur = parent
+        continue
+      except OSError as anc_exc:
+        return ("unreachable", anc_exc)
+      if stat.S_ISDIR(anc_stat.st_mode):
+        return ("deleted", None)
+      return ("unreachable", exc)
+  except OSError as exc:
+    return ("unreachable", exc)
+
+
 def migrate_legacy_spool(
     spool_dir: str | os.PathLike[str],
     *,
@@ -1923,7 +1956,11 @@ def migrate_legacy_spool(
       result["error"] = str(exc)
     result["skipped_reasons"][entry_name] = str(exc)
 
-  if not os.path.lexists(legacy_path):
+  src_state, src_state_err = classify_source_dir_state(legacy_path)
+  if src_state == "unreachable":
+    result["error"] = str(src_state_err)
+    return result
+  if src_state == "deleted":
     try:
       with open_destination_spool_dir(
           spool_dir, dest_proj, dest_ds, dest_tbl, create=False

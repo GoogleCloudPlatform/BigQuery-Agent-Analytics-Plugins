@@ -46,6 +46,7 @@ from ._utils import _read_private_bytes  # noqa: E402  (after env tweak)
 from ._utils import _read_verified_legacy_file  # noqa: E402
 from ._utils import _write_atomic_private_bytes  # noqa: E402
 from ._utils import bounded_collision_event_name  # noqa: E402
+from ._utils import classify_source_dir_state  # noqa: E402
 from ._utils import ensure_private_dir  # noqa: E402
 from ._utils import extract_envelope_config  # noqa: E402
 from ._utils import has_envelope_destination  # noqa: E402
@@ -1562,8 +1563,16 @@ def _adopt_matching_root_spool_files(
   so pre-partition drainers and partitioned drainers never race over
   unpartitioned root files.
   """
+  src_state, src_state_err = classify_source_dir_state(root_path)
+  if src_state == "unreachable":
+    _log_diagnostic_once(
+        config,
+        f"root_adopt_failed:{root_path}",
+        f"DRAINER root_adopt_failed path={root_path}: {src_state_err}",
+    )
+    return
   has_stages = any(n.startswith(".adopt-stage-") for n in part_spool.names())
-  if not os.path.lexists(root_path):
+  if src_state == "deleted":
     if not has_stages:
       return
     try:
