@@ -9093,6 +9093,569 @@ class TestDestinationPartitionedSpool(unittest.TestCase):
             self.assertTrue((src_dir / "event-1.json").is_file())
             self.assertEqual(list(dst_dir.iterdir()), [])
 
+    def test_migrate_legacy_spool_0500_identical_copy_withheld_direct_and_collision(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import _utils, drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("0500 directory unlink test requires non-root euid")
+
+        for with_pidfile in (True, False):
+            for collision_mode in ("direct", "hashed_collision"):
+                with self.subTest(with_pidfile=with_pidfile, collision_mode=collision_mode):
+                    tmp_root = tempfile.mkdtemp(prefix="bqaa_r10_leg_dup_")
+                    self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+                    legacy_dir = Path(tmp_root) / "legacy"
+                    legacy_spool = legacy_dir / "spool"
+                    legacy_spool.mkdir(parents=True, mode=0o700)
+                    os.chmod(legacy_dir, 0o700)
+                    os.chmod(legacy_spool, 0o700)
+                    self.addCleanup(
+                        lambda p=legacy_spool: os.path.exists(p) and os.chmod(p, 0o700)
+                    )
+
+                    if with_pidfile:
+                        pid_file = legacy_spool / ".drainer.pid"
+                        pid_file.write_text("", encoding="utf-8")
+                        os.chmod(pid_file, 0o600)
+
+                    dup_bytes = json.dumps({
+                        "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                        "row": {
+                            "timestamp": "2026-01-01T00:00:00Z",
+                            "event_type": "LLM_REQUEST",
+                            "content": json.dumps({"k": "dup"}),
+                        },
+                    }).encode("utf-8")
+                    retry_payload = {
+                        "attempts": 1,
+                        "first_failed_at": 1000.0,
+                        "next_retry_at": 1050.0,
+                        "last_error": "prior 503",
+                    }
+                    retry_bytes = json.dumps(retry_payload).encode("utf-8")
+                    leg_dup = legacy_spool / "event-dup.json"
+                    leg_dup_retry = legacy_spool / "event-dup.json.retry"
+                    leg_dup.write_bytes(dup_bytes)
+                    leg_dup_retry.write_bytes(retry_bytes)
+                    os.chmod(leg_dup, 0o600)
+                    os.chmod(leg_dup_retry, 0o600)
+
+                    new_spool = Path(tmp_root) / "new_spool"
+                    new_spool.mkdir(mode=0o700)
+                    os.chmod(new_spool, 0o700)
+                    part_a = Path(
+                        destination_spool_dir(new_spool, "proj-a", "ds_a", "agent_events")
+                    )
+                    part_a.mkdir(mode=0o700)
+                    os.chmod(part_a, 0o700)
+
+                    queued_env = part_a / "event-queued.json"
+                    queued_env.write_text(
+                        json.dumps({
+                            "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                            "row": {
+                                "timestamp": "2026-01-01T00:00:01Z",
+                                "event_type": "LLM_REQUEST",
+                                "content": json.dumps({"k": "queued"}),
+                            },
+                        }),
+                        encoding="utf-8",
+                    )
+                    os.chmod(queued_env, 0o600)
+
+                    sha_hex = hashlib.sha256(dup_bytes).hexdigest()
+                    if collision_mode == "direct":
+                        dst_dup_name = "event-dup.json"
+                    else:
+                        distinct_dst = part_a / "event-dup.json"
+                        distinct_dst.write_text(
+                            json.dumps({
+                                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                                "row": {
+                                    "timestamp": "2026-01-01T00:00:02Z",
+                                    "event_type": "LLM_REQUEST",
+                                    "content": json.dumps({"k": "distinct_dst"}),
+                                },
+                            }),
+                            encoding="utf-8",
+                        )
+                        os.chmod(distinct_dst, 0o600)
+                        dst_dup_name = _utils.bounded_collision_event_name(
+                            "event-dup.json", sha_hex, "event-legacy-"
+                        )
+
+                    dst_dup = part_a / dst_dup_name
+                    dst_dup_retry = part_a / f"{dst_dup_name}.retry"
+                    dst_dup.write_bytes(dup_bytes)
+                    dst_dup_retry.write_bytes(retry_bytes)
+                    os.chmod(dst_dup, 0o600)
+                    os.chmod(dst_dup_retry, 0o600)
+
+                    delivered: dict[str, list[dict]] = {}
+                    _install_fake_bigquery(
+                        self,
+                        insert_fn=lambda tid, rows: delivered.setdefault(tid, []).extend(rows) or [],
+                        get_table_fn=lambda tid: object(),
+                    )
+                    cfg_a = BQAAConfig(
+                        project_id="proj-a",
+                        dataset="ds_a",
+                        table="agent_events",
+                        auto_create_table=False,
+                        spool_dir=str(new_spool),
+                        state_dir=os.path.join(tmp_root, "state_a"),
+                        log_file=os.path.join(tmp_root, "a.log"),
+                        drain_retry_backoff_seconds=10.0,
+                        drain_max_retry_age_seconds=1000.0,
+                    )
+
+                    os.chmod(legacy_spool, 0o500)
+                    try:
+                        with mock.patch.object(drain.time, "time", return_value=1060.0), \
+                             mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+                            r1 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+                            r2 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+                    finally:
+                        os.chmod(legacy_spool, 0o700)
+
+                    expected_0500 = (
+                        [{"k": "queued"}]
+                        if collision_mode == "direct"
+                        else [{"k": "distinct_dst"}, {"k": "queued"}]
+                    )
+                    self.assertEqual((r1, r2), (len(expected_0500), 0))
+                    rows_0500 = [
+                        json.loads(r["content"])
+                        for r in delivered.get("proj-a.ds_a.agent_events", [])
+                    ]
+                    self.assertEqual(
+                        sorted(rows_0500, key=lambda x: x["k"]),
+                        expected_0500,
+                    )
+                    self.assertFalse(dst_dup.exists())
+                    self.assertFalse(dst_dup_retry.exists())
+                    self.assertEqual(len(list(part_a.glob(".migrate-stage-*.meta"))), 1)
+                    self.assertEqual(len(list(part_a.glob(".migrate-stage-*.env"))), 1)
+                    self.assertEqual(len(list(part_a.glob(".migrate-stage-*.rty"))), 1)
+                    self.assertEqual(leg_dup.read_bytes(), dup_bytes)
+
+                    # Restore 0700 while retry backoff is still in the future (t=1020 < 1050).
+                    with mock.patch.object(drain.time, "time", return_value=1020.0), \
+                         mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+                        r3 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+
+                    self.assertEqual(r3, 0)
+                    self.assertEqual(len(delivered.get("proj-a.ds_a.agent_events", [])), len(expected_0500))
+                    self.assertFalse(leg_dup.exists())
+                    self.assertFalse(leg_dup_retry.exists())
+                    self.assertTrue(dst_dup.is_file())
+                    self.assertTrue(dst_dup_retry.is_file())
+                    self.assertEqual(
+                        json.loads(dst_dup_retry.read_text(encoding="utf-8")),
+                        retry_payload,
+                    )
+                    self.assertEqual(list(part_a.glob(".migrate-stage-*")), [])
+
+                    # Advance past next_retry_at=1050.0 -> delivered exactly once.
+                    with mock.patch.object(drain.time, "time", return_value=1050.0), \
+                         mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+                        r4 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+                        r5 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+
+                    self.assertEqual((r4, r5), (1, 0))
+                    all_rows = [
+                        json.loads(r["content"])
+                        for r in delivered.get("proj-a.ds_a.agent_events", [])
+                    ]
+                    self.assertEqual(
+                        sorted(all_rows, key=lambda x: x["k"]),
+                        sorted(expected_0500 + [{"k": "dup"}], key=lambda x: x["k"]),
+                    )
+                    self.assertEqual(list(part_a.glob("event-*.json")), [])
+                    self.assertEqual(list(part_a.glob("*.retry")), [])
+                    self.assertEqual(list(part_a.glob(".migrate-stage-*")), [])
+
+    def test_root_adoption_0500_identical_copy_withheld_direct_and_collision(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import _utils, drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("0500 directory unlink test requires non-root euid")
+
+        for with_pidfile in (True, False):
+            for collision_mode in ("direct", "hashed_collision"):
+                with self.subTest(with_pidfile=with_pidfile, collision_mode=collision_mode):
+                    tmp_root = tempfile.mkdtemp(prefix="bqaa_r10_root_dup_")
+                    self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+                    spool_dir = Path(tmp_root) / "spool"
+                    spool_dir.mkdir(mode=0o700)
+                    os.chmod(spool_dir, 0o700)
+                    self.addCleanup(
+                        lambda p=spool_dir: os.path.exists(p) and os.chmod(p, 0o700)
+                    )
+
+                    if with_pidfile:
+                        pid_file = spool_dir / ".drainer.pid"
+                        pid_file.write_text("", encoding="utf-8")
+                        os.chmod(pid_file, 0o600)
+
+                    dup_bytes = json.dumps({
+                        "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                        "row": {
+                            "timestamp": "2026-01-01T00:00:00Z",
+                            "event_type": "LLM_REQUEST",
+                            "content": json.dumps({"k": "dup"}),
+                        },
+                    }).encode("utf-8")
+                    retry_payload = {
+                        "attempts": 2,
+                        "first_failed_at": 1000.0,
+                        "next_retry_at": 1050.0,
+                        "last_error": "prior 503",
+                    }
+                    retry_bytes = json.dumps(retry_payload).encode("utf-8")
+                    root_dup = spool_dir / "event-dup.json"
+                    root_dup_retry = spool_dir / "event-dup.json.retry"
+                    root_dup.write_bytes(dup_bytes)
+                    root_dup_retry.write_bytes(retry_bytes)
+                    os.chmod(root_dup, 0o600)
+                    os.chmod(root_dup_retry, 0o600)
+
+                    part_a = Path(
+                        destination_spool_dir(spool_dir, "proj-a", "ds_a", "agent_events")
+                    )
+                    part_a.mkdir(mode=0o700)
+                    os.chmod(part_a, 0o700)
+
+                    queued_env = part_a / "event-queued.json"
+                    queued_env.write_text(
+                        json.dumps({
+                            "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                            "row": {
+                                "timestamp": "2026-01-01T00:00:01Z",
+                                "event_type": "LLM_REQUEST",
+                                "content": json.dumps({"k": "queued"}),
+                            },
+                        }),
+                        encoding="utf-8",
+                    )
+                    os.chmod(queued_env, 0o600)
+
+                    sha_hex = hashlib.sha256(dup_bytes).hexdigest()
+                    if collision_mode == "direct":
+                        dst_dup_name = "event-dup.json"
+                    else:
+                        distinct_dst = part_a / "event-dup.json"
+                        distinct_dst.write_text(
+                            json.dumps({
+                                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                                "row": {
+                                    "timestamp": "2026-01-01T00:00:02Z",
+                                    "event_type": "LLM_REQUEST",
+                                    "content": json.dumps({"k": "distinct_dst"}),
+                                },
+                            }),
+                            encoding="utf-8",
+                        )
+                        os.chmod(distinct_dst, 0o600)
+                        dst_dup_name = _utils.bounded_collision_event_name(
+                            "event-dup.json", sha_hex, "event-root-"
+                        )
+
+                    dst_dup = part_a / dst_dup_name
+                    dst_dup_retry = part_a / f"{dst_dup_name}.retry"
+                    dst_dup.write_bytes(dup_bytes)
+                    dst_dup_retry.write_bytes(retry_bytes)
+                    os.chmod(dst_dup, 0o600)
+                    os.chmod(dst_dup_retry, 0o600)
+
+                    delivered: dict[str, list[dict]] = {}
+                    _install_fake_bigquery(
+                        self,
+                        insert_fn=lambda tid, rows: delivered.setdefault(tid, []).extend(rows) or [],
+                        get_table_fn=lambda tid: object(),
+                    )
+                    cfg_a = BQAAConfig(
+                        project_id="proj-a",
+                        dataset="ds_a",
+                        table="agent_events",
+                        auto_create_table=False,
+                        spool_dir=str(spool_dir),
+                        state_dir=os.path.join(tmp_root, "state_a"),
+                        log_file=os.path.join(tmp_root, "a.log"),
+                        drain_retry_backoff_seconds=10.0,
+                        drain_max_retry_age_seconds=1000.0,
+                    )
+
+                    os.chmod(spool_dir, 0o500)
+                    try:
+                        with mock.patch.object(drain.time, "time", return_value=1060.0):
+                            r1 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+                            r2 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+                    finally:
+                        os.chmod(spool_dir, 0o700)
+
+                    expected_0500 = (
+                        [{"k": "queued"}]
+                        if collision_mode == "direct"
+                        else [{"k": "distinct_dst"}, {"k": "queued"}]
+                    )
+                    self.assertEqual((r1, r2), (len(expected_0500), 0))
+                    rows_0500 = [
+                        json.loads(r["content"])
+                        for r in delivered.get("proj-a.ds_a.agent_events", [])
+                    ]
+                    self.assertEqual(
+                        sorted(rows_0500, key=lambda x: x["k"]),
+                        expected_0500,
+                    )
+                    self.assertFalse(dst_dup.exists())
+                    self.assertFalse(dst_dup_retry.exists())
+                    self.assertEqual(len(list(part_a.glob(".adopt-stage-*.meta"))), 1)
+                    self.assertEqual(len(list(part_a.glob(".adopt-stage-*.env"))), 1)
+                    self.assertEqual(len(list(part_a.glob(".adopt-stage-*.rty"))), 1)
+                    self.assertEqual(root_dup.read_bytes(), dup_bytes)
+
+                    # Restore 0700 while retry backoff is still in the future (t=1020 < 1050).
+                    with mock.patch.object(drain.time, "time", return_value=1020.0):
+                        r3 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+
+                    self.assertEqual(r3, 0)
+                    self.assertEqual(len(delivered.get("proj-a.ds_a.agent_events", [])), len(expected_0500))
+                    self.assertFalse(root_dup.exists())
+                    self.assertFalse(root_dup_retry.exists())
+                    self.assertTrue(dst_dup.is_file())
+                    self.assertTrue(dst_dup_retry.is_file())
+                    self.assertEqual(
+                        json.loads(dst_dup_retry.read_text(encoding="utf-8")),
+                        retry_payload,
+                    )
+                    self.assertEqual(list(part_a.glob(".adopt-stage-*")), [])
+
+                    # Advance past next_retry_at=1050.0 -> delivered exactly once.
+                    with mock.patch.object(drain.time, "time", return_value=1050.0):
+                        r4 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+                        r5 = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+
+                    self.assertEqual((r4, r5), (1, 0))
+                    all_rows = [
+                        json.loads(r["content"])
+                        for r in delivered.get("proj-a.ds_a.agent_events", [])
+                    ]
+                    self.assertEqual(
+                        sorted(all_rows, key=lambda x: x["k"]),
+                        sorted(expected_0500 + [{"k": "dup"}], key=lambda x: x["k"]),
+                    )
+                    self.assertEqual(list(part_a.glob("event-*.json")), [])
+                    self.assertEqual(list(part_a.glob("*.retry")), [])
+                    self.assertEqual(list(part_a.glob(".adopt-stage-*")), [])
+
+    def test_drain_orphan_cleanup_protects_staged_retry_and_serializes_migrate_lock(self):
+        import threading
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import _utils, drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+
+        with tempfile.TemporaryDirectory(prefix="bqaa_r10_lock_race_") as tmp_root:
+            legacy_dir = Path(tmp_root) / "legacy"
+            legacy_spool = legacy_dir / "spool"
+            legacy_spool.mkdir(parents=True, mode=0o700)
+            os.chmod(legacy_dir, 0o700)
+            os.chmod(legacy_spool, 0o700)
+
+            new_spool = Path(tmp_root) / "new_spool"
+            new_spool.mkdir(mode=0o700)
+            os.chmod(new_spool, 0o700)
+            part_a = Path(destination_spool_dir(new_spool, "proj-a", "ds_a", "agent_events"))
+            part_a.mkdir(mode=0o700)
+            os.chmod(part_a, 0o700)
+
+            delivered: dict[str, list[dict]] = {}
+            _install_fake_bigquery(
+                self,
+                insert_fn=lambda tid, rows: delivered.setdefault(tid, []).extend(rows) or [],
+                get_table_fn=lambda tid: object(),
+            )
+            cfg_a = BQAAConfig(
+                project_id="proj-a",
+                dataset="ds_a",
+                table="agent_events",
+                auto_create_table=False,
+                spool_dir=str(new_spool),
+                state_dir=os.path.join(tmp_root, "state_a"),
+                log_file=os.path.join(tmp_root, "a.log"),
+                drain_retry_backoff_seconds=10.0,
+                drain_max_retry_age_seconds=1000.0,
+            )
+
+            # 1. Mid-promotion SIGKILL protection: .retry sidecar already promoted while .env
+            # is still staged; _drain_single_spool must NOT delete it as an orphan.
+            mid_env_bytes = json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "mid"}},
+            }).encode("utf-8")
+            mid_retry_payload = {
+                "attempts": 2,
+                "first_failed_at": 1000.0,
+                "next_retry_at": 1050.0,
+                "last_error": "prior 503",
+            }
+            mid_retry_bytes = json.dumps(mid_retry_payload).encode("utf-8")
+            meta_name, stage_env, _ = _utils._make_stage_names(".migrate-stage-")
+            meta_bytes = _utils._build_stage_meta_bytes(
+                source="event-mid.json",
+                source_retry="event-mid.json.retry",
+                dst_name="event-mid.json",
+                dst_retry_name="event-mid.json.retry",
+                has_retry=True,
+                sha256_hex=hashlib.sha256(mid_env_bytes).hexdigest(),
+            )
+            with _utils.open_existing_private_dir(part_a) as part_priv:
+                _utils._write_atomic_private_bytes(part_priv, stage_env, mid_env_bytes)
+                _utils._write_atomic_private_bytes(part_priv, meta_name, meta_bytes)
+                _utils._write_atomic_private_bytes(part_priv, "event-mid.json.retry", mid_retry_bytes)
+                asyncio.run(drain._drain_single_spool(part_priv, cfg_a, use_storage_api=False))
+                self.assertTrue((part_a / "event-mid.json.retry").is_file())
+
+            # Deleting legacy_spool completely still recovers orphaned stages in part_a cleanly.
+            shutil.rmtree(legacy_spool)
+            with mock.patch.object(drain.time, "time", return_value=1020.0), \
+                 mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+                r_pre = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+            self.assertEqual(r_pre, 0)
+            self.assertTrue((part_a / "event-mid.json").is_file())
+            self.assertTrue((part_a / "event-mid.json.retry").is_file())
+            self.assertEqual(
+                json.loads((part_a / "event-mid.json.retry").read_text(encoding="utf-8")),
+                mid_retry_payload,
+            )
+            with mock.patch.object(drain.time, "time", return_value=1050.0), \
+                 mock.patch.dict(os.environ, {"BQAA_LEGACY_STATE_DIR": str(legacy_dir)}):
+                r_due = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+            self.assertEqual(r_due, 1)
+            self.assertEqual(
+                [r["content"] for r in delivered["proj-a.ds_a.agent_events"]],
+                [{"k": "mid"}],
+            )
+            self.assertEqual(list(part_a.glob("event-*.json")), [])
+            self.assertEqual(list(part_a.glob("*.retry")), [])
+            self.assertEqual(list(part_a.glob(".migrate-stage-*")), [])
+
+            # Also verify .adopt-stage-*.meta protects its .retry sidecar from orphan cleanup
+            # and deleted root_spool recovers orphaned .adopt-stage-* cleanly.
+            missing_root = Path(tmp_root) / "deleted_root"
+            adopt_meta, adopt_env, _ = _utils._make_stage_names(".adopt-stage-")
+            adopt_env_bytes = json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:03Z", "event_type": "LLM_REQUEST", "content": {"k": "adopt_orphan"}},
+            }).encode("utf-8")
+            adopt_retry_bytes = json.dumps({
+                "attempts": 1,
+                "first_failed_at": 1000.0,
+                "next_retry_at": 1050.0,
+                "last_error": "prior 503",
+            }).encode("utf-8")
+            adopt_meta_bytes = _utils._build_stage_meta_bytes(
+                source="event-adopt.json",
+                source_retry="event-adopt.json.retry",
+                dst_name="event-adopt.json",
+                dst_retry_name="event-adopt.json.retry",
+                has_retry=True,
+                sha256_hex=hashlib.sha256(adopt_env_bytes).hexdigest(),
+            )
+            with _utils.open_existing_private_dir(part_a) as part_priv:
+                _utils._write_atomic_private_bytes(part_priv, adopt_env, adopt_env_bytes)
+                _utils._write_atomic_private_bytes(part_priv, adopt_meta, adopt_meta_bytes)
+                _utils._write_atomic_private_bytes(part_priv, "event-adopt.json.retry", adopt_retry_bytes)
+                asyncio.run(drain._drain_single_spool(part_priv, cfg_a, use_storage_api=False))
+                self.assertTrue((part_a / "event-adopt.json.retry").is_file())
+                drain._adopt_matching_root_spool_files(missing_root, part_priv, cfg_a)
+            self.assertTrue((part_a / "event-adopt.json").is_file())
+            self.assertTrue((part_a / "event-adopt.json.retry").is_file())
+            self.assertEqual(list(part_a.glob(".adopt-stage-*")), [])
+            (part_a / "event-adopt.json").unlink()
+            (part_a / "event-adopt.json.retry").unlink()
+
+            # 2. Concurrent migrate_legacy_spool + _drain_single_spool serialize on .migrate.lock:
+            # pause migrate inside _promote_staged_entry (mid-promotion) and verify drain waits
+            # until promotion finishes, keeping retry metadata intact and honoring next_retry_at.
+            legacy_spool.mkdir(parents=True, mode=0o700)
+            os.chmod(legacy_spool, 0o700)
+            conc_env_bytes = json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:04Z", "event_type": "LLM_REQUEST", "content": {"k": "conc"}},
+            }).encode("utf-8")
+            conc_retry_bytes = json.dumps({
+                "attempts": 1,
+                "first_failed_at": 1000.0,
+                "next_retry_at": 1050.0,
+                "last_error": "prior 503",
+            }).encode("utf-8")
+            (legacy_spool / "event-conc.json").write_bytes(conc_env_bytes)
+            (legacy_spool / "event-conc.json.retry").write_bytes(conc_retry_bytes)
+            os.chmod(legacy_spool / "event-conc.json", 0o600)
+            os.chmod(legacy_spool / "event-conc.json.retry", 0o600)
+
+            mid_promote = threading.Event()
+            release_promote = threading.Event()
+            worker_finished = threading.Event()
+            orig_promote = _utils._promote_staged_entry
+            mig_holder: dict[str, object] = {}
+            worker_res: dict[str, int] = {}
+
+            def _paused_promote(*args, **kwargs):
+                mid_promote.set()
+                release_promote.wait(timeout=5.0)
+                return orig_promote(*args, **kwargs)
+
+            def _run_migration():
+                with mock.patch.object(_utils, "_promote_staged_entry", _paused_promote):
+                    mig_holder["res"] = _utils.migrate_legacy_spool(
+                        new_spool,
+                        legacy_spool_dir=legacy_spool,
+                        destination=("proj-a", "ds_a", "agent_events"),
+                    )
+
+            def _run_worker():
+                with mock.patch.object(drain.time, "time", return_value=1010.0), \
+                     _utils.open_existing_private_dir(part_a) as sp:
+                    worker_res["resolved"] = asyncio.run(
+                        drain._drain_single_spool(sp, cfg_a, use_storage_api=False)
+                    )
+                worker_finished.set()
+
+            t_mig = threading.Thread(target=_run_migration)
+            t_mig.start()
+            self.assertTrue(mid_promote.wait(timeout=5.0))
+
+            t_wrk = threading.Thread(target=_run_worker)
+            t_wrk.start()
+            # Worker must block on .migrate.lock while migration is paused mid-promotion.
+            self.assertFalse(worker_finished.wait(timeout=0.15))
+
+            release_promote.set()
+            t_mig.join(timeout=5.0)
+            t_wrk.join(timeout=5.0)
+            self.assertEqual(mig_holder["res"]["migrated"], 1)
+            self.assertEqual(worker_res["resolved"], 0)
+            self.assertTrue((part_a / "event-conc.json").is_file())
+            self.assertTrue((part_a / "event-conc.json.retry").is_file())
+            self.assertEqual(len(delivered["proj-a.ds_a.agent_events"]), 1)
+
+            with mock.patch.object(drain.time, "time", return_value=1050.0), \
+                 _utils.open_existing_private_dir(part_a) as sp:
+                r_conc_due = asyncio.run(
+                    drain._drain_single_spool(sp, cfg_a, use_storage_api=False)
+                )
+            self.assertEqual(r_conc_due, 1)
+            self.assertEqual(
+                [r["content"] for r in delivered["proj-a.ds_a.agent_events"]],
+                [{"k": "mid"}, {"k": "conc"}],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
