@@ -37,9 +37,15 @@ from typing import Any, Iterator
 # plugin behavior and keeps the channel safe if the host agent forks us.
 os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 
+from ._utils import _build_stage_meta_bytes  # noqa: E402
+from ._utils import _cleanup_stage_files  # noqa: E402
+from ._utils import _make_stage_names  # noqa: E402
+from ._utils import _MAX_STAGED_EVENT_NAME_BYTES  # noqa: E402
+from ._utils import _promote_staged_entry  # noqa: E402
 from ._utils import _read_private_bytes  # noqa: E402  (after env tweak)
 from ._utils import _read_verified_legacy_file  # noqa: E402
 from ._utils import _write_atomic_private_bytes  # noqa: E402
+from ._utils import bounded_collision_event_name  # noqa: E402
 from ._utils import ensure_private_dir  # noqa: E402
 from ._utils import extract_envelope_config  # noqa: E402
 from ._utils import has_envelope_destination  # noqa: E402
@@ -49,6 +55,7 @@ from ._utils import migrate_legacy_spool  # noqa: E402
 from ._utils import open_destination_spool_dir  # noqa: E402
 from ._utils import open_existing_private_dir  # noqa: E402
 from ._utils import PrivateDir  # noqa: E402
+from ._utils import recover_staged_transfers  # noqa: E402
 from ._utils import safe_json_loads  # noqa: E402
 from ._writer_identity import DEFAULT_WRITER_LABEL  # noqa: E402
 from .config import BQAAConfig  # noqa: E402
@@ -1301,11 +1308,25 @@ def _adopt_matching_root_under_lock(
     root_spool: PrivateDir, part_spool: PrivateDir, config: BQAAConfig
 ) -> None:
   """Move matching or destination-less root envelopes (and .retry) into ``part_spool``."""
+  def _log_adopt_recovery_error(entry_name: str, exc: Exception) -> None:
+    _log_diagnostic_once(
+        config,
+        f"root_adopt_failed:{root_spool.path / entry_name}",
+        f"DRAINER root_adopt_failed file={entry_name}: {exc}",
+    )
+
+  recover_staged_transfers(
+      root_spool,
+      part_spool,
+      stage_prefix=".adopt-stage-",
+      collision_prefix="event-root-",
+      on_error=_log_adopt_recovery_error,
+  )
+
   root_names = sorted(
       n for n in root_spool.names() if fnmatch.fnmatchcase(n, "event-*.json")
   )
   skip_cap = max(1, int(_IN_MEMORY_RETRY_META_CAP))
-  stage_idx = 0
   for name in root_names:
     try:
       raw = _read_verified_legacy_file(root_spool, name)
@@ -1352,7 +1373,12 @@ def _adopt_matching_root_under_lock(
         )
         continue
 
+    sha256_hex = hashlib.sha256(raw).hexdigest()
     dst_name = name
+    if len(dst_name.encode("utf-8")) > _MAX_STAGED_EVENT_NAME_BYTES:
+      dst_name = bounded_collision_event_name(
+          name, sha256_hex, "event-root-"
+      )
     if part_spool.exists(dst_name):
       existing = _read_private_bytes(part_spool, dst_name)
       if existing == raw:
@@ -1373,8 +1399,9 @@ def _adopt_matching_root_under_lock(
           except (FileNotFoundError, OSError):
             pass
         continue
-      digest = hashlib.sha256(raw).hexdigest()[:12]
-      dst_name = f"event-root-{digest}-{name[len('event-'):]}"
+      dst_name = bounded_collision_event_name(
+          name, sha256_hex, "event-root-"
+      )
       if part_spool.exists(dst_name):
         existing_dedup = _read_private_bytes(part_spool, dst_name)
         if existing_dedup == raw:
@@ -1398,11 +1425,16 @@ def _adopt_matching_root_under_lock(
         continue
 
     dst_retry_name = _retry_sidecar_name(dst_name)
-    wrote_retry = False
+    stage_meta, stage_env, stage_rty = _make_stage_names(".adopt-stage-")
+    staged_retry_written = False
+    promoted_retry = False
+    wrote_staged_env = False
+    wrote_staged_meta = False
+    source_unlinked = False
     if retry_bytes is not None and not part_spool.exists(dst_retry_name):
       try:
-        _write_atomic_private_bytes(part_spool, dst_retry_name, retry_bytes)
-        wrote_retry = True
+        _write_atomic_private_bytes(part_spool, stage_rty, retry_bytes)
+        staged_retry_written = True
       except OSError as exc:
         _log_diagnostic_once(
             config,
@@ -1411,48 +1443,71 @@ def _adopt_matching_root_under_lock(
         )
         continue
 
-    stage_idx += 1
-    staged_env = f".adopt-stage-{os.getpid()}-{stage_idx}.env"
-    source_unlinked = False
     try:
       try:
+        if staged_retry_written:
+          part_spool.replace(stage_rty, dst_retry_name)
+          promoted_retry = True
         root_spool.replace(name, dst_name, part_spool)
         source_unlinked = True
+        if retry_bytes is not None:
+          try:
+            root_spool.unlink(retry_name)
+          except (FileNotFoundError, OSError):
+            pass
       except OSError as exc:
         if exc.errno != errno.EXDEV:
           raise
-        _write_atomic_private_bytes(part_spool, staged_env, raw)
+        if promoted_retry:
+          part_spool.replace(dst_retry_name, stage_rty)
+          promoted_retry = False
+        _write_atomic_private_bytes(part_spool, stage_env, raw)
+        wrote_staged_env = True
+        meta_bytes = _build_stage_meta_bytes(
+            source=name,
+            source_retry=retry_name if retry_bytes is not None else "",
+            dst_name=dst_name,
+            dst_retry_name=dst_retry_name,
+            has_retry=staged_retry_written,
+            sha256_hex=sha256_hex,
+        )
+        _write_atomic_private_bytes(part_spool, stage_meta, meta_bytes)
+        wrote_staged_meta = True
         try:
+          root_spool.unlink(name)
+        except FileNotFoundError:
+          pass
+        source_unlinked = True
+        _promote_staged_entry(
+            root_spool,
+            part_spool,
+            stage_meta,
+            stage_env,
+            stage_rty,
+            dst_name,
+            dst_retry_name,
+            retry_name if retry_bytes is not None else "",
+            staged_retry_written,
+        )
+    except OSError as exc:
+      if not source_unlinked:
+        if promoted_retry:
           try:
-            root_spool.unlink(name)
-          except FileNotFoundError:
-            pass
-          source_unlinked = True
-        except OSError:
-          try:
-            part_spool.unlink(staged_env)
+            part_spool.unlink(dst_retry_name)
           except OSError:
             pass
-          raise
-        part_spool.replace(staged_env, dst_name)
-    except OSError as exc:
-      if wrote_retry and not source_unlinked:
-        try:
-          part_spool.unlink(dst_retry_name)
-        except OSError:
-          pass
+        _cleanup_stage_files(
+            part_spool,
+            stage_meta if wrote_staged_meta else "",
+            stage_env if wrote_staged_env else "",
+            stage_rty if staged_retry_written and not promoted_retry else "",
+        )
       _log_diagnostic_once(
           config,
           f"root_adopt_failed:{root_spool.path / name}",
           f"DRAINER root_adopt_failed file={name}: {exc}",
       )
       continue
-
-    if retry_bytes is not None:
-      try:
-        root_spool.unlink(retry_name)
-      except (FileNotFoundError, OSError):
-        pass
 
 
 def _adopt_matching_root_spool_files(
@@ -1461,8 +1516,9 @@ def _adopt_matching_root_spool_files(
   """Adopt matching/destination-less envelopes from ``root_path`` into ``part_spool``.
 
   Acquires a non-blocking flock on ``root_path/.drainer.pid`` (only when
-  candidate ``event-*.json`` entries are present) so pre-partition drainers and
-  partitioned drainers never race over unpartitioned root files.
+  candidate ``event-*.json`` or staged ``.adopt-stage-*`` entries are present)
+  so pre-partition drainers and partitioned drainers never race over
+  unpartitioned root files.
   """
   try:
     with open_existing_private_dir(root_path) as probe_root:
@@ -1471,7 +1527,8 @@ def _adopt_matching_root_spool_files(
       )
   except (OSError, RuntimeError):
     return
-  if not has_candidates:
+  has_stages = any(n.startswith(".adopt-stage-") for n in part_spool.names())
+  if not has_candidates and not has_stages:
     return
 
   try:

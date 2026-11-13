@@ -1159,6 +1159,313 @@ def migrate_legacy_session_state(
   return migrated
 
 
+_MAX_STAGED_EVENT_NAME_BYTES = 240
+
+
+def bounded_collision_event_name(
+    name: str, digest_hex: str, prefix: str
+) -> str:
+  """Return a collision-safe ``event-*.json`` filename bounded to <= 240 UTF-8 bytes."""
+  suffix = name[len("event-") :] if name.startswith("event-") else name
+  candidate = f"{prefix}{digest_hex[:12]}-{suffix}"
+  if len(candidate.encode("utf-8")) <= _MAX_STAGED_EVENT_NAME_BYTES:
+    return candidate
+  return f"{prefix}{digest_hex[:24]}.json"
+
+
+def _make_stage_names(stage_prefix: str) -> tuple[str, str, str]:
+  nonce = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+  return (
+      f"{stage_prefix}{nonce}.meta",
+      f"{stage_prefix}{nonce}.env",
+      f"{stage_prefix}{nonce}.rty",
+  )
+
+
+def _is_safe_stage_entry_name(name: Any, *, allow_empty: bool = False) -> bool:
+  if not isinstance(name, str):
+    return False
+  if not name:
+    return allow_empty
+  return (
+      os.sep not in name
+      and "/" not in name
+      and "\\" not in name
+      and name not in (".", "..")
+  )
+
+
+def _cleanup_stage_files(dst: PrivateDir, *names: str) -> None:
+  for sname in names:
+    if not sname:
+      continue
+    try:
+      if dst.exists(sname):
+        dst.unlink(sname)
+    except OSError:
+      pass
+
+
+def _build_stage_meta_bytes(
+    *,
+    source: str,
+    source_retry: str,
+    dst_name: str,
+    dst_retry_name: str,
+    has_retry: bool,
+    sha256_hex: str,
+) -> bytes:
+  return json.dumps(
+      {
+          "source": source,
+          "source_retry": source_retry,
+          "dst_name": dst_name,
+          "dst_retry_name": dst_retry_name,
+          "has_retry": has_retry,
+          "sha256": sha256_hex,
+      },
+      separators=(",", ":"),
+  ).encode("utf-8")
+
+
+def _promote_staged_entry(
+    src: PrivateDir | None,
+    dst: PrivateDir,
+    stage_meta: str,
+    stage_env: str,
+    stage_rty: str,
+    dst_name: str,
+    dst_retry_name: str,
+    source_retry: str,
+    has_retry: bool,
+) -> None:
+  """Promote staged ``stage_rty``/``stage_env`` into ``dst`` after source retirement.
+
+  If promoting ``stage_env`` fails after ``stage_rty`` was already promoted to
+  ``dst_retry_name``, rolls ``dst_retry_name`` back to ``stage_rty`` so the
+  retry sidecar is not deleted as an orphan before the next recovery pass.
+  """
+  promoted_retry = False
+  if has_retry and dst.exists(stage_rty) and not dst.exists(dst_retry_name):
+    dst.replace(stage_rty, dst_retry_name)
+    promoted_retry = True
+  try:
+    dst.replace(stage_env, dst_name)
+  except OSError:
+    if promoted_retry:
+      try:
+        dst.replace(dst_retry_name, stage_rty)
+      except OSError:
+        pass
+    raise
+  if source_retry and src is not None:
+    try:
+      src.unlink(source_retry)
+    except (FileNotFoundError, OSError):
+      pass
+  if dst.exists(stage_rty):
+    try:
+      dst.unlink(stage_rty)
+    except OSError:
+      pass
+  try:
+    dst.unlink(stage_meta)
+  except OSError:
+    pass
+
+
+def recover_staged_transfers(
+    src: PrivateDir,
+    dst: PrivateDir,
+    *,
+    stage_prefix: str,
+    collision_prefix: str,
+    on_error: Any = None,
+) -> int:
+  """Recover interrupted or post-unlink failed staged transfers in ``dst``.
+
+  Must be called while holding exclusive locks over both ``src`` and ``dst``.
+  """
+  recovered = 0
+  try:
+    names = sorted(dst.names())
+  except OSError as exc:
+    if on_error is not None:
+      on_error(stage_prefix, exc)
+    return 0
+
+  meta_names = [
+      n for n in names if n.startswith(stage_prefix) and n.endswith(".meta")
+  ]
+  meta_stems = {n[: -len(".meta")] for n in meta_names}
+
+  for meta_name in meta_names:
+    stem = meta_name[: -len(".meta")]
+    stage_env = f"{stem}.env"
+    stage_rty = f"{stem}.rty"
+    try:
+      raw_meta = _read_verified_legacy_file(dst, meta_name, max_bytes=65536)
+      meta = safe_json_loads(raw_meta.decode("utf-8", "strict"), None)
+    except (OSError, UnicodeDecodeError) as exc:
+      if on_error is not None:
+        on_error(meta_name, exc)
+      continue
+    if not isinstance(meta, dict):
+      if on_error is not None:
+        on_error(meta_name, ValueError("invalid staged transfer metadata"))
+      continue
+
+    source = meta.get("source")
+    dst_name = meta.get("dst_name")
+    source_retry = meta.get("source_retry") or ""
+    dst_retry_name = meta.get("dst_retry_name") or ""
+    has_retry = bool(meta.get("has_retry"))
+    sha256_hex = meta.get("sha256") or ""
+    if (
+        not _is_safe_stage_entry_name(source)
+        or not _is_safe_stage_entry_name(dst_name)
+        or not _is_safe_stage_entry_name(source_retry, allow_empty=True)
+        or not _is_safe_stage_entry_name(dst_retry_name, allow_empty=True)
+        or not isinstance(sha256_hex, str)
+    ):
+      if on_error is not None:
+        on_error(meta_name, ValueError("malformed staged transfer metadata"))
+      continue
+
+    try:
+      src_still_exists = src.exists(source)
+    except OSError as exc:
+      if on_error is not None:
+        on_error(source, exc)
+      continue
+
+    if src_still_exists:
+      _cleanup_stage_files(dst, stage_env, stage_rty, meta_name)
+      continue
+
+    if dst.exists(stage_env):
+      target_name = dst_name
+      staged_bytes: bytes | None = None
+      if len(target_name.encode("utf-8")) > _MAX_STAGED_EVENT_NAME_BYTES:
+        staged_bytes = _read_private_bytes(dst, stage_env)
+        digest = sha256_hex or (
+            hashlib.sha256(staged_bytes).hexdigest()
+            if staged_bytes is not None
+            else ""
+        )
+        if not digest:
+          if on_error is not None:
+            on_error(
+                source, ValueError("missing digest for oversized staged file")
+            )
+          continue
+        target_name = bounded_collision_event_name(
+            target_name, digest, collision_prefix
+        )
+      target_retry_name = (
+          dst_retry_name
+          if target_name == dst_name
+          and dst_retry_name
+          and len(dst_retry_name.encode("utf-8")) <= 246
+          else f"{target_name}.retry"
+      )
+      if dst.exists(target_name):
+        existing = _read_private_bytes(dst, target_name)
+        if staged_bytes is None:
+          staged_bytes = _read_private_bytes(dst, stage_env)
+        if (
+            existing is not None
+            and staged_bytes is not None
+            and existing == staged_bytes
+        ):
+          if source_retry:
+            try:
+              src.unlink(source_retry)
+            except (FileNotFoundError, OSError):
+              pass
+          _cleanup_stage_files(dst, stage_env, stage_rty, meta_name)
+          continue
+        digest = sha256_hex or (
+            hashlib.sha256(staged_bytes).hexdigest()
+            if staged_bytes is not None
+            else ""
+        )
+        if not digest:
+          if on_error is not None:
+            on_error(source, ValueError("missing digest for staged collision"))
+          continue
+        target_name = bounded_collision_event_name(
+            target_name, digest, collision_prefix
+        )
+        target_retry_name = f"{target_name}.retry"
+        if dst.exists(target_name):
+          existing_dedup = _read_private_bytes(dst, target_name)
+          if (
+              existing_dedup is not None
+              and staged_bytes is not None
+              and existing_dedup == staged_bytes
+          ):
+            if source_retry:
+              try:
+                src.unlink(source_retry)
+              except (FileNotFoundError, OSError):
+                pass
+            _cleanup_stage_files(dst, stage_env, stage_rty, meta_name)
+            continue
+          if on_error is not None:
+            on_error(
+                source,
+                FileExistsError(f"destination collision for {target_name}"),
+            )
+          continue
+
+      try:
+        _promote_staged_entry(
+            src,
+            dst,
+            meta_name,
+            stage_env,
+            stage_rty,
+            target_name,
+            target_retry_name,
+            source_retry,
+            has_retry,
+        )
+      except OSError as exc:
+        if on_error is not None:
+          on_error(source, exc)
+        continue
+      recovered += 1
+    else:
+      if source_retry:
+        try:
+          src.unlink(source_retry)
+        except (FileNotFoundError, OSError):
+          pass
+      _cleanup_stage_files(dst, stage_rty, meta_name)
+
+  try:
+    after_names = sorted(dst.names())
+  except OSError:
+    after_names = []
+  for extra in after_names:
+    if not extra.startswith(stage_prefix):
+      continue
+    if extra.endswith(".env"):
+      stem = extra[: -len(".env")]
+    elif extra.endswith(".rty"):
+      stem = extra[: -len(".rty")]
+    else:
+      continue
+    if stem not in meta_stems:
+      try:
+        dst.unlink(extra)
+      except (FileNotFoundError, OSError):
+        pass
+
+  return recovered
+
+
 def migrate_legacy_spool(
     spool_dir: str | os.PathLike[str],
     *,
@@ -1212,7 +1519,18 @@ def migrate_legacy_spool(
       result["error"] = str(exc)
       return result
     if not event_names:
-      return result
+      has_pending_stages = False
+      try:
+        with open_destination_spool_dir(
+            spool_dir, dest_proj, dest_ds, dest_tbl, create=False
+        ) as probe_dst:
+          has_pending_stages = any(
+              n.startswith(".migrate-stage-") for n in probe_dst.names()
+          )
+      except (FileNotFoundError, OSError, RuntimeError):
+        has_pending_stages = False
+      if not has_pending_stages:
+        return result
 
     try:
       legacy_pid_fd = legacy.open(
@@ -1242,11 +1560,26 @@ def migrate_legacy_spool(
           result["error"] = str(exc)
           return result
         if not event_names:
-          return result
+          has_pending_stages = False
+          try:
+            with open_destination_spool_dir(
+                spool_dir, dest_proj, dest_ds, dest_tbl, create=False
+            ) as probe_dst:
+              has_pending_stages = any(
+                  n.startswith(".migrate-stage-") for n in probe_dst.names()
+              )
+          except (FileNotFoundError, OSError, RuntimeError):
+            has_pending_stages = False
+          if not has_pending_stages:
+            return result
 
         try:
           with open_destination_spool_dir(
-              spool_dir, dest_proj, dest_ds, dest_tbl, create=True
+              spool_dir,
+              dest_proj,
+              dest_ds,
+              dest_tbl,
+              create=bool(event_names),
           ) as dst:
             if _same_private_dir(legacy, dst):
               return result
@@ -1255,7 +1588,22 @@ def migrate_legacy_spool(
             try:
               fcntl.flock(lock_fd, fcntl.LOCK_EX)
               locked = True
-              stage_idx = 0
+
+              def _record_recovery_error(
+                  entry_name: str, exc: Exception
+              ) -> None:
+                if result["error"] is None:
+                  result["error"] = str(exc)
+                result["skipped_reasons"][entry_name] = str(exc)
+
+              result["migrated"] += recover_staged_transfers(
+                  legacy,
+                  dst,
+                  stage_prefix=".migrate-stage-",
+                  collision_prefix="event-legacy-",
+                  on_error=_record_recovery_error,
+              )
+
               for name in event_names:
                 if not legacy.exists(name):
                   continue
@@ -1308,13 +1656,19 @@ def migrate_legacy_spool(
                       )
                     continue
 
+                sha256_hex = hashlib.sha256(raw).hexdigest()
                 dst_name = name
+                if len(dst_name.encode("utf-8")) > _MAX_STAGED_EVENT_NAME_BYTES:
+                  dst_name = bounded_collision_event_name(
+                      name, sha256_hex, "event-legacy-"
+                  )
                 dst_retry_name = f"{dst_name}.retry"
-                stage_idx += 1
-                staged_env = f".migrate-stage-{os.getpid()}-{stage_idx}.env"
-                staged_retry = f".migrate-stage-{os.getpid()}-{stage_idx}.rty"
+                stage_meta, stage_env, stage_rty = _make_stage_names(
+                    ".migrate-stage-"
+                )
                 wrote_staged_retry = False
                 wrote_staged_env = False
+                wrote_staged_meta = False
                 source_unlinked = False
                 try:
                   if dst.exists(dst_name):
@@ -1330,8 +1684,9 @@ def migrate_legacy_spool(
                         except (FileNotFoundError, OSError):
                           pass
                       continue
-                    digest = hashlib.sha256(raw).hexdigest()[:12]
-                    dst_name = f"event-legacy-{digest}-{name[len('event-'):]}"
+                    dst_name = bounded_collision_event_name(
+                        name, sha256_hex, "event-legacy-"
+                    )
                     dst_retry_name = f"{dst_name}.retry"
                     if dst.exists(dst_name):
                       existing_dedup = _read_private_bytes(dst, dst_name)
@@ -1346,45 +1701,54 @@ def migrate_legacy_spool(
                           except (FileNotFoundError, OSError):
                             pass
                         continue
+                      continue
 
-                  # Stage into hidden non-deliverable files first so a failed
-                  # legacy.unlink() never leaves a deliverable envelope in dst.
+                  # Stage sidecar, envelope, and recovery metadata BEFORE
+                  # unlinking the source so neither pre-unlink failures nor
+                  # post-unlink crashes/failures can duplicate or lose events.
                   if retry_bytes is not None and not dst.exists(dst_retry_name):
-                    _write_atomic_private_bytes(
-                        dst, staged_retry, retry_bytes
-                    )
+                    _write_atomic_private_bytes(dst, stage_rty, retry_bytes)
                     wrote_staged_retry = True
-                  _write_atomic_private_bytes(dst, staged_env, raw)
+                  _write_atomic_private_bytes(dst, stage_env, raw)
                   wrote_staged_env = True
+                  meta_bytes = _build_stage_meta_bytes(
+                      source=name,
+                      source_retry=retry_name if retry_bytes is not None else "",
+                      dst_name=dst_name,
+                      dst_retry_name=dst_retry_name,
+                      has_retry=wrote_staged_retry,
+                      sha256_hex=sha256_hex,
+                  )
+                  _write_atomic_private_bytes(dst, stage_meta, meta_bytes)
+                  wrote_staged_meta = True
                   try:
                     legacy.unlink(name)
                   except FileNotFoundError:
                     pass
                   source_unlinked = True
-                  if wrote_staged_retry:
-                    dst.replace(staged_retry, dst_retry_name)
-                  dst.replace(staged_env, dst_name)
+                  _promote_staged_entry(
+                      legacy,
+                      dst,
+                      stage_meta,
+                      stage_env,
+                      stage_rty,
+                      dst_name,
+                      dst_retry_name,
+                      retry_name if retry_bytes is not None else "",
+                      wrote_staged_retry,
+                  )
                 except OSError as exc:
                   if not source_unlinked:
-                    if wrote_staged_env:
-                      try:
-                        dst.unlink(staged_env)
-                      except OSError:
-                        pass
-                    if wrote_staged_retry:
-                      try:
-                        dst.unlink(staged_retry)
-                      except OSError:
-                        pass
+                    _cleanup_stage_files(
+                        dst,
+                        stage_meta if wrote_staged_meta else "",
+                        stage_env if wrote_staged_env else "",
+                        stage_rty if wrote_staged_retry else "",
+                    )
                   if result["error"] is None:
                     result["error"] = str(exc)
                   result["skipped_reasons"][name] = str(exc)
                   continue
-                if retry_bytes is not None:
-                  try:
-                    legacy.unlink(retry_name)
-                  except (FileNotFoundError, OSError):
-                    pass
                 result["migrated"] += 1
             finally:
               if locked:
