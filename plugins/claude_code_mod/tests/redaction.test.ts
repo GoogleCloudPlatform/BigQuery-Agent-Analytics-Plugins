@@ -404,6 +404,16 @@ test('CLI flags, positional secrets, Markdown labels/tables, code configs, armor
     [`postgres://app:abc/${s}@db.internal:5432/app`, /^postgres:\/\/\[REDACTED\]@db\.internal:5432\/app$/],
     [`https://user:p?a=1#${s}@example.com/path`, /^https:\/\/\[REDACTED\]@example\.com\/path$/],
     [`http://user:${s}@[::1]:8080/api`, /^http:\/\/\[REDACTED\]@\[::1\]:8080\/api$/],
+    [`https://alice:se@${s}@example.com`, /^https:\/\/\[REDACTED\]@example\.com$/],
+    [`https://alice:a@b@${s}@example.com/path?email=bob@foo.com`, /^https:\/\/\[REDACTED\]@example\.com\/path\?email=bob@foo\.com$/],
+    [`https://alice:se@${s}@intranet:8080/api`, /^https:\/\/\[REDACTED\]@intranet:8080\/api$/],
+    [`https://alice:${s}/path@intranet`, /^https:\/\/\[REDACTED\]@intranet$/],
+    [`https://alice:${s}?a=1@intranet`, /^https:\/\/\[REDACTED\]@intranet$/],
+    [`https://alice:${s}#frag@intranet`, /^https:\/\/\[REDACTED\]@intranet$/],
+    [`https://alice:${s}/path@intranet:8443/v1`, /^https:\/\/\[REDACTED\]@intranet:8443\/v1$/],
+    [`https://alice:p/a@${s}@intranet`, /^https:\/\/\[REDACTED\]@intranet$/],
+    [`https://alice:${s}/path@[::1]:8080/api`, /^https:\/\/\[REDACTED\]@\[::1\]:8080\/api$/],
+    [`https://alice:${s}@example.com/package/@types/node`, /^https:\/\/\[REDACTED\]@example\.com\/package\/@types\/node$/],
   ]
   for (const [input, pattern] of mustRedact) {
     const stats1 = newStats()
@@ -417,15 +427,38 @@ test('CLI flags, positional secrets, Markdown labels/tables, code configs, armor
     expect(stats2.redactions).toBe(0)
   }
 
+  for (const [input, expected, leakedFragments] of [
+    ['https://alice:se@cret@example.com', 'https://[REDACTED]@example.com', ['se@cret', 'cret']],
+    ['https://alice:a@b@c@example.com/path', 'https://[REDACTED]@example.com/path', ['a@b', 'b@c']],
+    ['https://alice:pAssw0rd/secretPath@intranet', 'https://[REDACTED]@intranet', ['pAssw0rd', 'secretPath']],
+    ['https://alice:pAssw0rd?a=secretVal@intranet', 'https://[REDACTED]@intranet', ['pAssw0rd', 'secretVal']],
+    ['https://alice:pAssw0rd#secretFrag@intranet', 'https://[REDACTED]@intranet', ['pAssw0rd', 'secretFrag']],
+  ] as const) {
+    const stats = newStats()
+    const out = redactText(input, stats)
+    expect(out).toBe(expected)
+    for (const frag of leakedFragments) expect(out).not.toContain(frag)
+    expect(stats.redactions).toBe(1)
+  }
+
   const keepUntouched = [
     'mkdir -p /tmp/foo/bar',
     'docker run -p 8080:80 nginx',
     'claude -p hello',
     'git config --global credential.helper store',
     'psql -p 5432 -U postgres',
+    'mailto:alice@example.com',
+    'mailto:alice@intranet',
+    'acct:alice@example.com',
+    'acct:alice@intranet',
     'https://www.npmjs.com/package/@types/node',
+    'https://intranet/package/@types/node',
+    'https://intranet/users/@alice',
+    'https://intranet:8080/users/@alice',
+    'https://intranet:8080?email=alice@intranet',
     'https://medium.com/@username/post',
     'https://api.example.com:8443/v1?email=alice@example.com',
+    'https://[::1]:8080/@me',
   ]
   for (const input of keepUntouched) {
     const stats = newStats()

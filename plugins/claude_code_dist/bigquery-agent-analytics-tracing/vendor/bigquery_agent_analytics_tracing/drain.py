@@ -54,6 +54,7 @@ from ._writer_identity import DEFAULT_WRITER_LABEL  # noqa: E402
 from .config import BQAAConfig  # noqa: E402
 from .config import DEFAULT_LOG_FILE  # noqa: E402
 from .config import DEFAULT_STATE_DIR  # noqa: E402
+from .config import destination_partition_id  # noqa: E402
 from .config import destination_spool_dir  # noqa: E402
 from .schema import bq_schema  # noqa: E402
 
@@ -1382,42 +1383,12 @@ def _adopt_matching_root_under_lock(
         continue
 
     dst_retry_name = _retry_sidecar_name(dst_name)
-    moved_retry = False
+    wrote_retry = False
     if retry_bytes is not None and not part_spool.exists(dst_retry_name):
       try:
-        root_spool.replace(retry_name, dst_retry_name, part_spool)
-        moved_retry = True
+        _write_atomic_private_bytes(part_spool, dst_retry_name, retry_bytes)
+        wrote_retry = True
       except OSError as exc:
-        if exc.errno == errno.EXDEV:
-          _write_atomic_private_bytes(part_spool, dst_retry_name, retry_bytes)
-          try:
-            root_spool.unlink(retry_name)
-          except (FileNotFoundError, OSError):
-            pass
-          moved_retry = True
-        else:
-          _log_diagnostic_once(
-              config,
-              f"root_adopt_failed:{root_spool.path / name}",
-              f"DRAINER root_adopt_failed file={name}: {exc}",
-          )
-          continue
-
-    try:
-      root_spool.replace(name, dst_name, part_spool)
-    except OSError as exc:
-      if exc.errno == errno.EXDEV:
-        _write_atomic_private_bytes(part_spool, dst_name, raw)
-        try:
-          root_spool.unlink(name)
-        except FileNotFoundError:
-          pass
-      else:
-        if moved_retry:
-          try:
-            part_spool.replace(dst_retry_name, retry_name, root_spool)
-          except OSError:
-            pass
         _log_diagnostic_once(
             config,
             f"root_adopt_failed:{root_spool.path / name}",
@@ -1425,7 +1396,31 @@ def _adopt_matching_root_under_lock(
         )
         continue
 
-    if retry_bytes is not None and root_spool.exists(retry_name):
+    try:
+      try:
+        root_spool.replace(name, dst_name, part_spool)
+      except OSError as exc:
+        if exc.errno != errno.EXDEV:
+          raise
+        _write_atomic_private_bytes(part_spool, dst_name, raw)
+        try:
+          root_spool.unlink(name)
+        except (FileNotFoundError, OSError):
+          pass
+    except OSError as exc:
+      if wrote_retry:
+        try:
+          part_spool.unlink(dst_retry_name)
+        except OSError:
+          pass
+      _log_diagnostic_once(
+          config,
+          f"root_adopt_failed:{root_spool.path / name}",
+          f"DRAINER root_adopt_failed file={name}: {exc}",
+      )
+      continue
+
+    if retry_bytes is not None:
       try:
         root_spool.unlink(retry_name)
       except (FileNotFoundError, OSError):
@@ -1607,9 +1602,9 @@ async def _drain_once(config: BQAAConfig, use_storage_api: bool) -> int:
   norm_proj = (config.project_id or "").strip()
   norm_ds = (config.dataset or "").strip()
   norm_tbl = (config.table or "").strip() or "agent_events"
-  destination = (
-      (norm_proj, norm_ds, norm_tbl) if (norm_proj and norm_ds) else None
-  )
+  if not destination_partition_id(norm_proj, norm_ds, norm_tbl):
+    return 0
+  destination = (norm_proj, norm_ds, norm_tbl)
   legacy_res = migrate_legacy_spool(config.spool_dir, destination=destination)
   if legacy_res.get("error"):
     key = f"legacy_error:{legacy_res['error']}"
@@ -1693,6 +1688,10 @@ def _next_deferred_wait_for_dir(
 
 def _next_deferred_wait_seconds(config: BQAAConfig) -> float | None:
   """Return seconds until earliest pending/deferred envelope is due, else None."""
+  if not destination_partition_id(
+      config.project_id, config.dataset, config.table
+  ):
+    return None
   root_path = Path(config.spool_dir).expanduser()
   part_path = Path(
       destination_spool_dir(
@@ -1715,6 +1714,10 @@ def _next_deferred_wait_seconds(config: BQAAConfig) -> float | None:
 
 
 async def _run(config: BQAAConfig) -> None:
+  if not destination_partition_id(
+      config.project_id, config.dataset, config.table
+  ):
+    return
   root_path = Path(config.spool_dir).expanduser()
   part_path = Path(
       destination_spool_dir(

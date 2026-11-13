@@ -2521,6 +2521,8 @@ test('r5/r6/r7 fixtures redact in the listed wrappers and paths; known gaps are 
     `${G}VERSION=v,DB_PASS$"WORD"=CanaryValue`,
     // the query escaped-opener, now read through its shell word.
     'sh -c "see q?token=\\"CanaryValue Suffix\\""',
+    // URL user-info containing extra @ characters before the authority delimiter.
+    'curl https://u:prefix@CanaryValue@example.test/path',
   ]
   for (const command of fixed) for (const wrapped of wrappersOf(command)) for (const text of pathsOf(wrapped)) expect([wrapped, /CanaryValue|Suffix/.test(text)]).toEqual([wrapped, false])
 
@@ -2530,7 +2532,6 @@ test('r5/r6/r7 fixtures redact in the listed wrappers and paths; known gaps are 
     String.raw`cli $'--password\x00ignored' CanaryValue`,
     String.raw`cli --pass$'\0'word CanaryValue`,
     String.raw`cli $'--oauth2-bearer\0ignored' CanaryValue`,
-    'curl https://u:prefix@CanaryValue@example.test/path',
     "curl https://example.test/?token=$'a CanaryValue'",
     'curl https://example.test/?token=${VALUE:-a CanaryValue}',
     `${G}"^q^VERSION=$(printf ^x^)qpass=CanaryValue"`,

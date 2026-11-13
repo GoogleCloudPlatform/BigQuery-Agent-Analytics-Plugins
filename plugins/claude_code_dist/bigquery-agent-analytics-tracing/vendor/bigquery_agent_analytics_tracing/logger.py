@@ -42,6 +42,9 @@ from ._writer_identity import __version__ as WRITER_VERSION
 from ._writer_identity import WRITER_PLUGIN_NAME
 from .config import BQAA_EVENT_TYPES
 from .config import BQAAConfig
+from .config import DEFAULT_WRITER_LABEL
+from .config import default_spool_dir
+from .config import default_state_dir
 from .schema import bq_schema
 
 _MISSING_BQ_LOGGED_KEYS: set[tuple[str, str]] = set()
@@ -150,6 +153,11 @@ def _serialize_bq_json_fields(row: dict[str, Any]) -> dict[str, Any]:
 
 def _ensure_drainer(config: BQAAConfig) -> None:
   """Spawn the drainer in a detached subprocess if none is running."""
+  if (
+      not (config.project_id or "").strip()
+      or not (config.dataset or "").strip()
+  ):
+    return
   env_python = os.environ.get("BQAA_PYTHON") or ""
   same_python = (
       _resolve_python_executable(env_python)
@@ -198,8 +206,18 @@ def _ensure_drainer(config: BQAAConfig) -> None:
   child_env["BQAA_MAX_CONTENT_LENGTH"] = str(config.max_content_length)
   child_env["BQAA_LOG_FILE"] = config.log_file
   child_env["BQAA_MAX_LOG_BYTES"] = str(config.max_log_bytes)
-  child_env["BQAA_SPOOL_DIR"] = config.spool_dir
-  child_env["BQAA_STATE_DIR"] = config.state_dir
+  if config.spool_dir != default_spool_dir() or (
+      os.environ.get("BQAA_SPOOL_DIR") or ""
+  ).strip():
+    child_env["BQAA_SPOOL_DIR"] = config.spool_dir
+  else:
+    child_env.pop("BQAA_SPOOL_DIR", None)
+  if config.state_dir != default_state_dir() or (
+      os.environ.get("BQAA_STATE_DIR") or ""
+  ).strip():
+    child_env["BQAA_STATE_DIR"] = config.state_dir
+  else:
+    child_env.pop("BQAA_STATE_DIR", None)
   child_env["BQAA_STATE_TTL_HOURS"] = str(config.state_ttl_hours)
   child_env["BQAA_TRANSCRIPT_MAX_BYTES"] = str(config.transcript_max_bytes)
   child_env["BQAA_DRAIN_IDLE_SECONDS"] = str(config.drain_idle_seconds)
@@ -548,7 +566,10 @@ class BigQueryAgentAnalyticsLogger:
           "DRY_RUN " + json.dumps(bq_row, sort_keys=True, default=str),
       )
       return
-    if not self.config.project_id or not self.config.dataset:
+    if (
+        not (self.config.project_id or "").strip()
+        or not (self.config.dataset or "").strip()
+    ):
       raise ValueError(
           "BQAA_PROJECT_ID/GCP_PROJECT_ID and BQAA_DATASET are required"
       )

@@ -77,9 +77,11 @@ copy of the released tarball, apart from:
   fixes in `hooks/common.sh`, `scripts/run_setup_check.sh`,
   `commands/bqaa-setup.md`, `README.md`, and the vendored `_utils.py`,
   `config.py`, `logger.py`, `setup_check.py`, `claude_code.py`, and
-  `drain.py`. Run `bash plugins/claude_code/build_dist.sh` to rebuild the
-  served copy from [`plugins/claude_code/`](../claude_code/) (and
-  `bash plugins/claude_code/build_dist.sh --check` to verify it stays in sync).
+  `drain.py`. Run
+  `bash plugins/claude_code/build_dist.sh plugins/claude_code_dist/bigquery-agent-analytics-tracing`
+  to rebuild the served copy from [`plugins/claude_code/`](../claude_code/)
+  (and `bash plugins/claude_code/build_dist.sh --check` to verify it stays in
+  sync).
 
 Other edits there get overwritten on the next release sync. Send patches to:
 

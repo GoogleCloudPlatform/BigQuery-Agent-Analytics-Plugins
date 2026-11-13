@@ -2390,7 +2390,7 @@ function trimUrlTrailerLinear(text: string, start: number, end: number): number 
   return end
 }
 
-const VALID_HOST_AFTER_AT = /^(?:\[[0-9a-fA-F:.]+\]|localhost(?::\d+)?|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?)(?:[/?#]|$)/
+const VALID_HOST_AFTER_AT = /^(?:\[[0-9a-fA-F:.]+\](?::\d+)?|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*(?::\d+)?)(?:[/?#]|$)/
 
 function redactUrl(url: string, stats: SanitizeStats): string {
   if (WEBHOOK_QUICK.test(url) && WEBHOOK_URLS.some(pattern => pattern.test(url))) {
@@ -2398,9 +2398,8 @@ function redactUrl(url: string, stats: SanitizeStats): string {
     return '[REDACTED:webhook-url]'
   }
   let out = url
-  const atIdx = out.indexOf('@')
-  if (atIdx !== -1) {
-    const schemeSep = out.indexOf('://')
+  const schemeSep = out.indexOf('://')
+  if (schemeSep !== -1 && out.includes('@')) {
     const authStart = schemeSep + 3
     let firstDelim = out.length
     for (let k = authStart; k < out.length; k += 1) {
@@ -2410,30 +2409,33 @@ function redactUrl(url: string, stats: SanitizeStats): string {
         break
       }
     }
-    const firstAt = out.indexOf('@', authStart)
-    if (firstAt !== -1 && firstAt < firstDelim) {
-      const userInfo = out.slice(authStart, firstAt)
+    const lastAt = firstDelim > authStart ? out.lastIndexOf('@', firstDelim - 1) : -1
+    if (lastAt >= authStart) {
+      const userInfo = out.slice(authStart, lastAt)
       if (userInfo !== '') {
         if (userInfo !== MARKER) stats.redactions += 1
-        out = `${out.slice(0, authStart)}${MARKER}${out.slice(firstAt)}`
+        out = `${out.slice(0, authStart)}${MARKER}${out.slice(lastAt)}`
       }
-    } else if (firstDelim < out.length && atIdx > firstDelim) {
-      // Check for `/`, `?` or `#` inside URL password (`https://user:p/a/s/s@host`
-      // or `https://user:p?a=1#b@host`). Do NOT touch benign URLs whose host
-      // has no non-port `:` (`npmjs.com/package/@types/node`, `example.com:8443?email=a@b`).
-      const preDelim = out.slice(authStart, firstDelim)
-      const colonIdx = preDelim.indexOf(':')
-      if (colonIdx > 0 && !preDelim.startsWith('[')) {
-        const afterColon = preDelim.slice(colonIdx + 1)
-        if (!/^\d+$/.test(afterColon)) {
-          let candidate = firstAt
-          for (let tries = 0; candidate !== -1 && tries < 8; tries += 1) {
-            if (VALID_HOST_AFTER_AT.test(out.slice(candidate + 1))) {
-              out = `${out.slice(0, authStart)}${MARKER}${out.slice(candidate)}`
-              stats.redactions += 1
-              break
+    } else if (firstDelim < out.length) {
+      const firstAt = out.indexOf('@', firstDelim + 1)
+      if (firstAt !== -1) {
+        // Check for `/`, `?` or `#` inside URL password (`https://user:p/a/s/s@host`
+        // or `https://user:p?a=1#b@host`). Do NOT touch benign URLs whose host
+        // has no non-port `:` (`npmjs.com/package/@types/node`, `example.com:8443?email=a@b`).
+        const preDelim = out.slice(authStart, firstDelim)
+        const colonIdx = preDelim.indexOf(':')
+        if (colonIdx > 0 && !preDelim.startsWith('[')) {
+          const afterColon = preDelim.slice(colonIdx + 1)
+          if (!/^\d+$/.test(afterColon)) {
+            let candidate = firstAt
+            for (let tries = 0; candidate !== -1 && tries < 32; tries += 1) {
+              if (VALID_HOST_AFTER_AT.test(out.slice(candidate + 1))) {
+                out = `${out.slice(0, authStart)}${MARKER}${out.slice(candidate)}`
+                stats.redactions += 1
+                break
+              }
+              candidate = out.indexOf('@', candidate + 1)
             }
-            candidate = out.indexOf('@', candidate + 1)
           }
         }
       }

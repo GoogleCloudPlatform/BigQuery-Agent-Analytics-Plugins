@@ -4701,6 +4701,19 @@ class TestRound3Fixes(unittest.TestCase):
                 mode["kind"] = "ok" if label == "missing_config" else label
                 insert_calls["n"] = 0
                 now_t = time.time()
+
+                def _run_drain_step(_sub_cfg=sub_cfg, _active=active_dir, _label=label):
+                    if _label == "missing_config":
+                        with drain.ensure_private_dir(_active) as sp:
+                            return asyncio.run(drain._drain_single_spool(sp, _sub_cfg, use_storage_api=False))
+                    return asyncio.run(drain._drain_once(_sub_cfg, use_storage_api=False))
+
+                def _next_wait_step(_sub_cfg=sub_cfg, _active=active_dir, _label=label):
+                    if _label == "missing_config":
+                        with drain.ensure_private_dir(_active) as sp:
+                            return drain._next_deferred_wait_for_dir(sp, _sub_cfg)
+                    return drain._next_deferred_wait_seconds(_sub_cfg)
+
                 with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2), \
                      mock.patch.object(drain, "_quarantine", return_value=False):
                     # Realistically fill _skipped_paths (2/2) via failing quarantine on s1, s2;
@@ -4712,25 +4725,25 @@ class TestRound3Fixes(unittest.TestCase):
                         "next_retry_at": 0.0,
                         "last_error": "prior transient",
                     }
-                    asyncio.run(drain._drain_once(sub_cfg, use_storage_api=False))
+                    _run_drain_step()
                     self.assertIn(str(p_perm), drain._in_memory_retry_meta)
                     self.assertIs(
                         drain._in_memory_retry_meta[str(p_perm)].get("quarantine_pending"),
                         True,
                     )
-                    self.assertIsNone(drain._next_deferred_wait_seconds(sub_cfg))
+                    self.assertIsNone(_next_wait_step())
                     calls_after_first = insert_calls["n"]
                     if label != "missing_config":
                         self.assertGreater(calls_after_first, 0)
                     # Subsequent poll while quarantine still fails must NEVER re-call BigQuery.
-                    resolved_again = asyncio.run(drain._drain_once(sub_cfg, use_storage_api=False))
+                    resolved_again = _run_drain_step()
                     self.assertEqual(resolved_again, 0)
                     self.assertEqual(insert_calls["n"], calls_after_first)
-                    self.assertIsNone(drain._next_deferred_wait_seconds(sub_cfg))
+                    self.assertIsNone(_next_wait_step())
 
                 # Once dead-letter recovers, quarantine_pending resolves cleanly without BigQuery call.
                 with mock.patch.object(drain, "_IN_MEMORY_RETRY_META_CAP", 2):
-                    resolved_recover = asyncio.run(drain._drain_once(sub_cfg, use_storage_api=False))
+                    resolved_recover = _run_drain_step()
                     self.assertEqual(resolved_recover, 1)
                     self.assertEqual(insert_calls["n"], calls_after_first)
                     self.assertNotIn(str(p_perm), drain._in_memory_retry_meta)
@@ -7401,7 +7414,7 @@ class TestDestinationPartitionedSpool(unittest.TestCase):
             self.assertEqual(child_env["BQAA_PROJECT_ID"], "proj-b")
             self.assertEqual(child_env["BQAA_DATASET"], "ds_b")
             self.assertEqual(child_env["BQAA_TABLE"], "agent_events")
-            self.assertEqual(child_env["BQAA_SPOOL_DIR"], str(shared_default_spool))
+            self.assertNotIn("BQAA_SPOOL_DIR", child_env)
             self.assertEqual(child_env["BQAA_DRAIN_RETRY_BACKOFF_SECONDS"], "0.05")
             self.assertNotIn("BQAA_LOCATION", child_env)
 
@@ -7836,6 +7849,15 @@ class TestDestinationPartitionedSpool(unittest.TestCase):
             encoding="utf-8",
         )
         os.chmod(root_a, 0o600)
+        root_b = spool_dir / "event-root-b.json"
+        root_b.write_text(
+            json.dumps({
+                "config": {"project_id": "proj-b", "dataset": "ds_b", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": json.dumps({"k": "old_b"})},
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(root_b, 0o600)
 
         delivered: dict[str, list[dict]] = {}
         _install_fake_bigquery(
@@ -7875,9 +7897,18 @@ class TestDestinationPartitionedSpool(unittest.TestCase):
 
         self.assertLess(elapsed, 0.8)
         self.assertTrue(root_a.is_file(), "new drainer must not touch root while old .drainer.pid lock is held")
+        self.assertTrue(root_b.is_file(), "new drainer must defer adopting root_b while old .drainer.pid lock is held")
         b_rows = delivered.get("proj-b.ds_b.agent_events", [])
         self.assertEqual(len(b_rows), 1)
         self.assertEqual(json.loads(b_rows[0]["content"]), {"k": "new_b"})
+
+        # Once old .drainer.pid lock is released, B adopts and delivers root_b while leaving root_a untouched.
+        resolved_after = asyncio.run(drain._drain_once(cfg_b, use_storage_api=False))
+        self.assertEqual(resolved_after, 1)
+        self.assertFalse(root_b.exists())
+        self.assertTrue(root_a.is_file())
+        b_rows_after = delivered.get("proj-b.ds_b.agent_events", [])
+        self.assertEqual([json.loads(r["content"]) for r in b_rows_after], [{"k": "new_b"}, {"k": "old_b"}])
 
     def test_migrate_legacy_spool_skips_when_destination_is_none(self):
         from bigquery_agent_analytics_tracing import _utils
@@ -8057,6 +8088,370 @@ class TestDestinationPartitionedSpool(unittest.TestCase):
         finally:
             os.environ.clear()
             os.environ.update(env_backup)
+
+    def test_migrate_legacy_spool_defers_while_old_drainer_holds_pid_lock(self):
+        import fcntl
+        from bigquery_agent_analytics_tracing import _utils, drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r8a_leg_lock_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        legacy_spool = Path(tmp_root) / "legacy" / "spool"
+        legacy_spool.mkdir(parents=True, mode=0o700)
+        os.chmod(legacy_spool.parent, 0o700)
+        os.chmod(legacy_spool, 0o700)
+        new_spool = Path(tmp_root) / "new_spool"
+        new_spool.mkdir(mode=0o700)
+        os.chmod(new_spool, 0o700)
+
+        env_inflight = legacy_spool / "event-inflight.json"
+        env_inflight.write_text(
+            json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "inflight"}},
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(env_inflight, 0o600)
+        retry_inflight = legacy_spool / "event-inflight.json.retry"
+        retry_inflight.write_text('{"attempts": 1}', encoding="utf-8")
+        os.chmod(retry_inflight, 0o600)
+
+        delivered: dict[str, list[dict]] = {}
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda tid, rows: delivered.setdefault(tid, []).extend(rows) or [],
+            get_table_fn=lambda tid: object(),
+        )
+        cfg_a = BQAAConfig(
+            project_id="proj-a",
+            dataset="ds_a",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(new_spool),
+            state_dir=os.path.join(tmp_root, "state_a"),
+            log_file=os.path.join(tmp_root, "a.log"),
+            drain_idle_seconds=0.06,
+            drain_poll_seconds=0.02,
+        )
+
+        # Simulate a paused v0.1.0 drainer holding an exclusive flock on legacy_spool/.drainer.pid.
+        old_pid_path = legacy_spool / ".drainer.pid"
+        old_pid_fd = os.open(str(old_pid_path), os.O_CREAT | os.O_RDWR, 0o600)
+        os.write(old_pid_fd, b"99999")
+        try:
+            fcntl.flock(old_pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            mig_held = _utils.migrate_legacy_spool(
+                new_spool,
+                legacy_spool_dir=legacy_spool,
+                destination=("proj-a", "ds_a", "agent_events"),
+            )
+            self.assertEqual(mig_held["migrated"], 0)
+            self.assertIsNone(mig_held["error"])
+            self.assertTrue(env_inflight.is_file())
+            self.assertTrue(retry_inflight.is_file())
+            self.assertEqual(old_pid_path.read_bytes(), b"99999")
+            part_a = Path(destination_spool_dir(new_spool, "proj-a", "ds_a", "agent_events"))
+            self.assertFalse(part_a.exists())
+
+            # Old drainer delivers inflight row and unlinks it before releasing its lock.
+            delivered.setdefault("proj-a.ds_a.agent_events", []).append(
+                json.loads(env_inflight.read_text(encoding="utf-8"))["row"]
+            )
+            env_inflight.unlink()
+            retry_inflight.unlink()
+        finally:
+            try:
+                fcntl.flock(old_pid_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(old_pid_fd)
+
+        # After lock release, migration + drain produces zero duplicate deliveries.
+        mig_after = _utils.migrate_legacy_spool(
+            new_spool,
+            legacy_spool_dir=legacy_spool,
+            destination=("proj-a", "ds_a", "agent_events"),
+        )
+        self.assertEqual(mig_after["migrated"], 0)
+        self.assertIsNone(mig_after["error"])
+        asyncio.run(drain._run(cfg_a))
+        self.assertEqual(len(delivered["proj-a.ds_a.agent_events"]), 1)
+
+        # If an unconsumed legacy row remains when the old drainer exits, migration moves and delivers it once.
+        env_leftover = legacy_spool / "event-leftover.json"
+        env_leftover.write_text(
+            json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "leftover"}},
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(env_leftover, 0o600)
+        mig_left = _utils.migrate_legacy_spool(
+            new_spool,
+            legacy_spool_dir=legacy_spool,
+            destination=("proj-a", "ds_a", "agent_events"),
+        )
+        self.assertEqual(mig_left["migrated"], 1)
+        self.assertIsNone(mig_left["error"])
+        self.assertFalse(env_leftover.exists())
+        asyncio.run(drain._run(cfg_a))
+        self.assertEqual(
+            [r["content"] for r in delivered["proj-a.ds_a.agent_events"]],
+            [{"k": "inflight"}, {"k": "leftover"}],
+        )
+
+        # Symlinked legacy .drainer.pid fails closed without touching legacy envelopes.
+        old_pid_path.unlink()
+        outside = Path(tmp_root) / "outside_pid"
+        outside.write_text("123", encoding="utf-8")
+        os.symlink(str(outside), str(old_pid_path))
+        env_sym = legacy_spool / "event-sym.json"
+        env_sym.write_text(
+            json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "sym"}},
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(env_sym, 0o600)
+        mig_sym = _utils.migrate_legacy_spool(
+            new_spool,
+            legacy_spool_dir=legacy_spool,
+            destination=("proj-a", "ds_a", "agent_events"),
+        )
+        self.assertEqual(mig_sym["migrated"], 0)
+        self.assertIsNotNone(mig_sym["error"])
+        self.assertTrue(env_sym.is_file())
+
+    def test_ensure_drainer_writer_label_empty_and_default_spool_omission(self):
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import _utils, logger as bq_logger
+        from bigquery_agent_analytics_tracing.config import (
+            BQAAConfig,
+            DEFAULT_WRITER_LABEL,
+            default_spool_dir,
+            default_state_dir,
+        )
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r8a_label_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        os.chmod(tmp_root, 0o700)
+
+        env_backup = os.environ.copy()
+        try:
+            os.environ["TMPDIR"] = tmp_root
+            os.environ.pop("BQAA_SPOOL_DIR", None)
+            os.environ.pop("BQAA_STATE_DIR", None)
+            os.environ.pop("BQAA_WRITER_LABEL", None)
+
+            cfg = BQAAConfig(
+                project_id="proj-a",
+                dataset="ds_a",
+                table="agent_events",
+                spool_dir=default_spool_dir(),
+                state_dir=default_state_dir(),
+                log_file=os.path.join(tmp_root, "a.log"),
+                writer_label="",
+            )
+            spawn_calls: list[dict] = []
+            with mock.patch.object(bq_logger, "_bigquery_spec_available", return_value=True), \
+                 mock.patch.object(
+                     bq_logger.subprocess,
+                     "Popen",
+                     side_effect=lambda *a, **kw: spawn_calls.append(dict(kw)) or None,
+                 ):
+                BigQueryAgentAnalyticsLogger(cfg).log_event(
+                    event_type="LLM_REQUEST", content={"k": "default_spool"}
+                )
+
+            self.assertEqual(len(spawn_calls), 1)
+            child_env = spawn_calls[0]["env"]
+            self.assertEqual(child_env["BQAA_WRITER_LABEL"], DEFAULT_WRITER_LABEL)
+            self.assertNotIn("BQAA_SPOOL_DIR", child_env)
+            self.assertNotIn("BQAA_STATE_DIR", child_env)
+
+            # In the spawned child, legacy migration remains active AND BQAAConfig.from_env() matches defaults.
+            os.environ.clear()
+            os.environ.update(child_env)
+            self.assertIsNotNone(_utils.resolve_legacy_spool_dir(default_spool_dir()))
+            self.assertIsNotNone(_utils.resolve_legacy_state_dir(default_state_dir()))
+            parsed = BQAAConfig.from_env()
+            self.assertEqual(parsed.spool_dir, cfg.spool_dir)
+            self.assertEqual(parsed.state_dir, cfg.state_dir)
+            self.assertEqual(parsed.writer_label, DEFAULT_WRITER_LABEL)
+
+            # When parent had a stale BQAA_SPOOL_DIR/BQAA_STATE_DIR, child_env overrides it with config's path.
+            os.environ["BQAA_SPOOL_DIR"] = "/tmp/stale-spool"
+            os.environ["BQAA_STATE_DIR"] = "/tmp/stale-state"
+            spawn_calls.clear()
+            with mock.patch.object(bq_logger, "_bigquery_spec_available", return_value=True), \
+                 mock.patch.object(
+                     bq_logger.subprocess,
+                     "Popen",
+                     side_effect=lambda *a, **kw: spawn_calls.append(dict(kw)) or None,
+                 ):
+                BigQueryAgentAnalyticsLogger(cfg).log_event(
+                    event_type="LLM_REQUEST", content={"k": "override_stale"}
+                )
+            self.assertEqual(len(spawn_calls), 1)
+            self.assertEqual(spawn_calls[0]["env"]["BQAA_SPOOL_DIR"], cfg.spool_dir)
+            self.assertEqual(spawn_calls[0]["env"]["BQAA_STATE_DIR"], cfg.state_dir)
+        finally:
+            os.environ.clear()
+            os.environ.update(env_backup)
+
+    def test_whitespace_only_project_or_dataset_rejected_and_not_drained_as_root(self):
+        from bigquery_agent_analytics_tracing import drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig
+        from bigquery_agent_analytics_tracing.logger import BigQueryAgentAnalyticsLogger
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r8a_ws_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        spool_dir.mkdir(mode=0o700)
+        os.chmod(spool_dir, 0o700)
+
+        for bad_proj, bad_ds in (("   ", "ds_a"), ("proj-a", "\t\n ")):
+            bad_cfg = BQAAConfig(
+                project_id=bad_proj,
+                dataset=bad_ds,
+                spool_dir=str(spool_dir),
+                state_dir=os.path.join(tmp_root, "state"),
+                log_file=os.path.join(tmp_root, "ws.log"),
+            )
+            with self.assertRaises(ValueError):
+                BigQueryAgentAnalyticsLogger(bad_cfg).log_event(
+                    event_type="LLM_REQUEST", content={"k": "bad"}
+                )
+        self.assertEqual(list(spool_dir.iterdir()), [])
+
+        # Pre-existing root envelope for proj-a must NOT be touched or quarantined when draining with whitespace config.
+        root_env = spool_dir / "event-root-a.json"
+        root_env.write_text(
+            json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "a"}},
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(root_env, 0o600)
+
+        ws_cfg = BQAAConfig(
+            project_id="   ",
+            dataset="ds_a",
+            spool_dir=str(spool_dir),
+            state_dir=os.path.join(tmp_root, "state"),
+            log_file=os.path.join(tmp_root, "ws.log"),
+            drain_idle_seconds=0.04,
+            drain_poll_seconds=0.02,
+        )
+        self.assertEqual(asyncio.run(drain._drain_once(ws_cfg, use_storage_api=False)), 0)
+        self.assertIsNone(drain._next_deferred_wait_seconds(ws_cfg))
+        asyncio.run(drain._run(ws_cfg))
+        self.assertTrue(root_env.is_file())
+        self.assertFalse((spool_dir / ".drainer.pid").exists())
+        self.assertFalse((spool_dir / "dead-letter").exists())
+
+    def test_root_adoption_exdev_failure_preserves_root_retry_sidecar(self):
+        import errno
+        from unittest import mock
+        from bigquery_agent_analytics_tracing import _utils, drain
+        from bigquery_agent_analytics_tracing.config import BQAAConfig, destination_spool_dir
+
+        tmp_root = tempfile.mkdtemp(prefix="bqaa_r8a_exdev_")
+        self.addCleanup(shutil.rmtree, tmp_root, ignore_errors=True)
+        spool_dir = Path(tmp_root) / "spool"
+        spool_dir.mkdir(mode=0o700)
+        os.chmod(spool_dir, 0o700)
+
+        root_env = spool_dir / "event-x.json"
+        root_env.write_text(
+            json.dumps({
+                "config": {"project_id": "proj-a", "dataset": "ds_a", "table": "agent_events"},
+                "row": {"timestamp": "2026-01-01T00:00:00Z", "event_type": "LLM_REQUEST", "content": {"k": "exdev"}},
+            }),
+            encoding="utf-8",
+        )
+        os.chmod(root_env, 0o600)
+        retry_payload = json.dumps({
+            "attempts": 3,
+            "first_failed_at": 1000.0,
+            "next_retry_at": 1050.0,
+            "last_error": "prior 503",
+        })
+        root_retry = spool_dir / "event-x.json.retry"
+        root_retry.write_text(retry_payload, encoding="utf-8")
+        os.chmod(root_retry, 0o600)
+
+        delivered: dict[str, list[dict]] = {}
+        _install_fake_bigquery(
+            self,
+            insert_fn=lambda tid, rows: delivered.setdefault(tid, []).extend(rows) or [],
+            get_table_fn=lambda tid: object(),
+        )
+        cfg_a = BQAAConfig(
+            project_id="proj-a",
+            dataset="ds_a",
+            table="agent_events",
+            auto_create_table=False,
+            spool_dir=str(spool_dir),
+            state_dir=os.path.join(tmp_root, "state_a"),
+            log_file=os.path.join(tmp_root, "a.log"),
+            drain_retry_backoff_seconds=10.0,
+            drain_max_retry_age_seconds=1000.0,
+        )
+        part_a = Path(destination_spool_dir(spool_dir, "proj-a", "ds_a", "agent_events"))
+
+        orig_replace = _utils.PrivateDir.replace
+        orig_write_atomic = drain._write_atomic_private_bytes
+
+        def _exdev_replace(self_dir, name, new_name, new_dir=None):
+            if new_dir is not None and new_dir is not self_dir:
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return orig_replace(self_dir, name, new_name, new_dir=new_dir)
+
+        def _fail_envelope_write(directory, name, data):
+            if name == "event-x.json":
+                raise OSError(errno.EIO, "simulated disk write failure")
+            return orig_write_atomic(directory, name, data)
+
+        now = {"t": 1010.0}
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(_utils.PrivateDir, "replace", _exdev_replace), \
+             mock.patch.object(drain, "_write_atomic_private_bytes", side_effect=_fail_envelope_write):
+            resolved_fail = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+
+        self.assertEqual(resolved_fail, 0)
+        self.assertTrue(root_env.is_file())
+        self.assertTrue(root_retry.is_file())
+        self.assertEqual(json.loads(root_retry.read_text(encoding="utf-8")), json.loads(retry_payload))
+        self.assertFalse((part_a / "event-x.json").exists())
+        self.assertFalse((part_a / "event-x.json.retry").exists())
+
+        # Once the disk error clears (still EXDEV, before retry due at t=1050.0), both adopt cleanly.
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]), \
+             mock.patch.object(_utils.PrivateDir, "replace", _exdev_replace):
+            resolved_adopt = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+
+        self.assertEqual(resolved_adopt, 0)
+        self.assertFalse(root_env.exists())
+        self.assertFalse(root_retry.exists())
+        self.assertTrue((part_a / "event-x.json").is_file())
+        self.assertTrue((part_a / "event-x.json.retry").is_file())
+        adopted_retry = json.loads((part_a / "event-x.json.retry").read_text(encoding="utf-8"))
+        self.assertEqual(adopted_retry["attempts"], 3)
+        self.assertEqual(adopted_retry["first_failed_at"], 1000.0)
+        self.assertEqual(delivered, {})
+
+        # Once retry is due (t=1050.0), it delivers cleanly.
+        now["t"] = 1050.0
+        with mock.patch.object(drain.time, "time", side_effect=lambda: now["t"]):
+            resolved_done = asyncio.run(drain._drain_once(cfg_a, use_storage_api=False))
+        self.assertEqual(resolved_done, 1)
+        self.assertEqual(len(delivered["proj-a.ds_a.agent_events"]), 1)
 
 
 if __name__ == "__main__":
