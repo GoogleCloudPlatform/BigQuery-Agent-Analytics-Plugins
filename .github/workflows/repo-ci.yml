@@ -17,11 +17,13 @@
 # and every push to main is checked by all three workflows.
 #
 # Run here:
-#   - repository hygiene (scripts/check_repo_hygiene.py): the marketplace
+#   - repository hygiene (scripts/check_repo_hygiene.py) and its unit tests
+#     (scripts/check_repo_hygiene.test.py): the marketplace
 #     catalog agrees with each plugin's manifest, JSON files parse, relative
 #     Markdown links and heading anchors resolve, nothing outside the
 #     migration notes refers to the repository the mod was first published
 #     from, and shell scripts pass bash -n;
+#   - the mod release-sync unit suite (scripts/check_mod_release_sync.test.py);
 #   - the mod's scripts (plugins/claude_code_mod/tests/scripts.test.py),
 #     against stand-ins for the BigQuery client and gcloud, so no Google
 #     Cloud call is made;
@@ -63,6 +65,9 @@ jobs:
 
       - name: Repository hygiene unit tests
         run: python3 scripts/check_repo_hygiene.test.py
+
+      - name: Mod release-sync unit tests
+        run: python3 -B scripts/check_mod_release_sync.test.py
 
       - name: The mod's scripts
         run: python3 plugins/claude_code_mod/tests/scripts.test.py

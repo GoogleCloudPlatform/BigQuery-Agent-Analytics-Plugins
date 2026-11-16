@@ -31,8 +31,11 @@
 #     the source builds now, which must be at the same version; once any
 #     release is tagged, a copy whose own tag is missing fails;
 #   - every mod-dist-v<version> tag, the ref an organization registers this
-#     repository at, holds the copy and the catalog entry at <version>.
-# The tags need a full checkout (fetch-depth: 0): a shallow one fails.
+#     repository at, holds the copy and the catalog entry at <version>, and
+#     (once any mod-v tag exists) every prior served version in first-parent
+#     history has its mod-dist-v<version> tag.
+# The tags and history need a full checkout (fetch-depth: 0): a shallow one
+# fails unconditionally.
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -62,7 +65,7 @@ lower() {
   python3 -B - "$1" "$2" <<'PY'
 import re, sys
 def parse(v):
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", v)
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", v)
     if not m:
         print(f"not a version: {v!r}", file=sys.stderr)
         sys.exit(2)
@@ -108,6 +111,10 @@ source_version="$(version_of "$here")"
 dist_version="$(version_of "$dist")"
 catalog_version="$(python3 -B -c 'import json, sys; print(next(p["version"] for p in json.load(open(sys.argv[1]))["plugins"] if p["name"] == "bigquery-agent-analytics-mod"))' "$repo/.claude-plugin/marketplace.json")"
 status=0
+if [[ "$(git -C "$repo" rev-parse --is-shallow-repository 2>/dev/null || echo true)" == true ]]; then
+  echo "not ok - this checkout is shallow, so release and mod-dist-v* history cannot be checked: fetch full history (fetch-depth: 0)"
+  status=1
+fi
 if [[ "$catalog_version" != "$dist_version" ]]; then
   echo "not ok - the catalog entry says $catalog_version, the committed copy is $dist_version"
   status=1
@@ -138,9 +145,6 @@ if git -C "$repo" rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null; th
 elif [[ -n "$(git -C "$repo" tag -l 'mod-v*')" ]]; then
   echo "not ok - there is no tag $tag to check the copy against, though other mod-v releases are tagged: a copy is checked against its own release"
   status=1
-elif [[ "$(git -C "$repo" rev-parse --is-shallow-repository)" == true ]]; then
-  echo "not ok - this checkout is shallow, so the mod-v tags cannot be seen: fetch them (fetch-depth: 0)"
-  status=1
 elif [[ "$source_version" == "$dist_version" ]]; then
   build "$here" "$work/built"
   against="the source now (no mod-v release is tagged yet)"
@@ -156,8 +160,19 @@ if [[ -d "$work/built" ]]; then
     status=1
   fi
 fi
-for dist_tag in $(git -C "$repo" tag -l 'mod-dist-v*'); do
+while IFS= read -r dist_tag; do
+  [[ -z "$dist_tag" ]] && continue
   want="${dist_tag#mod-dist-v}"
+  if [[ ! "$want" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "not ok - $dist_tag is not a valid mod-dist-vX.Y.Z tag"
+    status=1
+    continue
+  fi
+  if ! git -C "$repo" merge-base --is-ancestor "refs/tags/$dist_tag^{commit}" HEAD 2>/dev/null; then
+    echo "not ok - $dist_tag is not an ancestor of HEAD"
+    status=1
+    continue
+  fi
   at_copy="$(git -C "$repo" show "$dist_tag:plugins/claude_code_dist/bigquery-agent-analytics-mod/.claude-plugin/plugin.json" 2>/dev/null \
     | python3 -B -c 'import json, sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || echo none)"
   at_catalog="$(git -C "$repo" show "$dist_tag:.claude-plugin/marketplace.json" 2>/dev/null \
@@ -168,5 +183,87 @@ for dist_tag in $(git -C "$repo" tag -l 'mod-dist-v*'); do
     echo "not ok - $dist_tag holds the copy at $at_copy and the catalog entry at $at_catalog, not $want: an organization pinned to it installs that"
     status=1
   fi
-done
+done < <(git -C "$repo" tag -l 'mod-dist-v*')
+if [[ -n "$(git -C "$repo" tag -l 'mod-v*')" ]]; then
+  if ! prior_list="$(python3 -B - "$repo" "$dist_version" <<'PY'
+import json, re, subprocess, sys
+
+repo, dist_version = sys.argv[1:3]
+semver_re = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+m_dist = semver_re.match(dist_version)
+if not m_dist:
+    sys.exit(0)
+dist_tuple = tuple(int(x) for x in m_dist.groups())
+
+dist_rel = "plugins/claude_code_dist/bigquery-agent-analytics-mod/.claude-plugin/plugin.json"
+catalog_rel = ".claude-plugin/marketplace.json"
+log = subprocess.run(
+    ["git", "-C", repo, "log", "--first-parent", "--format=%H", "--", dist_rel, catalog_rel],
+    capture_output=True, text=True, check=False,
+)
+if log.returncode != 0:
+    print(log.stderr.strip(), file=sys.stderr)
+    sys.exit(1)
+
+both_matched = {}
+dist_only = {}
+closed_versions = set()
+active_ver = None
+for sha in log.stdout.splitlines():
+    sha = sha.strip()
+    if not sha:
+        continue
+    show_dist = subprocess.run(
+        ["git", "-C", repo, "show", f"{sha}:{dist_rel}"],
+        capture_output=True, text=True, check=False,
+    )
+    if show_dist.returncode != 0:
+        continue
+    try:
+        ver = json.loads(show_dist.stdout).get("version", "")
+    except Exception:
+        continue
+    m = semver_re.match(ver)
+    if not m:
+        continue
+    if active_ver is not None and ver != active_ver:
+        closed_versions.add(active_ver)
+    active_ver = ver
+    ver_tuple = tuple(int(x) for x in m.groups())
+    if ver_tuple >= dist_tuple or ver in closed_versions:
+        continue
+    dist_only[ver] = sha
+    show_cat = subprocess.run(
+        ["git", "-C", repo, "show", f"{sha}:{catalog_rel}"],
+        capture_output=True, text=True, check=False,
+    )
+    if show_cat.returncode == 0:
+        try:
+            plugins = json.loads(show_cat.stdout).get("plugins", [])
+            cat_ver = next(
+                (p.get("version") for p in plugins if isinstance(p, dict) and p.get("name") == "bigquery-agent-analytics-mod"),
+                None,
+            )
+            if cat_ver == ver:
+                both_matched[ver] = sha
+        except Exception:
+            pass
+
+for ver in sorted(dist_only, key=lambda v: tuple(int(x) for x in v.split("."))):
+    sha = both_matched.get(ver) or dist_only[ver]
+    print(f"{ver}\t{sha}")
+PY
+  )"; then
+    echo "not ok - failed to inspect prior served dist history"
+    status=1
+  else
+    while IFS=$'\t' read -r prior_ver prior_sha; do
+      [[ -z "$prior_ver" ]] && continue
+      if ! git -C "$repo" rev-parse -q --verify "refs/tags/mod-dist-v$prior_ver^{commit}" >/dev/null; then
+        echo "not ok - missing tag mod-dist-v$prior_ver for previously served dist commit $prior_sha; run: git tag -a mod-dist-v$prior_ver -m \"mod $prior_ver, served copy\" $prior_sha"
+        status=1
+      fi
+    done <<< "$prior_list"
+  fi
+fi
 exit "$status"

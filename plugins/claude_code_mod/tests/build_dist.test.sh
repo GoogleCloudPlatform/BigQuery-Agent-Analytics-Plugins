@@ -156,6 +156,8 @@ version "$src" 0.0.9
 check 'a source lower than the copy fails' fails checked
 version "$src" next
 check 'a source version that is not X.Y.Z fails' fails checked
+version "$src" 0.1.3-rc1
+check 'a source version with a prerelease suffix fails' fails checked
 version "$src" 0.1.1
 
 git -C "$repo" tag mod-v0.1.1
@@ -175,10 +177,54 @@ check 'sync: an archive that holds another version is refused' mislabeled
 check 'sync: ... and left the copy as it was' test "$(tree)" = "$before"
 check 'sync: the right archive replaces the copy' env BQAA_MOD_RELEASE_BASE="file://$work/release" bash "$src/sync_dist.sh" 0.1.1
 catalog 0.1.1
+check 'a missing prior mod-dist-v0.1.0 tag fails even after syncing 0.1.1' fails checked
+cp "$work/last.log" "$work/check.log"
+check '... and prints missing tag mod-dist-v0.1.0' grep -q 'missing tag mod-dist-v0.1.0' "$work/check.log"
+git -C "$repo" tag mod-dist-v0.1.0 mod-v0.1.0
 check 'the release cycle: the synced copy checks against mod-v0.1.1, though the source changed after it' checked
 git -C "$repo" add -A && commit "the copy synced to 0.1.1"
 git -C "$repo" tag mod-dist-v0.1.1
 check 'the sync merged and tagged mod-dist-v0.1.1: the tag holds the 0.1.1 copy and catalog entry' checked
+# An abandoned mod-v* tag that was never served in claude_code_dist must not break prior-tag checks.
+git -C "$repo" tag mod-v0.1.2
+check 'an abandoned never-served mod-v* tag does not require a mod-dist-v* tag' checked
+git -C "$repo" tag -d mod-v0.1.2 >/dev/null
+# A shallow clone that still has tags on HEAD must still fail unconditionally.
+mkdir -p "$work/single-origin/plugins/claude_code_dist" "$work/single-origin/.claude-plugin"
+cp -Rp "$mod" "$work/single-origin/plugins/claude_code_mod"
+rm -rf "$work/single-origin/plugins/claude_code_mod/.claude-plugin/types"
+version "$work/single-origin/plugins/claude_code_mod" 0.1.0
+bash "$work/single-origin/plugins/claude_code_mod/build_dist.sh" "$work/single-origin/plugins/claude_code_dist/bigquery-agent-analytics-mod"
+cp "$real/.claude-plugin/marketplace.json" "$work/single-origin/.claude-plugin/marketplace.json"
+python3 - "$work/single-origin/.claude-plugin/marketplace.json" "0.1.0" <<'PY'
+import json, sys
+path, v = sys.argv[1:3]
+data = json.load(open(path))
+for entry in data["plugins"]:
+    if entry["name"] == "bigquery-agent-analytics-mod":
+        entry["version"] = v
+open(path, "w").write(json.dumps(data, indent=2) + "\n")
+PY
+git -C "$work/single-origin" init -q
+git -C "$work/single-origin" -c user.name=test -c user.email=test@example.com add -A
+git -C "$work/single-origin" -c user.name=test -c user.email=test@example.com commit -qm "single commit"
+git -C "$work/single-origin" tag mod-v0.1.0
+git -C "$work/single-origin" tag mod-dist-v0.1.0
+git clone -q --depth 1 "file://$work/single-origin" "$work/shallow-with-tags"
+check 'a shallow checkout with mod-v and mod-dist-v tags on HEAD still fails' fails bash "$work/shallow-with-tags/plugins/claude_code_mod/build_dist.sh" --check
+cp "$work/last.log" "$work/check.log"
+check '... and prints this checkout is shallow' grep -q 'this checkout is shallow' "$work/check.log"
+# A mod-dist-v* tag on an orphan commit not in HEAD history must fail.
+cur_branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD)"
+git -C "$repo" checkout -q --orphan orphan-dist
+git -C "$repo" -c user.name=test -c user.email=test@example.com commit -qm "orphan dist"
+git -C "$repo" tag mod-dist-v0.1.9
+git -C "$repo" checkout -q "$cur_branch"
+git -C "$repo" branch -D -q orphan-dist
+check 'a non-ancestor mod-dist-v* tag fails' fails checked
+cp "$work/last.log" "$work/check.log"
+check '... and explains non-ancestor failure' grep -q 'not an ancestor of HEAD' "$work/check.log"
+git -C "$repo" tag -d mod-dist-v0.1.9 >/dev/null
 git -C "$repo" tag mod-dist-v0.1.2
 check 'a mod-dist-v0.1.2 tag on a commit whose copy is 0.1.1 fails' fails checked
 git -C "$repo" tag -d mod-dist-v0.1.2 >/dev/null

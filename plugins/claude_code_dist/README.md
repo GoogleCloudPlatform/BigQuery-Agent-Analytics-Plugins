@@ -130,9 +130,22 @@ git push origin mod-dist-vX.Y.Z
 
 Organizations that register this repository as their marketplace pin `ref`
 to it (the mod's MIGRATION.md): the `mod-vX.Y.Z` release tag still holds the
-previous copy. No workflow runs on `mod-dist-v*` tags, and
-`build_dist.sh --check` fails a `mod-dist-v` tag whose copy or catalog
-entry is at another version. For the first release, the copy is already at
-0.1.0 at `mod-v0.1.0`: tag that commit `mod-dist-v0.1.0` too.
-As with the tracing plugin, send patches to
+previous copy. [`.github/workflows/mod-release-sync.yml`](../../.github/workflows/mod-release-sync.yml)
+runs on `mod-dist-v*` tags (as well as release events and a daily schedule), and
+both `build_dist.sh --check` and
+[`scripts/check_mod_release_sync.py`](../../scripts/check_mod_release_sync.py)
+enforce tag integrity:
+
+- `build_dist.sh --check` fails unconditionally on shallow checkouts, fails a
+  `mod-dist-v*` tag whose copy or catalog entry is at another version, and
+  (once any `mod-v*` tag exists) fails if any prior served version in
+  first-parent history is missing its `mod-dist-v*` tag.
+- `scripts/check_mod_release_sync.py` (run in Mod CI, Release Mod, and
+  [`.github/workflows/mod-release-sync.yml`](../../.github/workflows/mod-release-sync.yml))
+  additionally checks that the committed copy and catalog entry match the
+  latest published `mod-vX.Y.Z` GitHub release (ignoring drafts, counting
+  prereleases) and that `mod-dist-v<version>` exists on `main`.
+
+For the first release, the copy is already at 0.1.0 at `mod-v0.1.0`: tag that
+commit `mod-dist-v0.1.0` too. As with the tracing plugin, send patches to
 [`plugins/claude_code_mod/`](../claude_code_mod/), not to this copy.
