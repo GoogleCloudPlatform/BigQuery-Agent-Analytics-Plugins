@@ -1,6 +1,6 @@
 {
   "name": "bigquery-agent-analytics-mod",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Coding-agent mod that records sessions, turns, model requests and tool calls as BigQuery Agent Analytics agent_events rows, written from the background so no hook waits on BigQuery.",
   "author": {
     "name": "Google LLC"
@@ -50,24 +50,20 @@
     "dryRun": {
       "type": "boolean",
       "title": "Dry run",
-      "description": "Write rows as JSONL beside the dead-letter directory (dry-run/) instead of sending them. BQAA_DRY_RUN=true also turns it on.",
+      "description": "Write rows as JSONL inside the dead-letter directory (dry-run/) instead of sending them. BQAA_DRY_RUN=true also turns it on.",
       "default": false
     },
     "maxPayloadChars": {
       "type": "number",
       "title": "Max payload size (characters)",
-      "description": "Cap for each JSON payload column (content, attributes); longer payloads are cut and the row marked is_truncated.",
-      "default": 16384,
-      "min": 1024,
-      "max": 500000
+      "description": "Cap for each JSON payload column (content, attributes) (1024-500000); longer payloads are cut and the row marked is_truncated.",
+      "default": 16384
     },
     "flushIntervalMs": {
       "type": "number",
       "title": "Flush interval (ms)",
-      "description": "How often the background writer sends queued rows.",
-      "default": 5000,
-      "min": 1000,
-      "max": 300000
+      "description": "How often the background writer sends queued rows, in ms (1000-300000).",
+      "default": 5000
     },
     "deadLetterDir": {
       "type": "string",

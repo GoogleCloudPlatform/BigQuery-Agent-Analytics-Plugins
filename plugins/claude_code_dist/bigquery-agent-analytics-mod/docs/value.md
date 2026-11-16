@@ -138,7 +138,7 @@ For docs, posts and partner write-ups, once the mod has a tagged release
 (`mod-vX.Y.Z`); its link goes where the bracket is:
 
 > BigQuery Agent Analytics for coding agents is an early-access mod
-> (version 0.1.2) that writes each coding-agent session to a BigQuery table
+> (version 0.1.3) that writes each coding-agent session to a BigQuery table
 > in the `agent_events` schema of ADK's BigQuery Agent Analytics: prompts,
 > the model's answers, tool calls with their arguments and results, token
 > counts and timings. Teams can see adoption against who was enrolled,

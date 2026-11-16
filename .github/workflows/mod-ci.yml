@@ -23,6 +23,8 @@
 #     before the first tag, what it builds now (build_dist.sh --check), and
 #     the check's own regression test, with the release sync
 #     (tests/build_dist.test.sh);
+#   - the release-sync guard's unit suite (scripts/check_mod_release_sync.test.py)
+#     and live release/mod-dist-v* verification (scripts/check_mod_release_sync.py);
 #   - setup.sh against a stand-in bq (tests/setup.test.sh);
 #   - plugin.json and PLUGIN_VERSION agree (tests/version.test.sh);
 #   - the welcome card across a fresh load (tests/reload.test.mjs, Node 24);
@@ -83,6 +85,30 @@ jobs:
 
       - name: The copy check and the release sync
         run: bash tests/build_dist.test.sh
+
+      - name: Release-sync unit tests
+        working-directory: .
+        run: python3 -B scripts/check_mod_release_sync.test.py
+
+      - name: Marketplace copy matches latest published mod release and mod-dist-v* tags
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          base_args=()
+          grace_args=()
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            grace_args=(--grace-minutes 60)
+            if [ -n "${PR_BASE_SHA}" ]; then
+              base_args=(--base-ref "${PR_BASE_SHA}")
+            fi
+          elif [ "${EVENT_NAME}" = "push" ] && [ -n "${PUSH_BEFORE_SHA}" ] && [ "${PUSH_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+            base_args=(--base-ref "${PUSH_BEFORE_SHA}")
+          fi
+          python3 -B scripts/check_mod_release_sync.py --repo "${GITHUB_REPOSITORY}" "${grace_args[@]}" "${base_args[@]}"
 
       - name: setup.sh
         run: bash tests/setup.test.sh

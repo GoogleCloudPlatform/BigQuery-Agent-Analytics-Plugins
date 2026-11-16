@@ -16,8 +16,9 @@
 # Replaces the committed copy, plugins/claude_code_dist/bigquery-agent-analytics-mod,
 # with a published mod-vX.Y.Z release: only after the download, the
 # SHA256SUMS check, the extraction and the version check all succeed. Any
-# failure leaves the copy as it was. It then prints the two steps left: the
-# catalog entry's version, and build_dist.sh --check.
+# failure leaves the copy as it was. It then prints the three steps left:
+# updating the catalog entry's version, running build_dist.sh --check, and
+# tagging the post-merge commit as mod-dist-vX.Y.Z.
 #   bash plugins/claude_code_mod/sync_dist.sh X.Y.Z
 # BQAA_MOD_RELEASE_BASE names another place for the release files (a
 # file:// URL in the tests).
@@ -59,3 +60,4 @@ rm -rf "$dist"
 mv "$dist.new" "$dist"
 echo "ok - synced the committed copy to $version. Next: set the catalog entry's version to $version"
 echo "in .claude-plugin/marketplace.json, then run: bash plugins/claude_code_mod/build_dist.sh --check"
+echo "After the sync PR merges to main, tag the merge commit: git tag -a mod-dist-v$version -m \"mod $version, served copy\" <merge-commit> && git push origin mod-dist-v$version"
