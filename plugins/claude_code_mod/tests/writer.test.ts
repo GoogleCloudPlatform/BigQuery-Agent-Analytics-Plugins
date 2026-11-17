@@ -2066,3 +2066,463 @@ test('error-free recovery against only held files resets prior consecutiveFailur
   expect(exited.spilled).toBe(0)
   expect(world2.acceptedRows().some(r => r.event_id === '9'.repeat(32))).toBe(true)
 })
+
+// ---- Issue #53: exit replay budget and uncertain-delivery marks ----------
+
+function exitReplayHarness(overrides: Partial<Config> = {}) {
+  const config: Config = { ...resolveConfig(OPTIONS, { HOME, USER: 'dev' }), ...overrides }
+  const files = new Map<string, string>()
+  const store = new Map<string, unknown>()
+  const timers: { at: number; fn: () => void; cancelled: boolean }[] = []
+  const requests: { url: string; ids: string[]; at: number; resolve: (answer: { status: number; text: string }) => void; reject: (err: unknown) => void }[] = []
+  const sent: { id: string; status: number }[] = []
+  let now = 0
+  let fetchHandler: (
+    url: string,
+    ids: string[],
+    controls: { resolve: (answer: { status: number; text: string }) => void; reject: (err: unknown) => void },
+  ) => Promise<{ status: number; text: string }> | undefined = async () => OK_INSERT
+  let listDirHook: (() => Promise<void>) | null = null
+  let writeFileHook: ((path: string, text: string) => Promise<void>) | null = null
+
+  const ioFor = (): Io => ({
+    now: () => now,
+    after: (ms, fn) => {
+      const entry = { at: now + ms, fn, cancelled: false }
+      timers.push(entry)
+      return { cancel: () => { entry.cancelled = true } }
+    },
+    fetch: (url, init) => {
+      const ids = url.endsWith('/insertAll')
+        ? (JSON.parse(init.body ?? '{"rows":[]}') as { rows: { json: { event_id: string } }[] }).rows.map(r => r.json.event_id)
+        : []
+      return new Promise((resolve, reject) => {
+        const done = (answer: { status: number; text: string }) => {
+          if (url.endsWith('/insertAll')) {
+            for (const id of ids) sent.push({ id, status: answer.status })
+          }
+          resolve(answer)
+        }
+        const entry = { url, ids, at: now, resolve: done, reject }
+        requests.push(entry)
+        const immediate = fetchHandler(url, ids, { resolve: done, reject })
+        if (immediate !== undefined) {
+          void immediate.then(done, reject)
+        }
+      })
+    },
+    runCommand: async () => ({ exitCode: 0, stdout: `${'a'.repeat(24)}\n`, stderr: '' }),
+    envToken: async () => 'env-token-for-exit-replay',
+    writeFile: async (path, text) => {
+      if (writeFileHook) await writeFileHook(path, text)
+      files.set(path, text)
+    },
+    readFile: async path => files.get(path) ?? '',
+    exists: async path => files.has(path),
+    listDir: async dir => {
+      if (listDirHook) await listDirHook()
+      const prefix = `${dir.replace(/\/$/, '')}/`
+      return [...files]
+        .filter(([path]) => path.startsWith(prefix) && !path.slice(prefix.length).includes('/'))
+        .map(([path, text]) => ({ name: path.slice(prefix.length), kind: 'file', size: utf8Bytes(text) }))
+    },
+    storeGet: async key => store.get(key),
+    storeSet: async (key, value) => {
+      store.set(key, JSON.parse(JSON.stringify(value)) as unknown)
+    },
+    storeDelete: async key => {
+      store.delete(key)
+    },
+    status: () => undefined,
+    debug: () => undefined,
+  })
+
+  const settleMicrotasks = async (): Promise<void> => {
+    for (let i = 0; i < 40; i += 1) await Promise.resolve()
+  }
+
+  const advance = async (ms: number): Promise<void> => {
+    const target = now + ms
+    for (;;) {
+      await settleMicrotasks()
+      const next = timers
+        .filter(t => !t.cancelled && t.at <= target)
+        .sort((a, b) => a.at - b.at)[0]
+      if (!next) break
+      now = Math.max(now, next.at)
+      next.cancelled = true
+      next.fn()
+    }
+    now = Math.max(now, target)
+    await settleMicrotasks()
+  }
+
+  const newWriter = (session = 's-1', c = config) => new Writer(ioFor(), () => c, () => session)
+
+  const warmWriter = async (session = 's-1', c = config): Promise<Writer> => {
+    const w = newWriter(session, c)
+    w.enqueue(ownRow('0'.repeat(32)), 0)
+    await w.flush()
+    await settleMicrotasks()
+    sent.length = 0
+    requests.length = 0
+    return w
+  }
+
+  const seedSpill = (name: string, ...eventIds: string[]): string => {
+    const path = `${PARTITION_DIR}/${name}`
+    files.set(path, parkedFile(...eventIds.map(id => parkedLine(TABLE_REF, id, 'old-session'))))
+    return path
+  }
+
+  const doneMarksFor = (name: string) =>
+    [...files.entries()]
+      .filter(([p, text]) => p.includes(`/outcome-done-`) && p.endsWith(`-${name}`) && text !== '')
+      .map(([p, text]) => {
+        const parsed = parseFile(text)
+        return { path: p, complete: parsed.complete, data: parsed.unreadable[0] ? (JSON.parse(parsed.unreadable[0]) as Record<string, unknown>) : null }
+      })
+
+  return {
+    config,
+    files,
+    store,
+    timers,
+    requests,
+    sent,
+    advance,
+    settleMicrotasks,
+    newWriter,
+    warmWriter,
+    seedSpill,
+    doneMarksFor,
+    sentOf: (id: string) => sent.filter(s => s.id === id).length,
+    uncancelledTimers: () => timers.filter(t => !t.cancelled),
+    setFetch: (
+      fn: (
+        url: string,
+        ids: string[],
+        controls: { resolve: (answer: { status: number; text: string }) => void; reject: (err: unknown) => void },
+      ) => Promise<{ status: number; text: string }> | undefined,
+    ) => {
+      fetchHandler = fn
+    },
+    setListDirHook: (fn: (() => Promise<void>) | null) => {
+      listDirHook = fn
+    },
+    setWriteFileHook: (fn: ((path: string, text: string) => Promise<void>) | null) => {
+      writeFileHook = fn
+    },
+    advanceNow: (ms: number) => {
+      now += ms
+    },
+  }
+}
+
+test('T53-1: exit replay late 200 OK between marks.replay and marks.replayPost retires mark, empties spill, and sends 0 duplicates in next session', async () => {
+  const h = exitReplayHarness()
+  const w1 = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-1.jsonl'
+  const id = 'a'.repeat(32)
+  const spillPath = h.seedSpill(name, id)
+
+  h.setFetch(() => undefined)
+  const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(710)
+  expect(h.requests.length).toBe(1)
+  h.requests[0]!.resolve(OK_INSERT)
+  await h.advance(90)
+  await exiting
+
+  const marks = h.doneMarksFor(name)
+  expect(marks.length).toBe(1)
+  expect(marks[0]?.data?.retired).toBe(true)
+  expect(h.files.get(spillPath)).toBe('')
+  expect(h.uncancelledTimers()).toEqual([])
+
+  h.setFetch(async () => OK_INSERT)
+  await h.newWriter('s-2').backfill(['spill', 'retry'], 'auto')
+  expect(h.sentOf(id)).toBe(1)
+})
+
+test('T53-2: exit replay skips File 2 when File 1 leaves < 400 ms total / < 300 ms before marks.replay', async () => {
+  const h = exitReplayHarness()
+  const w1 = await h.warmWriter('s-1')
+  const name1 = 'spill-20261013T200102003Z-t53-2a.jsonl'
+  const name2 = 'spill-20261013T200102004Z-t53-2b.jsonl'
+  const id1 = '1'.repeat(32)
+  const id2 = '2'.repeat(32)
+  const path1 = h.seedSpill(name1, id1)
+  const path2 = h.seedSpill(name2, id2)
+  const raw2 = h.files.get(path2)
+
+  h.setFetch(() => undefined)
+  const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(420)
+  expect(h.requests.length).toBe(1)
+  h.requests[0]!.resolve(OK_INSERT)
+  await h.advance(380)
+  await exiting
+
+  expect(h.files.get(path1)).toBe('')
+  expect(h.doneMarksFor(name1)[0]?.data?.retired).toBe(true)
+  expect(h.requests.length).toBe(1)
+  expect(h.sentOf(id1)).toBe(1)
+  expect(h.sentOf(id2)).toBe(0)
+  expect(h.doneMarksFor(name2)).toEqual([])
+  expect(h.files.get(path2)).toBe(raw2)
+  expect(h.uncancelledTimers()).toEqual([])
+
+  h.setFetch(async () => OK_INSERT)
+  await h.newWriter('s-2').backfill(['spill', 'retry'], 'auto')
+  expect(h.sentOf(id1)).toBe(1)
+  expect(h.sentOf(id2)).toBe(1)
+  expect(h.files.get(path2)).toBe('')
+})
+
+test('T53-3a: exit replay does not start when sendAtExit leaves < 400 ms', async () => {
+  const h = exitReplayHarness()
+  const w1 = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-3a.jsonl'
+  const spilledId = '3'.repeat(32)
+  const queuedId = '4'.repeat(32)
+  const spillPath = h.seedSpill(name, spilledId)
+  const raw = h.files.get(spillPath)
+
+  w1.enqueue(ownRow(queuedId), 0)
+  h.setFetch(() => undefined)
+  const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(450)
+  expect(h.requests.length).toBe(1)
+  expect(h.requests[0]!.ids).toEqual([queuedId])
+  h.requests[0]!.resolve(OK_INSERT)
+  await h.advance(350)
+  await exiting
+
+  expect(h.requests.length).toBe(1)
+  expect(h.sentOf(spilledId)).toBe(0)
+  expect(h.doneMarksFor(name)).toEqual([])
+  expect(h.files.get(spillPath)).toBe(raw)
+  expect(h.uncancelledTimers()).toEqual([])
+})
+
+test('T53-3b: exit replay aborts before POST and unmarks when pre-POST I/O leaves < 300 ms before marks.replay', async () => {
+  const h = exitReplayHarness()
+  const w1 = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-3b.jsonl'
+  const id = '5'.repeat(32)
+  const spillPath = h.seedSpill(name, id)
+  const raw = h.files.get(spillPath)
+
+  let slowed = false
+  h.setWriteFileHook(async path => {
+    if (!slowed && path.includes('/outcome-done-')) {
+      slowed = true
+      h.advanceNow(450)
+    }
+  })
+  h.setFetch(async () => OK_INSERT)
+  const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(800)
+  await exiting
+
+  expect(h.sentOf(id)).toBe(0)
+  expect(h.doneMarksFor(name)).toEqual([])
+  expect(h.files.get(spillPath)).toBe(raw)
+  expect(h.uncancelledTimers()).toEqual([])
+
+  h.setWriteFileHook(null)
+  await h.newWriter('s-2').backfill(['spill', 'retry'], 'auto')
+  expect(h.sentOf(id)).toBe(1)
+  expect(h.files.get(spillPath)).toBe('')
+})
+
+test('T53-4a: unanswered exit-replay POST retains sending: true mark across sessions until force backfill', async () => {
+  const h = exitReplayHarness()
+  const w1 = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-4a.jsonl'
+  const id = '6'.repeat(32)
+  const spillPath = h.seedSpill(name, id)
+
+  h.setFetch(() => undefined)
+  const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(800)
+  await exiting
+
+  expect(h.sent.length).toBe(0)
+  expect(h.requests.length).toBe(1)
+  expect(h.uncancelledTimers()).toEqual([])
+  const marks = h.doneMarksFor(name)
+  expect(marks.length).toBe(1)
+  expect(marks[0]?.data?.sending).toBe(true)
+  expect(marks[0]?.data?.retired).not.toBe(true)
+  expect(h.files.get(spillPath)).not.toBe('')
+
+  // Next session auto-backfill holds the file (0 silent duplicates).
+  h.setFetch(async () => OK_INSERT)
+  const w2 = h.newWriter('s-2')
+  const autoReport = await w2.backfill(['spill', 'retry'], 'auto')
+  expect(autoReport.skippedFiles).toBe(1)
+  expect(autoReport.held ?? '').toMatch(/sent rows and has recorded no outcome/)
+  expect(h.sentOf(id)).toBe(0)
+
+  // Explicit force backfill replays it and empties the file.
+  const forceReport = await w2.backfill(['spill', 'retry'], 'force')
+  expect(forceReport.rowsSent).toBe(1)
+  expect(h.sentOf(id)).toBe(1)
+  expect(h.files.get(spillPath)).toBe('')
+})
+
+test('T53-4b: same-process interactive request timeout retains sending: true and holds same Writer auto/command backfill until force', async () => {
+  const h = exitReplayHarness({ requestTimeoutMs: 1000 })
+  const w = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-4b.jsonl'
+  const id = '7'.repeat(32)
+  const spillPath = h.seedSpill(name, id)
+
+  h.setFetch(() => undefined)
+  const running = w.backfill(['spill', 'retry'], 'auto')
+  await h.advance(1000)
+  const timedOutReport = await running
+  expect(timedOutReport.error ?? '').toMatch(/timed out/)
+  expect(h.doneMarksFor(name)[0]?.data?.sending).toBe(true)
+
+  // Same Writer instance: auto and command backfills must hold the uncertain file.
+  h.setFetch(async () => OK_INSERT)
+  const sameAuto = await w.backfill(['spill', 'retry'], 'auto')
+  expect(sameAuto.skippedFiles).toBe(1)
+  expect(h.sentOf(id)).toBe(0)
+
+  const sameCmd = await w.backfill(['spill', 'retry'], 'command')
+  expect(sameCmd.skippedFiles).toBe(1)
+  expect(h.sentOf(id)).toBe(0)
+
+  const forced = await w.backfill(['spill', 'retry'], 'force')
+  expect(forced.rowsSent).toBe(1)
+  expect(h.sentOf(id)).toBe(1)
+  expect(h.files.get(spillPath)).toBe('')
+  expect(h.uncancelledTimers()).toEqual([])
+})
+
+test('T53-5: multi-batch exit replay with Batch 2 skipped by budget retires Batch 1, writes unmarked leftover for Batch 2, and next session sends Batch 2 once', async () => {
+  const h = exitReplayHarness({ maxBatchRows: 1 })
+  const w1 = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-5.jsonl'
+  const id1 = '8'.repeat(32)
+  const id2 = '9'.repeat(32)
+  const sourcePath = h.seedSpill(name, id1, id2)
+
+  h.setFetch(() => undefined)
+  const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(420)
+  expect(h.requests.length).toBe(1)
+  expect(h.requests[0]!.ids).toEqual([id1])
+  h.requests[0]!.resolve(OK_INSERT)
+  await h.advance(380)
+  await exiting
+
+  expect(h.requests.length).toBe(1)
+  expect(h.sentOf(id1)).toBe(1)
+  expect(h.sentOf(id2)).toBe(0)
+  expect(h.files.get(sourcePath)).toBe('')
+  expect(h.doneMarksFor(name)[0]?.data?.retired).toBe(true)
+  expect(h.uncancelledTimers()).toEqual([])
+
+  const leftovers = [...h.files.entries()].filter(([p, t]) => p.startsWith(`${PARTITION_DIR}/spill-`) && p !== sourcePath && t !== '')
+  expect(leftovers.length).toBe(1)
+  const leftoverName = leftovers[0]![0].split('/').pop()!
+  expect(h.doneMarksFor(leftoverName)).toEqual([])
+
+  h.setFetch(async () => OK_INSERT)
+  await h.newWriter('s-2').backfill(['spill', 'retry'], 'auto')
+  expect(h.sentOf(id1)).toBe(1)
+  expect(h.sentOf(id2)).toBe(1)
+  expect(h.files.get(leftovers[0]![0])).toBe('')
+})
+
+test('T53-6: multi-batch exit replay with Batch 2 cut off at marks.replay retires Batch 1, marks Batch 2 leftover sending: true, and force replays only Batch 2', async () => {
+  const h = exitReplayHarness({ maxBatchRows: 1 })
+  const w1 = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-6.jsonl'
+  const id1 = 'a'.repeat(32)
+  const id2 = 'b'.repeat(32)
+  const sourcePath = h.seedSpill(name, id1, id2)
+
+  h.setFetch(() => undefined)
+  const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(50)
+  expect(h.requests.length).toBe(1)
+  expect(h.requests[0]!.ids).toEqual([id1])
+  h.requests[0]!.resolve(OK_INSERT)
+  // Batch 2 goes out at t=50 ms and hangs past marks.replay (700 ms).
+  await h.advance(656)
+  expect(h.requests.length).toBe(2)
+  expect(h.requests[1]!.ids).toEqual([id2])
+  // Late 200 OK arrives at t=706 ms (after marks.replay cutoff at 700 ms).
+  h.requests[1]!.resolve(OK_INSERT)
+  await h.advance(94)
+  await exiting
+
+  expect(h.files.get(sourcePath)).toBe('')
+  const sourceDone = h.doneMarksFor(name)
+  expect(sourceDone.length).toBe(1)
+  expect(sourceDone[0]?.data?.retired).toBe(true)
+  expect(sourceDone[0]?.data?.fates).toBe('LW')
+  expect(h.uncancelledTimers()).toEqual([])
+
+  const leftovers = [...h.files.entries()].filter(([p, t]) => p.startsWith(`${PARTITION_DIR}/spill-`) && p !== sourcePath && t !== '')
+  expect(leftovers.length).toBe(1)
+  const [leftoverPath, leftoverText] = leftovers[0]!
+  const leftoverName = leftoverPath.split('/').pop()!
+  expect(parseFile(leftoverText).lines.map(l => l.row.event_id)).toEqual([id2])
+  const leftoverMarks = h.doneMarksFor(leftoverName)
+  expect(leftoverMarks.length).toBe(1)
+  expect(leftoverMarks[0]?.data?.sending).toBe(true)
+
+  // Next session auto-backfill holds Batch 2 without silently duplicating it.
+  h.sent.length = 0
+  h.setFetch(async () => OK_INSERT)
+  const w2 = h.newWriter('s-2')
+  const autoReport = await w2.backfill(['spill', 'retry'], 'auto')
+  expect(autoReport.skippedFiles).toBe(1)
+  expect(h.sentOf(id1)).toBe(0)
+  expect(h.sentOf(id2)).toBe(0)
+
+  // Force backfill replays ONLY Batch 2 (never Batch 1).
+  const forceReport = await w2.backfill(['spill', 'retry'], 'force')
+  expect(forceReport.rowsSent).toBe(1)
+  expect(h.sentOf(id1)).toBe(0)
+  expect(h.sentOf(id2)).toBe(1)
+  expect(h.files.get(leftoverPath)).toBe('')
+})
+
+test('T53-7: definitive non-delivery (503, 401, offline fetch rejection, FIRST_AGAIN) still unmarks so auto-retry works without force', async () => {
+  for (const kind of ['503', '401', 'reject', 'again'] as const) {
+    const h = exitReplayHarness()
+    const w1 = await h.warmWriter('s-1')
+    const name = `spill-20261013T200102003Z-t53-7-${kind}.jsonl`
+    const id = 'c'.repeat(32)
+    const spillPath = h.seedSpill(name, id)
+
+    h.setFetch(async () => {
+      if (kind === '503') return UNAVAILABLE
+      if (kind === '401') return UNAUTHENTICATED
+      if (kind === 'reject') throw new Error('ECONNREFUSED')
+      return { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'backendError', message: 'try again' }] }] }) }
+    })
+
+    const r1 = await w1.backfill(['spill', 'retry'], 'auto')
+    expect(r1.rowsSent).toBe(0)
+    expect(h.doneMarksFor(name)).toEqual([])
+    expect(h.files.get(spillPath)).not.toBe('')
+
+    h.setFetch(async () => OK_INSERT)
+    h.sent.length = 0
+    const r2 = await h.newWriter('s-2').backfill(['spill', 'retry'], 'auto')
+    expect(r2.rowsSent).toBe(1)
+    expect(h.sentOf(id)).toBe(1)
+    expect(h.files.get(spillPath)).toBe('')
+    expect(h.uncancelledTimers()).toEqual([])
+  }
+})
+

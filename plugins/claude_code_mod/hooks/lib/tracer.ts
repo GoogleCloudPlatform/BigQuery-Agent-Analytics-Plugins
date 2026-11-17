@@ -148,6 +148,8 @@ export type TurnEnd = {
 const UNIDENTIFIED_LOOP = 'unidentified_loop'
 
 const RESERVED_TOOL_KEYS = new Set(['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent'])
+// SessionStart sources that inherit the previous main-loop model when the host omits `e.model`.
+const INHERIT_MODEL_SOURCES = new Set(['clear', 'compact', 'fork'])
 
 // Payload objects list their small identifying fields first: the copy is
 // built within one character budget, so a long `args`, `result` or
@@ -230,6 +232,9 @@ export class Tracer {
   private decisions = new Map<string, ToolDecision>()
   private awaitingDecision = new Map<string, AwaitingDecision>()
   private recordsArrive = false
+  // Most recent main-loop model observed on SessionStart or main turn.step,
+  // carried across clear/compact/fork when SessionStart omits `model`.
+  private lastModel: string | null = null
 
   constructor(deps: TracerDeps) {
     this.deps = deps
@@ -276,6 +281,10 @@ export class Tracer {
       this.turnCount = 0
       this.sessionHasActivity = false
     }
+    const explicitModel = typeof e.model === 'string' && e.model.trim() !== '' ? e.model.trim() : null
+    const model = explicitModel ?? (INHERIT_MODEL_SOURCES.has(e.source) ? this.lastModel : null)
+    if (explicitModel !== null) this.lastModel = explicitModel
+    else if (!INHERIT_MODEL_SOURCES.has(e.source)) this.lastModel = null
     const written = this.emit({
       eventType: 'STATE_DELTA',
       timestampMs: at,
@@ -285,7 +294,7 @@ export class Tracer {
         state_delta: {
           source: 'coding_agent_session_start',
           start_source: e.source,
-          ...(e.model ? { model: e.model } : {}),
+          ...(model ? { model } : {}),
           ...(e.permission_mode ? { permission_mode: e.permission_mode } : {}),
         },
         session_metadata: this.sessionMetadata(),
@@ -330,6 +339,7 @@ export class Tracer {
       this.sessionStartedAt = null
       this.turnCount = 0
     }
+    if (e.reason === 'resume') this.lastModel = null
   }
 
   // prompt.submit, once the prompt entered (after `next` resolved).
@@ -413,6 +423,10 @@ export class Tracer {
         startedAt,
       }
     } else {
+      if (this.main === null || this.main.turnId === e.turnId) {
+        const stepModel = typeof e.model === 'string' && e.model.trim() !== '' ? e.model.trim() : null
+        if (stepModel !== null) this.lastModel = stepModel
+      }
       const turn = this.turnFor(e.turnId)
       turn.lastStepSpan = spanId
       turn.steps += 1

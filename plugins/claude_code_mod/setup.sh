@@ -25,7 +25,8 @@
 #
 # Safe to run again: it creates what is missing, replaces the two views and
 # removes nothing. --dry-run prints the bq commands and the SQL and runs none;
-# --team prints the scripts/setup_gcp_prereqs.py command for a shared team table.
+# --team prints the scripts/setup_gcp_prereqs.py command for a shared team table
+# without running bq or creating any BigQuery resources.
 #
 # Usage:
 #   BQAA_PROJECT_ID=my-project BQAA_DATASET=agent_analytics ./setup.sh [--dry-run] [--team]
@@ -37,8 +38,9 @@
 #   BQAA_LOCATION       where new datasets go (default US)
 #   BQAA_VIEWS_DATASET  the dataset of the views (default <dataset>_reporting)
 #
-# Needs the bq CLI, signed in as someone who may create datasets, tables and
-# views in the project.
+# Personal setup needs the bq CLI, signed in as someone who may create
+# datasets, tables and views in the project; --team and --dry-run do not
+# require bq.
 
 set -euo pipefail
 
@@ -82,6 +84,31 @@ for name in "$dataset" "$table" "$views_dataset"; do
   [[ "$name" =~ ^[A-Za-z0-9_]+$ && ${#name} -le 1024 ]] || fail "\"$name\" is not a plain dataset or table name (letters, digits and underscores)"
 done
 [[ "$location" =~ ^[A-Za-z0-9-]+$ ]] || fail "BQAA_LOCATION \"$location\" is not a location"
+
+if ((team)); then
+  # The bootstrap's names for what is not its default: the table, the views
+  # dataset and the location.
+  names=""
+  if [[ "$table" != agent_events ]]; then names+=" --table $table"; fi
+  if [[ "$views_dataset" != "${dataset}_reporting" ]]; then names+=" --views-dataset $views_dataset"; fi
+  if [[ "$location" != US ]]; then names+=" --location $location"; fi
+  echo "==> $project: table $dataset.$table, views in $views_dataset"
+  echo "==> Print-only (--team): does not run bq or create BigQuery resources."
+  echo "    (Run setup.sh without --team first if the dataset, table, and views do not exist yet.)"
+  echo "Next, who writes and who reads (docs/service-account-auth.md). For a team, the"
+  echo "bootstrap in this plugin's scripts folder prints its plan; --execute applies it:"
+  printf '  python3 %q \\\n' "$here/scripts/setup_gcp_prereqs.py"
+  echo "    --project $project --dataset $dataset$names --no-create-dataset --no-create-table \\"
+  echo "    --service-account bqaa-row-writer --writer-role row-writer \\"
+  echo "    --token-creator group:WRITERS --reader group:READERS"
+  echo "sets up a writer service account that may only insert rows into the table, and"
+  echo "readers of the views in $project:$views_dataset who need no access to the table."
+  echo "Previewing the plan above uses only the Python standard library; applying it"
+  echo "(--execute) requires a virtual environment with google-cloud-bigquery installed"
+  echo "(python3 -m venv ~/.bqaa-mod/venv && ~/.bqaa-mod/venv/bin/pip install google-cloud-bigquery,"
+  echo "then run the command above with ~/.bqaa-mod/venv/bin/python)."
+  exit 0
+fi
 
 # A SQL file with its placeholders filled in.
 render() {
@@ -134,25 +161,4 @@ echo "Done. The mod writes to $project.$dataset.$table with these options:"
 echo "  project: $project"
 echo "  dataset: $dataset"
 if [[ "$table" != agent_events ]]; then echo "  table: $table"; fi
-if ((team)); then
-  # The bootstrap's names for what is not its default: the table, the views
-  # dataset and the location.
-  names=""
-  if [[ "$table" != agent_events ]]; then names+=" --table $table"; fi
-  if [[ "$views_dataset" != "${dataset}_reporting" ]]; then names+=" --views-dataset $views_dataset"; fi
-  if [[ "$location" != US ]]; then names+=" --location $location"; fi
-  echo "Next, who writes and who reads (docs/service-account-auth.md). For a team, the"
-  echo "bootstrap in this plugin's scripts folder prints its plan; --execute applies it:"
-  printf '  python3 %q \\\n' "$here/scripts/setup_gcp_prereqs.py"
-  echo "    --project $project --dataset $dataset$names --no-create-dataset --no-create-table \\"
-  echo "    --service-account bqaa-row-writer --writer-role row-writer \\"
-  echo "    --token-creator group:WRITERS --reader group:READERS"
-  echo "sets up a writer service account that may only insert rows into the table, and"
-  echo "readers of the views in $project:$views_dataset who need no access to the table."
-  echo "Previewing the plan above uses only the Python standard library; applying it"
-  echo "(--execute) requires a virtual environment with google-cloud-bigquery installed"
-  echo "(python3 -m venv ~/.bqaa-mod/venv && ~/.bqaa-mod/venv/bin/pip install google-cloud-bigquery,"
-  echo "then run the command above with ~/.bqaa-mod/venv/bin/python)."
-else
-  echo "For a shared team table (write-only service account + view readers), run setup.sh --team or see docs/service-account-auth.md."
-fi
+echo "For a shared team table (write-only service account + view readers), run setup.sh --team or see docs/service-account-auth.md."

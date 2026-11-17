@@ -607,6 +607,76 @@ test('session_start omits model and permission_mode when classic.SessionStart do
   expect('permission_mode' in delta).toBe(false)
 })
 
+test('session_start carries forward main-loop model across /clear, /compact, and /fork without leaking subagent or out-of-order models', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model-a', cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-clear-1'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-1', cwd: '/work/my-repo' })
+
+  // Main-loop turn step updates model; subagent turn step and out-of-order turn step must not overwrite it.
+  await $.turn.start({ turnId: 'main-1', text: 'hi' })
+  world.steps.push({ result: { answer: 'ok', stopReason: 'end_turn', usage: { ...USAGE, model: 'example-model-b-20260101' } } })
+  await runStep($, { turnId: 'main-1', index: 0, model: 'example-model-b' })
+  // Subagent step with a different model:
+  await $.classic.SubagentStart({ agent_id: 'sub-1', agent_type: 'Explore' })
+  world.steps.push({ result: { answer: 'sub', stopReason: 'end_turn', usage: { ...USAGE, model: 'example-subagent-model' } } })
+  await runStep($, { turnId: 'sub-turn-1', index: 0, model: 'example-subagent-model', agentId: 'sub-1' })
+  // Out-of-order step belonging to an earlier turn (main.turnId !== 'stale-turn'):
+  world.steps.push({ result: { answer: 'stale', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'stale-turn', index: 0, model: 'example-stale-model' })
+  await $.turn.complete({ turnId: 'main-1', answer: 'ok', durationMs: 10, isAborted: false, reason: 'answer' })
+
+  await $.session.end({ reason: 'clear', sessionId: 'after-clear-1', resume: { id: 'after-clear-1' } })
+  world.sessionId = 'after-clear-2'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-2', cwd: '/work/my-repo' })
+
+  // compact and fork without model inherit lastModel:
+  await $.classic.SessionStart({ source: 'compact', session_id: 'after-clear-2', cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'fork', session_id: 'forked-1', cwd: '/work/my-repo' })
+
+  // Explicit model on clear overrides and updates lastModel:
+  await $.session.end({ reason: 'clear', sessionId: 'forked-1', resume: { id: 'forked-1' } })
+  world.sessionId = 'after-clear-3'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-3', model: 'example-model-a', cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'compact', session_id: 'after-clear-3', cwd: '/work/my-repo' })
+
+  // resume clears lastModel (so subsequent clear without model omits model):
+  await $.session.end({ reason: 'resume', sessionId: 'after-clear-3', resume: { id: 'after-clear-3' } })
+  world.sessionId = 'resumed-1'
+  await $.classic.SessionStart({ source: 'resume', session_id: 'resumed-1', cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'clear', sessionId: 'resumed-1', resume: { id: 'resumed-1' } })
+  world.sessionId = 'after-resume-clear'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-resume-clear', cwd: '/work/my-repo' })
+  // startup without model also omits model:
+  await $.classic.SessionStart({ source: 'startup', session_id: 'fresh-no-model', cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'clear', sessionId: 'fresh-no-model', resume: { id: 'fresh-no-model' } })
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-fresh-clear', cwd: '/work/my-repo' })
+
+  await world.clock.advance(5000)
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => {
+      const sd = (json(r.attributes).state_delta ?? {}) as Record<string, unknown>
+      return { source: sd.start_source, model: sd.model }
+    })
+
+  expect(starts).toEqual([
+    { source: 'startup', model: 'example-model-a' },
+    { source: 'clear', model: 'example-model-a' },
+    { source: 'clear', model: 'example-model-b' },
+    { source: 'compact', model: 'example-model-b' },
+    { source: 'fork', model: 'example-model-b' },
+    { source: 'clear', model: 'example-model-a' },
+    { source: 'compact', model: 'example-model-a' },
+    { source: 'resume', model: undefined },
+    { source: 'clear', model: undefined },
+    { source: 'startup', model: undefined },
+    { source: 'clear', model: undefined },
+  ])
+})
+
 test('a session that runs only /bqaa-status and exits emits and spills no session_start or session_end rows', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)

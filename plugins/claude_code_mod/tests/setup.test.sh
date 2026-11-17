@@ -75,7 +75,9 @@ check 'default solo output omits the full team bootstrap command' lacks 'setup_g
 
 team_log="$work/team.log"
 check 'a --team run succeeds' env SETUP_ARGS=--team bash -c "$(declare -f run_setup); work='$work'; plugin='$plugin'; run_setup '$team_log' BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics"
-check 'with --team, the next step names the project and dataset, and no table, views dataset or location (the defaults)' bash -c "grep -qF -- '--project my-gcp-project --dataset agent_analytics --no-create-dataset' '$team_log.out'"
+check 'with --team, zero bq calls are made (print-only)' test ! -s "$team_log"
+check 'with --team, output notes it does not run bq or create BigQuery resources' has 'does not run bq' "$team_log.out"
+check 'with --team, the next step names the project and dataset, and no table, views dataset or location (the defaults)' bash -c "grep -qF -- '--project my-gcp-project --dataset agent_analytics --no-create-dataset --no-create-table' '$team_log.out'"
 printf -v bootstrap '%q' "$plugin/scripts/setup_gcp_prereqs.py"
 check "with --team, the next step runs the bootstrap that sits beside setup.sh, by its full path" has "python3 $bootstrap" "$team_log.out"
 check 'with --team, the next step notes that --execute needs a virtual environment with google-cloud-bigquery' has 'google-cloud-bigquery' "$team_log.out"
@@ -92,18 +94,27 @@ check 'the table DDL runs again (CREATE ... IF NOT EXISTS)' has 'CREATE TABLE IF
 
 # 3. Other names, and the fallbacks the mod reads.
 log="$work/names.log"
-check 'fallback variables and a views dataset of its own' env SETUP_ARGS=--team bash -c "$(declare -f run_setup); work='$work'; plugin='$plugin'; run_setup '$log' GOOGLE_CLOUD_PROJECT=other-project BQ_DATASET=events BQ_TABLE=coding_events BQAA_LOCATION=EU BQAA_VIEWS_DATASET=reports"
+check 'fallback variables and a views dataset of its own (without --team)' run_setup "$log" GOOGLE_CLOUD_PROJECT=other-project BQ_DATASET=events BQ_TABLE=coding_events BQAA_LOCATION=EU BQAA_VIEWS_DATASET=reports
 check 'the table comes from BQ_TABLE' has '`other-project.events.coding_events`' "$log"
 check 'the views go to BQAA_VIEWS_DATASET' has '`other-project.reports.daily_usage_by_model`' "$log"
 check 'the location is EU' has '--location=EU mk --dataset' "$log"
 check 'the table option is printed when not the default' has '  table: coding_events' "$log.out"
-check 'the next step carries the table, the views dataset and the location' has '--project other-project --dataset events --table coding_events --views-dataset reports --location EU --no-create-dataset' "$log.out"
 
-# 4. A dry run calls bq for nothing and prints the SQL.
+team_names_log="$work/team-names.log"
+check 'fallback variables with --team succeed without calling bq' env SETUP_ARGS=--team bash -c "$(declare -f run_setup); work='$work'; plugin='$plugin'; run_setup '$team_names_log' GOOGLE_CLOUD_PROJECT=other-project BQ_DATASET=events BQ_TABLE=coding_events BQAA_LOCATION=EU BQAA_VIEWS_DATASET=reports"
+check 'with custom vars and --team, zero bq calls are made' test ! -s "$team_names_log"
+check 'the next step carries the table, the views dataset and the location' has '--project other-project --dataset events --table coding_events --views-dataset reports --location EU --no-create-dataset --no-create-table' "$team_names_log.out"
+
+# 4. A dry run calls bq for nothing and prints the SQL; --dry-run --team prints only the team command.
 log="$work/dry.log"
 check 'a dry run succeeds' env SETUP_ARGS=--dry-run bash -c "$(declare -f run_setup); work='$work'; plugin='$plugin'; run_setup '$log' BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics"
 check 'a dry run makes no bq call' test ! -s "$log"
 check 'a dry run prints the view SQL' has 'CREATE OR REPLACE VIEW `my-gcp-project.agent_analytics_reporting.daily_usage_by_model`' "$log.out"
+
+dry_team_log="$work/dry-team.log"
+check 'a --dry-run --team run succeeds' env SETUP_ARGS='--dry-run --team' bash -c "$(declare -f run_setup); work='$work'; plugin='$plugin'; run_setup '$dry_team_log' BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics"
+check 'a --dry-run --team run makes no bq call' test ! -s "$dry_team_log"
+check 'a --dry-run --team run prints the setup_gcp_prereqs.py command' has '--project my-gcp-project --dataset agent_analytics --no-create-dataset --no-create-table' "$dry_team_log.out"
 
 # 5. Names that are not plain names, and missing settings, stop it before any call.
 for bad in 'BQAA_DATASET=x;DROP' 'BQAA_DATASET=a.b' 'BQAA_TABLE=t`s' 'BQAA_VIEWS_DATASET=v-w' 'BQAA_PROJECT_ID=My_Project' 'BQAA_LOCATION=us east'; do
