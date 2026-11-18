@@ -146,6 +146,9 @@ export type BackfillReport = {
   // stands over it, or this replay could not write its own): the replay
   // goes on with the files after it.
   held: string | null
+  // Files held by a standing `sending: true` mark or cut-off record that
+  // require `/bqaa-backfill force` to replay.
+  heldFiles?: number
   // What stopped the replay (the network, the credentials, the directory):
   // the files after it wait for the next one.
   error: string | null
@@ -181,8 +184,9 @@ type ReplayTally = { waiting: number; requests: number }
 // order (L landed, W waits as it was, R refused, K kept as written: another
 // table's, or a kind this replay does not send), with each refused line's
 // reason (`refusals`, in the same order, indexes `reasons`, which holds
-// MAX_REASONS at most).
-type Outcome = { fates: string; reasons: string[]; refusals: number[] }
+// MAX_REASONS at most) and any `W` line indices whose exit-replay request was
+// cut off or timed out after dispatch (`uncertainLines`).
+type Outcome = { fates: string; reasons: string[]; refusals: number[]; uncertainLines?: number[] }
 
 // A replayed file (`name`), and where its record is: in `$.store` under
 // `recordKey`, or, when the store does not take it, in one of the two files
@@ -371,7 +375,10 @@ const fitsLines = (file: ParsedFile, outcome: Outcome): boolean =>
   outcome.fates.length === file.lines.length &&
   /^[LWRK]*$/.test(outcome.fates) &&
   outcome.refusals.length === outcome.fates.split('R').length - 1 &&
-  outcome.refusals.every(k => outcome.reasons[k] !== undefined)
+  outcome.refusals.every(k => outcome.reasons[k] !== undefined) &&
+  (outcome.uncertainLines === undefined ||
+    (Array.isArray(outcome.uncertainLines) &&
+      outcome.uncertainLines.every(n => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n < file.lines.length && outcome.fates[n] === 'W')))
 
 const baseOf = (p: string): string => p.split(/[\\/]/).pop() ?? p
 
@@ -383,7 +390,7 @@ const sameNames = (a: readonly string[], b: readonly string[]): boolean =>
 type Found = { journal: Partial<Journal>; filed: boolean }
 // No outcome recorded, and replays' marks (`pending`, the writers that left
 // them): each sent rows, or is about to, and may yet record one.
-type Pending = { pending: string[] }
+type Pending = { pending: string[]; uncertain?: boolean }
 
 // Where the record of the file `name`, `size` long, in `dir` is kept.
 const sourceFor = (dir: string, name: string, size: number, c: Config): Source => ({
@@ -461,30 +468,42 @@ const markStands = (text: unknown, size: number): boolean => {
 // before that file's record has it as written. The same file and outcome
 // always give the same files, so a writer that resumes another's outcome
 // writes the same ones.
-function leftoverFiles(file: ParsedFile, fileKind: DeadLetterKind, outcome: Outcome, name: string): { kind: DeadLetterKind; text: string }[] {
+function leftoverFiles(
+  file: ParsedFile,
+  fileKind: DeadLetterKind,
+  outcome: Outcome,
+  name: string,
+): { kind: DeadLetterKind; text: string; uncertain?: boolean }[] {
+  const uncertainSet = outcome.uncertainLines && outcome.uncertainLines.length > 0 ? new Set(outcome.uncertainLines) : null
+  const uncertainRest = new Map<DeadLetterKind, string[]>()
   const rest = new Map<DeadLetterKind, string[]>()
-  const keep = (kind: DeadLetterKind, text: string): void => {
-    const texts = rest.get(kind)
+  const keepInto = (target: Map<DeadLetterKind, string[]>, kind: DeadLetterKind, text: string): void => {
+    const texts = target.get(kind)
     if (texts) texts.push(text)
-    else rest.set(kind, [text])
+    else target.set(kind, [text])
   }
   const kindOfLine = (line: DeadLetterLine): DeadLetterKind => (isDeadLetterKind(line.kind) ? line.kind : fileKind)
   const keyed = (line: DeadLetterLine, i: number): DeadLetterLine => (keyOf(line, name, i) === line.row.event_id ? line : { ...line, key: keyOf(line, name, i) })
   let refused = 0
   file.lines.forEach((line, i) => {
     const fate = outcome.fates[i]
-    if (fate === 'W') keep(kindOfLine(line), lineText({ ...keyed(line, i), kind: kindOfLine(line) }))
-    else if (fate === 'R') {
+    if (fate === 'W') {
+      const k = kindOfLine(line)
+      const formatted = lineText({ ...keyed(line, i), kind: k })
+      if (uncertainSet?.has(i)) keepInto(uncertainRest, k, formatted)
+      else keepInto(rest, k, formatted)
+    } else if (fate === 'R') {
       const reason = outcome.reasons[outcome.refusals[refused] ?? -1] ?? ''
       refused += 1
-      keep('rejected', lineText({ ...keyed(line, i), kind: 'rejected', reason, attempts: line.attempts + 1 }))
+      keepInto(rest, 'rejected', lineText({ ...keyed(line, i), kind: 'rejected', reason, attempts: line.attempts + 1 }))
     }
   })
   file.lines.forEach((line, i) => {
-    if (outcome.fates[i] === 'K') keep(kindOfLine(line), file.raw[i] as string)
+    if (outcome.fates[i] === 'K') keepInto(rest, kindOfLine(line), file.raw[i] as string)
   })
-  for (const text of file.unreadable) keep(fileKind, text)
-  const files: { kind: DeadLetterKind; text: string }[] = []
+  for (const text of file.unreadable) keepInto(rest, fileKind, text)
+  const files: { kind: DeadLetterKind; text: string; uncertain?: boolean }[] = []
+  for (const [kind, texts] of uncertainRest) for (const text of packFiles(texts, name)) files.push({ kind, text, uncertain: true })
   for (const [kind, texts] of rest) for (const text of packFiles(texts, name)) files.push({ kind, text })
   return files
 }
@@ -578,10 +597,14 @@ export class Writer {
   // un-progressed requests), whichever comes first, and takes no token but
   // one already at hand.
   private exitReplay: { until: number; postUntil: number; cutoff: Mark; postCutoff: Mark } | null = null
-  // Source paths whose replay request timed out or hit an exit cutoff in this
-  // process: held until /bqaa-backfill force even when the standing mark
+  // Source paths whose exit-replay request timed out or hit an exit cutoff in
+  // this process: held until /bqaa-backfill force even when the standing mark
   // belongs to `this.mark`.
   private uncertainSources = new Map<string, number>()
+  // Latest count and summary of dead-letter files held for `/bqaa-backfill force`
+  // (surfaced by `-p` `headlessNotice` when `problem === null`).
+  private lastHeld: { files: number; reason: string | null; trigger: BackfillReport['trigger'] | null } = { files: 0, reason: null, trigger: null }
+  private inProgressHeld: { files: number; reason: string | null; trigger: BackfillReport['trigger'] | null } = { files: 0, reason: null, trigger: null }
   // Why rows cannot be written now, if credentials or permission stop them.
   problem: Problem | null = null
   // Rows parked on disk while the problem stood (sent once it clears), and
@@ -1487,7 +1510,11 @@ export class Writer {
     if (cutoff) races.push(cutoff.mark.at.then(() => CUTOFF))
     try {
       const result = await Promise.race(races)
-      if (result === TIMED_OUT) return { error: `request timed out after ${timeoutMs} ms`, uncertain: true }
+      if (result === TIMED_OUT) {
+        return cutoff !== undefined
+          ? { error: `request timed out after ${timeoutMs} ms`, uncertain: true }
+          : { error: `request timed out after ${timeoutMs} ms` }
+      }
       if (result === CUTOFF) return { error: cutoff!.message, uncertain: true }
       return result
     } finally {
@@ -2061,9 +2088,22 @@ export class Writer {
     return this.backfilling !== null
   }
 
+  private noteHeld(report: BackfillReport, trigger: BackfillReport['trigger'], message: string): void {
+    const cleanMsg = diagnostic(message)
+    report.heldFiles = (report.heldFiles ?? 0) + 1
+    report.held ??= cleanMsg
+    this.inProgressHeld = { files: report.heldFiles, reason: report.held, trigger }
+  }
+
+  heldNoticeInfo(): { files: number; reason: string | null; trigger: BackfillReport['trigger'] | null } {
+    if (this.inProgressHeld.files > 0) return this.inProgressHeld
+    return this.lastHeld
+  }
+
   private async backfillRun(kinds: DeadLetterKind[], trigger: BackfillReport['trigger'], dir: string, parked: number): Promise<BackfillReport> {
     const c = this.config()
-    const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, rowsRefused: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], incompleteFiles: [], held: null, error: null, finishedAt: null }
+    const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, rowsRefused: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], incompleteFiles: [], held: null, heldFiles: 0, error: null, finishedAt: null }
+    this.inProgressHeld = { files: 0, reason: null, trigger }
     const tally: ReplayTally = { waiting: 0, requests: 0 }
     const finish = (): BackfillReport => {
       report.finishedAt = this.io.now()
@@ -2083,8 +2123,11 @@ export class Writer {
         (this.backfillReport.files > 0 || this.backfillReport.rowsSent > 0 || this.backfillReport.error !== null)
       if (!emptyAuto || !hasPrevious) this.backfillReport = report
       else if (this.backfillReport !== null && this.backfillReport.held !== null && !this.replayDue.has(dir)) {
-        this.backfillReport = { ...this.backfillReport, held: null }
+        this.backfillReport = { ...this.backfillReport, held: null, heldFiles: 0 }
       }
+      const heldFiles = report.heldFiles ?? 0
+      this.lastHeld = { files: heldFiles, reason: heldFiles > 0 ? report.held : null, trigger }
+      this.inProgressHeld = { files: 0, reason: null, trigger: null }
       return report
     }
     if (!canDeliver(c) || c.dryRun) {
@@ -2278,7 +2321,7 @@ export class Writer {
           // holds the outcome writes it again; any other replay leaves the
           // file waiting, and /bqaa-backfill force replays it afresh.
           if (held === undefined && trigger !== 'force') {
-            report.held ??= diagnostic(`the replay record of ${name} is cut off part-way; /bqaa-backfill force replays the file afresh`)
+            this.noteHeld(report, trigger, `the replay record of ${name} is cut off part-way; /bqaa-backfill force replays the file afresh`)
             report.skippedFiles += 1
             if (kindOf(name) !== 'rejected') tally.waiting += 1
             continue
@@ -2294,7 +2337,11 @@ export class Writer {
           // this writer's own is no other replay's: it would hold the outcome.
           const ownUncertain = this.uncertainSources.get(path) === source.size
           if (held === undefined && trigger !== 'force' && found.pending.some(by => by !== this.mark || ownUncertain)) {
-            report.held ??= diagnostic(`a replay of ${name} sent rows and has recorded no outcome; if that session stopped, /bqaa-backfill force replays the file afresh`)
+            const msg =
+              ownUncertain || found.uncertain === true
+                ? `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`
+                : `a replay of ${name} sent rows and has recorded no outcome; if that session stopped, /bqaa-backfill force replays the file afresh`
+            this.noteHeld(report, trigger, msg)
             report.skippedFiles += 1
             if (kindOf(name) !== 'rejected') tally.waiting += 1
             continue
@@ -2424,14 +2471,19 @@ export class Writer {
   }
 
   // A replay's request: during session end's own replay, answered by its
-  // cutoff at the latest (postCutoff on an un-progressed first batch so a late
-  // 200 can still commit its mark; cutoff once earlier batches progressed).
-  private replayPost(url: string, body: string, token: string, timeoutMs: number, hasProgress = false): Promise<HttpAnswer | { error: string; uncertain?: boolean }> {
+  // cutoff at the latest (postCutoff on a single-batch whole file so a late
+  // 200 can still commit its mark; cutoff once a rewrite/split reserve is
+  // needed). Outside session end (`exit === null`), client timeouts release
+  // the mark so recovery delivers parked files once BigQuery answers again.
+  private async replayPost(url: string, body: string, token: string, timeoutMs: number, needsReserve = false): Promise<HttpAnswer | { error: string; uncertain?: boolean }> {
     const exit = this.exitReplay
-    if (exit === null) return this.post(url, body, token, timeoutMs)
-    const deadline = hasProgress ? exit.until : exit.postUntil
-    const mark = hasProgress ? exit.cutoff : exit.postCutoff
-    if (mark.passed() || deadline - this.io.now() <= 0) return Promise.resolve({ error: 'no answer before the session ended' })
+    if (exit === null) {
+      const answer = await this.post(url, body, token, timeoutMs)
+      return 'error' in answer ? { error: answer.error } : answer
+    }
+    const deadline = needsReserve ? exit.until : exit.postUntil
+    const mark = needsReserve ? exit.cutoff : exit.postCutoff
+    if (mark.passed() || deadline - this.io.now() <= 0) return { error: 'no answer before the session ended' }
     return this.post(url, body, token, Math.max(1, Math.min(timeoutMs, deadline - this.io.now())), { mark, message: 'no answer before the session ended' })
   }
 
@@ -2522,11 +2574,11 @@ export class Writer {
       // go. So the marks are read, and only then the done marks listed
       // again, before none is taken for an answer.
       entries = await this.io.listDir(source.dir)
-      const by = await this.marksOn(source, entries)
+      const { by, uncertain } = await this.marksDetailed(source, entries)
       const again = await doneIn(await this.io.listDir(source.dir))
       if (again.done !== undefined) return { journal: again.done, filed: true }
       if (torn || doneTorn || again.torn) return 'torn'
-      return by.length === 0 ? undefined : { pending: by }
+      return by.length === 0 ? undefined : { pending: by, ...(uncertain ? { uncertain: true } : {}) }
     }
     if (filed === undefined) return { journal: stored, filed: torn }
     // Two outcomes: the file's was written when the store did not take it.
@@ -2642,7 +2694,12 @@ export class Writer {
     const { journal } = found
     const paths = Array.isArray(journal.files) ? journal.files : []
     const written = writtenOf(journal)
-    const outcome: Outcome = { fates: typeof journal.fates === 'string' ? journal.fates : '', reasons: Array.isArray(journal.reasons) ? journal.reasons : [], refusals: Array.isArray(journal.refusals) ? journal.refusals : [] }
+    const outcome: Outcome = {
+      fates: typeof journal.fates === 'string' ? journal.fates : '',
+      reasons: Array.isArray(journal.reasons) ? journal.reasons : [],
+      refusals: Array.isArray(journal.refusals) ? journal.refusals : [],
+      ...(Array.isArray(journal.uncertainLines) ? { uncertainLines: journal.uncertainLines } : {}),
+    }
     const rewrite: Rewrite = {
       ...outcome,
       ...source,
@@ -2675,7 +2732,7 @@ export class Writer {
     rewrite.files = paths.map((p, i) => ({
       path: joinPath(source.dir, baseOf(p)),
       text: written[i] === true ? null : (texts[i]?.text ?? ''),
-      ...(journal.uncertain?.[i] === true ? { uncertain: true } : {}),
+      ...(journal.uncertain?.[i] === true || texts[i]?.uncertain === true ? { uncertain: true } : {}),
     }))
     return rewrite
   }
@@ -2723,11 +2780,12 @@ export class Writer {
     }
     const record = async (): Promise<void> => {
       rewrite.seq += 1
-      const { fates, reasons, refusals, size, waits, seq } = rewrite
+      const { fates, reasons, refusals, uncertainLines, size, waits, seq } = rewrite
       const journal: Journal = {
         fates,
         reasons,
         refusals,
+        ...(uncertainLines && uncertainLines.length > 0 ? { uncertainLines } : {}),
         size,
         waits,
         seq,
@@ -2784,7 +2842,7 @@ export class Writer {
         const size = utf8Length(file.text)
         await this.io.writeFile(
           doneFileOf(rewrite.dir, baseOf(file.path), this.mark),
-          sealFile(`${JSON.stringify({ size, sending: true, by: this.mark })}\n`),
+          sealFile(`${JSON.stringify({ size, sending: true, uncertain: true, by: this.mark })}\n`),
         )
         this.uncertainSources.set(file.path, size)
       }
@@ -2857,7 +2915,11 @@ export class Writer {
   private async markSending(path: string, source: Source, trigger: BackfillReport['trigger'], report: BackfillReport): Promise<boolean> {
     const ownUncertain = this.uncertainSources.get(path) === source.size
     if (trigger !== 'force' && ownUncertain) {
-      report.held ??= diagnostic(`a replay of ${source.name} sent rows and has recorded no outcome; if that session stopped, /bqaa-backfill force replays the file afresh`)
+      this.noteHeld(
+        report,
+        trigger,
+        `a replay of ${source.name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
+      )
       return false
     }
     try {
@@ -2877,16 +2939,25 @@ export class Writer {
       let found = Writer.recorded(read)
       const isOther = (by: string): boolean => by !== this.mark || ownUncertain
       let others: string[] = []
+      let otherUncertain = ownUncertain
       if (read === 'torn') {
-        others = (await this.marksOn(source)).filter(isOther)
+        const detailed = await this.marksDetailed(source)
+        others = detailed.by.filter(isOther)
+        otherUncertain ||= detailed.uncertain
         const last = await this.doneMarks(source, await this.io.listDir(source.dir))
         if (last.done !== undefined) found = { journal: last.done, filed: true }
       } else if (read !== undefined && 'pending' in read) {
         others = read.pending.filter(isOther)
+        otherUncertain ||= read.uncertain === true
       }
       const another = trigger !== 'force' && others.length > 0
       if ((found !== undefined && found !== 'torn') || another || (await this.io.readFile(path)) === '') {
-        if (another && (found === undefined || found === 'torn')) report.held ??= diagnostic(`another session is replaying ${source.name}; if it stopped, /bqaa-backfill force replays the file afresh`)
+        if (another && (found === undefined || found === 'torn')) {
+          const msg = otherUncertain
+            ? `a replay of ${source.name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`
+            : `another session is replaying ${source.name}; if it stopped, /bqaa-backfill force replays the file afresh`
+          this.noteHeld(report, trigger, msg)
+        }
         await this.unmark(source)
         return false
       }
@@ -2898,17 +2969,35 @@ export class Writer {
   }
 
   // The writers whose marks stand beside `source`, read from its directory
-  // (`entries`, when it was just listed). An emptied mark, which its writer
-  // let go, is not read. A mark that cannot be read, or a directory that
-  // cannot be listed, throws: it is never taken for none.
-  private async marksOn(source: Source, entries?: readonly { name: string; size: number }[]): Promise<string[]> {
+  // (`entries`, when it was just listed), plus whether any standing mark came
+  // from an unanswered exit replay (`uncertain: true`). An emptied mark, which
+  // its writer let go, is not read. A mark that cannot be read, or a directory
+  // that cannot be listed, throws: it is never taken for none.
+  private async marksDetailed(source: Source, entries?: readonly { name: string; size: number }[]): Promise<{ by: string[]; uncertain: boolean }> {
     const by: string[] = []
+    let uncertain = false
     for (const entry of entries ?? (await this.io.listDir(source.dir))) {
       const writer = markerOf(entry.name, source.name)
       if (writer === null || entry.size === 0) continue
-      if (markStands(await this.io.readFile(joinPath(source.dir, entry.name)), source.size)) by.push(writer)
+      const raw = await this.io.readFile(joinPath(source.dir, entry.name))
+      if (markStands(raw, source.size)) {
+        by.push(writer)
+        const parsed = journalOf(raw) as { uncertain?: unknown } | 'torn' | undefined
+        if (parsed !== undefined && parsed !== 'torn' && parsed.uncertain === true) uncertain = true
+      }
     }
-    return by
+    return { by, uncertain }
+  }
+
+  private async markUncertain(source: Source): Promise<void> {
+    try {
+      await this.io.writeFile(
+        doneFileOf(source.dir, source.name, this.mark),
+        sealFile(`${JSON.stringify({ size: source.size, sending: true, uncertain: true, by: this.mark })}\n`),
+      )
+    } catch {
+      // Existing sending: true mark already stands on disk.
+    }
   }
 
   // This writer's own mark beside `source` let go. Best effort: one left is
@@ -2964,7 +3053,10 @@ export class Writer {
     }
     let changed = false
     let marked = false
-    let uncertainKinds: Set<DeadLetterKind> | null = null
+    const uncertainLines: number[] = []
+    const recordUncertain = (first: number, count: number): void => {
+      for (let i = 0; i < count; i += 1) uncertainLines.push(at[first + i] as number)
+    }
     let index = 0
     while (index < mine.length) {
       if (report.error || this.replayStops(trigger, tally)) break
@@ -2978,6 +3070,7 @@ export class Writer {
       }
       const first = index
       const chunk = mine.slice(index, end)
+      const needsReserve = changed || end < mine.length || kept > 0 || file.unreadable.length > 0
       index = end
       let token: string
       try {
@@ -2994,12 +3087,9 @@ export class Writer {
       if (this.replayHalted()) break
       const body = insertAllBody(chunk.map(l => l.row))
       tally.requests += 1
-      let answer = await this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs, changed)
+      let answer = await this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs, needsReserve)
       if ('error' in answer) {
-        if (answer.uncertain) {
-          uncertainKinds ??= new Set()
-          for (const line of chunk) uncertainKinds.add(line.kind)
-        }
+        if (answer.uncertain) recordUncertain(first, chunk.length)
         report.error = diagnostic(answer.error)
         continue
       }
@@ -3018,12 +3108,9 @@ export class Writer {
         }
         if (this.closing) break
         tally.requests += 1
-        answer = await this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs, changed)
+        answer = await this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs, needsReserve)
         if ('error' in answer) {
-          if (answer.uncertain) {
-            uncertainKinds ??= new Set()
-            for (const line of chunk) uncertainKinds.add(line.kind)
-          }
+          if (answer.uncertain) recordUncertain(first, chunk.length)
           report.error = diagnostic(answer.error)
           continue
         }
@@ -3034,12 +3121,9 @@ export class Writer {
         if (await this.createTable(c, token)) {
           if (this.replayHalted()) break
           tally.requests += 1
-          answer = await this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs, changed)
+          answer = await this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs, needsReserve)
           if ('error' in answer) {
-            if (answer.uncertain) {
-              uncertainKinds ??= new Set()
-              for (const line of chunk) uncertainKinds.add(line.kind)
-            }
+            if (answer.uncertain) recordUncertain(first, chunk.length)
             report.error = diagnostic(answer.error)
             continue
           }
@@ -3102,36 +3186,71 @@ export class Writer {
     }
     tally.waiting += mine.filter((line, n) => fates[at[n] as number] === 'W' && line.kind !== 'rejected').length
     report.rowsLeft += at.filter(i => fates[i] !== 'L').length + kept
+    const needsSplit = uncertainLines.length > 0 && (uncertainLines.length < lines.length || file.unreadable.length > 0)
     // Nothing sent and nothing new to record: the file stays as it was, and
     // its mark goes while it is still this writer's (best effort: one left is
-    // this writer's own).
-    if (!changed) {
+    // this writer's own). When the whole single-batch file had an unanswered
+    // exit-replay request, keep its mark standing instead of zeroing it.
+    if (!changed && !needsSplit) {
       if (marked) {
-        if (uncertainKinds !== null) this.uncertainSources.set(path, source.size)
-        else await this.unmark(source)
+        if (uncertainLines.length > 0) {
+          this.uncertainSources.set(path, source.size)
+          this.noteHeld(
+            report,
+            trigger,
+            `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
+          )
+          await this.markUncertain(source)
+        } else {
+          await this.unmark(source)
+        }
       }
       return true
     }
     // What is left goes to new files first, each kind to files of its own (a
     // row refused here to a `rejected` file, which no replay that runs by
-    // itself reads), each file ending with its completion record; only once
+    // itself reads; rows of an unanswered exit-replay batch to their own
+    // marked file so unsubmitted batches stay eligible for automatic replay),
+    // each file ending with its completion record; only once
     // every one is written is the source emptied: `$.fs` has no rename or
     // delete. A write that fails leaves the source as it was, so an unsent
     // row is never held only in memory, and this outcome is kept: the next
     // replay finishes writing it out (`writeOut`) and sends none of the
     // file again.
-    const outcome: Outcome = { fates: fates.join(''), reasons, refusals }
+    const outcome: Outcome = {
+      fates: fates.join(''),
+      reasons,
+      refusals,
+      ...(uncertainLines.length > 0 ? { uncertainLines } : {}),
+    }
     const rest = leftoverFiles(file, fileKind, outcome, name)
-    const files = rest.map(({ kind, text }) => ({
+    const files = rest.map(({ kind, text, uncertain }) => ({
       path: joinPath(dir, fileName(kind, this.io.now(), this.sessionId(), ++this.seq, this.mark)),
       text,
-      ...(uncertainKinds?.has(kind) ? { uncertain: true } : {}),
+      ...(uncertain ? { uncertain: true } : {}),
     }))
     // Another writer that replayed the file at the same time may have
     // recorded its outcome meanwhile, or finished it: writeOut finds out
     // before it records this one.
     const rewrite: Rewrite = { ...source, ...outcome, files, waits: rest.some(f => f.kind !== 'rejected'), filed: false, seq: 0 }
+    const uncertainFiles = rewrite.files.filter(f => f.uncertain)
+    const hadHeldReason = report.held !== null
+    for (let i = 0; i < uncertainFiles.length; i += 1) {
+      this.noteHeld(
+        report,
+        trigger,
+        `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
+      )
+    }
     const done = await this.writeOut(path, rewrite)
+    const firstWrittenUncertain = uncertainFiles.find(f => f.text === null)
+    if (!hadHeldReason && firstWrittenUncertain !== undefined) {
+      const updated = diagnostic(
+        `a replay of ${baseOf(firstWrittenUncertain.path)} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
+      )
+      report.held = updated
+      this.inProgressHeld = { files: report.heldFiles ?? uncertainFiles.length, reason: updated, trigger }
+    }
     // The file done, clear our sending mark only when this write did not
     // replace it with a retired done mark (`wroteDone`).
     if (done && !rewrite.wroteDone) await this.unmark(source)

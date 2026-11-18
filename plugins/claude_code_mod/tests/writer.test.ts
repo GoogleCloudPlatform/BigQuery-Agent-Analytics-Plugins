@@ -2373,34 +2373,104 @@ test('T53-4a: unanswered exit-replay POST retains sending: true mark across sess
   expect(h.files.get(spillPath)).toBe('')
 })
 
-test('T53-4b: same-process interactive request timeout retains sending: true and holds same Writer auto/command backfill until force', async () => {
+test('T53-4b: live-session request timeouts across 3 parked files release marks and auto-deliver all 3 once BigQuery answers again', async () => {
   const h = exitReplayHarness({ requestTimeoutMs: 1000 })
   const w = await h.warmWriter('s-1')
-  const name = 'spill-20261013T200102003Z-t53-4b.jsonl'
-  const id = '7'.repeat(32)
+  const names = [
+    'spill-20261013T200102003Z-t53-4b-1.jsonl',
+    'spill-20261013T200102004Z-t53-4b-2.jsonl',
+    'retry-20261013T200102005Z-t53-4b-3.jsonl',
+  ]
+  const ids = ['7'.repeat(32), 'd'.repeat(32), 'e'.repeat(32)]
+  const paths = names.map((n, i) => h.seedSpill(n, ids[i]!))
+
+  // Requests hang for 10 minutes across repeated auto/recovery attempts.
+  h.setFetch(() => undefined)
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const running = w.backfill(['spill', 'retry'], attempt === 0 ? 'auto' : 'recovery')
+    await h.advance(150_000)
+    const timedOut = await running
+    expect(timedOut.error ?? '').toMatch(/timed out/)
+    for (const n of names) expect(h.doneMarksFor(n)).toEqual([])
+  }
+  expect(h.sent.length).toBe(0)
+
+  // Once BigQuery answers again, automatic recovery delivers all 3 files without force.
+  h.setFetch(async () => OK_INSERT)
+  const delivered = await w.backfill(['spill', 'retry'], 'recovery')
+  expect(delivered.rowsSent).toBe(3)
+  expect(delivered.skippedFiles).toBe(0)
+  for (const id of ids) expect(h.sentOf(id)).toBe(1)
+  for (const p of paths) expect(h.files.get(p)).toBe('')
+  expect(h.uncancelledTimers()).toEqual([])
+})
+
+test('T53-4c: unanswered exit-replay POST records own-unanswered held message on both exiting and subsequent sessions until force', async () => {
+  const h = exitReplayHarness()
+  const w = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-4c.jsonl'
+  const id = 'f'.repeat(32)
   const spillPath = h.seedSpill(name, id)
 
   h.setFetch(() => undefined)
-  const running = w.backfill(['spill', 'retry'], 'auto')
-  await h.advance(1000)
-  const timedOutReport = await running
-  expect(timedOutReport.error ?? '').toMatch(/timed out/)
+  const exiting = w.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(800)
+  await exiting
   expect(h.doneMarksFor(name)[0]?.data?.sending).toBe(true)
+  expect(h.doneMarksFor(name)[0]?.data?.uncertain).toBe(true)
+  expect(w.backfillReport?.held ?? '').toContain('no answer before the session ended')
+  expect(w.backfillReport?.held ?? '').not.toContain('another session')
+  expect(w.heldNoticeInfo().files).toBe(1)
 
-  // Same Writer instance: auto and command backfills must hold the uncertain file.
   h.setFetch(async () => OK_INSERT)
-  const sameAuto = await w.backfill(['spill', 'retry'], 'auto')
-  expect(sameAuto.skippedFiles).toBe(1)
+  const w2 = h.newWriter('s-2')
+  const nextAuto = await w2.backfill(['spill', 'retry'], 'auto')
+  expect(nextAuto.skippedFiles).toBe(1)
+  expect(nextAuto.held ?? '').toContain('no answer before the session ended')
+  expect(nextAuto.held ?? '').not.toContain('another session')
   expect(h.sentOf(id)).toBe(0)
 
-  const sameCmd = await w.backfill(['spill', 'retry'], 'command')
-  expect(sameCmd.skippedFiles).toBe(1)
+  const nextCmd = await w2.backfill(['spill', 'retry'], 'command')
+  expect(nextCmd.skippedFiles).toBe(1)
+  expect(nextCmd.held ?? '').toContain('no answer before the session ended')
   expect(h.sentOf(id)).toBe(0)
 
-  const forced = await w.backfill(['spill', 'retry'], 'force')
+  const forced = await w2.backfill(['spill', 'retry'], 'force')
   expect(forced.rowsSent).toBe(1)
   expect(h.sentOf(id)).toBe(1)
   expect(h.files.get(spillPath)).toBe('')
+  expect(w2.heldNoticeInfo().files).toBe(0)
+  expect(h.uncancelledTimers()).toEqual([])
+})
+
+test('T53-4d: slow disk I/O during post-cutoff markUncertain/writeOut still populates heldNoticeInfo before marks.end settles spillForExit', async () => {
+  const h = exitReplayHarness()
+  const w = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-4d.jsonl'
+  h.seedSpill(name, 'e'.repeat(32))
+
+  let unblockSlowWrite = (): void => undefined
+  const slowWrite = new Promise<void>(resolve => {
+    unblockSlowWrite = resolve
+  })
+  let markWrites = 0
+  h.setWriteFileHook(async path => {
+    if (path.includes('/outcome-done-')) {
+      markWrites += 1
+      if (markWrites >= 2) await slowWrite
+    }
+  })
+
+  h.setFetch(() => undefined)
+  const exiting = w.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(800)
+  await exiting
+
+  // Even while markUncertain is still blocked past marks.end, heldNoticeInfo already reports 1 held file.
+  expect(w.heldNoticeInfo().files).toBe(1)
+  expect(w.heldNoticeInfo().reason ?? '').toContain('no answer before the session ended')
+  unblockSlowWrite()
+  await h.settleMicrotasks()
   expect(h.uncancelledTimers()).toEqual([])
 })
 
@@ -2524,5 +2594,161 @@ test('T53-7: definitive non-delivery (503, 401, offline fetch rejection, FIRST_A
     expect(h.files.get(spillPath)).toBe('')
     expect(h.uncancelledTimers()).toEqual([])
   }
+})
+
+test('T53-6b: 1,001-row spill where Batch 1 cuts off at exit splits Batch 1 (500 held) from Batches 2-3 (501 unmarked auto-replayed)', async () => {
+  const h = exitReplayHarness({ maxBatchRows: 500 })
+  const w1 = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-6b.jsonl'
+  const ids = Array.from({ length: 1001 }, (_, i) => i.toString(16).padStart(32, '0'))
+  const sourcePath = h.seedSpill(name, ...ids)
+
+  h.setFetch(() => undefined)
+  const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(800)
+  await exiting
+
+  // Only Batch 1 (500 rows) went out on the wire; parent was split into 2 leftovers and emptied.
+  expect(h.requests.length).toBe(1)
+  expect(h.requests[0]!.ids.length).toBe(500)
+  expect(h.files.get(sourcePath)).toBe('')
+  expect(h.doneMarksFor(name)[0]?.data?.retired).toBe(true)
+  expect(h.uncancelledTimers()).toEqual([])
+
+  const leftovers = [...h.files.entries()].filter(([p, t]) => p.startsWith(`${PARTITION_DIR}/spill-`) && p !== sourcePath && t !== '')
+  expect(leftovers.length).toBe(2)
+
+  // Next session auto-backfill delivers the 501 never-submitted rows while holding the 500 uncertain rows.
+  h.sent.length = 0
+  h.setFetch(async () => OK_INSERT)
+  const w2 = h.newWriter('s-2')
+  const autoReport = await w2.backfill(['spill', 'retry'], 'auto')
+  expect(autoReport.rowsSent).toBe(501)
+  expect(autoReport.skippedFiles).toBe(1)
+  for (let i = 0; i < 500; i += 1) expect(h.sentOf(ids[i]!)).toBe(0)
+  for (let i = 500; i < 1001; i += 1) expect(h.sentOf(ids[i]!)).toBe(1)
+
+  // Force backfill then delivers only the 500 uncertain rows.
+  const forceReport = await w2.backfill(['spill', 'retry'], 'force')
+  expect(forceReport.rowsSent).toBe(500)
+  for (let i = 0; i < 500; i += 1) expect(h.sentOf(ids[i]!)).toBe(1)
+  for (let i = 500; i < 1001; i += 1) expect(h.sentOf(ids[i]!)).toBe(1)
+})
+
+test('T53-6c: 1,001-row spill where Batch 1 lands and Batch 2 cuts off retires Batch 1, holds Batch 2 (500), and auto-replays row 1,001', async () => {
+  const h = exitReplayHarness({ maxBatchRows: 500 })
+  const w1 = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-6c.jsonl'
+  const ids = Array.from({ length: 1001 }, (_, i) => (10_000 + i).toString(16).padStart(32, '0'))
+  const sourcePath = h.seedSpill(name, ...ids)
+
+  h.setFetch(() => undefined)
+  const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(50)
+  expect(h.requests.length).toBe(1)
+  expect(h.requests[0]!.ids.length).toBe(500)
+  h.requests[0]!.resolve(OK_INSERT)
+  await h.advance(750)
+  await exiting
+
+  expect(h.requests.length).toBe(2)
+  expect(h.requests[1]!.ids.length).toBe(500)
+  expect(h.files.get(sourcePath)).toBe('')
+  expect(h.doneMarksFor(name)[0]?.data?.retired).toBe(true)
+  expect(h.uncancelledTimers()).toEqual([])
+
+  const leftovers = [...h.files.entries()].filter(([p, t]) => p.startsWith(`${PARTITION_DIR}/spill-`) && p !== sourcePath && t !== '')
+  expect(leftovers.length).toBe(2)
+
+  // Next session auto-backfill sends row 1,001 immediately while holding Batch 2 (500..999) and never resending Batch 1 (0..499).
+  h.sent.length = 0
+  h.setFetch(async () => OK_INSERT)
+  const w2 = h.newWriter('s-2')
+  const autoReport = await w2.backfill(['spill', 'retry'], 'auto')
+  expect(autoReport.rowsSent).toBe(1)
+  expect(autoReport.skippedFiles).toBe(1)
+  expect(h.sentOf(ids[1000]!)).toBe(1)
+  for (let i = 0; i < 1000; i += 1) expect(h.sentOf(ids[i]!)).toBe(0)
+
+  const forceReport = await w2.backfill(['spill', 'retry'], 'force')
+  expect(forceReport.rowsSent).toBe(500)
+  for (let i = 500; i < 1001; i += 1) expect(h.sentOf(ids[i]!)).toBe(1)
+  for (let i = 0; i < 500; i += 1) expect(h.sentOf(ids[i]!)).toBe(0)
+})
+
+test('T53-8a: unattended -p session.end emits a one-line held-file notice with count and force command on stderr and debug log when exit replay cuts off', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  const name = 'spill-20261013T200102003Z-t53-8a.jsonl'
+  const spilledId = '9'.repeat(32)
+  world.files.set(`${PARTITION_DIR}/${name}`, parkedFile(parkedLine(TABLE_REF, spilledId, 'earlier-p')))
+
+  // -p run: its own rows land (OK_INSERT), then exit replay hangs ({ hang: true }) and leaves 1 held file.
+  world.replies = [OK_INSERT, { hang: true }]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  const ending1 = $.session.end({ reason: 'other', sessionId: 'p-run-1', resume: { id: 'p-run-1' } })
+  await world.clock.advance(2000)
+  await ending1
+
+  const heldNotices1 = world.stderr.filter(l => l.includes('dead-letter file(s) held'))
+  expect(heldNotices1.length).toBe(1)
+  expect(heldNotices1[0]).toContain('1 dead-letter file(s) held')
+  expect(heldNotices1[0]).toContain('/bqaa-backfill force')
+  expect(heldNotices1[0]).toContain('no answer before the session ended')
+  expect(world.logs.filter(l => l.includes('dead-letter file(s) held')).length).toBe(1)
+})
+
+test('T53-8b: subsequent -p process with standing held mark emits held-file notice, interactive stays silent on stderr, and force clears it', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const name = 'spill-20261013T200102003Z-t53-8b.jsonl'
+  const spilledId = '9'.repeat(32)
+  const text = parkedFile(parkedLine(TABLE_REF, spilledId, 'earlier-p'))
+  world.files.set(`${PARTITION_DIR}/${name}`, text)
+  world.files.set(
+    `${PARTITION_DIR}/outcome-done-earlier123-${name}`,
+    sealFile(`${JSON.stringify({ size: utf8Bytes(text), sending: true, uncertain: true, by: 'earlier123' })}\n`),
+  )
+
+  // Normal -p run using accessTokenCommand: auto-backfill sees the standing mark and session.end emits the notice.
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  await world.clock.advance(5000)
+  await world.clock.settle()
+  const ending2 = $.session.end({ reason: 'other', sessionId: 'p-run-2', resume: { id: 'p-run-2' } })
+  await world.clock.advance(2000)
+  await ending2
+
+  expect(world.stderr.filter(l => l.includes('1 dead-letter file(s) held')).length).toBe(1)
+  expect(world.stderr[0]).toContain('/bqaa-backfill force')
+  expect(world.stderr[0]).toContain('no answer before the session ended')
+})
+
+test('T53-8c: /bqaa-backfill force in -p mode replays held file and emits 0 stderr notices on exit (and interactive never writes stderr)', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const name = 'spill-20261013T200102003Z-t53-8c.jsonl'
+  const spilledId = '9'.repeat(32)
+  const text = parkedFile(parkedLine(TABLE_REF, spilledId, 'earlier-p'))
+  world.files.set(`${PARTITION_DIR}/${name}`, text)
+  world.files.set(
+    `${PARTITION_DIR}/outcome-done-earlier123-${name}`,
+    sealFile(`${JSON.stringify({ size: utf8Bytes(text), sending: true, uncertain: true, by: 'earlier123' })}\n`),
+  )
+
+  // Interactive session seeing a standing held mark uses UI status/bands and never writes stderr.
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'c.ts' })
+  await world.clock.advance(5000)
+  await world.clock.settle()
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  expect(world.stderr).toEqual([])
+
+  // Running /bqaa-backfill force in -p mode replays the held file and emits 0 stderr notices on exit.
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  const cmdOut = (await $.command.run({ command: 'bqaa-backfill', args: 'force', ...COMMAND })).text ?? ''
+  expect(cmdOut).toContain('1 row(s) sent, 0 left')
+  const ending = $.session.end({ reason: 'other', sessionId: 'p-run-3', resume: { id: 'p-run-3' } })
+  await world.clock.advance(2000)
+  await ending
+  expect(world.stderr).toEqual([])
 })
 

@@ -236,13 +236,26 @@ export function writeStderr(line: string): void {
 // would change it, the line names /bqaa-mod-setup, which prints it.
 function headlessNotice(current: Writer, hadActivity: boolean, logDebug?: (line: string) => void): void {
   const { counters } = current.snapshot()
-  if (current.problem === null || !(hadActivity || counters.spilled > 0 || counters.failed > 0)) return
-  const { headline, fix } = current.problemText()
-  const base = clean(`BigQuery Agent Analytics: rows could not be sent (${headline}; to fix, ${fix}).`, 1000)
-  const run = current.commandLine()
-  const withCommand = run === null ? base : clean(`${base} ${run}`, 2100)
-  const line = run === null || withCommand.includes(run) ? withCommand : `${base} Run /bqaa-mod-setup for the setup.sh command.`
-  const oneLine = line.replace(/[\r\n]+/g, ' ')
+  if (current.problem !== null) {
+    if (!(hadActivity || counters.spilled > 0 || counters.failed > 0)) return
+    const { headline, fix } = current.problemText()
+    const base = clean(`BigQuery Agent Analytics: rows could not be sent (${headline}; to fix, ${fix}).`, 1000)
+    const run = current.commandLine()
+    const withCommand = run === null ? base : clean(`${base} ${run}`, 2100)
+    const line = run === null || withCommand.includes(run) ? withCommand : `${base} Run /bqaa-mod-setup for the setup.sh command.`
+    const oneLine = line.replace(/[\r\n]+/g, ' ')
+    writeStderr(oneLine)
+    logDebug?.(oneLine)
+    return
+  }
+  const held = current.heldNoticeInfo()
+  if (held.files <= 0 || held.trigger === 'command' || held.trigger === 'force') return
+  const detail = held.reason ? held.reason.replace(/; \/bqaa-backfill force replays the file afresh$/, '') : ''
+  const suffix = detail ? ` (${detail})` : ''
+  const oneLine = clean(
+    `BigQuery Agent Analytics: ${held.files} dead-letter file(s) held; run \`claude -p "/bqaa-backfill force" < /dev/null\` (or \`/bqaa-backfill force\`) to replay${suffix}.`,
+    1000,
+  ).replace(/[\r\n]+/g, ' ')
   writeStderr(oneLine)
   logDebug?.(oneLine)
 }
