@@ -289,8 +289,6 @@ If you pinned a tag yourself from the CLI (`claude plugin marketplace add "…#m
 - **Keep saved `pluginConfigs` options:** Edit `extraKnownMarketplaces["bqaa-tracing"].source.ref` in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) to the new `mod-dist-vX.Y.Z` tag, then run `claude plugin marketplace add "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins.git#<NEW_TAG>" --sparse .claude-plugin plugins/claude_code_dist` and `claude plugin update bigquery-agent-analytics-mod@bqaa-tracing`.
 - **Fresh re-add (drops saved plugin options):** Run `claude plugin marketplace remove bqaa-tracing`, then re-run `marketplace add` at the new tag and `claude plugin install`.
 
-Note when upgrading from `0.1.3` or earlier to `0.1.4+`: `setup.sh --team` now exits `0` after printing the `scripts/setup_gcp_prereqs.py` command without calling `bq` or creating any BigQuery resources (`--dry-run` has no extra effect with `--team`). If you previously ran `setup.sh --team` as your single provisioning step, run `./setup.sh` without `--team` first to create the datasets, table, and views, then run `./setup.sh --team` (or `scripts/setup_gcp_prereqs.py`).
-
 Each release's tag carries its own version, which is what
 `plugin update` compares and `plugin list` shows. Check by commit instead
 of by version. Look up the tag's commit once:

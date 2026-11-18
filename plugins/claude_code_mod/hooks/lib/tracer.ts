@@ -221,6 +221,7 @@ export class Tracer {
   // Turns seen only through their model requests (this module loaded after
   // their turn.start), kept apart so they never replace the current turn.
   private others = new Map<string, TurnCtx>()
+  private pastTurns = new Map<string, true>()
   private loops = new Map<string, LoopCtx>()
   private inflightTools = new Set<ToolCtx>()
   // With recordHostname: the machine's name, once looked up.
@@ -257,6 +258,7 @@ export class Tracer {
         this.sessionHasStart = false
         this.main = null
         this.others.clear()
+        this.pastTurns.clear()
         this.loops.clear()
         this.inflightTools.clear()
         this.decisions.clear()
@@ -323,6 +325,8 @@ export class Tracer {
         },
       })
     }
+    if (this.main) remember(this.pastTurns, this.main.turnId, true)
+    for (const id of this.others.keys()) remember(this.pastTurns, id, true)
     this.sessionHasActivity = false
     this.sessionHasStart = false
     this.main = null
@@ -339,7 +343,10 @@ export class Tracer {
       this.sessionStartedAt = null
       this.turnCount = 0
     }
-    if (e.reason === 'resume') this.lastModel = null
+    if (e.reason === 'resume') {
+      this.lastModel = null
+      this.pastTurns.clear()
+    }
   }
 
   // prompt.submit, once the prompt entered (after `next` resolved).
@@ -381,6 +388,7 @@ export class Tracer {
       this.loopRunStarted(e.agentId, e.turnId)
       return
     }
+    if (this.main && this.main.turnId !== e.turnId) remember(this.pastTurns, this.main.turnId, true)
     this.main = {
       turnId: e.turnId,
       traceId: this.deps.ids.traceId(),
@@ -423,11 +431,11 @@ export class Tracer {
         startedAt,
       }
     } else {
-      if (this.main === null || this.main.turnId === e.turnId) {
+      const turn = this.turnFor(e.turnId)
+      if (this.main === turn) {
         const stepModel = typeof e.model === 'string' && e.model.trim() !== '' ? e.model.trim() : null
         if (stepModel !== null) this.lastModel = stepModel
       }
-      const turn = this.turnFor(e.turnId)
       turn.lastStepSpan = spanId
       turn.steps += 1
       turn.lastMainToolUseId = null
@@ -782,6 +790,7 @@ export class Tracer {
       return
     }
     const turn = this.turnFor(e.turnId)
+    remember(this.pastTurns, e.turnId, true)
     if (this.main === turn) this.main = null
     remember(this.others, e.turnId, turn)
     const finish = (): void => {
@@ -847,7 +856,7 @@ export class Tracer {
       lastMainToolUseId: null,
       lastMainToolDecisionSource: null,
     }
-    if (this.main === null) this.main = turn
+    if (this.main === null && this.turnCount === 0 && !this.pastTurns.has(turnId)) this.main = turn
     else remember(this.others, turnId, turn)
     return turn
   }

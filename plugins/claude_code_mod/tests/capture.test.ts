@@ -627,6 +627,15 @@ test('session_start carries forward main-loop model across /clear, /compact, and
   world.steps.push({ result: { answer: 'stale', stopReason: 'end_turn', usage: USAGE } })
   await runStep($, { turnId: 'stale-turn', index: 0, model: 'example-stale-model' })
   await $.turn.complete({ turnId: 'main-1', answer: 'ok', durationMs: 10, isAborted: false, reason: 'answer' })
+  // Late steps arriving after main-1 completed (while main === null) must not overwrite lastModel either:
+  world.steps.push(
+    { result: { answer: 'late-1', stopReason: 'end_turn', usage: USAGE } },
+    { result: { answer: 'late-2', stopReason: 'end_turn', usage: USAGE } },
+    { result: { answer: 'late-3', stopReason: 'end_turn', usage: USAGE } },
+  )
+  await runStep($, { turnId: 'main-1', index: 1, model: 'example-post-complete-stale-1' })
+  await runStep($, { turnId: 'stale-turn', index: 1, model: 'example-post-complete-stale-2' })
+  await runStep($, { turnId: 'unseen-late-turn', index: 0, model: 'example-post-complete-stale-3' })
 
   await $.session.end({ reason: 'clear', sessionId: 'after-clear-1', resume: { id: 'after-clear-1' } })
   world.sessionId = 'after-clear-2'
@@ -653,6 +662,16 @@ test('session_start carries forward main-loop model across /clear, /compact, and
   await $.classic.SessionStart({ source: 'startup', session_id: 'fresh-no-model', cwd: '/work/my-repo' })
   await $.session.end({ reason: 'clear', sessionId: 'fresh-no-model', resume: { id: 'fresh-no-model' } })
   await $.classic.SessionStart({ source: 'clear', session_id: 'after-fresh-clear', cwd: '/work/my-repo' })
+  // Mid-turn reload (turn.step before any turn.start in this session) sets lastModel, and a late step after its completion does not clobber it:
+  world.steps.push(
+    { result: { answer: 'mid', stopReason: 'end_turn', usage: USAGE } },
+    { result: { answer: 'mid-late', stopReason: 'end_turn', usage: USAGE } },
+  )
+  await runStep($, { turnId: 'mid-turn-1', index: 0, model: 'example-midturn-model' })
+  await $.turn.complete({ turnId: 'mid-turn-1', answer: 'mid', durationMs: 10, isAborted: false, reason: 'answer' })
+  await runStep($, { turnId: 'mid-turn-1', index: 1, model: 'example-midturn-late-stale' })
+  await $.session.end({ reason: 'clear', sessionId: 'after-fresh-clear', resume: { id: 'after-fresh-clear' } })
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-midturn-clear', cwd: '/work/my-repo' })
 
   await world.clock.advance(5000)
   const starts = byType(world.sentRows(), 'STATE_DELTA')
@@ -674,6 +693,7 @@ test('session_start carries forward main-loop model across /clear, /compact, and
     { source: 'clear', model: undefined },
     { source: 'startup', model: undefined },
     { source: 'clear', model: undefined },
+    { source: 'clear', model: 'example-midturn-model' },
   ])
 })
 

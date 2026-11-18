@@ -2668,6 +2668,28 @@ def clean_dead_letter_checks():
               and len(listdir_fds) == 2 and all(isinstance(fd, int) for fd in listdir_fds),
               f'{status_ld} listdir_fds={listdir_fds!r} {err_ld!r}')
 
+        v2_empty = d / 'spill-v2-done.jsonl'
+        v2_empty.write_bytes(b'')
+        v2_out_a = d / 'outcome2-spill-v2-done.jsonl'
+        v2_out_b = d / 'outcome2-b-spill-v2-done.jsonl'
+        v2_out_a.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        v2_out_b.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        v2_live = d / 'spill-v2-live.jsonl'
+        v2_live.write_text(seal('{"row":1}\n'), encoding='utf-8')
+        v2_live_out = d / 'outcome2-spill-v2-live.jsonl'
+        v2_live_out.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        check('13n. record_of recognizes outcome2- and outcome2-b- versioned split journals',
+              clean.record_of('outcome2-spill-v2-done.jsonl') == 'spill-v2-done.jsonl'
+              and clean.record_of('outcome2-b-spill-v2-done.jsonl') == 'spill-v2-done.jsonl'
+              and clean.plan_deletions(d) == [v2_out_b, v2_out_a, v2_empty],
+              f'{clean.plan_deletions(d)!r}')
+        status_v2, _out_v2, err_v2 = call(clean.main, '--dir', str(base), '--execute')
+        check('13o. --execute removes outcome2-* beside 0-byte source while keeping outcome2-* beside live source',
+              status_v2 == 0 and err_v2 == ''
+              and not v2_empty.exists() and not v2_out_a.exists() and not v2_out_b.exists()
+              and v2_live.exists() and v2_live_out.exists(),
+              f'{status_v2} {err_v2!r}')
+
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
           writer_grants_checks, row_writer_role_checks, resources_checks, readers_checks, api_checks,

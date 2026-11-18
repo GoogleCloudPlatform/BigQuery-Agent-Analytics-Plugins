@@ -80,11 +80,11 @@ def _list_pinned_dir(directory: Path, dfd: int | None) -> list[Path]:
 
 
 def record_of(name: str) -> str | None:
-    """Return the valid mod source filename for an ``outcome-*`` record, or None."""
+    """Return the valid mod source filename for an ``outcome-*`` / ``outcome2-*`` record, or None."""
     m = MARKED_RE.match(name)
     candidate = m.group(1) if m is not None else None
     if candidate is None:
-        for prefix in ("outcome-b-", "outcome-"):
+        for prefix in ("outcome2-b-", "outcome2-", "outcome-b-", "outcome-"):
             if name.startswith(prefix):
                 candidate = name[len(prefix):]
                 break
