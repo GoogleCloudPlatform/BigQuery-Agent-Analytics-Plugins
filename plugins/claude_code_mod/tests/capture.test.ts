@@ -697,6 +697,103 @@ test('session_start carries forward main-loop model across /clear, /compact, and
   ])
 })
 
+test('a second turn whose turn.start was missed still links its tool rows to that turn without letting late unseen steps overwrite lastModel', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model-init', cwd: '/work/my-repo' })
+
+  // Turn 1 runs normally.
+  await $.turn.start({ turnId: 'turn-1', text: 'first' })
+  world.steps.push({ result: { answer: 'one', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'turn-1', index: 0, model: 'example-model-turn-1' })
+  await $.turn.complete({ turnId: 'turn-1', answer: 'one', durationMs: 20, isAborted: false, reason: 'answer' })
+
+  // Turn 2 misses turn.start: its step and tool call must still share trace_id, parent_span_id, and invocation_id.
+  world.steps.push({ result: { answer: 'two', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'turn-2-missed-start', index: 0, model: 'example-model-turn-2' })
+  await $.tool.call({ tool: 'Read', file_path: 'second-turn.ts' })
+  await $.turn.complete({ turnId: 'turn-2-missed-start', answer: 'two', durationMs: 20, isAborted: false, reason: 'answer' })
+
+  // Clear without explicit model keeps Turn 1's confirmed main-loop model rather than an unstarted turn's model.
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-missed-turn-clear'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-missed-turn-clear', cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+
+  const rows = world.sentRows()
+  const req2 = byType(rows, 'LLM_REQUEST').find(r => r.invocation_id === 'turn-2-missed-start')
+  const toolStart = byType(rows, 'TOOL_STARTING').find(r => json(r.content).args && (json(r.content).args as Record<string, unknown>).file_path === 'second-turn.ts')
+  const toolDone = byType(rows, 'TOOL_COMPLETED').find(r => r.span_id === toolStart?.span_id)
+  const invDone2 = byType(rows, 'INVOCATION_COMPLETED').find(r => r.invocation_id === 'turn-2-missed-start')
+
+  expect(req2?.trace_id).not.toBeNull()
+  expect(toolStart?.invocation_id).toBe('turn-2-missed-start')
+  expect(toolStart?.trace_id).toBe(req2?.trace_id)
+  expect(toolStart?.parent_span_id).toBe(req2?.span_id)
+  expect(toolDone?.invocation_id).toBe('turn-2-missed-start')
+  expect(toolDone?.trace_id).toBe(req2?.trace_id)
+  expect(invDone2?.trace_id).toBe(req2?.trace_id)
+
+  const clearStart = byType(rows, 'STATE_DELTA').find(r => (json(r.attributes).state_delta as Record<string, unknown>)?.start_source === 'clear')
+  expect((json(clearStart?.attributes ?? null).state_delta as Record<string, unknown>)?.model).toBe('example-model-turn-1')
+})
+
+test('a late step from a pre-resume or pre-branch turn arriving before the first new turn does not set lastModel', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model-pre', cwd: '/work/my-repo' })
+
+  // Completed turn + still-open turn before /resume:
+  await $.turn.start({ turnId: 'pre-resume-done', text: 'first' })
+  world.steps.push({ result: { answer: 'ok', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'pre-resume-done', index: 0, model: 'example-model-pre' })
+  await $.turn.complete({ turnId: 'pre-resume-done', answer: 'ok', durationMs: 10, isAborted: false, reason: 'answer' })
+  await $.turn.start({ turnId: 'pre-resume-open', text: 'second' })
+
+  await $.session.end({ reason: 'resume', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'resumed-session'
+  await $.classic.SessionStart({ source: 'resume', session_id: 'resumed-session', cwd: '/work/my-repo' })
+
+  // Late steps from both pre-resume turns arrive while turnCount === 0:
+  world.steps.push(
+    { result: { answer: 'late-done', stopReason: 'end_turn', usage: USAGE } },
+    { result: { answer: 'late-open', stopReason: 'end_turn', usage: USAGE } },
+  )
+  await runStep($, { turnId: 'pre-resume-done', index: 1, model: 'stale-pre-resume-model-1' })
+  await runStep($, { turnId: 'pre-resume-open', index: 0, model: 'stale-pre-resume-model-2' })
+
+  // Subsequent /clear without explicit model must omit model (not inherit stale pre-resume model):
+  await $.session.end({ reason: 'clear', sessionId: 'resumed-session', resume: { id: 'resumed-session' } })
+  world.sessionId = 'post-resume-clear'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'post-resume-clear', cwd: '/work/my-repo' })
+
+  // Sibling check: session switch via setSession (/branch) also retains pastTurns so a late pre-branch step does not set lastModel after startup without model.
+  await $.turn.start({ turnId: 'pre-branch-open', text: 'branching' })
+  world.sessionId = 'branched-session'
+  await $.classic.SessionStart({ source: 'startup', session_id: 'branched-session', cwd: '/work/my-repo' })
+  world.steps.push({ result: { answer: 'late-branch', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'pre-branch-open', index: 0, model: 'stale-pre-branch-model' })
+  await $.session.end({ reason: 'clear', sessionId: 'branched-session', resume: { id: 'branched-session' } })
+  world.sessionId = 'post-branch-clear'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'post-branch-clear', cwd: '/work/my-repo' })
+
+  await world.clock.advance(5000)
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => {
+      const sd = (json(r.attributes).state_delta ?? {}) as Record<string, unknown>
+      return { source: sd.start_source, model: sd.model }
+    })
+
+  expect(starts).toEqual([
+    { source: 'startup', model: 'example-model-pre' },
+    { source: 'resume', model: undefined },
+    { source: 'clear', model: undefined },
+    { source: 'startup', model: undefined },
+    { source: 'clear', model: undefined },
+  ])
+})
+
 test('a session that runs only /bqaa-status and exits emits and spills no session_start or session_end rows', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)

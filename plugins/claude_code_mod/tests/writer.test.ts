@@ -2187,7 +2187,15 @@ function exitReplayHarness(overrides: Partial<Config> = {}) {
       .filter(([p, text]) => p.includes(`/outcome-done-`) && p.endsWith(`-${name}`) && text !== '')
       .map(([p, text]) => {
         const parsed = parseFile(text)
-        return { path: p, complete: parsed.complete, data: parsed.unreadable[0] ? (JSON.parse(parsed.unreadable[0]) as Record<string, unknown>) : null }
+        let data: Record<string, unknown> | null = null
+        if (parsed.complete && parsed.unreadable[0]) {
+          try {
+            data = JSON.parse(parsed.unreadable[0]) as Record<string, unknown>
+          } catch {
+            data = null
+          }
+        }
+        return { path: p, complete: parsed.complete, data }
       })
 
   return {
@@ -2715,6 +2723,9 @@ test('T53-8a: unattended -p session.end emits a one-line held-file notice with c
   expect(heldNotices1.length).toBe(1)
   expect(heldNotices1[0]).toContain('1 dead-letter file(s) held')
   expect(heldNotices1[0]).toContain('/bqaa-backfill force')
+  expect(heldNotices1[0]).toContain('--plugin-dir')
+  expect(heldNotices1[0]).toContain('destination')
+  expect(heldNotices1[0]).toContain('dead-letter dir')
   expect(heldNotices1[0]).toContain('no answer before the session ended')
   expect(world.logs.filter(l => l.includes('dead-letter file(s) held')).length).toBe(1)
 })
@@ -2741,6 +2752,9 @@ test('T53-8b: subsequent -p process with standing held mark emits held-file noti
 
   expect(world.stderr.filter(l => l.includes('1 dead-letter file(s) held')).length).toBe(1)
   expect(world.stderr[0]).toContain('/bqaa-backfill force')
+  expect(world.stderr[0]).toContain('--plugin-dir')
+  expect(world.stderr[0]).toContain('destination')
+  expect(world.stderr[0]).toContain('dead-letter dir')
   expect(world.stderr[0]).toContain('no answer before the session ended')
 })
 
@@ -2924,6 +2938,91 @@ test('T53-9b: resuming a v2 split journal before its uncertain child was written
   expect(h.uncancelledTimers()).toEqual([])
 })
 
+test('T53-9c: interrupted markDone on a 501-row v2 split (0-byte truncation or partial write) leaves sending guard intact so 0.1.3 sends 0 rows and 0.1.4 finishes cleanly', async () => {
+  for (const storage of ['store', 'file'] as const) {
+    for (const cut of ['truncated', 'torn'] as const) {
+      const h = exitReplayHarness({ maxBatchRows: 500 })
+      if (storage === 'file') {
+        h.setStoreSetHook(async key => {
+          if (key.startsWith('replayed:')) throw new Error('store full')
+        })
+      }
+      const w1 = await h.warmWriter('s-1')
+      const name = `spill-20261013T200102003Z-t53-9c-${storage}-${cut}.jsonl`
+      const ids = Array.from({ length: 501 }, (_, i) => (40_000 + i).toString(16).padStart(32, '0'))
+      const sourcePath = h.seedSpill(name, ...ids)
+
+      // Simulate crash/failure inside markDone right after truncating or partially writing the retired mark.
+      let interruptedMarkDone = false
+      h.setWriteFileHook(async (path, text) => {
+        if (!interruptedMarkDone && path.includes('/outcome-done-') && path.endsWith(`-${name}`) && text.includes('"retired":true')) {
+          interruptedMarkDone = true
+          h.files.set(path, cut === 'truncated' ? '' : '{"fates":"L')
+          throw new Error(`killed during markDone (${cut})`)
+        }
+      })
+
+      h.setFetch(() => undefined)
+      const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+      await h.advance(50)
+      expect(h.requests.length).toBe(1)
+      expect(h.requests[0]!.ids.length).toBe(500)
+      // Batch 1 (500 rows) is acknowledged; Batch 2 (row 501) times out at exit cutoff.
+      h.requests[0]!.resolve(OK_INSERT)
+      await h.advance(750)
+      await exiting
+
+      expect(interruptedMarkDone).toBe(true)
+      expect(h.files.get(sourcePath)).not.toBe('')
+
+      // Advance past the 10-minute lease and run a 0.1.3 reader (ignores replayed:v2:* and outcome2-*).
+      await h.advance(600_001)
+      const baseIo = h.ioFor()
+      const io013: Io = {
+        ...baseIo,
+        storeGet: async key => {
+          if (key.startsWith('replayed:v2:')) return undefined
+          const val = await baseIo.storeGet(key)
+          if (key.startsWith('replayed:') && val && typeof val === 'object') {
+            const clone = { ...(val as Record<string, unknown>) }
+            delete clone.uncertainLines
+            delete clone.uncertain
+            return clone
+          }
+          return val
+        },
+        exists: async path => (path.includes('/outcome2-') ? false : baseIo.exists!(path)),
+        readFile: async path => (path.includes('/outcome2-') ? '' : baseIo.readFile(path)),
+        listDir: async dir => (await baseIo.listDir(dir)).filter(e => !e.name.startsWith('outcome2-')),
+      }
+      h.sent.length = 0
+      h.setFetch(async () => OK_INSERT)
+      const w013 = new Writer(io013, () => h.config, () => 's-013')
+      const r013Auto = await w013.backfill(['spill', 'retry'], 'auto')
+      expect(r013Auto.rowsSent).toBe(0)
+      const r013Cmd = await w013.backfill(['spill', 'retry', 'rejected'], 'command')
+      expect(r013Cmd.rowsSent).toBe(0)
+      expect(h.sent.length).toBe(0)
+
+      // Fresh 0.1.4 reader finishes retiring the parent with 0 rows sent on auto, and force sends only row 501.
+      h.setWriteFileHook(null)
+      await h.advance(600_001)
+      const w014 = h.newWriter('s-014')
+      const r014Auto = await w014.backfill(['spill', 'retry'], 'auto')
+      expect(r014Auto.rowsSent).toBe(0)
+      expect(h.sent.length).toBe(0)
+      expect(h.files.get(sourcePath)).toBe('')
+      expect(h.doneMarksFor(name).some(m => m.data?.retired === true)).toBe(true)
+
+      const r014Force = await w014.backfill(['spill', 'retry'], 'force')
+      expect(r014Force.rowsSent).toBe(1)
+      expect(h.sentOf(ids[500]!)).toBe(1)
+      for (let i = 0; i < 500; i += 1) expect(h.sentOf(ids[i]!)).toBe(0)
+      expect(h.uncancelledTimers()).toEqual([])
+    }
+  }
+})
+
 test('T53-10: single-batch exit replay writes outcome-done-* once up front with uncertain: true and performs no second overwrite at cutoff', async () => {
   const h = exitReplayHarness()
   const w1 = await h.warmWriter('s-1')
@@ -2986,6 +3085,91 @@ test('T53-11: live replay dispatched before shutdown retains its sending mark if
     expect(h.sentOf(id)).toBe(0)
     expect(h.uncancelledTimers()).toEqual([])
   }
+})
+
+test('T53-11b: live replay dispatched before shutdown on a 10s client timeout reports 1 held file when the 800 ms (or 0 ms) exit budget runs out first', async () => {
+  // Case 1: 800 ms -p exit budget with Batch 1 (500 rows) acknowledged and Batch 2 (row 501) on 10s timeout.
+  {
+    const h = exitReplayHarness({ requestTimeoutMs: 10_000, maxBatchRows: 500 })
+    const w1 = await h.warmWriter('s-1')
+    const name = 'spill-20261013T200102003Z-t53-11b-warm.jsonl'
+    const ids = Array.from({ length: 501 }, (_, i) => (50_000 + i).toString(16).padStart(32, '0'))
+    const sourcePath = h.seedSpill(name, ...ids)
+
+    h.setFetch(() => undefined)
+    const liveBackfill = w1.backfill(['spill', 'retry'], 'auto')
+    await h.advance(50)
+    expect(h.requests.length).toBe(1)
+    h.requests[0]!.resolve(OK_INSERT)
+    await h.advance(50)
+    expect(h.requests.length).toBe(2)
+
+    // Shutdown starts at t=100 ms with 800 ms exit budget while Batch 2 is on its 10s client timeout.
+    const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+    await h.advance(800)
+    await exiting
+
+    expect(w1.heldNoticeInfo().files).toBe(1)
+    expect(w1.heldNoticeInfo().reason ?? '').toContain('no answer before the session ended')
+    expect(h.files.get(sourcePath)).toBe('')
+    expect(h.uncancelledTimers()).toEqual([])
+    await liveBackfill
+
+    h.sent.length = 0
+    h.setFetch(async () => OK_INSERT)
+    const w2 = h.newWriter('s-2')
+    const autoReport = await w2.backfill(['spill', 'retry'], 'auto')
+    expect(autoReport.rowsSent).toBe(0)
+    const forceReport = await w2.backfill(['spill', 'retry'], 'force')
+    expect(forceReport.rowsSent).toBe(1)
+    expect(h.sentOf(ids[500]!)).toBe(1)
+    for (let i = 0; i < 500; i += 1) expect(h.sentOf(ids[i]!)).toBe(0)
+  }
+
+  // Case 2: cold / zero-budget exit while a 10s live replay batch is still in flight when spillForExit returns.
+  {
+    const h = exitReplayHarness({ requestTimeoutMs: 10_000 })
+    const w1 = h.newWriter('s-cold')
+    const name = 'spill-20261013T200102003Z-t53-11b-cold.jsonl'
+    h.seedSpill(name, 'c'.repeat(32))
+
+    h.setFetch(() => undefined)
+    const liveBackfill = w1.backfill(['spill', 'retry'], 'auto')
+    await h.advance(50)
+    expect(h.requests.length).toBe(1)
+
+    await w1.spillForExit(0, { sendQueued: true, replaySpills: true })
+    // Batch is still awaiting its 10s timeout, yet heldNoticeInfo already reports 1 held file for stderr notice.
+    expect(w1.heldNoticeInfo().files).toBe(1)
+    expect(w1.heldNoticeInfo().reason ?? '').toContain('no answer before the session ended')
+
+    await h.advance(10_000)
+    await liveBackfill
+    expect(h.uncancelledTimers()).toEqual([])
+  }
+})
+
+test('T53-11c: end-to-end -p session whose pre-shutdown replay stays on a 10s timeout emits 1 held-file notice on stderr at 800 ms exit', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_REQUEST_TIMEOUT_MS: '10000' })
+  const name = 'spill-20261013T200102003Z-t53-11c.jsonl'
+  world.files.set(`${PARTITION_DIR}/${name}`, parkedFile(parkedLine(TABLE_REF, '9'.repeat(32), 'earlier-p')))
+
+  // First flush of this session's row lands (OK_INSERT); then live auto-backfill starts and hangs on its 10s timeout.
+  world.replies = [OK_INSERT, { hang: true }, OK_INSERT]
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  await world.clock.settle()
+
+  const ending = $.session.end({ reason: 'other', sessionId: 'p-10s-inflight', resume: { id: 'p-10s-inflight' } })
+  await world.clock.advance(900)
+  await ending
+
+  const notices = world.stderr.filter(l => l.includes('1 dead-letter file(s) held'))
+  expect(notices.length).toBe(1)
+  expect(notices[0]).toContain('--plugin-dir')
+  world.releaseHung(OK_INSERT.status, OK_INSERT.text)
+  await world.clock.settle()
 })
 
 test('T53-12: 1,000-row exit replay with 500 retryable errors in Batch 1 gives Batch 2 the 100 ms reserve so Batch 1 auto-replays next session', async () => {
@@ -3109,9 +3293,143 @@ test('T53-14: a later scan that stops early on an earlier file preserves heldNot
 
   // Force backfill when BigQuery recovers clears both files and resets heldNoticeInfo to 0.
   h.setFetch(async () => OK_INSERT)
-  const forced = await w.backfill(['spill', 'retry'], 'force')
+  const wAdopted = h.newWriter('s-1b')
+  wAdopted.adopt(w)
+  const forced = await wAdopted.backfill(['spill', 'retry'], 'force')
   expect(forced.rowsSent).toBe(2)
+  expect(wAdopted.heldNoticeInfo().files).toBe(0)
+  expect(h.uncancelledTimers()).toEqual([])
+})
+
+test('T53-14b: a fresh -p writer whose first scan stops on an earlier file error still seeds later held files from the directory listing', async () => {
+  const h = exitReplayHarness()
+  const w = await h.warmWriter('s-fresh')
+
+  // Earlier file fails with 503 so backfillRun stops before scanning any of the later files.
+  h.seedSpill('spill-20261013T200102001Z-a-err.jsonl', '1'.repeat(32))
+
+  // Later file 1: held by another writer's unanswered mark.
+  const heldName = 'spill-20261013T200102005Z-b-held.jsonl'
+  const heldPath = h.seedSpill(heldName, '2'.repeat(32))
+  h.files.set(
+    `${PARTITION_DIR}/outcome-done-otherwriter-${heldName}`,
+    sealFile(`${JSON.stringify({ size: utf8Bytes(h.files.get(heldPath)!), sending: true, uncertain: true, by: 'otherwriter' })}\n`),
+  )
+
+  // Later file 2: held by a torn replay record.
+  const tornName = 'spill-20261013T200102006Z-c-torn.jsonl'
+  h.seedSpill(tornName, '3'.repeat(32))
+  h.files.set(`${PARTITION_DIR}/outcome-done-otherwriter-${tornName}`, '{"sending":true')
+
+  // Later file 3: unmarked ordinary spill (must NOT count as held).
+  h.seedSpill('spill-20261013T200102007Z-d-plain.jsonl', '4'.repeat(32))
+
+  // Later file 4: already-retired mark waiting only for source truncation (must NOT count as held).
+  const retiredName = 'spill-20261013T200102008Z-e-retired.jsonl'
+  const retiredPath = h.seedSpill(retiredName, '5'.repeat(32))
+  h.files.set(
+    `${PARTITION_DIR}/outcome-done-otherwriter-${retiredName}`,
+    sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: utf8Bytes(h.files.get(retiredPath)!), waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: 1_000 })}\n`),
+  )
+
+  h.setFetch(async () => UNAVAILABLE)
+  const r = await w.backfill(['spill', 'retry'], 'auto')
+  expect(r.error).not.toBeNull()
+  expect(w.heldNoticeInfo().files).toBe(2)
+  expect(w.heldNoticeInfo().reason ?? '').toContain('b-held.jsonl')
+  expect(h.uncancelledTimers()).toEqual([])
+})
+
+test('T53-14c: Windows dead-letter paths with backslash separators preserve heldNoticeInfo across early-stopped scans and prune emptied files', async () => {
+  const winRoot = 'C:\\Users\\dev\\.bqaa-mod\\dead-letter'
+  const winConfig = resolveConfig({ ...OPTIONS, deadLetterDir: winRoot }, { USERPROFILE: 'C:\\Users\\dev', USERNAME: 'dev' })
+  const winDir = deadLetterPartition(winConfig)
+  expect(winDir).toContain('\\')
+
+  const files = new Map<string, string>()
+  const store = new Map<string, unknown>()
+  let status = 200
+  const io: Io = {
+    now: () => 1_000,
+    after: () => ({ cancel: () => undefined }),
+    fetch: async () => (status === 200 ? OK_INSERT : UNAVAILABLE),
+    runCommand: async () => ({ exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' }),
+    envToken: async () => ACCESS_TOKEN,
+    writeFile: async (p, t) => void files.set(p, t),
+    readFile: async p => files.get(p) ?? '',
+    exists: async p => files.has(p),
+    listDir: async dir => {
+      const prefix = `${dir}\\`
+      return [...files.entries()]
+        .filter(([p]) => p.startsWith(prefix) && !p.slice(prefix.length).includes('\\'))
+        .map(([p, t]) => ({ name: p.slice(prefix.length), kind: 'file', size: utf8Bytes(t) }))
+    },
+    storeGet: async k => store.get(k),
+    storeSet: async (k, v) => void store.set(k, v),
+    storeDelete: async k => void store.delete(k),
+    status: () => undefined,
+    debug: () => undefined,
+  }
+
+  const w = new Writer(io, () => winConfig, () => 'win-s1')
+  const heldName = 'spill-20261013T200102005Z-b-held.jsonl'
+  const heldText = parkedFile(parkedLine(TABLE_REF, '1'.repeat(32), 'old'))
+  files.set(`${winDir}\\${heldName}`, heldText)
+  files.set(
+    `${winDir}\\outcome-done-otherwriter-${heldName}`,
+    sealFile(`${JSON.stringify({ size: utf8Bytes(heldText), sending: true, uncertain: true, by: 'otherwriter' })}\n`),
+  )
+
+  await w.backfill(['spill', 'retry'], 'auto')
+  expect(w.heldNoticeInfo().files).toBe(1)
+
+  // Add earlier failing file: Windows path in heldPaths must survive finish() prefix filter.
+  files.set(`${winDir}\\spill-20261013T200102001Z-a-err.jsonl`, parkedFile(parkedLine(TABLE_REF, '2'.repeat(32), 'old')))
+  status = 503
+  await w.backfill(['spill', 'retry'], 'recovery')
+  expect(w.heldNoticeInfo().files).toBe(1)
+
+  // Empty held file externally: Windows path must be pruned on next scan.
+  files.set(`${winDir}\\${heldName}`, '')
+  files.delete(`${winDir}\\spill-20261013T200102001Z-a-err.jsonl`)
+  status = 200
+  await w.backfill(['spill', 'retry'], 'auto')
   expect(w.heldNoticeInfo().files).toBe(0)
+})
+
+test('T53-14d: resuming an interrupted v2 split whose uncertain child and mark already landed before record() crashed counts the child only once', async () => {
+  const h = exitReplayHarness({ maxBatchRows: 1 })
+  const w1 = await h.warmWriter('s-1')
+  const name = 'spill-20261013T200102003Z-t53-14d.jsonl'
+  h.seedSpill(name, 'a'.repeat(32), 'b'.repeat(32))
+
+  // Let w1 record seq=1 (written: [false]), write the uncertain child's mark + file, and crash on record() seq=2!
+  let v2Sets = 0
+  h.setStoreSetHook(async key => {
+    if (key.startsWith('replayed:v2:')) {
+      v2Sets += 1
+      if (v2Sets >= 2) throw new Error('store failed on child record')
+    }
+  })
+  h.setWriteFileHook(async path => {
+    if (path.includes('/outcome2-')) throw new Error('disk failed on child record')
+  })
+
+  h.setFetch(() => undefined)
+  const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(50)
+  h.requests[0]!.resolve(OK_INSERT)
+  await h.advance(750)
+  await exiting
+
+  // Both parent and uncertain child exist on disk while journal still says written: [false].
+  h.setStoreSetHook(null)
+  h.setWriteFileHook(null)
+  await h.advance(600_001)
+  const w2 = h.newWriter('s-2')
+  const r2 = await w2.backfill(['spill', 'retry'], 'auto')
+  expect(r2.heldFiles).toBe(1)
+  expect(w2.heldNoticeInfo().files).toBe(1)
   expect(h.uncancelledTimers()).toEqual([])
 })
 
@@ -3146,4 +3464,84 @@ test('T53-15: exit-only headless spillForExit truncates >24h expired outcome-* a
   for (const p of expiredPaths) expect(h.files.get(p)).toBe('')
   expect(h.files.get(freshMark)).not.toBe('')
   expect(h.uncancelledTimers()).toEqual([])
+})
+
+test('T53-16: recording a fresh v1 or v2 outcome clears stale higher-seq journals in the opposite slot so waiting rows are never dropped', async () => {
+  for (const activeSlot of ['v2', 'v1'] as const) {
+    for (const storage of ['store', 'file'] as const) {
+      const h = exitReplayHarness({ maxBatchRows: 1 })
+      if (storage === 'file') {
+        h.setStoreSetHook(async key => {
+          if (key.startsWith('replayed:')) throw new Error('store full')
+        })
+      }
+      const w1 = await h.warmWriter('s-1')
+      const name = `spill-20261013T200102003Z-t53-16-${activeSlot}-${storage}.jsonl`
+      const id1 = '1'.repeat(32)
+      const id2 = '2'.repeat(32)
+      const sourcePath = h.seedSpill(name, id1, id2)
+      const size = utf8Bytes(h.files.get(sourcePath)!)
+
+      // Seed a stale higher-seq journal (seq: 9, claiming all rows landed with 0 leftover files) in the opposite slot
+      // from an earlier size of the same filename: ignored while source is live (size differs), but if left uncleared
+      // it wins seq comparison in parentFate (size: -1) and drops the newly written leftover child unsent!
+      const staleJournal = { fates: 'LL', reasons: [], refusals: [], size: size - 1, waits: false, seq: 9, files: [], written: [] }
+      if (activeSlot === 'v2') {
+        h.store.set(`replayed:${TABLE_REF}/${name}`, staleJournal)
+        h.files.set(`${PARTITION_DIR}/outcome-${name}`, sealFile(`${JSON.stringify(staleJournal)}\n`))
+      } else {
+        h.store.set(`replayed:v2:${TABLE_REF}/${name}`, staleJournal)
+        h.files.set(`${PARTITION_DIR}/outcome2-${name}`, sealFile(`${JSON.stringify(staleJournal)}\n`))
+      }
+
+      let calls = 0
+      h.setFetch((_url, _ids, controls) => {
+        calls += 1
+        if (calls === 1) {
+          controls.resolve(OK_INSERT)
+          return undefined
+        }
+        if (activeSlot === 'v1') {
+          controls.resolve(UNAVAILABLE)
+        }
+        return undefined
+      })
+
+      if (activeSlot === 'v2') {
+        const exiting = w1.spillForExit(800, { sendQueued: true, replaySpills: true })
+        await h.advance(800)
+        await exiting
+      } else {
+        await w1.backfill(['spill', 'retry'], 'auto')
+      }
+
+      // Opposite slot must be cleared on the first record() (both store key and outcome* files),
+      // parent emptied, and id2 preserved in a non-empty child spill file.
+      expect(h.files.get(sourcePath)).toBe('')
+      if (activeSlot === 'v2') {
+        expect(h.store.get(`replayed:${TABLE_REF}/${name}`)).toBeUndefined()
+        expect(h.files.get(`${PARTITION_DIR}/outcome-${name}`) ?? '').toBe('')
+      } else {
+        expect(h.store.get(`replayed:v2:${TABLE_REF}/${name}`)).toBeUndefined()
+        expect(h.files.get(`${PARTITION_DIR}/outcome2-${name}`) ?? '').toBe('')
+      }
+      const children = [...h.files.entries()].filter(([p, t]) => p.startsWith(`${PARTITION_DIR}/spill-`) && p !== sourcePath && t !== '')
+      expect(children.length).toBe(1)
+      expect(parseFile(children[0]![1]).lines.map(l => l.row.event_id)).toEqual([id2])
+
+      // Even if the done mark is absent (e.g., markDone failed on v1), parentFate (size: -1) must NOT pick the stale
+      // opposite-slot seq: 9 journal and drop the waiting child!
+      if (activeSlot === 'v1') {
+        for (const p of [...h.files.keys()]) {
+          if (p.includes('/outcome-done-') && p.endsWith(`-${name}`)) h.files.set(p, '')
+        }
+        h.sent.length = 0
+        h.setFetch(async () => OK_INSERT)
+        const r2 = await h.newWriter('s-2').backfill(['spill', 'retry'], 'auto')
+        expect(r2.rowsSent).toBe(1)
+        expect(h.sentOf(id2)).toBe(1)
+      }
+      expect(h.uncancelledTimers()).toEqual([])
+    }
+  }
 })

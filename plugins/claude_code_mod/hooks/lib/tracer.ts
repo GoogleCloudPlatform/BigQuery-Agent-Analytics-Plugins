@@ -64,6 +64,7 @@ type TurnCtx = {
   steps: number
   lastMainToolUseId: string | null
   lastMainToolDecisionSource: string | null
+  updatesLastModel: boolean
 }
 
 // One run of a subagent's (or teammate's) loop: its span under the main turn
@@ -213,6 +214,7 @@ export class Tracer {
   private engineVersion: string | null = null
   private sessionStartedAt: number | null = null
   private turnCount = 0
+  private sawTurnInSession = false
   private sessionHasActivity = false
   // Whether this session wrote its session_start row: a managed CLI that
   // keeps classic hooks from a user plugin raises no classic.SessionStart.
@@ -252,13 +254,15 @@ export class Tracer {
   setSession(info: { sessionId?: string | null; cwd?: string | null; engineVersion?: string | null; hostName?: string | null }): void {
     if (info.sessionId) {
       if (this.sessionId !== null && info.sessionId !== this.sessionId) {
+        if (this.main) remember(this.pastTurns, this.main.turnId, true)
+        for (const id of this.others.keys()) remember(this.pastTurns, id, true)
         this.sessionStartedAt = this.deps.now()
         this.turnCount = 0
+        this.sawTurnInSession = false
         this.sessionHasActivity = false
         this.sessionHasStart = false
         this.main = null
         this.others.clear()
-        this.pastTurns.clear()
         this.loops.clear()
         this.inflightTools.clear()
         this.decisions.clear()
@@ -275,12 +279,24 @@ export class Tracer {
   // `atMs`, the time the event came: its row can be written later, once the
   // configuration is loaded.
   sessionStarted(e: { session_id?: string; source: string; model?: string; permission_mode?: string; cwd?: string }, atMs?: number): void {
-    if (e.session_id) this.sessionId = e.session_id
+    if (e.session_id) {
+      if (this.sessionId !== null && e.session_id !== this.sessionId) {
+        if (this.main) remember(this.pastTurns, this.main.turnId, true)
+        for (const id of this.others.keys()) remember(this.pastTurns, id, true)
+        this.main = null
+        this.others.clear()
+        this.loops.clear()
+        this.inflightTools.clear()
+        this.decisions.clear()
+      }
+      this.sessionId = e.session_id
+    }
     if (e.cwd) this.cwd = e.cwd
     const at = atMs ?? this.deps.now()
     if (e.source !== 'compact') {
       this.sessionStartedAt = at
       this.turnCount = 0
+      this.sawTurnInSession = false
       this.sessionHasActivity = false
     }
     const explicitModel = typeof e.model === 'string' && e.model.trim() !== '' ? e.model.trim() : null
@@ -342,10 +358,10 @@ export class Tracer {
       this.sessionId = null
       this.sessionStartedAt = null
       this.turnCount = 0
+      this.sawTurnInSession = false
     }
     if (e.reason === 'resume') {
       this.lastModel = null
-      this.pastTurns.clear()
     }
   }
 
@@ -399,7 +415,9 @@ export class Tracer {
       steps: 0,
       lastMainToolUseId: null,
       lastMainToolDecisionSource: null,
+      updatesLastModel: true,
     }
+    this.sawTurnInSession = true
     this.turnCount += 1
     this.emit({
       eventType: 'INVOCATION_STARTING',
@@ -432,7 +450,7 @@ export class Tracer {
       }
     } else {
       const turn = this.turnFor(e.turnId)
-      if (this.main === turn) {
+      if (this.main === turn && turn.updatesLastModel) {
         const stepModel = typeof e.model === 'string' && e.model.trim() !== '' ? e.model.trim() : null
         if (stepModel !== null) this.lastModel = stepModel
       }
@@ -845,6 +863,7 @@ export class Tracer {
     // A turn whose turn.start this module did not see (it loaded mid-turn):
     // continue under a fresh trace, with no INVOCATION_STARTING row. It is
     // the current turn only when there is no other.
+    const canBeMain = this.main === null && !this.pastTurns.has(turnId)
     const turn: TurnCtx = {
       turnId,
       traceId: this.deps.ids.traceId(),
@@ -855,9 +874,12 @@ export class Tracer {
       steps: 0,
       lastMainToolUseId: null,
       lastMainToolDecisionSource: null,
+      updatesLastModel: canBeMain && !this.sawTurnInSession,
     }
-    if (this.main === null && this.turnCount === 0 && !this.pastTurns.has(turnId)) this.main = turn
-    else remember(this.others, turnId, turn)
+    if (canBeMain) {
+      this.main = turn
+      this.sawTurnInSession = true
+    } else remember(this.others, turnId, turn)
     return turn
   }
 
