@@ -297,6 +297,10 @@ const EXIT_REPLAY_POST_MIN_MS = 300
 const EXIT_REPLAY_RESERVE_MS = 100
 const EXIT_REPLAY_COMMIT_MS = 25
 const EXIT_REPLAY_MIN_MS = EXIT_REPLAY_POST_MIN_MS + EXIT_REPLAY_RESERVE_MS
+// Historical cleanup runs only after live spills, and during session-end
+// replay takes at most this cap and share of the remaining exit budget.
+const EXIT_CLEANUP_CAP_MS = 100
+const EXIT_CLEANUP_SHARE = 0.25
 
 const diagnostic = (text: string, maxChars = DIAGNOSTIC_CHARS): string => redactDiagnostic(text, maxChars)
 // An error's own message, without the `Error: ` errorText puts first.
@@ -415,16 +419,25 @@ const inDir = (path: string, dir: string): boolean => {
   return rest !== '' && !rest.includes('/') && !rest.includes('\\')
 }
 
+const dirKey = (dir: string): string => {
+  const trimmed = dir.replace(/[\\/]+$/, '')
+  return trimmed === '' && (dir.startsWith('/') || dir.startsWith('\\')) ? '/' : trimmed
+}
+
 const sameNames = (a: readonly string[], b: readonly string[]): boolean =>
   a.length === b.length && a.every((name, i) => baseOf(name) === baseOf(b[i] ?? ''))
+
+type HeldEntry = { reason: string; mayBeActive: boolean }
+type ActiveSendingMark = { path: string; name: string; dir: string; trigger: BackfillReport['trigger']; size: number }
 
 // A record as a writer finds it, and whether one may be in a file beside the
 // source (to empty along with it). `v2` marks versioned split journals carrying
 // `uncertainLines`, stored under keys/filenames older 0.1.3 readers ignore.
 type Found = { journal: Partial<Journal>; filed: boolean; v2?: boolean }
 // No outcome recorded, and replays' marks (`pending`, the writers that left
-// them): each sent rows, or is about to, and may yet record one.
-type Pending = { pending: string[]; uncertain?: boolean }
+// them; `activeBy`, those without `uncertain: true` whose session may still be
+// running): each sent rows, or is about to, and may yet record one.
+type Pending = { pending: string[]; activeBy?: string[]; uncertain?: boolean }
 
 // Where the record of the file `name`, `size` long, in `dir` is kept.
 const sourceFor = (dir: string, name: string, size: number, c: Config): Source => {
@@ -650,14 +663,16 @@ export class Writer {
   // Latest count and summary of dead-letter files held for `/bqaa-backfill force`
   // (surfaced by `-p` `headlessNotice` when `problem === null`), plus known
   // held file paths so a scan that stops early preserves standing held marks.
-  private lastHeld: { files: number; reason: string | null; trigger: BackfillReport['trigger'] | null } = { files: 0, reason: null, trigger: null }
-  private inProgressHeld: { files: number; reason: string | null; trigger: BackfillReport['trigger'] | null } = { files: 0, reason: null, trigger: null }
-  private currentScanHeld = new Map<string, string>()
-  private heldPaths = new Map<string, string>()
-  // Replay whose marked HTTP batch is currently dispatched on the wire, so an
-  // exit whose budget ends while a pre-shutdown replay is still in flight
-  // still reports the held file, and replayAtExit can cut off its wait.
-  private inFlightReplay: { path: string; name: string; dir: string; trigger: BackfillReport['trigger'] } | null = null
+  private lastHeld: { files: number; reason: string | null; trigger: BackfillReport['trigger'] | null; mayBeActive: boolean } = { files: 0, reason: null, trigger: null, mayBeActive: false }
+  private inProgressHeld: { files: number; reason: string | null; trigger: BackfillReport['trigger'] | null; mayBeActive: boolean } = { files: 0, reason: null, trigger: null, mayBeActive: false }
+  private currentScanHeld = new Map<string, HeldEntry>()
+  private heldPaths = new Map<string, HeldEntry>()
+  private heldCountByDir = new Map<string, number>()
+  private heldActiveCountByDir = new Map<string, number>()
+  // Sources for which this writer has written a standing sending mark on disk
+  // (`markSending`) and has not yet confirmed its release (`unmark`) or
+  // retirement (`writeOut`), so exit notices stay aligned with durable marks.
+  private activeSendingMarks = new Map<string, ActiveSendingMark>()
   private activeExitMarks: ReplayExitMarks | null = null
   private pendingReplayWakeups = new Set<(marks: ReplayExitMarks) => void>()
   // Orphaned v2 store keys already verified/deleted for retired sources in this session.
@@ -777,8 +792,10 @@ export class Writer {
     // comes to is held here too. Its marks stay its own: one with no
     // outcome held keeps this writer from sending the file, as another's.
     this.rewrites = previous.rewrites
-    for (const [p, msg] of this.heldPaths) previous.heldPaths.set(p, msg)
+    for (const [p, entry] of this.heldPaths) previous.setHeldPath(p, entry)
     this.heldPaths = previous.heldPaths
+    this.heldCountByDir = previous.heldCountByDir
+    this.heldActiveCountByDir = previous.heldActiveCountByDir
     // A denial of writes BigQuery gave rows (insertAll, not tables.get)
     // stands across the takeover, with the rows parked under it, while the
     // table and dead-letter directory stay the same: a /bqaa-status check
@@ -2176,55 +2193,105 @@ export class Writer {
     return this.backfilling !== null
   }
 
-  private noteHeld(report: BackfillReport, trigger: BackfillReport['trigger'], message: string, heldPath: string): void {
+  private setHeldPath(path: string, entry: HeldEntry): void {
+    const prev = this.heldPaths.get(path)
+    this.heldPaths.set(path, entry)
+    const key = dirKey(dirOf(path))
+    if (prev === undefined) {
+      this.heldCountByDir.set(key, (this.heldCountByDir.get(key) ?? 0) + 1)
+      if (entry.mayBeActive) this.heldActiveCountByDir.set(key, (this.heldActiveCountByDir.get(key) ?? 0) + 1)
+    } else if (prev.mayBeActive !== entry.mayBeActive) {
+      const next = (this.heldActiveCountByDir.get(key) ?? 0) + (entry.mayBeActive ? 1 : -1)
+      if (next <= 0) this.heldActiveCountByDir.delete(key)
+      else this.heldActiveCountByDir.set(key, next)
+    }
+  }
+
+  private deleteHeldPath(path: string): void {
+    const prev = this.heldPaths.get(path)
+    if (prev === undefined) return
+    this.heldPaths.delete(path)
+    const key = dirKey(dirOf(path))
+    const next = (this.heldCountByDir.get(key) ?? 0) - 1
+    if (next <= 0) this.heldCountByDir.delete(key)
+    else this.heldCountByDir.set(key, next)
+    if (prev.mayBeActive) {
+      const nextActive = (this.heldActiveCountByDir.get(key) ?? 0) - 1
+      if (nextActive <= 0) this.heldActiveCountByDir.delete(key)
+      else this.heldActiveCountByDir.set(key, nextActive)
+    }
+  }
+
+  private heldCountIn(dir: string): number {
+    return this.heldCountByDir.get(dirKey(dir)) ?? 0
+  }
+
+  private hasActiveHeldIn(dir: string): boolean {
+    return (this.heldActiveCountByDir.get(dirKey(dir)) ?? 0) > 0
+  }
+
+  private noteHeld(report: BackfillReport, trigger: BackfillReport['trigger'], message: string, heldPath: string, mayBeActive = false): void {
     const cleanMsg = diagnostic(message)
-    this.currentScanHeld.set(heldPath, cleanMsg)
-    this.heldPaths.set(heldPath, cleanMsg)
+    const entry: HeldEntry = { reason: cleanMsg, mayBeActive }
+    this.currentScanHeld.set(heldPath, entry)
+    this.setHeldPath(heldPath, entry)
     report.heldFiles = this.currentScanHeld.size
     report.held ??= cleanMsg
     const dir = dirOf(heldPath)
-    const heldCount = Math.max(report.heldFiles, [...this.heldPaths.keys()].filter(p => inDir(p, dir)).length)
-    this.inProgressHeld = { files: heldCount, reason: report.held, trigger }
+    const heldCount = Math.max(report.heldFiles, this.heldCountIn(dir))
+    const active = this.hasActiveHeldIn(dir)
+    this.inProgressHeld = { files: heldCount, reason: this.inProgressHeld.reason ?? report.held, trigger, mayBeActive: active }
   }
 
-  heldNoticeInfo(): { files: number; reason: string | null; trigger: BackfillReport['trigger'] | null } {
+  heldNoticeInfo(): { files: number; reason: string | null; trigger: BackfillReport['trigger'] | null; mayBeActive: boolean } {
     const dir = deadLetterPartition(this.config())
-    const paths = new Map<string, string>()
-    let activeInFlight: { path: string; name: string; dir: string; trigger: BackfillReport['trigger'] } | null = null
+    const paths = new Map<string, HeldEntry>()
+    let activeMark: ActiveSendingMark | null = null
+    const seenMaps = new Set<Map<string, HeldEntry>>()
     for (const w of [...this.before, this]) {
-      for (const [p, msg] of w.heldPaths) {
-        if (inDir(p, dir)) paths.set(p, msg)
+      if (!seenMaps.has(w.heldPaths)) {
+        seenMaps.add(w.heldPaths)
+        for (const [p, entry] of w.heldPaths) {
+          if (inDir(p, dir)) paths.set(p, entry)
+        }
       }
-      if (this.closing && w.inFlightReplay !== null && inDir(w.inFlightReplay.path, dir)) {
-        activeInFlight ??= w.inFlightReplay
-        if (!paths.has(w.inFlightReplay.path)) {
-          paths.set(
-            w.inFlightReplay.path,
-            diagnostic(
-              `a replay of ${w.inFlightReplay.name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
-            ),
-          )
+      if (this.closing || w.backfilling === null) {
+        for (const [p, mark] of w.activeSendingMarks) {
+          if (!inDir(p, dir)) continue
+          activeMark ??= mark
+          if (!paths.has(p)) {
+            paths.set(p, {
+              reason: diagnostic(
+                `a replay of ${mark.name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
+              ),
+              mayBeActive: false,
+            })
+          }
         }
       }
     }
-    const base =
-      this.inProgressHeld.files > 0 && this.inProgressHeld.files >= this.lastHeld.files
-        ? this.inProgressHeld
-        : this.lastHeld.files > 0
-          ? this.lastHeld
-          : this.inProgressHeld
-    const files = Math.max(base.files, paths.size)
-    if (files <= 0) return { files: 0, reason: null, trigger: base.trigger }
-    const reason = base.reason ?? paths.values().next().value ?? null
-    const trigger = base.trigger ?? activeInFlight?.trigger ?? null
-    return { files, reason, trigger }
+    const trigger = this.inProgressHeld.trigger ?? (this.lastHeld.files > 0 ? this.lastHeld.trigger : null) ?? activeMark?.trigger ?? this.lastHeld.trigger ?? null
+    const files = paths.size
+    if (files <= 0) return { files: 0, reason: null, trigger, mayBeActive: false }
+    let mayBeActive = false
+    let activeReason: string | null = null
+    let firstReason: string | null = null
+    for (const entry of paths.values()) {
+      firstReason ??= entry.reason
+      if (entry.mayBeActive) {
+        mayBeActive = true
+        activeReason ??= entry.reason
+      }
+    }
+    return { files, reason: activeReason ?? firstReason, trigger, mayBeActive }
   }
 
   private async backfillRun(kinds: DeadLetterKind[], trigger: BackfillReport['trigger'], dir: string, parked: number): Promise<BackfillReport> {
     const c = this.config()
+    const startedAtExit = this.exitReplay !== null
     const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, rowsRefused: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], incompleteFiles: [], held: null, heldFiles: 0, error: null, finishedAt: null }
     this.currentScanHeld.clear()
-    this.inProgressHeld = { files: 0, reason: null, trigger }
+    this.inProgressHeld = { files: 0, reason: null, trigger, mayBeActive: false }
     const tally: ReplayTally = { waiting: 0, requests: 0 }
     const finish = (): BackfillReport => {
       report.finishedAt = this.io.now()
@@ -2247,11 +2314,40 @@ export class Writer {
         this.backfillReport = { ...this.backfillReport, held: null, heldFiles: 0 }
       }
       const scannedHeld = this.currentScanHeld.size
-      const heldInDir = [...this.heldPaths.entries()].filter(([p]) => inDir(p, dir))
-      const knownHeld = Math.max(scannedHeld, heldInDir.length)
-      const reason = scannedHeld > 0 ? report.held : (heldInDir[0]?.[1] ?? null)
-      this.lastHeld = { files: knownHeld, reason: knownHeld > 0 ? reason : null, trigger }
-      this.inProgressHeld = { files: 0, reason: null, trigger: null }
+      const knownHeld = Math.max(scannedHeld, this.heldCountIn(dir))
+      const mayBeActive = this.hasActiveHeldIn(dir)
+      let reason: string | null = null
+      if (knownHeld > 0) {
+        if (mayBeActive) {
+          for (const entry of this.currentScanHeld.values()) {
+            if (entry.mayBeActive) {
+              reason = entry.reason
+              break
+            }
+          }
+          if (reason === null) {
+            for (const [p, entry] of this.heldPaths) {
+              if (entry.mayBeActive && inDir(p, dir)) {
+                reason = entry.reason
+                break
+              }
+            }
+          }
+        }
+        if (reason === null) {
+          if (scannedHeld > 0) reason = report.held
+          else {
+            for (const [p, entry] of this.heldPaths) {
+              if (inDir(p, dir)) {
+                reason = entry.reason
+                break
+              }
+            }
+          }
+        }
+      }
+      this.lastHeld = { files: knownHeld, reason, trigger, mayBeActive }
+      this.inProgressHeld = { files: 0, reason: null, trigger: null, mayBeActive: false }
       this.currentScanHeld.clear()
       return report
     }
@@ -2385,110 +2481,20 @@ export class Writer {
     // say) are let go.
     for (const path of this.rewrites.keys()) if (inDir(path, dir) && !there.has(path)) this.rewrites.delete(path)
     for (const path of this.uncertainSources.keys()) if (inDir(path, dir) && !there.has(path)) this.uncertainSources.delete(path)
-    for (const path of this.heldPaths.keys()) if (inDir(path, dir) && !there.has(path)) this.heldPaths.delete(path)
-    // The records of files emptied more than a day ago go: no late copy of
-    // another session's comes that long after. How long ago: by the record
-    // file's time in the listing, or, where the listing gives none, by when
-    // the file's done mark says it was done (none: kept).
-    const doneAt = new Map<string, number | null>()
-    const retiredAt = async (of: string): Promise<number | null> => {
-      const known = doneAt.get(of)
-      if (known !== undefined) return known
-      let at: number | null = null
-      for (const x of companions.get(of) ?? []) {
-        if (doneMarkerOf(x.name, of) === null || x.size === 0) continue
-        try {
-          const kept = journalOf(await this.io.readFile(joinPath(dir, x.name)))
-          if (kept !== undefined && kept !== 'torn' && typeof kept.retiredAt === 'number') at = Math.max(at ?? kept.retiredAt, kept.retiredAt)
-        } catch {
-          // Not read: no time from it.
-        }
-      }
-      doneAt.set(of, at)
-      return at
+    for (const path of [...this.heldPaths.keys()]) if (inDir(path, dir) && !there.has(path)) this.deleteHeldPath(path)
+    for (const w of [...this.before, this]) {
+      for (const path of [...w.activeSendingMarks.keys()]) if (inDir(path, dir) && !there.has(path)) w.activeSendingMarks.delete(path)
     }
-    // A legacy writer that retires a source only deletes `replayed:<dest>/<name>`
-    // and leaves `replayed:v2:<dest>/<name>` orphaned in `$.store`. Reclaim any
-    // such orphaned v2 key once a retired done mark stands beside the emptied
-    // or removed source (checked at most once per source per session), while
-    // never deleting a store journal that still names a non-empty child in `listed`.
-    const hasLiveChild = (stored: unknown): boolean => {
-      if (stored === null || typeof stored !== 'object') return false
-      const fs = (stored as Partial<Journal>).files
-      return Array.isArray(fs) && fs.some(f => typeof f === 'string' && (listed.get(baseOf(f)) ?? 0) > 0)
-    }
-    const cleanOrphanedRetiredV2 = async (): Promise<void> => {
-      for (const [of, beside] of besides) {
-        if (this.exitReplay !== null && (this.exitReplay.postCutoff.passed() || this.exitReplay.postUntil - this.io.now() <= 0)) break
-        if (beside.done.length === 0 || (listed.get(of) ?? 0) > 0) continue
-        const v2Key = `replayed:v2:${dest}/${of}`
-        if (this.cleanedRetiredV2.has(v2Key)) continue
-        try {
-          const stored = await this.io.storeGet(v2Key)
-          if (stored === undefined) {
-            this.cleanedRetiredV2.add(v2Key)
-            continue
-          }
-          if (hasLiveChild(stored)) continue
-          let retired = false
-          for (const doneName of beside.done) {
-            const kept = journalOf(await this.io.readFile(joinPath(dir, doneName)).catch(() => ''))
-            if (kept !== undefined && kept !== 'torn' && kept.retired === true) {
-              retired = true
-              break
-            }
-          }
-          if (!retired) continue
-          await this.io.storeDelete(v2Key)
-          this.cleanedRetiredV2.add(v2Key)
-        } catch {
-          // Best-effort cleanup; next replay retries.
-        }
-      }
-    }
-    const cleanExpiredRecords = async (): Promise<void> => {
-      const expiredOf = new Set<string>()
-      const unexpiredOf = new Set<string>()
-      for (const e of items) {
-        if (this.exitReplay !== null && (this.exitReplay.postCutoff.passed() || this.exitReplay.postUntil - this.io.now() <= 0)) break
-        if (e.kind !== 'file' || e.size === 0) continue
-        const of = recordOf(e.name)
-        if (of === null || (listed.get(of) ?? 0) > 0) continue
-        const at = e.mtimeMs ? e.mtimeMs : await retiredAt(of)
-        if (at === null || this.io.now() - at < RETIRED_MS) {
-          unexpiredOf.add(of)
-          continue
-        }
-        try {
-          await this.io.writeFile(joinPath(dir, e.name), '')
-          expiredOf.add(of)
-        } catch {
-          // The next replay tries again.
-        }
-      }
-      for (const of of expiredOf) {
-        if (this.exitReplay !== null && (this.exitReplay.postCutoff.passed() || this.exitReplay.postUntil - this.io.now() <= 0)) break
-        if (unexpiredOf.has(of)) continue
-        for (const key of [`replayed:${dest}/${of}`, `replayed:v2:${dest}/${of}`]) {
-          try {
-            const stored = await this.io.storeGet(key)
-            if (stored !== undefined && !hasLiveChild(stored)) await this.io.storeDelete(key)
-          } catch {
-            // Best-effort store cleanup.
-          }
-        }
-      }
-      if (besides.size > 0) await cleanOrphanedRetiredV2()
-    }
-    if (this.exitReplay === null && companions.size > 0) await cleanExpiredRecords()
+    const emptiedInRun = new Set<string>()
+    const fileParent = new Map<string, string>()
+    const isSourceLive = (n: string): boolean => (listed.get(n) ?? 0) > 0 && !emptiedInRun.has(n)
     const me = this.sessionId() ?? 'unknown'
-    const seededState: { dirCount: number | null } = { dirCount: null }
     for (const name of files) {
       if (report.error || this.replayStops(trigger, tally)) {
         const companionEntries = companions.get(name)
         if (trigger !== 'force' && companionEntries !== undefined) {
           try {
-            await this.seedSkippedHeld(dir, name, sizes.get(name) ?? -1, c, companionEntries, listed, seededState, trigger)
+            await this.seedSkippedHeld(dir, name, sizes.get(name) ?? -1, c, companionEntries, listed, trigger)
           } catch {
             // Best-effort held-file seeding on early stop.
           }
@@ -2542,7 +2548,7 @@ export class Writer {
           if (kindOf(name) !== 'rejected') tally.waiting += 1
           continue
         }
-        this.heldPaths.delete(path)
+        this.deleteHeldPath(path)
         if (found === 'torn' || found === 'conflict') {
           // Its record was cut off part-way (with none whole), or conflicting
           // v1/v2 journals disagree for this source size: nothing of what it
@@ -2553,7 +2559,8 @@ export class Writer {
               found === 'conflict'
                 ? `conflicting replay records exist for ${name}; /bqaa-backfill force replays the file afresh`
                 : `the replay record of ${name} is cut off part-way; /bqaa-backfill force replays the file afresh`
-            this.noteHeld(report, trigger, msg, path)
+            const hasActiveForeign = await this.hasActiveForeignMark(source)
+            this.noteHeld(report, trigger, msg, path, hasActiveForeign)
             report.skippedFiles += 1
             if (kindOf(name) !== 'rejected') tally.waiting += 1
             continue
@@ -2568,12 +2575,13 @@ export class Writer {
           // force, for a writer that stopped, replays it afresh. A mark of
           // this writer's own is no other replay's: it would hold the outcome.
           const ownUncertain = this.uncertainSources.get(path) === source.size
+          const hasActiveForeign = (found.activeBy ?? []).some(by => by !== this.mark)
           if (held === undefined && trigger !== 'force' && found.pending.some(by => by !== this.mark || ownUncertain)) {
             const msg =
-              ownUncertain || found.uncertain === true
+              !hasActiveForeign && (ownUncertain || found.uncertain === true)
                 ? `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`
                 : `a replay of ${name} sent rows and has recorded no outcome; if that session stopped, /bqaa-backfill force replays the file afresh`
-            this.noteHeld(report, trigger, msg, path)
+            this.noteHeld(report, trigger, msg, path, hasActiveForeign)
             report.skippedFiles += 1
             if (kindOf(name) !== 'rejected') tally.waiting += 1
             continue
@@ -2598,7 +2606,7 @@ export class Writer {
                 )
               }
             }
-            if (!done && known.files.some(f => f.uncertain && f.text !== null)) {
+            if (!done && this.rewrites.has(path) && known.files.some(f => f.uncertain && f.text !== null)) {
               this.noteHeld(
                 report,
                 trigger,
@@ -2607,6 +2615,7 @@ export class Writer {
               )
             }
           }
+          if (done) emptiedInRun.add(name)
           emptied = done
           // What it wrote out waits for the next replay.
           if (known.waits) tally.waiting += 1
@@ -2633,6 +2642,8 @@ export class Writer {
             if (kindOf(name) !== 'rejected') tally.waiting += 1
           } else if (text === '') {
             this.uncertainSources.delete(path)
+            for (const w of [...this.before, this]) w.activeSendingMarks.delete(path)
+            emptiedInRun.add(name)
             // Emptied since it was listed: by another writer, which writes
             // its done mark first, or by a write that starts it over, still
             // under way. With no done mark beside it, it waits.
@@ -2640,7 +2651,9 @@ export class Writer {
           } else {
             this.seenSince.delete(path)
             const parentName = parsed.parent === null ? null : baseOf(parsed.parent)
-            const fate = parentName === null ? 'go' : await this.parentFate(dir, parentName, path, listed.get(parentName) ?? 0, c)
+            fileParent.set(name, parentName ?? '')
+            const parentSize = parentName !== null && isSourceLive(parentName) ? (listed.get(parentName) ?? 0) : 0
+            const fate = parentName === null ? 'go' : await this.parentFate(dir, parentName, path, parentSize, c)
             if (fate === 'wait') {
               // Written by a replay of another file whose record does not have
               // it as written yet: it waits until that replay is finished.
@@ -2652,6 +2665,7 @@ export class Writer {
               // the outcome its parent was done by does not name: those rows
               // that outcome has. It is emptied, and none of it goes.
               emptied = await this.emptyCopy(path)
+              if (emptied) emptiedInRun.add(name)
             } else if (fate === 'ambiguous' && trigger !== 'force') {
               // Conflicting parent records disagree without naming this child:
               // preserve the child untouched and report the ambiguity rather
@@ -2667,6 +2681,7 @@ export class Writer {
             } else {
               if (trigger === 'force') this.uncertainSources.delete(path)
               emptied = await this.backfillFile(dir, name, parsed, source, c, kinds, trigger, report, tally)
+              if (this.retiredEmpty.has(path)) emptiedInRun.add(name)
               report.files += 1
             }
           }
@@ -2676,7 +2691,7 @@ export class Writer {
         // A file whose record could not be read or written partway (the
         // store or the disk refusing it): its rows stay, it waits for the
         // next replay, and the replay goes on with the files after it.
-        if (priorHeld !== undefined && !this.heldPaths.has(path)) this.heldPaths.set(path, priorHeld)
+        if (priorHeld !== undefined && !this.heldPaths.has(path)) this.setHeldPath(path, priorHeld)
         report.held ??= diagnostic(`${name}: ${messageOf(err)}`)
         report.skippedFiles += 1
         if (kindOf(name) !== 'rejected') tally.waiting += 1
@@ -2688,7 +2703,232 @@ export class Writer {
         }
       }
     }
-    if (this.exitReplay !== null && companions.size > 0) await cleanExpiredRecords()
+    // Historical record retention and orphaned v2 store reclamation always run
+    // AFTER live spills so cleanup never starves waiting rows or wipes a file
+    // journal that a live child still depends on.
+    if (companions.size > 0 || besides.size > 0) {
+      let cleanupUntil = Number.POSITIVE_INFINITY
+      if (startedAtExit && this.exitReplay !== null) {
+        const now = this.io.now()
+        const remaining = Math.max(0, this.exitReplay.postUntil - now)
+        const budget = Math.min(EXIT_CLEANUP_CAP_MS, Math.floor(remaining * EXIT_CLEANUP_SHARE))
+        cleanupUntil = Math.min(this.exitReplay.postUntil, now + budget)
+      }
+      const cleanupStopped = (): boolean => {
+        if (this.exitReplay === null) return this.closing
+        if (!startedAtExit) return true
+        return this.exitReplay.postCutoff.passed() || this.io.now() >= cleanupUntil
+      }
+      if (!cleanupStopped()) {
+        const doneAt = new Map<string, number | null>()
+        const retiredAt = async (of: string): Promise<number | null> => {
+          const known = doneAt.get(of)
+          if (known !== undefined) return known
+          let at: number | null = null
+          for (const x of companions.get(of) ?? []) {
+            if (cleanupStopped()) return null
+            if (doneMarkerOf(x.name, of) === null || x.size === 0) continue
+            try {
+              const kept = journalOf(await this.io.readFile(joinPath(dir, x.name)))
+              if (kept !== undefined && kept !== 'torn' && typeof kept.retiredAt === 'number') at = Math.max(at ?? kept.retiredAt, kept.retiredAt)
+            } catch {
+              // Not read: no time from it.
+            }
+          }
+          doneAt.set(of, at)
+          return at
+        }
+        const hasLiveChild = (stored: unknown): boolean => {
+          if (stored === null || typeof stored !== 'object') return false
+          const fs = (stored as Partial<Journal>).files
+          return Array.isArray(fs) && fs.some(f => typeof f === 'string' && isSourceLive(baseOf(f)))
+        }
+        let liveSourceRemains = false
+        for (const [n, sz] of listed) {
+          if (sz > 0 && kindOf(n) !== null && !emptiedInRun.has(n)) {
+            liveSourceRemains = true
+            break
+          }
+        }
+        // Lazily inspect remaining live dead-letter files so cleanup never
+        // truncates or deletes parent evidence that any live file on disk still
+        // names as its `parent` (including unlisted children held as ambiguous).
+        let liveParentsChecked = false
+        let liveParentsIncomplete = false
+        const liveParents = new Set<string>()
+        const ensureLiveParents = async (): Promise<void> => {
+          if (liveParentsChecked) return
+          liveParentsChecked = true
+          if (!liveSourceRemains) return
+          for (const [n, sz] of listed) {
+            if (sz <= 0 || kindOf(n) === null || emptiedInRun.has(n)) continue
+            const known = fileParent.get(n)
+            if (known !== undefined) {
+              if (known !== '') liveParents.add(known)
+              continue
+            }
+            if (sz > HOST_FILE_BYTES || cleanupStopped()) {
+              liveParentsIncomplete = true
+              return
+            }
+            try {
+              const raw = await this.io.readFile(joinPath(dir, n))
+              if (raw === '') continue
+              const parsed = parseFile(raw)
+              if (!parsed.complete) {
+                liveParentsIncomplete = true
+                return
+              }
+              if (parsed.parent !== null) liveParents.add(baseOf(parsed.parent))
+            } catch {
+              liveParentsIncomplete = true
+              return
+            }
+          }
+        }
+        const cleanedParents = new Set<string>()
+        for (const [of, list] of companions) {
+          if (cleanupStopped()) break
+          if ((listed.get(of) ?? 0) > 0) continue
+          const nonEmpty = list.filter(e => e.size > 0)
+          if (nonEmpty.length === 0) continue
+          let allExpired = true
+          for (const e of nonEmpty) {
+            if (cleanupStopped()) {
+              allExpired = false
+              break
+            }
+            const at = e.mtimeMs ? e.mtimeMs : await retiredAt(of)
+            if (at === null || this.io.now() - at < RETIRED_MS) {
+              allExpired = false
+              break
+            }
+          }
+          if (!allExpired || cleanupStopped()) continue
+          await ensureLiveParents()
+          if (liveParentsIncomplete || liveParents.has(of) || cleanupStopped()) continue
+          // Inspect ALL companion files and both store slots for this parent
+          // before deleting or truncating any record: journals and retired
+          // marks that any live child still depends on must stay intact together.
+          let keepParent = false
+          for (const e of nonEmpty) {
+            if (cleanupStopped()) {
+              keepParent = true
+              break
+            }
+            try {
+              const parsed = journalOf(await this.io.readFile(joinPath(dir, e.name)))
+              if (parsed === 'torn') {
+                if (liveSourceRemains) {
+                  keepParent = true
+                  break
+                }
+              } else if (parsed !== undefined && hasLiveChild(parsed)) {
+                keepParent = true
+                break
+              }
+            } catch {
+              keepParent = true
+              break
+            }
+          }
+          if (keepParent) continue
+          const storeKeys = [`replayed:${dest}/${of}`, `replayed:v2:${dest}/${of}`]
+          const storedKeysPresent: string[] = []
+          for (const key of storeKeys) {
+            if (cleanupStopped()) {
+              keepParent = true
+              break
+            }
+            try {
+              const stored = await this.io.storeGet(key)
+              if (stored !== undefined) {
+                if (hasLiveChild(stored)) {
+                  keepParent = true
+                  break
+                }
+                storedKeysPresent.push(key)
+              }
+            } catch {
+              keepParent = true
+              break
+            }
+          }
+          if (keepParent || cleanupStopped()) continue
+          // Delete store entries BEFORE truncating on-disk companion files so a
+          // store failure or exit-cleanup cutoff never strands an orphaned v2
+          // store key with no remaining done mark on disk to reclaim it.
+          const v2Key = `replayed:v2:${dest}/${of}`
+          let allStoreDeleted = true
+          let v2Clean = !storedKeysPresent.includes(v2Key)
+          for (const key of storedKeysPresent) {
+            if (cleanupStopped()) {
+              allStoreDeleted = false
+              break
+            }
+            try {
+              await this.io.storeDelete(key)
+              if (key === v2Key) v2Clean = true
+            } catch {
+              allStoreDeleted = false
+            }
+          }
+          if (v2Clean) this.cleanedRetiredV2.add(v2Key)
+          if (!allStoreDeleted || cleanupStopped()) continue
+          let allTruncated = true
+          for (const e of nonEmpty) {
+            if (cleanupStopped()) {
+              allTruncated = false
+              break
+            }
+            try {
+              await this.io.writeFile(joinPath(dir, e.name), '')
+            } catch {
+              allTruncated = false
+            }
+          }
+          if (allTruncated) cleanedParents.add(of)
+        }
+        // A legacy writer that retires a source only deletes `replayed:<dest>/<name>`
+        // and leaves `replayed:v2:<dest>/<name>` orphaned in `$.store`. Reclaim any
+        // such orphaned v2 key once a retired done mark stands beside the emptied
+        // or removed source (checked at most once per source per session), while
+        // never deleting a store journal that still names a live child or whose
+        // parent is still referenced by a live dead-letter file on disk.
+        if (!cleanupStopped() && besides.size > 0) {
+          for (const [of, beside] of besides) {
+            if (cleanupStopped()) break
+            if (cleanedParents.has(of) || beside.done.length === 0 || (listed.get(of) ?? 0) > 0) continue
+            const v2Key = `replayed:v2:${dest}/${of}`
+            if (this.cleanedRetiredV2.has(v2Key)) continue
+            try {
+              const stored = await this.io.storeGet(v2Key)
+              if (stored === undefined) {
+                this.cleanedRetiredV2.add(v2Key)
+                continue
+              }
+              if (hasLiveChild(stored)) continue
+              await ensureLiveParents()
+              if (liveParentsIncomplete || liveParents.has(of) || cleanupStopped()) continue
+              let retired = false
+              for (const doneName of beside.done) {
+                if (cleanupStopped()) break
+                const kept = journalOf(await this.io.readFile(joinPath(dir, doneName)).catch(() => ''))
+                if (kept !== undefined && kept !== 'torn' && kept.retired === true) {
+                  retired = true
+                  break
+                }
+              }
+              if (!retired || cleanupStopped()) continue
+              await this.io.storeDelete(v2Key)
+              this.cleanedRetiredV2.add(v2Key)
+            } catch {
+              // Best-effort cleanup; next replay retries.
+            }
+          }
+        }
+      }
+    }
     if (emptyWaiting.length > 0) report.held ??= diagnostic(`${emptyWaiting[0]} is empty, perhaps still being written; it waits for the next replay`)
     if (parentWaits.length > 0) report.held ??= diagnostic(`${parentWaits[0]} waits until the replay of the file it came from has it as written`)
     if (leased.length > 0) report.held ??= diagnostic(`another session's lease holds ${leased[0]} (ten minutes at most); it waits for the next replay`)
@@ -2799,7 +3039,6 @@ export class Writer {
     c: Config,
     companionEntries: readonly { name: string; kind: string; size: number }[],
     listed: ReadonlyMap<string, number>,
-    seededState: { dirCount: number | null },
     trigger: BackfillReport['trigger'],
   ): Promise<void> {
     const skippedPath = joinPath(dir, name)
@@ -2812,23 +3051,20 @@ export class Writer {
       this.readJournalSlot(source, source.v2RecordKey, source.v2RecordFiles, true),
     ])
     const picked = Writer.pickJournalSlots(v1, v2)
-    const recordHeld = (targetPath: string, message: string): void => {
+    const recordHeld = (targetPath: string, message: string, mayBeActive = false): void => {
       const cleanMsg = diagnostic(message)
-      const isNew = !this.heldPaths.has(targetPath)
-      this.heldPaths.set(targetPath, cleanMsg)
-      if (seededState.dirCount === null) {
-        seededState.dirCount = [...this.heldPaths.keys()].filter(p => inDir(p, dir)).length
-      } else if (isNew) {
-        seededState.dirCount += 1
-      }
+      this.setHeldPath(targetPath, { reason: cleanMsg, mayBeActive })
+      const active = this.hasActiveHeldIn(dir)
       this.inProgressHeld = {
-        files: Math.max(this.inProgressHeld.files, seededState.dirCount),
+        files: Math.max(this.inProgressHeld.files, this.heldCountIn(dir)),
         reason: this.inProgressHeld.reason ?? cleanMsg,
         trigger: this.inProgressHeld.trigger ?? trigger,
+        mayBeActive: active,
       }
     }
     if (picked === 'conflict') {
-      recordHeld(skippedPath, `conflicting replay records exist for ${name}; /bqaa-backfill force replays the file afresh`)
+      const hasActiveForeign = await this.hasActiveForeignMark(source, companionEntries)
+      recordHeld(skippedPath, `conflicting replay records exist for ${name}; /bqaa-backfill force replays the file afresh`, hasActiveForeign)
       return
     }
     if (picked !== undefined) {
@@ -2858,17 +3094,19 @@ export class Writer {
       return
     }
     if (v1.torn || v2.torn || first.torn) {
-      recordHeld(skippedPath, `the replay record of ${name} is cut off part-way; /bqaa-backfill force replays the file afresh`)
+      const hasActiveForeign = await this.hasActiveForeignMark(source, companionEntries)
+      recordHeld(skippedPath, `the replay record of ${name} is cut off part-way; /bqaa-backfill force replays the file afresh`, hasActiveForeign)
       return
     }
-    const { by, uncertain } = await this.marksDetailed(source, companionEntries)
+    const { by, activeBy, uncertain } = await this.marksDetailed(source, companionEntries)
     const ownUncertain = this.uncertainSources.get(skippedPath) === source.size
+    const hasActiveForeign = activeBy.some(w => w !== this.mark)
     if (by.some(w => w !== this.mark || ownUncertain)) {
       const msg =
-        ownUncertain || uncertain
+        !hasActiveForeign && (ownUncertain || uncertain)
           ? `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`
           : `a replay of ${name} sent rows and has recorded no outcome; if that session stopped, /bqaa-backfill force replays the file afresh`
-      recordHeld(skippedPath, msg)
+      recordHeld(skippedPath, msg, hasActiveForeign)
     }
   }
 
@@ -3020,11 +3258,11 @@ export class Writer {
     // go. So the marks are read, and only then the done marks listed
     // again, before none is taken for an answer.
     entries = await this.io.listDir(source.dir)
-    const { by, uncertain } = await this.marksDetailed(source, entries)
+    const { by, activeBy, uncertain } = await this.marksDetailed(source, entries)
     const again = await doneIn(await this.io.listDir(source.dir))
     if (again.done !== undefined) return { journal: again.done, filed: true }
     if (v1.torn || v2.torn || doneTorn || again.torn) return 'torn'
-    return by.length === 0 ? undefined : { pending: by, ...(uncertain ? { uncertain: true } : {}) }
+    return by.length === 0 ? undefined : { pending: by, ...(activeBy.length > 0 ? { activeBy } : {}), ...(uncertain ? { uncertain: true } : {}) }
   }
 
   // All whole retired done marks for `source` from `entries` (sorted by mark
@@ -3070,16 +3308,22 @@ export class Writer {
   private async readJournalSlotAll(
     recordKey: string,
     recordFiles: readonly string[],
-  ): Promise<{ stored: Partial<Journal> | undefined; filed: Partial<Journal>[] }> {
+  ): Promise<{ stored: Partial<Journal> | undefined; filed: Partial<Journal>[]; tornSizes: (number | null)[] }> {
     const read = ((await this.io.storeGet(recordKey)) ?? undefined) as Partial<Journal> | undefined
     const filed: Partial<Journal>[] = []
+    const tornSizes: (number | null)[] = []
     for (const file of recordFiles) {
       if (this.io.exists !== undefined && !(await this.io.exists(file))) continue
       const text = await this.io.readFile(file)
       const kept = journalOf(text)
-      if (kept !== undefined && kept !== 'torn') filed.push(kept)
+      if (kept === 'torn') {
+        const matched = /(?<!\\)"size"\s*:\s*(\d+)\s*[,}]/.exec(text)
+        tornSizes.push(matched ? Number(matched[1]) : null)
+      } else if (kept !== undefined) {
+        filed.push(kept)
+      }
     }
-    return { stored: read, filed }
+    return { stored: read, filed, tornSizes }
   }
 
   // What becomes of the file `path`, which a replay of `parent` wrote (the
@@ -3088,10 +3332,11 @@ export class Writer {
   // outcome), or is gone; `wait` while the parent still holds its rows and
   // its record may yet write the file again, or while that record cannot be
   // read, is cut off, conflicts, or is yet to be written (a replay's mark).
-  // Once the parent is emptied, records from different parent-size generations
-  // are never compared by `seq`: any distinct-size generation that names the
-  // child yields `go`, a single unambiguous generation that does not name it
-  // yields `drop`, and conflicting records that do not resolve cleanly yield
+  // Before authorizing `drop`, all parent-size generations are inspected so
+  // records from different parent sizes are never compared by `seq`: any
+  // distinct-size generation that names the child yields `go`, a single
+  // unambiguous generation with no unexplained torn evidence that does not
+  // name it yields `drop`, and conflicting or incomplete evidence yields
   // `ambiguous` so the child is preserved rather than truncated.
   private async parentFate(dir: string, parent: string, path: string, size: number, c: Config): Promise<'go' | 'wait' | 'drop' | 'ambiguous'> {
     const parentName = baseOf(parent)
@@ -3108,13 +3353,16 @@ export class Writer {
       if (found === 'torn' || found === 'conflict' || (found !== undefined && 'pending' in found)) return 'wait'
       if (found === undefined) return 'go'
       const at = (Array.isArray(found.journal.files) ? found.journal.files : []).findIndex(entry => entry === path || baseOf(entry) === targetName)
-      if (at === -1) return found.journal.retired === true ? 'drop' : 'go'
-      return writtenOf(found.journal)[at] === true ? 'go' : 'wait'
+      if (at !== -1) return writtenOf(found.journal)[at] === true ? 'go' : 'wait'
+      if (found.journal.retired !== true) return 'go'
+      // Never authorize `drop` from a single-size lookup alone: fall through to
+      // the multi-generation inspection below so another parent-size generation
+      // that owns `path` is not overlooked.
     }
     const source = { ...sourceFor(dir, parentName, -1, c), live: false }
     let doneAll: { records: Partial<Journal>[]; torn: boolean }
-    let v1: { stored: Partial<Journal> | undefined; filed: Partial<Journal>[] }
-    let v2: { stored: Partial<Journal> | undefined; filed: Partial<Journal>[] }
+    let v1: { stored: Partial<Journal> | undefined; filed: Partial<Journal>[]; tornSizes: (number | null)[] }
+    let v2: { stored: Partial<Journal> | undefined; filed: Partial<Journal>[]; tornSizes: (number | null)[] }
     try {
       const entries = await this.io.listDir(dir)
       doneAll = await this.doneMarksAll(source, entries)
@@ -3195,11 +3443,11 @@ export class Writer {
       if (filed === undefined) return stored
       return mergeSameSlot(stored, filed)
     }
-    const resolved: Partial<Journal>[] = []
+    const resolved: { journal: Partial<Journal>; canAuthorizeDrop: boolean }[] = []
     let hasConflict = false
     for (const group of bySize.values()) {
       if (group.done !== undefined) {
-        resolved.push(group.done)
+        resolved.push({ journal: group.done, canAuthorizeDrop: true })
         continue
       }
       const v1Merged = mergeSlot(group.v1Stored, group.v1Filed, group.v1Conflict)
@@ -3209,26 +3457,34 @@ export class Writer {
       } else if (v1Merged !== undefined && v2Merged !== undefined) {
         const picked = Writer.pickJournalSlots({ found: { journal: v1Merged, filed: false }, torn: false }, { found: { journal: v2Merged, filed: false, v2: true }, torn: false })
         if (picked === 'conflict') hasConflict = true
-        else if (picked !== undefined) resolved.push(picked.journal)
-      } else {
-        const only = v1Merged ?? v2Merged
-        if (only !== undefined) resolved.push(only)
+        else if (picked !== undefined) resolved.push({ journal: picked.journal, canAuthorizeDrop: true })
+      } else if (v1Merged !== undefined) {
+        resolved.push({ journal: v1Merged, canAuthorizeDrop: true })
+      } else if (v2Merged !== undefined) {
+        // A v2 split never empties its parent without writing a retired done
+        // mark, so a bare v2 journal beside an emptied parent cannot prove
+        // ownership over unlisted children from other generations.
+        resolved.push({ journal: v2Merged, canAuthorizeDrop: false })
       }
     }
     if (bySize.size === 1) {
       if (hasConflict || resolved.length === 0) return 'ambiguous'
-      const only = resolved[0] as Partial<Journal>
-      if (namesTarget(only)) return 'go'
+      const only = resolved[0]!
+      if (namesTarget(only.journal)) return 'go'
+      const unexplainedTorn = [...v1.tornSizes, ...v2.tornSizes].some(
+        sz => sz === null || sz !== only.journal.size || only.journal.retired !== true,
+      )
+      if (doneAll.torn || unexplainedTorn || !only.canAuthorizeDrop) return 'ambiguous'
       // Not named: a late copy of another session's outcome, where the record
       // is the mark the parent was done, or a whole one of an emptied parent
       // with every file it names written (its done mark lost, or never written:
       // its outcome has every row of the parent).
-      return only.retired === true || writtenOf(only).every(Boolean) ? 'drop' : 'go'
+      return only.journal.retired === true || writtenOf(only.journal).every(Boolean) ? 'drop' : 'go'
     }
     // Multiple distinct parent-size generations coexist (e.g. a legacy 0.1.3
     // rewrite alongside a stale v2 slot): never drop a child named by any
     // resolved generation, and preserve the child as ambiguous otherwise.
-    if (resolved.some(namesTarget)) return 'go'
+    if (resolved.some(r => namesTarget(r.journal))) return 'go'
     return 'ambiguous'
   }
 
@@ -3356,6 +3612,12 @@ export class Writer {
     if (found !== undefined && found !== 'torn' && found !== 'conflict') {
       if (!Writer.catchUp(rewrite, found)) {
         this.rewrites.delete(path)
+        for (const w of [...this.before, this]) w.activeSendingMarks.delete(path)
+        if (found.journal.retired === true) {
+          this.deleteHeldPath(path)
+          this.currentScanHeld.delete(path)
+        }
+        await this.unmark(rewrite)
         return false
       }
       // The record has this outcome as this writer has it: no need to write it again.
@@ -3363,6 +3625,10 @@ export class Writer {
       recorded = rewrite.files.every((file, i) => (file.text === null) === written[i])
     } else if ((await this.io.readFile(path)) === '') {
       this.rewrites.delete(path)
+      this.deleteHeldPath(path)
+      this.currentScanHeld.delete(path)
+      for (const w of [...this.before, this]) w.activeSendingMarks.delete(path)
+      await this.unmark(rewrite)
       return true
     }
     const activeKey = rewrite.useV2 ? rewrite.v2RecordKey : rewrite.recordKey
@@ -3498,10 +3764,16 @@ export class Writer {
       const found = Writer.recorded(await this.readJournal(rewrite))
       if (found === 'torn' || found === 'conflict' || (found !== undefined && found.journal.size === rewrite.size && !Writer.catchUp(rewrite, found))) {
         this.rewrites.delete(path)
-        // Another outcome finished the file: a record of this one that the
-        // store took meanwhile is let go, as that writer let its own go.
-        if (found !== 'torn' && found !== 'conflict' && found.journal.retired === true) {
-          await Promise.allSettled([this.io.storeDelete(rewrite.recordKey), this.io.storeDelete(rewrite.v2RecordKey)])
+        // Another outcome superseded or finished the file: release our standing
+        // mark and, if retired, drop any store copy we recorded meanwhile.
+        if (found !== 'torn' && found !== 'conflict' && found !== undefined) {
+          for (const w of [...this.before, this]) w.activeSendingMarks.delete(path)
+          await this.unmark(rewrite)
+          if (found.journal.retired === true) {
+            this.deleteHeldPath(path)
+            this.currentScanHeld.delete(path)
+            await Promise.allSettled([this.io.storeDelete(rewrite.recordKey), this.io.storeDelete(rewrite.v2RecordKey)])
+          }
         }
         return false
       }
@@ -3519,20 +3791,33 @@ export class Writer {
           sealFile(`${JSON.stringify({ size, sending: true, uncertain: true, by: this.mark })}\n`),
         )
         this.uncertainSources.set(file.path, size)
-        this.heldPaths.set(
-          file.path,
-          diagnostic(
-            `a replay of ${baseOf(file.path)} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
-          ),
-        )
       }
       await this.io.writeFile(file.path, file.text)
       file.text = null
+      if (file.uncertain) {
+        const childEntry: HeldEntry = {
+          reason: diagnostic(
+            `a replay of ${baseOf(file.path)} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
+          ),
+          mayBeActive: false,
+        }
+        this.setHeldPath(file.path, childEntry)
+        this.currentScanHeld.set(file.path, childEntry)
+        if (rewrite.files.every(f => !f.uncertain || f.text === null)) {
+          this.deleteHeldPath(path)
+          this.currentScanHeld.delete(path)
+        }
+      }
       await record()
     }
     if (!(await stillOurs())) return false
     const wroteDone = !finished && (await this.markDone(rewrite))
-    if (wroteDone) rewrite.wroteDone = true
+    if (wroteDone) {
+      rewrite.wroteDone = true
+      if (!rewrite.useV2) {
+        for (const w of [...this.before, this]) w.activeSendingMarks.delete(path)
+      }
+    }
     const done = finished || wroteDone
     if (rewrite.useV2 && !done) {
       this.recordError(`could not record completion mark for ${path}; keeping parent sending mark until retried`)
@@ -3545,12 +3830,15 @@ export class Writer {
       return false
     }
     // Known done from here on, whether or not its done mark was written: the
-    // next replay does not wait on it as on a file still being written.
+    // next replay does not wait on it as on a file still being written. Clear
+    // standing sending-mark tracking before store cleanup so a stall during
+    // storeDelete or unmark never reports a retired source as held.
     this.retiredEmpty.add(path)
     this.rewrites.delete(path)
     this.uncertainSources.delete(path)
-    this.heldPaths.delete(path)
+    this.deleteHeldPath(path)
     this.currentScanHeld.delete(path)
+    for (const w of [...this.before, this]) w.activeSendingMarks.delete(path)
     if (done) {
       if (rewrite.useV2) await this.unmark(rewrite)
       if (!clearedOppositeSlot) clearedOppositeSlot = await clearOppositeSlot()
@@ -3611,14 +3899,22 @@ export class Writer {
       )
       return false
     }
+    const donePath = doneFileOf(source.dir, source.name, this.mark)
     try {
       const markPayload = { size: source.size, sending: true, ...(this.exitReplay !== null ? { uncertain: true } : {}), by: this.mark }
-      await this.io.writeFile(doneFileOf(source.dir, source.name, this.mark), sealFile(`${JSON.stringify(markPayload)}\n`))
+      await this.io.writeFile(donePath, sealFile(`${JSON.stringify(markPayload)}\n`))
     } catch (err) {
-      await this.unmark(source)
+      const released = await this.unmark(source)
+      if (!released) {
+        const remaining = await this.io.readFile(donePath).catch(() => '')
+        if (remaining !== '') {
+          this.activeSendingMarks.set(path, { path, name: source.name, dir: source.dir, trigger, size: source.size })
+        }
+      }
       report.held ??= diagnostic(`could not mark the replay of ${source.name} before sending, so none of it is sent: ${errorText(err)}`)
       return false
     }
+    this.activeSendingMarks.set(path, { path, name: source.name, dir: source.dir, trigger, size: source.size })
     try {
       // The marks as readJournal read them, before its last look at the done
       // marks, so no mark let go meanwhile (by a writer that finished the
@@ -3629,27 +3925,38 @@ export class Writer {
       let found = Writer.recorded(read)
       const isOther = (by: string): boolean => by !== this.mark || ownUncertain
       let others: string[] = []
+      let othersActive: string[] = []
       let otherUncertain = ownUncertain
       if (read === 'torn' || read === 'conflict') {
         const detailed = await this.marksDetailed(source)
         others = detailed.by.filter(isOther)
+        othersActive = detailed.activeBy.filter(by => by !== this.mark)
         otherUncertain ||= detailed.uncertain
         const last = await this.doneMarks(source, await this.io.listDir(source.dir))
         if (last.done !== undefined) found = { journal: last.done, filed: true }
       } else if (read !== undefined && 'pending' in read) {
         others = read.pending.filter(isOther)
+        othersActive = (read.activeBy ?? []).filter(by => by !== this.mark)
         otherUncertain ||= read.uncertain === true
       }
       const another = trigger !== 'force' && others.length > 0
       const conflicted = trigger !== 'force' && found === 'conflict'
       if ((found !== undefined && found !== 'torn' && found !== 'conflict') || another || conflicted || (await this.io.readFile(path)) === '') {
         if (conflicted) {
-          this.noteHeld(report, trigger, `conflicting replay records exist for ${source.name}; /bqaa-backfill force replays the file afresh`, path)
+          this.noteHeld(
+            report,
+            trigger,
+            `conflicting replay records exist for ${source.name}; /bqaa-backfill force replays the file afresh`,
+            path,
+            othersActive.length > 0,
+          )
         } else if (another && (found === undefined || found === 'torn' || found === 'conflict')) {
-          const msg = otherUncertain
-            ? `a replay of ${source.name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`
-            : `another session is replaying ${source.name}; if it stopped, /bqaa-backfill force replays the file afresh`
-          this.noteHeld(report, trigger, msg, path)
+          const hasActiveForeign = othersActive.length > 0
+          const msg =
+            !hasActiveForeign && otherUncertain
+              ? `a replay of ${source.name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`
+              : `another session is replaying ${source.name}; if it stopped, /bqaa-backfill force replays the file afresh`
+          this.noteHeld(report, trigger, msg, path, hasActiveForeign)
         }
         await this.unmark(source)
         return false
@@ -3661,13 +3968,26 @@ export class Writer {
     }
   }
 
+  private async hasActiveForeignMark(source: Source, entries?: readonly { name: string; kind?: string; size: number }[]): Promise<boolean> {
+    try {
+      const { activeBy } = await this.marksDetailed(source, entries)
+      return activeBy.some(by => by !== this.mark)
+    } catch {
+      // Cannot inspect standing marks while holding on torn/conflict: keep
+      // the owner-stopped + lease-expired qualification on headless notices.
+      return true
+    }
+  }
+
   // The writers whose marks stand beside `source`, read from its directory
-  // (`entries`, when it was just listed), plus whether any standing mark came
-  // from an unanswered exit replay (`uncertain: true`). An emptied mark, which
-  // its writer let go, is not read. A mark that cannot be read, or a directory
-  // that cannot be listed, throws: it is never taken for none.
-  private async marksDetailed(source: Source, entries?: readonly { name: string; kind?: string; size: number }[]): Promise<{ by: string[]; uncertain: boolean }> {
+  // (`entries`, when it was just listed), plus which writers hold non-uncertain
+  // marks (whose session may still be running) and whether any standing mark
+  // came from an unanswered exit replay (`uncertain: true`). An emptied mark,
+  // which its writer let go, is not read. A mark that cannot be read, or a
+  // directory that cannot be listed, throws: it is never taken for none.
+  private async marksDetailed(source: Source, entries?: readonly { name: string; kind?: string; size: number }[]): Promise<{ by: string[]; activeBy: string[]; uncertain: boolean }> {
     const by: string[] = []
+    const activeBy: string[] = []
     let uncertain = false
     for (const entry of entries ?? (await this.io.listDir(source.dir))) {
       if (entry.kind !== undefined && entry.kind !== 'file') continue
@@ -3677,19 +3997,25 @@ export class Writer {
       if (markStands(raw, source.size)) {
         by.push(writer)
         const parsed = journalOf(raw) as { uncertain?: unknown } | 'torn' | undefined
-        if (parsed !== undefined && parsed !== 'torn' && parsed.uncertain === true) uncertain = true
+        if (parsed !== undefined && parsed !== 'torn') {
+          if (parsed.uncertain === true) uncertain = true
+          else activeBy.push(writer)
+        }
       }
     }
-    return { by, uncertain }
+    return { by, activeBy, uncertain }
   }
 
-  // This writer's own mark beside `source` let go. Best effort: one left is
-  // this writer's own, which it replays past.
-  private async unmark(source: Source): Promise<void> {
+  // This writer's own mark beside `source` let go. Best effort: returns true
+  // only once truncation succeeds (and removes the tracked sending mark).
+  private async unmark(source: Source): Promise<boolean> {
     try {
       await this.io.writeFile(doneFileOf(source.dir, source.name, this.mark), '')
+      this.activeSendingMarks.delete(joinPath(source.dir, source.name))
+      return true
     } catch {
-      // Left.
+      // Left on disk.
+      return false
     }
   }
 
@@ -3740,63 +4066,72 @@ export class Writer {
     const recordUncertain = (first: number, count: number): void => {
       for (let i = 0; i < count; i += 1) uncertainLines.push(at[first + i] as number)
     }
-    const dispatchReplayPost = async (body: string, token: string, needsReserve: boolean): Promise<HttpAnswer | { error: string; uncertain?: boolean }> => {
-      this.inFlightReplay = { path, name, dir, trigger }
-      return this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs, needsReserve)
-    }
+    const dispatchReplayPost = async (body: string, token: string, needsReserve: boolean): Promise<HttpAnswer | { error: string; uncertain?: boolean }> =>
+      this.replayPost(insertAllUrl(c), body, token, c.requestTimeoutMs, needsReserve)
     let index = 0
-    try {
-      while (index < mine.length) {
-        if (report.error || this.replayStops(trigger, tally)) break
-        let bytes = 0
-        let end = index
-        while (end < mine.length && end - index < c.maxBatchRows) {
-          const size = rowBytes((mine[end] as DeadLetterLine).row)
-          if (end > index && bytes + size > c.maxBatchBytes) break
-          bytes += size
-          end += 1
-        }
-        const first = index
-        const chunk = mine.slice(index, end)
-        const needsReserve = first > 0 || end < mine.length || kept > 0 || file.unreadable.length > 0
-        index = end
-        let token: string
+    while (index < mine.length) {
+      if (report.error || this.replayStops(trigger, tally)) break
+      let bytes = 0
+      let end = index
+      while (end < mine.length && end - index < c.maxBatchRows) {
+        const size = rowBytes((mine[end] as DeadLetterLine).row)
+        if (end > index && bytes + size > c.maxBatchBytes) break
+        bytes += size
+        end += 1
+      }
+      const first = index
+      const chunk = mine.slice(index, end)
+      const needsReserve = first > 0 || end < mine.length || kept > 0 || file.unreadable.length > 0
+      index = end
+      let token: string
+      try {
+        token = await this.replayToken()
+      } catch (err) {
+        report.error = diagnostic(`authentication: ${messageOf(err)}`)
+        continue
+      }
+      if (this.replayHalted()) break
+      if (!marked) {
+        if (!(await this.markSending(path, source, trigger, report))) break
+        marked = true
+      }
+      if (this.replayHalted()) break
+      const body = insertAllBody(chunk.map(l => l.row))
+      if (this.replayHalted()) break
+      tally.requests += 1
+      let answer = await dispatchReplayPost(body, token, needsReserve)
+      if ('error' in answer) {
+        if (answer.uncertain) recordUncertain(first, chunk.length)
+        report.error = diagnostic(answer.error)
+        continue
+      }
+      let outcome = classifyInsert(answer, chunk.length)
+      if (outcome.kind === 'auth' && !this.closing) {
+        // As for a send: one more try at once with a fresh token, and a
+        // second 401 is the credentials notice. The rows keep the user_id
+        // they were parked with. Once the exit began, no fresh token is
+        // fetched.
+        this.dropToken()
         try {
-          token = await this.replayToken()
+          token = await this.getToken()
         } catch (err) {
           report.error = diagnostic(`authentication: ${messageOf(err)}`)
           continue
         }
-        if (this.replayHalted()) break
-        if (!marked) {
-          if (!(await this.markSending(path, source, trigger, report))) break
-          marked = true
-        }
-        if (this.replayHalted()) break
-        const body = insertAllBody(chunk.map(l => l.row))
-        if (this.replayHalted()) break
+        if (this.closing) break
         tally.requests += 1
-        let answer = await dispatchReplayPost(body, token, needsReserve)
+        answer = await dispatchReplayPost(body, token, needsReserve)
         if ('error' in answer) {
           if (answer.uncertain) recordUncertain(first, chunk.length)
           report.error = diagnostic(answer.error)
           continue
         }
-        let outcome = classifyInsert(answer, chunk.length)
-        if (outcome.kind === 'auth' && !this.closing) {
-          // As for a send: one more try at once with a fresh token, and a
-          // second 401 is the credentials notice. The rows keep the user_id
-          // they were parked with. Once the exit began, no fresh token is
-          // fetched.
-          if (!changed && uncertainLines.length === 0) this.inFlightReplay = null
-          this.dropToken()
-          try {
-            token = await this.getToken()
-          } catch (err) {
-            report.error = diagnostic(`authentication: ${messageOf(err)}`)
-            continue
-          }
-          if (this.closing) break
+        outcome = classifyInsert(answer, chunk.length)
+        if (outcome.kind === 'auth') this.noteProblem('credentials', `BigQuery refused a fresh token too: ${outcome.message}`)
+      }
+      if (outcome.kind === 'not-found' && !this.closing && c.autoCreateTable && !this.createAttempted && !isDatasetMissing(outcome.message)) {
+        if (await this.createTable(c, token)) {
+          if (this.replayHalted()) break
           tally.requests += 1
           answer = await dispatchReplayPost(body, token, needsReserve)
           if ('error' in answer) {
@@ -3805,181 +4140,166 @@ export class Writer {
             continue
           }
           outcome = classifyInsert(answer, chunk.length)
-          if (outcome.kind === 'auth') this.noteProblem('credentials', `BigQuery refused a fresh token too: ${outcome.message}`)
         }
-        if (outcome.kind === 'not-found' && !this.closing && c.autoCreateTable && !this.createAttempted && !isDatasetMissing(outcome.message)) {
-          if (!changed && uncertainLines.length === 0) this.inFlightReplay = null
-          if (await this.createTable(c, token)) {
-            if (this.replayHalted()) break
-            tally.requests += 1
-            answer = await dispatchReplayPost(body, token, needsReserve)
-            if ('error' in answer) {
-              if (answer.uncertain) recordUncertain(first, chunk.length)
-              report.error = diagnostic(answer.error)
-              continue
-            }
-            outcome = classifyInsert(answer, chunk.length)
+      }
+      if (outcome.kind === 'ok' || outcome.kind === 'partial') {
+        // BigQuery took the request: the table is there and the credentials
+        // work, whatever it made of each row. The command's replay sends
+        // the refused rows too, so its count of rows parked meanwhile starts
+        // over.
+        if (trigger === 'command' || trigger === 'force') {
+          this.parkedDuringProblem = 0
+          this.parkedIds.clear()
+          this.parkedRough = false
+        }
+        let landed = 0
+        const refused: string[] = []
+        let refusal = ''
+        const { rejected, retry } = outcome.kind === 'partial' ? outcome : { rejected: new Map<number, string>(), retry: new Set<number>() }
+        chunk.forEach((_, i) => {
+          const reason = rejected.get(i)
+          if (reason !== undefined) {
+            refused.push(keys[first + i] as string)
+            refusal = reason
+            refuse(first + i, reason)
+          } else if (!retry.has(i)) {
+            landed += 1
+            fates[at[first + i] as number] = 'L'
           }
-        }
-        if (outcome.kind === 'ok' || outcome.kind === 'partial') {
-          // BigQuery took the request: the table is there and the credentials
-          // work, whatever it made of each row. The command's replay sends
-          // the refused rows too, so its count of rows parked meanwhile starts
-          // over.
-          if (trigger === 'command' || trigger === 'force') {
-            this.parkedDuringProblem = 0
-            this.parkedIds.clear()
-            this.parkedRough = false
-          }
-          let landed = 0
-          const refused: string[] = []
-          let refusal = ''
-          const { rejected, retry } = outcome.kind === 'partial' ? outcome : { rejected: new Map<number, string>(), retry: new Set<number>() }
-          chunk.forEach((_, i) => {
-            const reason = rejected.get(i)
-            if (reason !== undefined) {
-              refused.push(keys[first + i] as string)
-              refusal = reason
-              refuse(first + i, reason)
-            } else if (!retry.has(i)) {
-              landed += 1
-              fates[at[first + i] as number] = 'L'
-            }
-          })
-          report.rowsSent += landed
-          this.counters.batches += 1
-          this.counters.sent += landed
-          this.counters.replayed += landed
-          // In the order they came, as for a send: rows landing end the count,
-          // then this request's refusals start it again.
-          this.tookRequest(landed)
-          this.refusedOnReplay(refused, refusal)
-          // Said at once, before the file is emptied (which may fail).
-          if (landed > 0) this.call(() => this.io.sent?.(landed, c))
-          // Rows asked for again, and nothing else, leave the file as it was.
-          if (outcome.kind === 'ok' || outcome.retry.size < chunk.length) changed = true
-          continue
-        }
-        if (outcome.kind === 'rejected') {
-          // Refused whole, as a send would be: parked for /bqaa-backfill, and
-          // access denied is the notice. The rest waits for the next replay.
-          if (outcome.permission) this.noteProblem('permission', outcome.message, 'write')
-          else this.tableAnswered()
-          chunk.forEach((line, i) => refuse(first + i, outcome.message))
-          this.refusedOnReplay(keys.slice(first, first + chunk.length), outcome.message)
-          changed = true
-          report.error = diagnostic(outcome.message)
-          continue
-        }
-        if (outcome.kind === 'auth') this.dropToken()
-        if (outcome.kind === 'not-found') this.missingDestination(outcome.message)
+        })
+        report.rowsSent += landed
+        this.counters.batches += 1
+        this.counters.sent += landed
+        this.counters.replayed += landed
+        // In the order they came, as for a send: rows landing end the count,
+        // then this request's refusals start it again.
+        this.tookRequest(landed)
+        this.refusedOnReplay(refused, refusal)
+        // Said at once, before the file is emptied (which may fail).
+        if (landed > 0) this.call(() => this.io.sent?.(landed, c))
+        // Rows asked for again, and nothing else, leave the file as it was.
+        if (outcome.kind === 'ok' || outcome.retry.size < chunk.length) changed = true
+        continue
+      }
+      if (outcome.kind === 'rejected') {
+        // Refused whole, as a send would be: parked for /bqaa-backfill, and
+        // access denied is the notice. The rest waits for the next replay.
+        if (outcome.permission) this.noteProblem('permission', outcome.message, 'write')
+        else this.tableAnswered()
+        chunk.forEach((line, i) => refuse(first + i, outcome.message))
+        this.refusedOnReplay(keys.slice(first, first + chunk.length), outcome.message)
+        changed = true
         report.error = diagnostic(outcome.message)
+        continue
       }
-      tally.waiting += mine.filter((line, n) => fates[at[n] as number] === 'W' && line.kind !== 'rejected').length
-      report.rowsLeft += at.filter(i => fates[i] !== 'L').length + kept
-      const needsSplit = uncertainLines.length > 0 && (uncertainLines.length < lines.length || file.unreadable.length > 0)
-      // Nothing sent and nothing new to record: the file stays as it was, and
-      // its mark goes while it is still this writer's (best effort: one left is
-      // this writer's own). When the whole single-batch file had an unanswered
-      // exit-replay request, keep its mark standing instead of zeroing it.
-      if (!changed && !needsSplit) {
-        if (marked) {
-          if (uncertainLines.length > 0) {
-            this.uncertainSources.set(path, source.size)
-            this.noteHeld(
-              report,
-              trigger,
-              `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
-              path,
-            )
-            this.inFlightReplay = null
-          } else {
-            await this.unmark(source)
-            this.inFlightReplay = null
-          }
+      if (outcome.kind === 'auth') this.dropToken()
+      if (outcome.kind === 'not-found') this.missingDestination(outcome.message)
+      report.error = diagnostic(outcome.message)
+    }
+    tally.waiting += mine.filter((line, n) => fates[at[n] as number] === 'W' && line.kind !== 'rejected').length
+    report.rowsLeft += at.filter(i => fates[i] !== 'L').length + kept
+    const needsSplit = uncertainLines.length > 0 && (uncertainLines.length < lines.length || file.unreadable.length > 0)
+    // Nothing sent and nothing new to record: the file stays as it was, and
+    // its mark goes while it is still this writer's (best effort: one left is
+    // this writer's own). When the whole single-batch file had an unanswered
+    // exit-replay request, keep its mark standing instead of zeroing it.
+    if (!changed && !needsSplit) {
+      if (marked) {
+        if (uncertainLines.length > 0) {
+          this.uncertainSources.set(path, source.size)
+          this.noteHeld(
+            report,
+            trigger,
+            `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
+            path,
+          )
+          this.activeSendingMarks.delete(path)
+        } else {
+          await this.unmark(source)
         }
-        return true
       }
-      // What is left goes to new files first, each kind to files of its own (a
-      // row refused here to a `rejected` file, which no replay that runs by
-      // itself reads; rows of an unanswered exit-replay batch to their own
-      // marked file so unsubmitted batches stay eligible for automatic replay),
-      // each file ending with its completion record; only once
-      // every one is written is the source emptied: `$.fs` has no rename or
-      // delete. A write that fails leaves the source as it was, so an unsent
-      // row is never held only in memory, and this outcome is kept: the next
-      // replay finishes writing it out (`writeOut`) and sends none of the
-      // file again.
-      const outcome: Outcome = {
-        fates: fates.join(''),
-        reasons,
-        refusals,
-        ...(uncertainLines.length > 0 ? { uncertainLines } : {}),
-      }
-      const rest = leftoverFiles(file, fileKind, outcome, name)
-      const files = rest.map(({ kind, text, uncertain }) => ({
-        path: joinPath(dir, fileName(kind, this.io.now(), this.sessionId(), ++this.seq, this.mark)),
-        text,
-        ...(uncertain ? { uncertain: true } : {}),
-      }))
-      // Another writer that replayed the file at the same time may have
-      // recorded its outcome meanwhile, or finished it: writeOut finds out
-      // before it records this one.
-      const useV2 = uncertainLines.length > 0
-      const rewrite: Rewrite = { ...source, ...outcome, files, waits: rest.some(f => f.kind !== 'rejected'), filed: false, seq: 0, ...(useV2 ? { useV2: true } : {}) }
-      const uncertainFiles = rewrite.files.filter(f => f.uncertain)
-      const hadHeldReason = report.held !== null
-      for (let i = 0; i < uncertainFiles.length; i += 1) {
-        this.noteHeld(
-          report,
-          trigger,
-          `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
-          uncertainFiles[i]!.path,
-        )
-      }
-      if (uncertainFiles.length > 0) this.inFlightReplay = null
-      let done = false
-      try {
-        done = await this.writeOut(path, rewrite)
-      } finally {
+      return true
+    }
+    // What is left goes to new files first, each kind to files of its own (a
+    // row refused here to a `rejected` file, which no replay that runs by
+    // itself reads; rows of an unanswered exit-replay batch to their own
+    // marked file so unsubmitted batches stay eligible for automatic replay),
+    // each file ending with its completion record; only once
+    // every one is written is the source emptied: `$.fs` has no rename or
+    // delete. A write that fails leaves the source as it was, so an unsent
+    // row is never held only in memory, and this outcome is kept: the next
+    // replay finishes writing it out (`writeOut`) and sends none of the
+    // file again.
+    const outcome: Outcome = {
+      fates: fates.join(''),
+      reasons,
+      refusals,
+      ...(uncertainLines.length > 0 ? { uncertainLines } : {}),
+    }
+    const rest = leftoverFiles(file, fileKind, outcome, name)
+    const files = rest.map(({ kind, text, uncertain }) => ({
+      path: joinPath(dir, fileName(kind, this.io.now(), this.sessionId(), ++this.seq, this.mark)),
+      text,
+      ...(uncertain ? { uncertain: true } : {}),
+    }))
+    // Another writer that replayed the file at the same time may have
+    // recorded its outcome meanwhile, or finished it: writeOut finds out
+    // before it records this one.
+    const useV2 = uncertainLines.length > 0
+    const rewrite: Rewrite = { ...source, ...outcome, files, waits: rest.some(f => f.kind !== 'rejected'), filed: false, seq: 0, ...(useV2 ? { useV2: true } : {}) }
+    const uncertainFiles = rewrite.files.filter(f => f.uncertain)
+    const hadHeldReason = report.held !== null
+    if (uncertainFiles.length > 0) {
+      this.noteHeld(
+        report,
+        trigger,
+        `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
+        path,
+      )
+      this.activeSendingMarks.delete(path)
+    }
+    let done = false
+    try {
+      done = await this.writeOut(path, rewrite)
+    } finally {
+      if (uncertainFiles.length > 0) {
         if (!done) {
           for (const f of uncertainFiles) {
             if (f.text !== null) {
-              this.heldPaths.delete(f.path)
+              this.deleteHeldPath(f.path)
               this.currentScanHeld.delete(f.path)
             }
           }
-          if (uncertainFiles.some(f => f.text !== null)) {
-            const parentMsg = diagnostic(
-              `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
-            )
-            this.heldPaths.set(path, parentMsg)
-            this.currentScanHeld.set(path, parentMsg)
-          }
-          report.heldFiles = this.currentScanHeld.size
         }
         const firstWrittenUncertain = uncertainFiles.find(f => f.text === null)
         if (!hadHeldReason && firstWrittenUncertain !== undefined) {
           const updated = diagnostic(
             `a replay of ${baseOf(firstWrittenUncertain.path)} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
           )
+          const updatedEntry: HeldEntry = { reason: updated, mayBeActive: false }
           report.held = updated
-          this.heldPaths.set(firstWrittenUncertain.path, updated)
-          this.currentScanHeld.set(firstWrittenUncertain.path, updated)
-          report.heldFiles = this.currentScanHeld.size
-          const heldCount = Math.max(report.heldFiles, [...this.heldPaths.keys()].filter(p => inDir(p, dir)).length)
-          this.inProgressHeld = { files: heldCount, reason: updated, trigger }
+          this.setHeldPath(firstWrittenUncertain.path, updatedEntry)
+          this.currentScanHeld.set(firstWrittenUncertain.path, updatedEntry)
+        } else if (!done && !this.rewrites.has(path) && firstWrittenUncertain === undefined && !hadHeldReason) {
+          report.held = null
+        }
+        report.heldFiles = this.currentScanHeld.size
+        const heldCount = Math.max(report.heldFiles, this.heldCountIn(dir))
+        const active = this.hasActiveHeldIn(dir)
+        this.inProgressHeld = {
+          files: heldCount,
+          reason: report.held ?? this.inProgressHeld.reason,
+          trigger,
+          mayBeActive: active,
         }
       }
-      // The file done, clear our sending mark only when this write did not
-      // replace it with a retired done mark (`wroteDone`). On `v2` splits,
-      // `writeOut` already released the sending mark after writing the
-      // separate retired mark and emptying `path`.
-      if (done && !rewrite.wroteDone) await this.unmark(source)
-      return done
-    } finally {
-      this.inFlightReplay = null
     }
+    // The file done, clear our sending mark only when this write did not
+    // replace it with a retired done mark (`wroteDone`). On `v2` splits,
+    // `writeOut` already released the sending mark after writing the
+    // separate retired mark and emptying `path`.
+    if (done && !rewrite.wroteDone) await this.unmark(source)
+    return done
   }
 
   // ---- status ------------------------------------------------------------

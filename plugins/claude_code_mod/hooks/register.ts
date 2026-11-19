@@ -252,8 +252,11 @@ function headlessNotice(current: Writer, hadActivity: boolean, logDebug?: (line:
   if (held.files <= 0 || held.trigger === 'command' || held.trigger === 'force') return
   const detail = held.reason ? held.reason.replace(/; (?:if (?:that session|it) stopped, )?\/bqaa-backfill force replays the file afresh$/, '') : ''
   const suffix = detail ? ` (${detail})` : ''
+  const instruction = held.mayBeActive
+    ? `another session may still be replaying ${held.files === 1 ? 'it' : 'them'}; only after confirming that session stopped and its lease expired, run \`claude -p "/bqaa-backfill force" < /dev/null\` (or \`/bqaa-backfill force\`) with the same --plugin-dir, destination, and dead-letter dir to replay`
+    : `run \`claude -p "/bqaa-backfill force" < /dev/null\` (or \`/bqaa-backfill force\`) with the same --plugin-dir, destination, and dead-letter dir to replay`
   const oneLine = clean(
-    `BigQuery Agent Analytics: ${held.files} dead-letter file(s) held; run \`claude -p "/bqaa-backfill force" < /dev/null\` (or \`/bqaa-backfill force\`) with the same --plugin-dir, destination, and dead-letter dir to replay${suffix}.`,
+    `BigQuery Agent Analytics: ${held.files} dead-letter file(s) held; ${instruction}${suffix}.`,
     1000,
   ).replace(/[\r\n]+/g, ' ')
   writeStderr(oneLine)
