@@ -94,6 +94,14 @@ let welcomeStarts = 0
 let resets = 0
 let classicSessionSeq = 0
 let classicCwdSeq = 0
+type StartupIdentity = {
+  start: number
+  resets: number
+  sessionId: string | null
+  cwd: string | null
+}
+let currentStartup: StartupIdentity | null = null
+const startupByResets = new Map<number, StartupIdentity>()
 const RESET_SOURCES: ReadonlySet<string> = new Set(['clear', 'resume', 'fork'])
 let records: CardRecords | null = null
 // Who speaks for the card a session.start run of this load showed (its
@@ -977,6 +985,8 @@ export const register: Register = (on, registered) => {
   awaitingConfig.length = 0
   classicSessionSeq = 0
   classicCwdSeq = 0
+  currentStartup = null
+  startupByResets.clear()
 
   on('session.start', async ($, e, next) => {
     // A read for the card by an earlier run of this load is not used from
@@ -985,6 +995,10 @@ export const register: Register = (on, registered) => {
     const startResets = resets
     const startClassicSession = classicSessionSeq
     const startClassicCwd = classicCwdSeq
+    const startupIdentity: StartupIdentity = { start, resets: startResets, sessionId: null, cwd: e.cwd ?? null }
+    currentStartup = startupIdentity
+    startupByResets.set(startResets, startupIdentity)
+    const startupIdPromise = $.session.id().catch(() => null)
     cardReady = null
     // Its rank, in a session a person sees (a `-p` run draws no card).
     cardSession = e.isInteractive && e.surface !== null
@@ -1053,16 +1067,17 @@ export const register: Register = (on, registered) => {
       // denial of writes from the writer before (see adopt), which it shows.
       writer.clearStatus()
       for (const held of early.splice(0)) writer.enqueue(held.row, held.redactions)
-      const [sessionId, version] = await Promise.all([$.session.id().catch(() => null), $.session.version().catch(() => null)])
+      const [sessionId, version] = await Promise.all([startupIdPromise, $.session.version().catch(() => null)])
+      startupIdentity.sessionId = sessionId
       const engineVersion = version?.version ?? null
       if (engineVersion) tracer.setSession({ engineVersion })
-      const sessionStillCurrent =
-        start === welcomeStarts &&
-        resets === startResets &&
-        (classicSessionSeq === startClassicSession || (sessionId !== null && tracer.sessionId === sessionId))
-      if (sessionStillCurrent) {
+      if (start === welcomeStarts && resets === startResets) {
         const nextSessionId = classicSessionSeq === startClassicSession ? sessionId : null
-        const nextCwd = classicCwdSeq === startClassicCwd ? e.cwd : null
+        const nextCwd =
+          classicCwdSeq === startClassicCwd &&
+          (classicSessionSeq === startClassicSession || sessionId === null || tracer.sessionId === sessionId)
+            ? e.cwd
+            : null
         if (nextSessionId || nextCwd) tracer.setSession({ sessionId: nextSessionId, cwd: nextCwd })
       }
       flushTimer?.cancel()
@@ -1143,11 +1158,20 @@ export const register: Register = (on, registered) => {
     }
     if (e.session_id) classicSessionSeq += 1
     if (e.cwd) classicCwdSeq += 1
+    const eventResets = resets
+    const boundStartup = currentStartup !== null && currentStartup.resets === eventResets ? currentStartup : null
     const pending = next(e)
     // Apply session state / lastModel observations synchronously in event order,
     // deferring only row emission until configurationLoaded() supplies host/config metadata.
     const observed = tracer.observeSessionStart(e, Date.now())
-    whenConfigured(() => tracer.emitSessionStart(observed))
+    whenConfigured(() => {
+      const startup = boundStartup ?? startupByResets.get(eventResets) ?? null
+      const cwdFallback =
+        startup !== null && (observed.sessionId === null || startup.sessionId === null || observed.sessionId === startup.sessionId)
+          ? startup.cwd
+          : null
+      tracer.emitSessionStart(observed, startup ? { sessionId: startup.sessionId, cwd: cwdFallback } : undefined)
+    })
     return pending
   }).catch(($, e, next) => next(e))
 

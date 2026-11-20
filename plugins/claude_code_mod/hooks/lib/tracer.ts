@@ -309,9 +309,12 @@ export class Tracer {
     return { at, sessionId: this.sessionId, cwd: this.cwd, source: e.source, model, permissionMode: e.permission_mode }
   }
 
-  emitSessionStart(observed: { at: number; sessionId: string | null; cwd: string | null; source: string; model: string | null; permissionMode?: string }): void {
-    const sessionId = observed.sessionId ?? this.sessionId
-    const cwd = observed.cwd ?? this.cwd
+  emitSessionStart(
+    observed: { at: number; sessionId: string | null; cwd: string | null; source: string; model: string | null; permissionMode?: string },
+    fallback?: { sessionId?: string | null; cwd?: string | null },
+  ): void {
+    const sessionId = observed.sessionId ?? fallback?.sessionId ?? null
+    const cwd = observed.cwd ?? fallback?.cwd ?? null
     const written = this.emit({
       eventType: 'STATE_DELTA',
       timestampMs: observed.at,

@@ -5881,7 +5881,8 @@ test('T53-16i: restarting an interrupted forced replay with an adopted child res
   expect(h.sentOf(rowA)).toBe(1)
   expect(h.sentOf(rowB)).toBe(1)
   expect(h.files.get(parentPath) !== '').toBe(true)
-  const checkpoint = h.store.get(`replayed:${TABLE_REF}/${parentName}`) as { files?: string[]; written?: boolean[]; adopted?: string[] } | undefined
+  expect(h.store.get(`replayed:${TABLE_REF}/${parentName}`)).toBeUndefined()
+  const checkpoint = h.store.get(`replayed:v2:${TABLE_REF}/${parentName}`) as { files?: string[]; written?: boolean[]; adopted?: string[] } | undefined
   expect(checkpoint?.files ?? []).toContain(childCName)
 
   // Now child writes succeed; a fresh writer resumes the checkpoint cleanly.
@@ -6100,4 +6101,265 @@ test('T53-19b: torn-marker recovery scales linearly in source reads across 8 vs 
   // Per-run parent indexing keeps source reads linear (~4*N: <= 3.5x ratio and <= 120 for 24 files).
   expect(reads24).toBeLessThanOrEqual(120)
   expect(reads24).toBeLessThanOrEqual(Math.ceil(reads8 * 3.5))
+})
+
+test('T53-16j: forced replay adopting a live child stores its checkpoint in versioned v2 slot so 0.1.3 never deletes it on restart', async () => {
+  const h = exitReplayHarness()
+  const parentName = 'spill-20261013T200102003Z-t53-16j-parent.jsonl'
+  const childCName = 'retry-20261013T200102500Z-t53-16j-c.jsonl'
+  const rowA = 'a'.repeat(32)
+  const rowB = 'b'.repeat(32)
+  const rowC = 'c'.repeat(32)
+  const parentPath = h.seedSpill(parentName, rowA, rowB)
+  const childCText = packFiles(
+    [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.500Z', table: TABLE_REF, row: ownRow(rowC) })],
+    parentName,
+  )[0]!
+  h.files.set(`${PARTITION_DIR}/${childCName}`, childCText)
+  const parentSize = utf8Bytes(h.files.get(parentPath)!)
+  h.store.set(`replayed:${TABLE_REF}/${parentName}`, { fates: 'LL', reasons: [], refusals: [], size: parentSize, waits: false, seq: 2, files: [], written: [] })
+  h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, { fates: 'WW', reasons: [], refusals: [], size: parentSize, waits: true, seq: 9, files: [childCName], written: [true] })
+
+  h.setFetch(async (_url, ids) => {
+    if (ids.includes(rowA) && ids.includes(rowB)) {
+      return { status: 200, text: JSON.stringify({ insertErrors: [{ index: 1, errors: [{ reason: 'invalid', message: 'bad row B' }] }] }) }
+    }
+    return OK_INSERT
+  })
+  h.setWriteFileHook(async (p, text) => {
+    if (p.includes('/rejected-') && text !== '') throw new Error('EIO writing child B')
+  })
+
+  await h.newWriter('s-16j-1').backfill(['spill'], 'force')
+  // Checkpoint with adopted child MUST live in v2 slot (invisible to 0.1.3), v1 slot cleared, sending mark visible.
+  expect(h.store.get(`replayed:${TABLE_REF}/${parentName}`)).toBeUndefined()
+  const v2Checkpoint = h.store.get(`replayed:v2:${TABLE_REF}/${parentName}`) as { files?: string[]; adopted?: string[]; written?: boolean[] } | undefined
+  expect(v2Checkpoint?.adopted).toEqual([childCName])
+  expect(v2Checkpoint?.files ?? []).toContain(childCName)
+  expect(h.doneMarksFor(parentName).some(m => m.complete && m.data?.sending === true)).toBe(true)
+
+  // Fresh writer resumes from v2 without resending A and preserves C.
+  h.setWriteFileHook(null)
+  await h.newWriter('s-16j-2').backfill(['spill', 'retry'], 'auto')
+  expect(h.sentOf(rowA)).toBe(1)
+  expect(h.sentOf(rowC)).toBe(1)
+  expect(h.files.get(parentPath)).toBe('')
+})
+
+test('T53-16k: single force run reconciles overlapping rows in adopted children without duplicate submits or losing non-overlapping rows', async () => {
+  // Subcase 1: parent [A, B] + conflicting v2 child [B], in both parent-first and child-first sort orders.
+  for (const order of ['parent-first', 'child-first'] as const) {
+    const h = exitReplayHarness()
+    const parentName =
+      order === 'parent-first'
+        ? 'spill-20261013T200102001Z-t53-16k-parent.jsonl'
+        : 'spill-20261013T200102003Z-t53-16k-parent.jsonl'
+    const childName = 'spill-20261013T200102002Z-t53-16k-child.jsonl'
+    const rowA = 'a'.repeat(32)
+    const rowB = 'b'.repeat(32)
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const childText = packFiles(
+      [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) })],
+      parentName,
+    )[0]!
+    h.files.set(childPath, childText)
+    const parentSize = utf8Bytes(h.files.get(parentPath)!)
+    h.store.set(`replayed:${TABLE_REF}/${parentName}`, { fates: 'LL', reasons: [], refusals: [], size: parentSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, { fates: 'LW', reasons: [], refusals: [], size: parentSize, waits: true, seq: 9, files: [childName], written: [true] })
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-otherw-${childName}`,
+      sealFile(`${JSON.stringify({ size: utf8Bytes(childText), sending: true, by: 'otherw' })}\n`),
+    )
+
+    h.setFetch(async () => OK_INSERT)
+    const report = await h.newWriter(`s-16k-${order}`).backfill(['spill', 'retry'], 'force')
+    expect(report.error).toBeNull()
+    expect(h.sentOf(rowA)).toBe(1)
+    expect(h.sentOf(rowB)).toBe(1)
+    expect(report.rowsSent).toBe(2)
+    expect(h.files.get(parentPath)).toBe('')
+    expect(h.files.get(childPath)).toBe('')
+  }
+
+  // Subcase 2: mixed child [B, C] where B landed with parent [A, B] and C did not -> sends A, B, C exactly once each.
+  const hMix = exitReplayHarness()
+  const parentMix = 'spill-20261013T200102001Z-t53-16k-mix-parent.jsonl'
+  const childMix = 'spill-20261013T200102002Z-t53-16k-mix-child.jsonl'
+  const rowA = 'a'.repeat(32)
+  const rowB = 'b'.repeat(32)
+  const rowC = 'c'.repeat(32)
+  const parentMixPath = hMix.seedSpill(parentMix, rowA, rowB)
+  const childMixPath = `${PARTITION_DIR}/${childMix}`
+  const childMixText = packFiles(
+    [
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ],
+    parentMix,
+  )[0]!
+  hMix.files.set(childMixPath, childMixText)
+  const parentMixSize = utf8Bytes(hMix.files.get(parentMixPath)!)
+  hMix.store.set(`replayed:${TABLE_REF}/${parentMix}`, { fates: 'LL', reasons: [], refusals: [], size: parentMixSize, waits: false, seq: 2, files: [], written: [] })
+  hMix.store.set(`replayed:v2:${TABLE_REF}/${parentMix}`, { fates: 'WW', reasons: [], refusals: [], size: parentMixSize, waits: true, seq: 9, files: [childMix], written: [true] })
+  hMix.setFetch(async () => OK_INSERT)
+
+  await hMix.newWriter('s-16k-mix-1').backfill(['spill', 'retry'], 'force')
+  await hMix.newWriter('s-16k-mix-2').backfill(['spill', 'retry'], 'auto')
+  expect(hMix.sentOf(rowA)).toBe(1)
+  expect(hMix.sentOf(rowB)).toBe(1)
+  expect(hMix.sentOf(rowC)).toBe(1)
+  expect(hMix.files.get(parentMixPath)).toBe('')
+  expect(hMix.files.get(childMixPath)).toBe('')
+})
+
+test('T53-15i: skipped-file held discovery after request error yields on shutdown so exit replay delivers fresh spills', async () => {
+  const h = exitReplayHarness()
+  const w = await h.warmWriter('s-15i')
+  const file1 = 'spill-20261013T200102001Z-t53-15i-1.jsonl'
+  const file2 = 'spill-20261013T200102002Z-t53-15i-2.jsonl'
+  const fresh = 'spill-20261013T200102999Z-t53-15i-fresh.jsonl'
+  const id1 = '1'.repeat(32)
+  const id2 = '2'.repeat(32)
+  const idFresh = '3'.repeat(32)
+  h.seedSpill(file1, id1)
+  h.seedSpill(file2, id2)
+
+  let backendOk = false
+  h.setFetch(async () => (backendOk ? OK_INSERT : UNAVAILABLE))
+
+  let leaseStallStarted = (): void => undefined
+  const leaseStallReached = new Promise<void>(resolve => {
+    leaseStallStarted = resolve
+  })
+  let releaseLeaseStall = (): void => undefined
+  const leaseStall = new Promise<void>(resolve => {
+    releaseLeaseStall = resolve
+  })
+  let leaseHit = false
+  h.setStoreGetHook(async key => {
+    if (key === `lease:${TABLE_REF}/${file2}` && !leaseHit) {
+      leaseHit = true
+      leaseStallStarted()
+      await leaseStall
+    }
+  })
+
+  try {
+    let liveSettled = false
+    const liveScan = w.backfill(['spill', 'retry'], 'auto').then(r => {
+      liveSettled = true
+      return r
+    })
+    await leaseStallReached
+
+    // Backend recovers and a fresh spill arrives after live listing; shutdown begins.
+    backendOk = true
+    h.seedSpill(fresh, idFresh)
+    const exit = w.spillForExit(800, { sendQueued: true, replaySpills: true })
+    // Settle microtasks at t=0 so exit replay delivers all live spills without waiting for the 800 ms timer.
+    for (let i = 0; i < 6; i += 1) await h.settleMicrotasks()
+    await h.advance(800)
+    await exit
+    expect(liveSettled).toBe(true)
+    expect(h.sentOf(id1)).toBe(2)
+    expect(h.sentOf(id2)).toBe(1)
+    expect(h.sentOf(idFresh)).toBe(1)
+    expect(h.files.get(`${PARTITION_DIR}/${fresh}`)).toBe('')
+    await liveScan
+  } finally {
+    releaseLeaseStall()
+  }
+})
+
+test('T53-16l: interrupted forced replay persists reconciled children in v2 and holds them on auto replay until parent retires', async () => {
+  // Subcase 1: mixed child [B, D] (retry-* sorts before spill-*) with EIO on rejected-B write.
+  const hMix = exitReplayHarness()
+  const parentName = 'spill-20261013T200102001Z-t53-16l-parent.jsonl'
+  const childName = 'retry-20261013T200102003Z-t53-16l-child.jsonl'
+  const rowA = 'a'.repeat(32)
+  const rowB = 'b'.repeat(32)
+  const rowD = 'd'.repeat(32)
+  const parentPath = hMix.seedSpill(parentName, rowA, rowB)
+  const childPath = `${PARTITION_DIR}/${childName}`
+  const childText = packFiles(
+    [
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowB) }),
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowD) }),
+    ],
+    parentName,
+  )[0]!
+  hMix.files.set(childPath, childText)
+  const parentSize = utf8Bytes(hMix.files.get(parentPath)!)
+  hMix.store.set(`replayed:${TABLE_REF}/${parentName}`, { fates: 'LL', reasons: [], refusals: [], size: parentSize, waits: false, seq: 2, files: [], written: [] })
+  hMix.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, { fates: 'WW', reasons: [], refusals: [], size: parentSize, waits: true, seq: 9, files: [childName], written: [true] })
+
+  hMix.setFetch(async (_url, ids) => {
+    if (ids.includes(rowB)) {
+      const idx = ids.indexOf(rowB)
+      return { status: 200, text: JSON.stringify({ insertErrors: [{ index: idx, errors: [{ reason: 'invalid', message: 'bad row B' }] }] }) }
+    }
+    return OK_INSERT
+  })
+  hMix.setWriteFileHook(async (p, text) => {
+    if (p.includes('/rejected-') && text !== '') throw new Error('EIO writing rejected B')
+  })
+
+  await hMix.newWriter('s-16l-mix-1').backfill(['spill', 'retry'], 'force')
+  expect(hMix.store.get(`replayed:${TABLE_REF}/${parentName}`)).toBeUndefined()
+  const v2Mix = hMix.store.get(`replayed:v2:${TABLE_REF}/${parentName}`) as { reconciled?: string[]; adopted?: string[]; files?: string[] } | undefined
+  expect(v2Mix?.reconciled).toEqual([childName])
+  expect(hMix.files.get(parentPath)).not.toBe('')
+  expect(hMix.files.get(childPath)).not.toBe('')
+
+  // Clear EIO: auto backfill visits retry-* before spill-*; childName MUST wait,
+  // replacement [D] sends once, rejected B is written once, and childName is emptied.
+  hMix.setWriteFileHook(null)
+  await hMix.newWriter('s-16l-mix-2').backfill(['spill', 'retry'], 'auto')
+  expect(hMix.sentOf(rowA)).toBe(1)
+  expect(hMix.sentOf(rowB)).toBe(1)
+  expect(hMix.sentOf(rowD)).toBe(1)
+  expect(hMix.files.get(parentPath)).toBe('')
+  expect(hMix.files.get(childPath)).toBe('')
+  const rejectedFiles = [...hMix.files.entries()].filter(([p, txt]) => p.includes('/rejected-') && txt !== '')
+  expect(rejectedFiles.length).toBe(1)
+
+  // Subcase 2: exact overlap [B] with fates 'LL' (files: []), interrupted by markDone failure.
+  const hExact = exitReplayHarness()
+  const parentExact = 'spill-20261013T200102011Z-t53-16l-exact-parent.jsonl'
+  const childExact = 'retry-20261013T200102013Z-t53-16l-exact-child.jsonl'
+  const parentExactPath = hExact.seedSpill(parentExact, rowA, rowB)
+  const childExactPath = `${PARTITION_DIR}/${childExact}`
+  const childExactText = packFiles(
+    [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.013Z', table: TABLE_REF, row: ownRow(rowB) })],
+    parentExact,
+  )[0]!
+  hExact.files.set(childExactPath, childExactText)
+  const parentExactSize = utf8Bytes(hExact.files.get(parentExactPath)!)
+  hExact.store.set(`replayed:${TABLE_REF}/${parentExact}`, { fates: 'LL', reasons: [], refusals: [], size: parentExactSize, waits: false, seq: 2, files: [], written: [] })
+  hExact.store.set(`replayed:v2:${TABLE_REF}/${parentExact}`, { fates: 'LW', reasons: [], refusals: [], size: parentExactSize, waits: true, seq: 9, files: [childExact], written: [true] })
+  hExact.setFetch(async () => OK_INSERT)
+  hExact.setWriteFileHook(async (p, text) => {
+    if (p.includes(`/outcome-done-`) && p.endsWith(`-${parentExact}`) && text.includes('"retired":true')) {
+      throw new Error('EIO writing retired done mark')
+    }
+  })
+
+  await hExact.newWriter('s-16l-exact-1').backfill(['spill', 'retry'], 'force')
+  // Even with adoptedFiles empty, reconciledFiles MUST be stored in v2 with sending mark visible.
+  expect(hExact.store.get(`replayed:${TABLE_REF}/${parentExact}`)).toBeUndefined()
+  const v2Exact = hExact.store.get(`replayed:v2:${TABLE_REF}/${parentExact}`) as { reconciled?: string[]; files?: string[] } | undefined
+  expect(v2Exact?.reconciled).toEqual([childExact])
+  expect(hExact.doneMarksFor(parentExact).some(m => m.complete && m.data?.sending === true)).toBe(true)
+  expect(hExact.files.get(parentExactPath)).not.toBe('')
+  expect(hExact.files.get(childExactPath)).not.toBe('')
+
+  // Clear EIO: auto backfill visits retry-* before spill-*; childExact MUST wait,
+  // parent resumes and retires, emptying childExact without resending rowB.
+  hExact.setWriteFileHook(null)
+  await hExact.newWriter('s-16l-exact-2').backfill(['spill', 'retry'], 'auto')
+  expect(hExact.sentOf(rowA)).toBe(1)
+  expect(hExact.sentOf(rowB)).toBe(1)
+  expect(hExact.files.get(parentExactPath)).toBe('')
+  expect(hExact.files.get(childExactPath)).toBe('')
 })

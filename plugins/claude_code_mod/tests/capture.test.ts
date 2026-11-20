@@ -921,6 +921,142 @@ test('late startup version lookup applies host version independently without ove
   }
 })
 
+test('deferred startup SessionStart without optional identity keeps its own startup session and cwd when /clear arrives before version resolves', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionId = 'first'
+
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/first' })
+  await versionReached
+
+  // Startup SessionStart omits optional session_id & cwd while version lookup is still pending.
+  await $.classic.SessionStart({ source: 'startup' })
+  // /clear transitions to second session & cwd before version lookup finishes.
+  world.sessionId = 'second'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'second', cwd: '/work/second' })
+
+  releaseVersion()
+  await starting
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => ({
+      sessionId: r.session_id,
+      source: ((json(r.attributes).state_delta ?? {}) as Record<string, unknown>).start_source,
+      cwd: ((json(r.attributes).session_metadata ?? {}) as Record<string, unknown>).cwd,
+      hostVersion: ((json(r.attributes).session_metadata ?? {}) as Record<string, unknown>).host_version,
+    }))
+  expect(starts).toEqual([
+    { sessionId: 'first', source: 'startup', cwd: '/work/first', hostVersion: '2.9.99' },
+    { sessionId: 'second', source: 'clear', cwd: '/work/second', hostVersion: '2.9.99' },
+  ])
+})
+
+test('denied native session.id does not drop native cwd when classic startup omits optional cwd', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionIdRefused = true
+
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/first' })
+  await versionReached
+  await $.classic.SessionStart({ source: 'startup', session_id: 'first' })
+  releaseVersion()
+  await starting
+
+  await $.turn.start({ turnId: 'turn-denied-id', text: 'hello' })
+  await runStep($, { turnId: 'turn-denied-id', index: 0, model: 'claude-sonnet-4-6' })
+  await $.turn.complete({ turnId: 'turn-denied-id', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_start === true)
+  expect(starts.length).toBe(1)
+  expect(starts[0]!.session_id).toBe('first')
+  expect(json(starts[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/first', project_name: 'first' })
+  const invRows = byType(world.sentRows(), 'INVOCATION_STARTING')
+  expect(invRows.length).toBe(1)
+  expect(invRows[0]!.session_id).toBe('first')
+  expect(json(invRows[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/first', project_name: 'first' })
+})
+
+test('deferred classic SessionStart with mismatched session_id does not inherit native startup cwd', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionId = 'first'
+
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/first' })
+  await versionReached
+  world.sessionId = 'second'
+  await $.classic.SessionStart({ source: 'startup', session_id: 'second' })
+  releaseVersion()
+  await starting
+
+  await $.turn.start({ turnId: 'turn-mismatch-id', text: 'hello' })
+  await runStep($, { turnId: 'turn-mismatch-id', index: 0, model: 'claude-sonnet-4-6' })
+  await $.turn.complete({ turnId: 'turn-mismatch-id', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_start === true)
+  expect(starts.length).toBe(1)
+  expect(starts[0]!.session_id).toBe('second')
+  expect(json(starts[0]!.attributes).session_metadata).toMatchObject({ cwd: null, project_name: null })
+  const invRows = byType(world.sentRows(), 'INVOCATION_STARTING')
+  expect(invRows.length).toBe(1)
+  expect(invRows[0]!.session_id).toBe('second')
+  expect(json(invRows[0]!.attributes).session_metadata).toMatchObject({ cwd: null, project_name: null })
+})
+
 test('a session that runs only /bqaa-status and exits emits and spills no session_start or session_end rows', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)
