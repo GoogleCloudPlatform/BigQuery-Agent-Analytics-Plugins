@@ -96,7 +96,7 @@ export function packLines(lines: readonly string[], maxBytes = MAX_FILE_BYTES): 
 }
 
 // FNV-1a, 32 bits, over UTF-16 code units: a checksum, not a secret.
-const fnv1a = (text: string): string => {
+export const fnv1a = (text: string): string => {
   let hash = 0x811c9dc5
   for (let i = 0; i < text.length; i += 1) {
     hash ^= text.charCodeAt(i)

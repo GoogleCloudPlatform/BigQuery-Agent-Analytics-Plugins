@@ -34,7 +34,7 @@
 
 import { type Config, canDeliver, deadLetterPartition, destinationDir, joinPath, tableRef } from './config.ts'
 import { type HttpAnswer, TOKEN_INFO_URL, apiErrorMessage, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tablesUrl } from './bigquery.ts'
-import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, type ParsedFile, fileName, isDeadLetterKind, kindOf, lineText, packBodies, packFiles, packLines, parseFile, sealFile } from './deadletter.ts'
+import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, type ParsedFile, fileName, fnv1a, isDeadLetterKind, kindOf, lineText, packBodies, packFiles, packLines, parseFile, sealFile } from './deadletter.ts'
 import { randomHex } from './ids.ts'
 import { BoundedQueue, type Queued } from './queue.ts'
 import { type BqaaRow, fitRow, rowBytes, utf8Length } from './rows.ts'
@@ -222,6 +222,11 @@ type Source = {
 // whether any of those holds rows that wait for a replay, whether its record
 // may be in `recordFiles`, the number of its last record (`seq`), and whether
 // this write converted the writer's sending mark into a retired done mark.
+// Exact content identity of a reconciled or pending-reconciliation child file,
+// validated by byte length and FNV-1a checksum before any truncation so a newer
+// generation repopulating the same basename is never emptied.
+type ReconciledFile = { name: string; size: number; fnv1a: string }
+
 type Rewrite = Outcome &
   Source & {
     files: { path: string; text: string | null; uncertain?: boolean }[]
@@ -231,8 +236,18 @@ type Rewrite = Outcome &
     adoptedFiles?: string[]
     // Earlier same-size live children whose rows are already fully accounted
     // for by this forced rewrite (or moved into replacement adopted files),
-    // omitted from the retired mark and emptied only after retirement is durable.
-    reconciledFiles?: string[]
+    // omitted from the retired mark and emptied only after retirement is durable
+    // and content still matches `{ size, fnv1a }`.
+    reconciledFiles?: ReconciledFile[]
+    // Earlier same-size live children that must be reconciled before parent
+    // retirement (mixed children awaiting replacement writes, or children held
+    // by a foreign lease / transient read error), persisted in v2 so parent's
+    // confirmed outcome is durable first and automatic replay holds them.
+    pendingReconcile?: ReconciledFile[]
+    // Planned replacement filenames pre-recorded in v2 before writing any part
+    // to disk in Phase 3 so a partial multi-part write failure or crash never
+    // allows an unpromoted replacement part to be delivered prematurely.
+    stagedFiles?: string[]
     accountedRowKeys?: ReadonlySet<string>
     waits: boolean
     filed: boolean
@@ -256,7 +271,9 @@ type Journal = Outcome & {
   files: string[]
   written: boolean[]
   adopted?: string[]
-  reconciled?: string[]
+  reconciled?: ReconciledFile[]
+  pendingReconcile?: ReconciledFile[]
+  stagedFiles?: string[]
   uncertain?: boolean[]
   waits: boolean
   seq: number
@@ -515,9 +532,62 @@ const writtenOf = (journal: Partial<Journal>): boolean[] => {
   return Array.isArray(journal.written) ? files.map((_, i) => journal.written?.[i] === true) : files.map(() => true)
 }
 
-const rowIdentity = (line: DeadLetterLine): string => {
+const isClearedSlot = (val: unknown): boolean =>
+  val === undefined || val === null || (typeof val === 'object' && !Array.isArray(val) && (val as { cleared?: unknown }).cleared === true)
+
+const normalizeReconciled = (value: unknown, allowEmptyChecksum = false): ReconciledFile[] => {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  const out: ReconciledFile[] = []
+  for (const item of value) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
+    const rec = item as { name?: unknown; size?: unknown; fnv1a?: unknown }
+    if (typeof rec.name !== 'string' || rec.name === '') continue
+    const name = baseOf(rec.name)
+    if (seen.has(name)) continue
+    const size = typeof rec.size === 'number' && Number.isFinite(rec.size) && rec.size >= 0 ? rec.size : -1
+    const digest = typeof rec.fnv1a === 'string' ? rec.fnv1a : ''
+    if (size < 0 || (!allowEmptyChecksum && (size === 0 || digest === ''))) continue
+    seen.add(name)
+    out.push({ name, size, fnv1a: digest })
+  }
+  return out
+}
+
+const sameReconciled = (a: readonly ReconciledFile[], b: readonly ReconciledFile[]): boolean =>
+  a.length === b.length && a.every((x, i) => x.name === b[i]?.name && x.size === b[i]?.size && x.fnv1a === b[i]?.fnv1a)
+
+const normalizeStaged = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string' || item === '') continue
+    const name = baseOf(item)
+    if (seen.has(name)) continue
+    seen.add(name)
+    out.push(name)
+  }
+  return out
+}
+
+// Row identity for forced-replay parent/child reconciliation. Uses `event_id`
+// when present; for legacy rows without `event_id`, uses the persisted `key`
+// (or reconstructs `<parentName>#<index>` for unkeyed parent rows). Child rows
+// lacking both `event_id` and `key` return `null` so distinct events with
+// identical payloads are never dropped.
+const parentRowIdentity = (line: DeadLetterLine, parentName: string, index: number): string => {
   const id = line.row.event_id
-  return typeof id === 'string' && id !== '' ? `id:${line.table}\0${id}` : `raw:${line.table}\0${JSON.stringify(line.row)}`
+  if (typeof id === 'string' && id !== '') return `id:${line.table}\0${id}`
+  const key = typeof line.key === 'string' && line.key !== '' ? line.key : `${parentName}#${index}`
+  return `key:${line.table}\0${key}`
+}
+
+const childRowIdentity = (line: DeadLetterLine): string | null => {
+  const id = line.row.event_id
+  if (typeof id === 'string' && id !== '') return `id:${line.table}\0${id}`
+  if (typeof line.key === 'string' && line.key !== '') return `key:${line.table}\0${line.key}`
+  return null
 }
 
 // The number of a record (0 for one that does not say).
@@ -2520,11 +2590,11 @@ export class Writer {
         const emptySource = sourceFor(dir, name, 0, c)
         const s1 = await boundedLookup(() => this.io.storeGet(emptySource.recordKey))
         if (s1 === OP_ABORTED) return 'aborted'
-        if (s1 !== undefined) retired = true
+        if (!isClearedSlot(s1)) retired = true
         else {
           const s2 = await boundedLookup(() => this.io.storeGet(emptySource.v2RecordKey))
           if (s2 === OP_ABORTED) return 'aborted'
-          retired = s2 !== undefined
+          retired = !isClearedSlot(s2)
         }
       }
       if (retired) this.retiredEmpty.add(path)
@@ -2713,7 +2783,7 @@ export class Writer {
           const unwrittenUncertain = resumed.files.filter(f => f.uncertain && f.text !== null)
           let done = false
           try {
-            done = await this.writeOut(path, resumed, parentIndex, emptiedInRun)
+            done = await this.writeOut(path, resumed, c, parentIndex, emptiedInRun)
           } finally {
             for (const f of unwrittenUncertain) {
               if (f.text === null) {
@@ -2783,7 +2853,37 @@ export class Writer {
               continue
             }
             const parentSize = parentName !== null && isSourceLive(parentName) ? (listed.get(parentName) ?? 0) : 0
-            const fate = parentName === null ? 'go' : await this.parentFate(dir, parentName, path, parentSize, c)
+            const rawFate = parentName === null ? 'go' : await this.parentFate(dir, parentName, path, parentSize, c)
+            const hasLiveOrWrittenGrandchild =
+              supersededUnaccounted !== undefined &&
+              Array.isArray(supersededUnaccounted.files) &&
+              supersededUnaccounted.files.length > 0 &&
+              (writtenOf(supersededUnaccounted).some(Boolean) ||
+                supersededUnaccounted.files.some(f => typeof f === 'string' && (listed.get(baseOf(f)) ?? 0) > 0))
+            let parentAccountedKeys: ReadonlySet<string> | undefined
+            let breakWrittenChildDeadlock = rawFate === 'wait-pending' && trigger === 'force' && hasLiveOrWrittenGrandchild
+            if (breakWrittenChildDeadlock && parentName !== null) {
+              const parentPath = joinPath(dir, parentName)
+              const liveRewrite = this.rewrites.get(parentPath)
+              if (liveRewrite?.accountedRowKeys !== undefined) {
+                parentAccountedKeys = liveRewrite.accountedRowKeys
+              } else if (parentSize > 0 && parentSize <= HOST_FILE_BYTES) {
+                try {
+                  const parentRaw = await this.io.readFile(parentPath)
+                  const parsedParent = parseFile(parentRaw)
+                  if (parsedParent.complete && utf8Length(parentRaw) === parentSize) {
+                    parentAccountedKeys = new Set(parsedParent.lines.map((line, i) => parentRowIdentity(line, parentName, i)))
+                  } else {
+                    breakWrittenChildDeadlock = false
+                  }
+                } catch {
+                  breakWrittenChildDeadlock = false
+                }
+              } else {
+                breakWrittenChildDeadlock = false
+              }
+            }
+            const fate = breakWrittenChildDeadlock ? 'go' : rawFate === 'wait-pending' ? 'wait' : rawFate
             if (fate === 'wait') {
               // Written by a replay of another file whose record does not have
               // it as written yet: it waits until that replay is finished.
@@ -2813,7 +2913,21 @@ export class Writer {
               if (kindOf(name) !== 'rejected') tally.waiting += 1
             } else {
               if (trigger === 'force') this.uncertainSources.delete(path)
-              emptied = await this.backfillFile(dir, name, parsed, source, c, kinds, trigger, report, tally, parentIndex, supersededUnaccounted, emptiedInRun)
+              emptied = await this.backfillFile(
+                dir,
+                name,
+                parsed,
+                source,
+                c,
+                kinds,
+                trigger,
+                report,
+                tally,
+                parentIndex,
+                supersededUnaccounted,
+                emptiedInRun,
+                parentAccountedKeys,
+              )
               if (this.retiredEmpty.has(path)) {
                 emptiedInRun.add(name)
                 parentIndex.delete(name)
@@ -2922,34 +3036,61 @@ export class Writer {
             doneAt.set(of, at)
             return at
           }
-          const hasLiveChild = (stored: unknown): boolean => {
-            if (stored === null || typeof stored !== 'object') return false
-            const fs = (stored as Partial<Journal>).files
-            return Array.isArray(fs) && fs.some(f => typeof f === 'string' && isSourceLive(baseOf(f)))
-          }
+          // Lazily refresh the directory listing before deleting any parent
+          // evidence so a late child written while an unrelated request was in
+          // flight (or while cleanup reads are running) is never overlooked.
+          let freshListed: Map<string, number> | null = null
+          let freshListFailed = false
           let liveSourceRemains = false
-          for (const [n, sz] of listed) {
-            if (sz > 0 && kindOf(n) !== null && !emptiedInRun.has(n)) {
-              liveSourceRemains = true
-              break
-            }
-          }
-          // Lazily inspect remaining live dead-letter files so cleanup never
-          // truncates or deletes parent evidence that any live file on disk still
-          // names as its `parent` (including unlisted children held as ambiguous).
           let liveParentsChecked = false
           let liveParentsIncomplete = false
           const liveParents = new Set<string>()
+          const ensureFreshListing = async (): Promise<boolean> => {
+            if (freshListed !== null) return true
+            if (freshListFailed) return false
+            try {
+              const latest = await cleanupOp(this.io.listDir(dir))
+              if (latest === CLEANUP_ABORT) {
+                freshListFailed = true
+                return false
+              }
+              const map = new Map<string, number>()
+              for (const entry of latest) {
+                if (entry.kind === undefined || entry.kind === 'file') {
+                  map.set(entry.name, entry.size)
+                  if (entry.size > 0 && kindOf(entry.name) !== null) liveSourceRemains = true
+                }
+              }
+              freshListed = map
+              return true
+            } catch {
+              freshListFailed = true
+              return false
+            }
+          }
+          const isFreshLive = (n: string): boolean => (freshListed !== null ? (freshListed.get(n) ?? 0) > 0 : isSourceLive(n))
+          const hasLiveChild = (stored: unknown): boolean => {
+            if (stored === null || typeof stored !== 'object') return false
+            const fs = (stored as Partial<Journal>).files
+            return Array.isArray(fs) && fs.some(f => typeof f === 'string' && isFreshLive(baseOf(f)))
+          }
           const ensureLiveParents = async (): Promise<void> => {
             if (liveParentsChecked) return
             liveParentsChecked = true
+            if (!(await ensureFreshListing()) || freshListed === null) {
+              liveParentsIncomplete = true
+              return
+            }
             if (!liveSourceRemains) return
-            for (const [n, sz] of listed) {
-              if (sz <= 0 || kindOf(n) === null || emptiedInRun.has(n)) continue
-              const known = fileParent.get(n)
-              if (known !== undefined) {
-                if (known !== '') liveParents.add(known)
-                continue
+            for (const [n, sz] of freshListed) {
+              if (sz <= 0 || kindOf(n) === null) continue
+              const preSize = listed.get(n)
+              if (preSize === sz && !emptiedInRun.has(n)) {
+                const known = fileParent.get(n)
+                if (known !== undefined) {
+                  if (known !== '') liveParents.add(known)
+                  continue
+                }
               }
               const indexed = parentIndex.get(n)
               if (indexed !== undefined && indexed.size === sz) {
@@ -2979,6 +3120,26 @@ export class Writer {
               }
             }
           }
+          // Re-verify immediately before deleting store/companion evidence that
+          // no new or grown live dead-letter file appeared in `dir` after
+          // `freshListed` was captured.
+          const confirmDirStable = async (parentName: string): Promise<boolean> => {
+            if (freshListed === null) return false
+            try {
+              const nowEntries = await cleanupOp(this.io.listDir(dir))
+              if (nowEntries === CLEANUP_ABORT) return false
+              for (const entry of nowEntries) {
+                if (entry.kind !== undefined && entry.kind !== 'file') continue
+                if (entry.name === parentName && entry.size > 0) return false
+                if (kindOf(entry.name) !== null && (!freshListed.has(entry.name) || (entry.size > 0 && freshListed.get(entry.name) !== entry.size))) {
+                  return false
+                }
+              }
+              return true
+            } catch {
+              return false
+            }
+          }
           const cleanedParents = new Set<string>()
           for (const [of, list] of companions) {
             if (cleanupStopped()) break
@@ -2999,105 +3160,112 @@ export class Writer {
             }
             if (!allExpired || cleanupStopped()) continue
             await ensureLiveParents()
-            if (liveParentsIncomplete || liveParents.has(of) || cleanupStopped()) continue
+            if (liveParentsIncomplete || liveParents.has(of) || isFreshLive(of) || cleanupStopped()) continue
             // Inspect ALL companion files and both store slots for this parent
             // before deleting or truncating any record: journals and retired
             // marks that any live child still depends on must stay intact together.
             let keepParent = false
-            for (const e of nonEmpty) {
-              if (cleanupStopped()) {
+            const storeKeys = [`replayed:${dest}/${of}`, `replayed:v2:${dest}/${of}`]
+            const storedKeysPresent: string[] = []
+            const inspectBatch = await cleanupOp(
+              Promise.all([
+                Promise.all(
+                  nonEmpty.map(async e => {
+                    try {
+                      return { ok: true as const, raw: await this.io.readFile(joinPath(dir, e.name)) }
+                    } catch {
+                      return { ok: false as const, raw: '' }
+                    }
+                  }),
+                ),
+                Promise.all(
+                  storeKeys.map(async key => {
+                    try {
+                      return { ok: true as const, key, stored: await this.io.storeGet(key) }
+                    } catch {
+                      return { ok: false as const, key, stored: undefined }
+                    }
+                  }),
+                ),
+              ]),
+            )
+            if (inspectBatch === CLEANUP_ABORT) break
+            const [companionReads, storeReads] = inspectBatch
+            for (const read of companionReads) {
+              if (!read.ok) {
                 keepParent = true
                 break
               }
-              try {
-                const raw = await cleanupOp(this.io.readFile(joinPath(dir, e.name)))
-                if (raw === CLEANUP_ABORT) {
+              const parsed = journalOf(read.raw)
+              if (parsed === 'torn') {
+                if (liveSourceRemains) {
                   keepParent = true
                   break
                 }
-                const parsed = journalOf(raw)
-                if (parsed === 'torn') {
-                  if (liveSourceRemains) {
-                    keepParent = true
-                    break
-                  }
-                } else if (parsed !== undefined && hasLiveChild(parsed)) {
-                  keepParent = true
-                  break
-                }
-              } catch {
+              } else if (parsed !== undefined && hasLiveChild(parsed)) {
                 keepParent = true
                 break
               }
             }
             if (keepParent) continue
-            const storeKeys = [`replayed:${dest}/${of}`, `replayed:v2:${dest}/${of}`]
-            const storedKeysPresent: string[] = []
-            for (const key of storeKeys) {
-              if (cleanupStopped()) {
+            for (const read of storeReads) {
+              if (!read.ok) {
                 keepParent = true
                 break
               }
-              try {
-                const stored = await cleanupOp(this.io.storeGet(key))
-                if (stored === CLEANUP_ABORT) {
+              if (read.stored !== undefined) {
+                if (!isClearedSlot(read.stored) && hasLiveChild(read.stored)) {
                   keepParent = true
                   break
                 }
-                if (stored !== undefined) {
-                  if (hasLiveChild(stored)) {
-                    keepParent = true
-                    break
-                  }
-                  storedKeysPresent.push(key)
-                }
-              } catch {
-                keepParent = true
-                break
+                storedKeysPresent.push(read.key)
               }
             }
             if (keepParent || cleanupStopped()) continue
+            if (!(await confirmDirStable(of)) || cleanupStopped()) continue
             // Delete store entries BEFORE truncating on-disk companion files so a
             // store failure or exit-cleanup cutoff never strands an orphaned v2
             // store key with no remaining done mark on disk to reclaim it.
             const v2Key = `replayed:v2:${dest}/${of}`
             let allStoreDeleted = true
             let v2Clean = !storedKeysPresent.includes(v2Key)
-            for (const key of storedKeysPresent) {
-              if (cleanupStopped()) {
+            if (storedKeysPresent.length > 0) {
+              const deleteResults = await cleanupOp(
+                Promise.all(
+                  storedKeysPresent.map(async key => {
+                    try {
+                      await this.io.storeDelete(key)
+                      return { ok: true as const, key }
+                    } catch {
+                      return { ok: false as const, key }
+                    }
+                  }),
+                ),
+              )
+              if (deleteResults === CLEANUP_ABORT) {
                 allStoreDeleted = false
-                break
-              }
-              try {
-                const deleted = await cleanupOp(this.io.storeDelete(key))
-                if (deleted === CLEANUP_ABORT) {
-                  allStoreDeleted = false
-                  break
+              } else {
+                for (const res of deleteResults) {
+                  if (!res.ok) allStoreDeleted = false
+                  else if (res.key === v2Key) v2Clean = true
                 }
-                if (key === v2Key) v2Clean = true
-              } catch {
-                allStoreDeleted = false
               }
             }
             if (v2Clean) this.cleanedRetiredV2.add(v2Key)
             if (!allStoreDeleted || cleanupStopped()) continue
-            let allTruncated = true
-            for (const e of nonEmpty) {
-              if (cleanupStopped()) {
-                allTruncated = false
-                break
-              }
-              try {
-                const truncated = await cleanupOp(this.io.writeFile(joinPath(dir, e.name), ''))
-                if (truncated === CLEANUP_ABORT) {
-                  allTruncated = false
-                  break
-                }
-              } catch {
-                allTruncated = false
-              }
-            }
-            if (allTruncated) cleanedParents.add(of)
+            const truncateResults = await cleanupOp(
+              Promise.all(
+                nonEmpty.map(async e => {
+                  try {
+                    await this.io.writeFile(joinPath(dir, e.name), '')
+                    return true
+                  } catch {
+                    return false
+                  }
+                }),
+              ),
+            )
+            if (truncateResults !== CLEANUP_ABORT && truncateResults.every(Boolean)) cleanedParents.add(of)
           }
           // A legacy writer that retires a source only deletes `replayed:<dest>/<name>`
           // and leaves `replayed:v2:<dest>/<name>` orphaned in `$.store`. Reclaim any
@@ -3119,9 +3287,9 @@ export class Writer {
                   this.cleanedRetiredV2.add(v2Key)
                   continue
                 }
-                if (hasLiveChild(stored)) continue
                 await ensureLiveParents()
-                if (liveParentsIncomplete || liveParents.has(of) || cleanupStopped()) continue
+                if (liveParentsIncomplete || liveParents.has(of) || isFreshLive(of) || cleanupStopped()) continue
+                if (!isClearedSlot(stored) && hasLiveChild(stored)) continue
                 let retired = beside.done.length === 0 && beside.zeroDone && !beside.record
                 for (const doneName of beside.done) {
                   if (cleanupStopped()) break
@@ -3137,6 +3305,7 @@ export class Writer {
                   }
                 }
                 if (!retired || cleanupStopped()) continue
+                if (!(await confirmDirStable(of)) || cleanupStopped()) continue
                 const deleted = await cleanupOp(this.io.storeDelete(v2Key))
                 if (deleted === CLEANUP_ABORT) break
                 this.cleanedRetiredV2.add(v2Key)
@@ -3475,7 +3644,8 @@ export class Writer {
   ): Promise<{ found: Found | undefined; torn: boolean; rawStored?: Partial<Journal> }> {
     // A record of another size is not this file's (`size` -1: any size).
     const fits = (journal: Partial<Journal> | undefined): journal is Partial<Journal> => journal !== undefined && (source.size < 0 || journal.size === source.size)
-    const read = ((await this.io.storeGet(recordKey)) ?? undefined) as Partial<Journal> | undefined
+    const rawRead = await this.io.storeGet(recordKey)
+    const read = isClearedSlot(rawRead) ? undefined : (rawRead as Partial<Journal>)
     const stored = fits(read) ? read : undefined
     let filed: Partial<Journal> | undefined
     let slotTorn = false
@@ -3630,7 +3800,8 @@ export class Writer {
     recordKey: string,
     recordFiles: readonly string[],
   ): Promise<{ stored: Partial<Journal> | undefined; filed: Partial<Journal>[]; tornSizes: (number | null)[] }> {
-    const read = ((await this.io.storeGet(recordKey)) ?? undefined) as Partial<Journal> | undefined
+    const rawRead = await this.io.storeGet(recordKey)
+    const read = isClearedSlot(rawRead) ? undefined : (rawRead as Partial<Journal>)
     const filed: Partial<Journal>[] = []
     const tornSizes: (number | null)[] = []
     for (const file of recordFiles) {
@@ -3659,7 +3830,7 @@ export class Writer {
   // unambiguous generation with no unexplained torn evidence that does not
   // name it yields `drop`, and conflicting or incomplete evidence yields
   // `ambiguous` so the child is preserved rather than truncated.
-  private async parentFate(dir: string, parent: string, path: string, size: number, c: Config): Promise<'go' | 'wait' | 'drop' | 'ambiguous'> {
+  private async parentFate(dir: string, parent: string, path: string, size: number, c: Config): Promise<'go' | 'wait' | 'wait-pending' | 'drop' | 'ambiguous'> {
     const parentName = baseOf(parent)
     const targetName = baseOf(path)
     const namesTarget = (journal: Partial<Journal>): boolean =>
@@ -3675,10 +3846,27 @@ export class Writer {
       if (found === undefined) return 'go'
       const at = (Array.isArray(found.journal.files) ? found.journal.files : []).findIndex(entry => entry === path || baseOf(entry) === targetName)
       if (at !== -1) return writtenOf(found.journal)[at] === true ? 'go' : 'wait'
-      const isReconciled =
-        Array.isArray(found.journal.reconciled) &&
-        found.journal.reconciled.some(entry => typeof entry === 'string' && (entry === path || baseOf(entry) === targetName))
-      if (isReconciled && found.journal.retired !== true) return 'wait'
+      if (found.journal.retired !== true && normalizeStaged(found.journal.stagedFiles).includes(targetName)) return 'wait'
+      const reconciledEntry = normalizeReconciled(found.journal.reconciled).find(entry => entry.name === targetName)
+      if (reconciledEntry !== undefined && found.journal.retired !== true) {
+        if (reconciledEntry.fnv1a === '') return 'wait'
+        try {
+          const curRaw = await this.io.readFile(path)
+          if (curRaw === '' || (utf8Length(curRaw) === reconciledEntry.size && fnv1a(curRaw) === reconciledEntry.fnv1a)) return 'wait'
+        } catch {
+          return 'wait'
+        }
+      }
+      const pendingEntry = normalizeReconciled(found.journal.pendingReconcile, true).find(entry => entry.name === targetName)
+      if (pendingEntry !== undefined && found.journal.retired !== true) {
+        if (pendingEntry.fnv1a === '') return 'wait-pending'
+        try {
+          const curRaw = await this.io.readFile(path)
+          if (curRaw === '' || (utf8Length(curRaw) === pendingEntry.size && fnv1a(curRaw) === pendingEntry.fnv1a)) return 'wait-pending'
+        } catch {
+          return 'wait'
+        }
+      }
       if (found.journal.retired !== true) return 'go'
       // Never authorize `drop` from a single-size lookup alone: fall through to
       // the multi-generation inspection below so another parent-size generation
@@ -3827,8 +4015,13 @@ export class Writer {
 
   private async safeStoreDeleteSameSize(key: string, expectedSize: number, dir: string): Promise<void> {
     try {
-      const stored = (await this.io.storeGet(key)) as Partial<Journal> | undefined
-      if (stored === undefined) return
+      const rawStored = await this.io.storeGet(key)
+      if (rawStored === undefined) return
+      if (isClearedSlot(rawStored)) {
+        await this.io.storeDelete(key)
+        return
+      }
+      const stored = rawStored as Partial<Journal>
       if (expectedSize >= 0 && stored.size !== expectedSize) {
         if (Array.isArray(stored.files)) {
           const entries = await this.io.listDir(dir)
@@ -3924,12 +4117,26 @@ export class Writer {
     rewrite.files.forEach((file, i) => {
       if (written[i] === true) file.text = null
     })
-    if (Array.isArray(found.journal.reconciled)) {
-      const merged = new Set(rewrite.reconciledFiles ?? [])
-      for (const entry of found.journal.reconciled) {
-        if (typeof entry === 'string' && entry !== '') merged.add(baseOf(entry))
+    const foundReconciled = normalizeReconciled(found.journal.reconciled)
+    if (foundReconciled.length > 0) {
+      const merged = new Map<string, ReconciledFile>((rewrite.reconciledFiles ?? []).map(r => [r.name, r]))
+      for (const entry of foundReconciled) merged.set(entry.name, entry)
+      rewrite.reconciledFiles = [...merged.values()]
+    }
+    const foundPending = normalizeReconciled(found.journal.pendingReconcile, true)
+    if (foundPending.length > 0 || rewrite.pendingReconcile !== undefined) {
+      const reconciledNames = new Set((rewrite.reconciledFiles ?? []).map(r => r.name))
+      const mergedPending = new Map<string, ReconciledFile>((rewrite.pendingReconcile ?? []).filter(r => !reconciledNames.has(r.name)).map(r => [r.name, r]))
+      for (const entry of foundPending) {
+        if (!reconciledNames.has(entry.name)) mergedPending.set(entry.name, entry)
       }
-      if (merged.size > 0) rewrite.reconciledFiles = [...merged]
+      rewrite.pendingReconcile = mergedPending.size > 0 ? [...mergedPending.values()] : undefined
+    }
+    const foundStaged = normalizeStaged(found.journal.stagedFiles)
+    if (foundStaged.length > 0 || rewrite.stagedFiles !== undefined) {
+      const adoptedNames = new Set(rewrite.adoptedFiles ?? [])
+      const mergedStaged = new Set<string>([...(rewrite.stagedFiles ?? []), ...foundStaged].filter(n => !adoptedNames.has(n)))
+      rewrite.stagedFiles = mergedStaged.size > 0 ? [...mergedStaged] : undefined
     }
     rewrite.filed ||= found.filed
     rewrite.seq = Math.max(rewrite.seq, seqOf(found.journal))
@@ -3966,10 +4173,12 @@ export class Writer {
         }))
     const generatedPaths = adoptedValid ? paths.slice(0, paths.length - adoptedCount) : paths
     const adoptedFiles = adoptedValid && adoptedCount > 0 ? adoptedList : undefined
-    const reconciledList = Array.isArray(journal.reconciled)
-      ? journal.reconciled.filter((x): x is string => typeof x === 'string' && x !== '').map(baseOf)
-      : []
+    const reconciledList = normalizeReconciled(journal.reconciled)
     const reconciledFiles = reconciledList.length > 0 ? reconciledList : undefined
+    const pendingList = normalizeReconciled(journal.pendingReconcile, true)
+    const pendingReconcile = pendingList.length > 0 ? pendingList : undefined
+    const stagedList = normalizeStaged(journal.stagedFiles)
+    const stagedFiles = stagedList.length > 0 ? stagedList : undefined
     const outcome: Outcome = {
       fates: typeof journal.fates === 'string' ? journal.fates : '',
       reasons: Array.isArray(journal.reasons) ? journal.reasons : [],
@@ -3980,19 +4189,24 @@ export class Writer {
       found.v2 === true ||
       (Array.isArray(journal.uncertainLines) && journal.uncertainLines.length > 0) ||
       (adoptedFiles !== undefined && adoptedFiles.length > 0) ||
-      (reconciledFiles !== undefined && reconciledFiles.length > 0)
+      (reconciledFiles !== undefined && reconciledFiles.length > 0) ||
+      (pendingReconcile !== undefined && pendingReconcile.length > 0) ||
+      (stagedFiles !== undefined && stagedFiles.length > 0)
     const rewrite: Rewrite = {
       ...outcome,
       ...source,
-      waits: journal.waits === true,
+      waits: journal.waits === true || (pendingReconcile !== undefined && pendingReconcile.length > 0) || (stagedFiles !== undefined && stagedFiles.length > 0),
       filed: found.filed,
       seq: seqOf(journal),
       files: generatedPaths.map((p, i) => ({ path: joinPath(source.dir, baseOf(p)), text: null, ...(journal.uncertain?.[i] === true ? { uncertain: true } : {}) })),
       ...(adoptedFiles ? { adoptedFiles } : {}),
       ...(reconciledFiles ? { reconciledFiles } : {}),
+      ...(pendingReconcile ? { pendingReconcile } : {}),
+      ...(stagedFiles ? { stagedFiles } : {}),
       ...(useV2 ? { useV2: true } : {}),
     }
-    if (written.every(Boolean)) return rewrite
+    const needsPendingReconcile = pendingReconcile !== undefined && pendingReconcile.length > 0
+    if (written.every(Boolean) && !needsPendingReconcile) return rewrite
     const text = await this.io.readFile(path)
     // Emptied meanwhile (another writer finished it): nothing to resume, and
     // its record is left as that writer left it.
@@ -4002,6 +4216,10 @@ export class Writer {
     // one since): the record is kept, and the file waits, as one with no
     // record does, until it reads whole.
     if (!lines.complete || (source.size >= 0 && utf8Length(text) !== source.size)) return undefined
+    if (needsPendingReconcile) {
+      rewrite.accountedRowKeys = new Set(lines.lines.map((line, i) => parentRowIdentity(line, source.name, i)))
+    }
+    if (written.every(Boolean)) return rewrite
     const texts = fitsLines(lines, outcome) ? leftoverFiles(lines, fileKind, outcome, source.name) : null
     if (texts === null || !adoptedValid || texts.length !== generatedPaths.length) {
       // Keep the checkpoint whenever its fates still fit the file (so recovery
@@ -4055,15 +4273,16 @@ export class Writer {
   // emptied: nothing is written either. A record that cannot be read keeps
   // this outcome here until it can be. The same check comes before each
   // file of what is left, and before the mark that the file was done.
-  private async writeOut(path: string, rewrite: Rewrite, parentIndex?: RunParentIndex, emptiedInRun?: Set<string>): Promise<boolean> {
+  private async writeOut(path: string, rewrite: Rewrite, c: Config, parentIndex?: RunParentIndex, emptiedInRun?: Set<string>): Promise<boolean> {
     this.rewrites.set(path, rewrite)
     const initialSlots: { slotsRead: boolean; v1Stored?: Partial<Journal>; v2Stored?: Partial<Journal> } = { slotsRead: false }
     const found = Writer.recorded(await this.readJournal(rewrite, initialSlots))
     const normalizeSlot = (val: unknown): Partial<Journal> | 'torn' | undefined => {
-      if (val === undefined) return undefined
+      if (isClearedSlot(val)) return undefined
       return typeof val === 'object' && val !== null && !Array.isArray(val) ? (val as Partial<Journal>) : 'torn'
     }
     const cachedStore = new Map<string, Partial<Journal> | 'torn' | undefined>()
+    const neutralizedKeys = new Set<string>()
     if (initialSlots.slotsRead) {
       cachedStore.set(rewrite.recordKey, normalizeSlot(initialSlots.v1Stored))
       cachedStore.set(rewrite.v2RecordKey, normalizeSlot(initialSlots.v2Stored))
@@ -4074,6 +4293,8 @@ export class Writer {
       cachedStore.set(key, val)
       return val
     }
+    const dest = destinationDir(tableRef(c))
+    const me = this.sessionId() ?? 'unknown'
     // Finished already (the file left again, by a late copy, say), here or
     // at any check below: the mark that it was done stands as it is, never
     // written again, and only the file is emptied.
@@ -4095,13 +4316,16 @@ export class Writer {
         // The record has this outcome as this writer has it: no need to write it again.
         const written = writtenOf(found.journal)
         const allWritten = [...rewrite.files.map(file => file.text === null), ...(rewrite.adoptedFiles ?? []).map(() => true)]
-        const foundReconciled = Array.isArray(found.journal.reconciled)
-          ? found.journal.reconciled.filter((x): x is string => typeof x === 'string' && x !== '').map(baseOf)
-          : []
+        const foundReconciled = normalizeReconciled(found.journal.reconciled)
+        const foundPending = normalizeReconciled(found.journal.pendingReconcile, true)
+        const foundStaged = normalizeStaged(found.journal.stagedFiles)
         recorded =
           allWritten.length === written.length &&
           allWritten.every((w, i) => w === written[i]) &&
-          (finished || sameNames(foundReconciled, rewrite.reconciledFiles ?? []))
+          (finished ||
+            (sameReconciled(foundReconciled, rewrite.reconciledFiles ?? []) &&
+              sameReconciled(foundPending, rewrite.pendingReconcile ?? []) &&
+              sameNames(foundStaged, rewrite.stagedFiles ?? [])))
       }
     } else if ((await this.io.readFile(path)) === '') {
       this.rewrites.delete(path)
@@ -4122,11 +4346,139 @@ export class Writer {
         return null
       }
     }
+    type ChildClassification =
+      | { action: 'skip' }
+      | { action: 'adopt' }
+      | { action: 'reconciled'; ref: ReconciledFile }
+      | {
+          action: 'replace'
+          ref: ReconciledFile
+          childKind: DeadLetterKind
+          markUncertain: boolean
+          entries: { line: DeadLetterLine; index: number; refusedReason?: string }[]
+          unreadable: string[]
+        }
+      | { action: 'defer'; ref: ReconciledFile; reason: string }
+    const classifyChild = async (
+      base: string,
+      sz: number,
+      fallbackRef?: ReconciledFile,
+      currentListing?: ReadonlyMap<string, number> | null,
+    ): Promise<ChildClassification> => {
+      const childPath = joinPath(rewrite.dir, base)
+      const fallback: ReconciledFile = fallbackRef ?? { name: base, size: Math.max(0, sz), fnv1a: '' }
+      // Check the child's own foreign lease before reading, copying, or reconciling it.
+      try {
+        const lease = (await this.io.storeGet(`lease:${dest}/${base}`)) as { by?: string; until?: number } | undefined
+        if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
+          return { action: 'defer', ref: fallback, reason: `another session's lease holds ${base}; deferring reconciliation` }
+        }
+      } catch {
+        return { action: 'defer', ref: fallback, reason: `cannot inspect lease for ${base}; deferring reconciliation` }
+      }
+      // Inspect the child's own delivery record before creating any replacement.
+      let childFound: Found | Pending | 'torn' | 'conflict' | undefined
+      try {
+        childFound = await this.readJournal(sourceFor(rewrite.dir, base, sz, c))
+      } catch {
+        return { action: 'defer', ref: fallback, reason: `cannot read replay record for ${base}; deferring reconciliation` }
+      }
+      if (childFound !== undefined && childFound !== 'torn' && childFound !== 'conflict' && !('pending' in childFound) && childFound.journal.retired === true) {
+        // Child already completed its own replay and wrote its retired marker
+        // (e.g. failed to truncate): never copy its rows into a replacement.
+        try {
+          const raw = await this.io.readFile(childPath)
+          if (raw === '') return { action: 'skip' }
+          return { action: 'reconciled', ref: { name: base, size: utf8Length(raw), fnv1a: fnv1a(raw) } }
+        } catch {
+          return { action: 'defer', ref: fallback, reason: `cannot read retired child ${base}; deferring reconciliation` }
+        }
+      }
+      if (rewrite.accountedRowKeys === undefined || sz > HOST_FILE_BYTES) {
+        return { action: 'adopt' }
+      }
+      let raw: string
+      try {
+        raw = await this.io.readFile(childPath)
+      } catch {
+        return { action: 'defer', ref: fallback, reason: `cannot read child ${base}; deferring reconciliation` }
+      }
+      if (raw === '') return { action: 'skip' }
+      const actualSize = utf8Length(raw)
+      const actualDigest = fnv1a(raw)
+      const ref: ReconciledFile = { name: base, size: actualSize, fnv1a: actualDigest }
+      const parsed = parseFile(raw)
+      if (!parsed.complete) {
+        return { action: 'defer', ref, reason: `${base} is incomplete; deferring reconciliation` }
+      }
+      if (fallbackRef !== undefined && fallbackRef.fnv1a !== '' && (actualSize !== fallbackRef.size || actualDigest !== fallbackRef.fnv1a)) {
+        const currentParent = parsed.parent === null ? null : baseOf(parsed.parent)
+        if (currentParent !== rewrite.name) return { action: 'skip' }
+      }
+      let isChildPendingOrBad = childFound === 'torn' || childFound === 'conflict' || (childFound !== undefined && 'pending' in childFound)
+      let childOutcome: Outcome | null = null
+      if (childFound !== undefined && childFound !== 'torn' && childFound !== 'conflict' && !('pending' in childFound)) {
+        const cj = childFound.journal
+        const hasLiveOrWrittenGrandchild =
+          Array.isArray(cj.files) &&
+          cj.files.length > 0 &&
+          (writtenOf(cj).some(Boolean) ||
+            currentListing === null ||
+            (currentListing !== undefined &&
+              cj.files.some(f => typeof f === 'string' && (currentListing.get(baseOf(f)) ?? 0) > 0)))
+        if (hasLiveOrWrittenGrandchild) {
+          return { action: 'defer', ref, reason: `${base} has its own written children; deferring reconciliation` }
+        }
+        const candidate: Outcome = {
+          fates: typeof cj.fates === 'string' ? cj.fates : '',
+          reasons: Array.isArray(cj.reasons) ? cj.reasons : [],
+          refusals: Array.isArray(cj.refusals) ? cj.refusals : [],
+          ...(Array.isArray(cj.uncertainLines) ? { uncertainLines: cj.uncertainLines } : {}),
+        }
+        if (!fitsLines(parsed, candidate)) {
+          // Unaccounted child journal with no written grandchildren: treat its
+          // delivery status as uncertain rather than deadlocking parent and child.
+          isChildPendingOrBad = true
+        } else {
+          childOutcome = candidate
+        }
+      }
+      const remainingEntries: { line: DeadLetterLine; index: number; refusedReason?: string }[] = []
+      let childRefusedIdx = 0
+      for (let i = 0; i < parsed.lines.length; i += 1) {
+        const line = parsed.lines[i] as DeadLetterLine
+        const childFate = childOutcome ? childOutcome.fates[i] : undefined
+        let refusedReason: string | undefined
+        if (childFate === 'R' && childOutcome) {
+          refusedReason = childOutcome.reasons[childOutcome.refusals[childRefusedIdx] ?? -1] ?? ''
+          childRefusedIdx += 1
+        }
+        if (childFate === 'L') continue
+        const identity = childRowIdentity(line)
+        if (identity !== null && rewrite.accountedRowKeys.has(identity)) continue
+        remainingEntries.push({ line, index: i, ...(refusedReason !== undefined ? { refusedReason } : {}) })
+      }
+      if (remainingEntries.length === 0 && parsed.unreadable.length === 0) {
+        return { action: 'reconciled', ref }
+      }
+      if (remainingEntries.length === parsed.lines.length && childOutcome === null) {
+        return { action: 'adopt' }
+      }
+      return {
+        action: 'replace',
+        ref,
+        childKind: kindOf(base) ?? 'retry',
+        markUncertain: isChildPendingOrBad || (childOutcome?.uncertainLines?.length ?? 0) > 0,
+        entries: remainingEntries,
+        unreadable: parsed.unreadable,
+      }
+    }
     if (rewrite.force && !finished) {
       const listed = await dirListing()
       if (listed !== null) {
         const adopted = new Set([...rewrite.files.map(f => baseOf(f.path)), ...(rewrite.adoptedFiles ?? [])])
-        const reconciled = new Set(rewrite.reconciledFiles ?? [])
+        const reconciled = new Set((rewrite.reconciledFiles ?? []).map(r => r.name))
+        const pendingSet = new Set((rewrite.pendingReconcile ?? []).map(r => r.name))
         const entries = [...listed.entries()].map(([n, sz]) => ({ name: n, size: sz }))
         const candidateJournals: (Partial<Journal> | 'torn')[] = []
         for (const key of [rewrite.recordKey, rewrite.v2RecordKey]) {
@@ -4156,50 +4508,24 @@ export class Writer {
         } catch {
           // Best-effort inspection before forced rewrite.
         }
-        const adoptOrReconcile = async (base: string, sz: number): Promise<void> => {
-          if (base === '' || base === rewrite.name || adopted.has(base) || reconciled.has(base) || sz <= 0) return
-          if (rewrite.accountedRowKeys !== undefined && sz <= HOST_FILE_BYTES) {
-            try {
-              const raw = await this.io.readFile(joinPath(rewrite.dir, base))
-              if (raw === '') return
-              const parsed = parseFile(raw)
-              if (parsed.complete && parsed.unreadable.length === 0) {
-                const remaining = parsed.lines.filter(l => !rewrite.accountedRowKeys!.has(rowIdentity(l)))
-                if (remaining.length === 0) {
-                  // Every row in this earlier split child is already accounted
-                  // for by the parent's current forced outcome; omit it from
-                  // the new checkpoint/retired mark and empty it only after
-                  // retirement is durable.
-                  reconciled.add(base)
-                  ;(rewrite.reconciledFiles ??= []).push(base)
-                  return
-                }
-                if (remaining.length < parsed.lines.length) {
-                  // Mixed child: persist non-overlapping rows into replacement
-                  // child file(s) FIRST and adopt them, then reconcile the old
-                  // overlapping file after retirement is durable.
-                  const childKind = kindOf(base) ?? 'retry'
-                  const packed = packFiles(remaining.map(lineText), rewrite.name)
-                  const writtenReplacements: string[] = []
-                  for (const part of packed) {
-                    const replacementName = fileName(childKind, this.io.now(), this.sessionId(), ++this.seq, this.mark)
-                    await this.io.writeFile(joinPath(rewrite.dir, replacementName), part)
-                    parentIndex?.set(replacementName, { size: utf8Length(part), parent: rewrite.name })
-                    writtenReplacements.push(replacementName)
-                  }
-                  for (const replacementName of writtenReplacements) {
-                    adopted.add(replacementName)
-                    ;(rewrite.adoptedFiles ??= []).push(replacementName)
-                    if (childKind !== 'rejected') rewrite.waits = true
-                  }
-                  reconciled.add(base)
-                  ;(rewrite.reconciledFiles ??= []).push(base)
-                  return
-                }
-              }
-            } catch {
-              // Fail closed: keep the child intact as adopted if inspection or replacement fails.
-            }
+        // Phase 1: Classify candidate live children WITHOUT writing any
+        // replacement files yet. Mixed or leased/unreadable children go into
+        // `pendingReconcile` so the parent's confirmed outcome is checkpointed
+        // in v2 FIRST and a replacement write error never adopts landed rows.
+        const inspectCandidate = async (base: string, sz: number): Promise<void> => {
+          if (base === '' || base === rewrite.name || adopted.has(base) || reconciled.has(base) || pendingSet.has(base) || sz <= 0) return
+          const decision = await classifyChild(base, sz, undefined, listed)
+          if (decision.action === 'skip') return
+          if (decision.action === 'reconciled') {
+            reconciled.add(base)
+            ;(rewrite.reconciledFiles ??= []).push(decision.ref)
+            return
+          }
+          if (decision.action === 'replace' || decision.action === 'defer') {
+            pendingSet.add(base)
+            ;(rewrite.pendingReconcile ??= []).push(decision.ref)
+            rewrite.waits = true
+            return
           }
           adopted.add(base)
           ;(rewrite.adoptedFiles ??= []).push(base)
@@ -4214,47 +4540,55 @@ export class Writer {
           if (j.size !== rewrite.size || !Array.isArray(j.files)) continue
           for (const entry of j.files) {
             const base = typeof entry === 'string' ? baseOf(entry) : ''
-            await adoptOrReconcile(base, listed.get(base) ?? 0)
+            await inspectCandidate(base, listed.get(base) ?? 0)
           }
         }
         if (sawTorn) {
           for (const [n, sz] of listed) {
-            if (sz <= 0 || n === rewrite.name || adopted.has(n) || reconciled.has(n) || kindOf(n) === null || sz > HOST_FILE_BYTES) continue
+            if (sz <= 0 || n === rewrite.name || adopted.has(n) || reconciled.has(n) || pendingSet.has(n) || kindOf(n) === null || sz > HOST_FILE_BYTES) continue
             const info = await this.readParentInfo(rewrite.dir, n, sz, parentIndex)
             if (info.state === 'ok' && info.complete && info.parent === rewrite.name) {
-              await adoptOrReconcile(n, sz)
+              await inspectCandidate(n, sz)
             }
           }
         }
       }
     }
-    const adoptedNames = rewrite.adoptedFiles ?? []
-    const reconciledNames = rewrite.reconciledFiles ?? []
-    // Store checkpoints with adopted or reconciled children in the versioned v2
-    // slot so 0.1.3 readers (which only know positional leftoverFiles() and
-    // return 'go' on un-retired checkpoints for unlisted children) never delete
-    // the checkpoint or resend a reconciled child while the standing sending
-    // mark keeps the parent held.
-    if (adoptedNames.length > 0 || reconciledNames.length > 0) rewrite.useV2 = true
+    const getAdoptedNames = (): string[] => rewrite.adoptedFiles ?? []
+    const getReconciledRefs = (): ReconciledFile[] => rewrite.reconciledFiles ?? []
+    const getPendingRefs = (): ReconciledFile[] => rewrite.pendingReconcile ?? []
+    const getStagedNames = (): string[] => rewrite.stagedFiles ?? []
+    const getRewriteNames = (): string[] => [...rewrite.files.map(f => baseOf(f.path)), ...getAdoptedNames()]
+    // Store checkpoints with adopted, reconciled, pending-reconcile, or staged
+    // replacement children in the versioned v2 slot so 0.1.3 readers never
+    // delete the checkpoint or resend a reconciled/pending/staged child while
+    // the standing sending mark holds the parent.
+    if (getAdoptedNames().length > 0 || getReconciledRefs().length > 0 || getPendingRefs().length > 0 || getStagedNames().length > 0) rewrite.useV2 = true
     const activeKey = rewrite.useV2 ? rewrite.v2RecordKey : rewrite.recordKey
     const activeFiles = rewrite.useV2 ? rewrite.v2RecordFiles : rewrite.recordFiles
     const otherKey = rewrite.useV2 ? rewrite.recordKey : rewrite.v2RecordKey
     const otherFiles = rewrite.useV2 ? rewrite.recordFiles : rewrite.v2RecordFiles
-    const reconciledNameSet = new Set(reconciledNames)
-    const rewriteNames = [...rewrite.files.map(f => baseOf(f.path)), ...adoptedNames]
-    const rewriteNameSet = new Set(rewriteNames)
     const matchesRewrite = (journal: Partial<Journal> | 'torn' | undefined): boolean =>
       journal !== undefined &&
       journal !== 'torn' &&
       journal.size === rewrite.size &&
       journal.fates === rewrite.fates &&
       Array.isArray(journal.files) &&
-      sameNames(journal.files, rewriteNames) &&
-      sameNames(Array.isArray(journal.reconciled) ? journal.reconciled : [], reconciledNames) &&
+      sameNames(journal.files, getRewriteNames()) &&
+      sameReconciled(normalizeReconciled(journal.reconciled), getReconciledRefs()) &&
+      sameReconciled(normalizeReconciled(journal.pendingReconcile, true), getPendingRefs()) &&
+      sameNames(normalizeStaged(journal.stagedFiles), getStagedNames()) &&
       seqOf(journal) <= rewrite.seq
+    const isOwnedOrTracked = (name: string): boolean => {
+      if (getRewriteNames().includes(name)) return true
+      if (getReconciledRefs().some(r => r.name === name)) return true
+      if (getPendingRefs().some(r => r.name === name)) return true
+      if (getStagedNames().includes(name)) return true
+      return false
+    }
     const hasUnownedLiveChild = async (listed: ReadonlyMap<string, number>): Promise<boolean> => {
       for (const [n, sz] of listed) {
-        if (sz <= 0 || n === rewrite.name || rewriteNameSet.has(n) || reconciledNameSet.has(n) || kindOf(n) === null) continue
+        if (sz <= 0 || n === rewrite.name || isOwnedOrTracked(n) || kindOf(n) === null) continue
         const info = await this.readParentInfo(rewrite.dir, n, sz, parentIndex)
         if (info.state === 'oversized' || info.state === 'error') return true
         if (info.state === 'ok' && (!info.complete || info.parent === rewrite.name)) return true
@@ -4272,7 +4606,7 @@ export class Writer {
         f =>
           typeof f === 'string' &&
           (listed.get(baseOf(f)) ?? 0) > 0 &&
-          (journal.size !== rewrite.size || (!rewriteNameSet.has(baseOf(f)) && !reconciledNameSet.has(baseOf(f)))),
+          (journal.size !== rewrite.size || !isOwnedOrTracked(baseOf(f))),
       )
     }
     class StaleRecordClearError extends Error {}
@@ -4314,8 +4648,34 @@ export class Writer {
       try {
         const existing = await readStoreSlot(otherKey)
         if (existing !== undefined && !(await protectsLiveChild(existing))) {
-          await this.io.storeDelete(otherKey)
-          cachedStore.set(otherKey, undefined)
+          try {
+            await this.io.storeDelete(otherKey)
+            cachedStore.set(otherKey, undefined)
+            neutralizedKeys.delete(otherKey)
+          } catch {
+            // If deleting the superseded v1 store key fails, neutralize it in place
+            // so 0.1.3 readers ignore it and honor the standing sending mark instead.
+            let neutralized = false
+            if (otherKey === rewrite.recordKey) {
+              try {
+                await this.io.storeSet(otherKey, null)
+                neutralized = true
+              } catch {
+                try {
+                  await this.io.storeSet(otherKey, { cleared: true, size: -1, files: [], written: [] })
+                  neutralized = true
+                } catch {
+                  neutralized = false
+                }
+              }
+            }
+            if (neutralized) {
+              cachedStore.set(otherKey, undefined)
+              neutralizedKeys.add(otherKey)
+            } else {
+              ok = false
+            }
+          }
         }
       } catch {
         ok = false
@@ -4339,11 +4699,20 @@ export class Writer {
         clearedOppositeSlot = true
         return
       }
+      // On versioned v2 writes, if v1 cannot be deleted or neutralized in place,
+      // proceed so markDone can write a retired completion mark (`outcome-done-<mark>d-`),
+      // which both 0.1.3 and 0.1.4 readers honor ahead of any stale v1 record.
+      if (rewrite.useV2) return
       failStaleClear()
     }
     const record = async (): Promise<void> => {
       rewrite.seq += 1
       const { fates, reasons, refusals, uncertainLines, size, waits, seq } = rewrite
+      const adoptedNow = getAdoptedNames()
+      const reconciledNow = getReconciledRefs()
+      const pendingNow = getPendingRefs()
+      const stagedNow = getStagedNames()
+      const namesNow = getRewriteNames()
       const journal: Journal = {
         fates,
         reasons,
@@ -4352,12 +4721,14 @@ export class Writer {
         size,
         waits,
         seq,
-        files: rewriteNames,
-        written: [...rewrite.files.map(f => f.text === null), ...adoptedNames.map(() => true)],
-        ...(adoptedNames.length > 0 ? { adopted: adoptedNames } : {}),
-        ...(reconciledNames.length > 0 ? { reconciled: reconciledNames } : {}),
+        files: namesNow,
+        written: [...rewrite.files.map(f => f.text === null), ...adoptedNow.map(() => true)],
+        ...(adoptedNow.length > 0 ? { adopted: adoptedNow } : {}),
+        ...(reconciledNow.length > 0 ? { reconciled: reconciledNow } : {}),
+        ...(pendingNow.length > 0 ? { pendingReconcile: pendingNow } : {}),
+        ...(stagedNow.length > 0 ? { stagedFiles: stagedNow } : {}),
         ...(rewrite.files.some(f => f.uncertain === true)
-          ? { uncertain: [...rewrite.files.map(f => f.uncertain === true), ...adoptedNames.map(() => false)] }
+          ? { uncertain: [...rewrite.files.map(f => f.uncertain === true), ...adoptedNow.map(() => false)] }
           : {}),
       }
       if (utf8Length(JSON.stringify(journal)) <= STORE_RECORD_BYTES) {
@@ -4430,15 +4801,47 @@ export class Writer {
       }
       await ensureOppositeSlotCleared()
     }
+    let stuckV1Journal: Partial<Journal> | 'torn' | undefined
+    let stuckV1Captured = false
+    const sameJournalSnapshot = (a: Partial<Journal> | 'torn' | undefined, b: Partial<Journal> | 'torn' | undefined): boolean => {
+      if (a === b) return true
+      if (a === undefined || b === undefined || a === 'torn' || b === 'torn') return false
+      return (
+        a.size === b.size &&
+        seqOf(a) === seqOf(b) &&
+        a.fates === b.fates &&
+        sameNames(Array.isArray(a.files) ? a.files : [], Array.isArray(b.files) ? b.files : [])
+      )
+    }
+    if (!finished && rewrite.useV2 && !clearedOppositeSlot) {
+      const v1Now = await this.readJournalSlot(rewrite, rewrite.recordKey, rewrite.recordFiles, false)
+      stuckV1Journal = v1Now.found?.journal ?? (v1Now.torn ? 'torn' : undefined)
+      stuckV1Captured = true
+    }
     // Another writer may have written a file of it since, replayed the file
     // at the same time with an outcome of its own, or finished it: the record
     // says. That outcome goes on, at the next replay, and no more of this one.
     const stillOurs = async (): Promise<boolean> => {
       const latestSlots: { slotsRead: boolean; v1Stored?: Partial<Journal>; v2Stored?: Partial<Journal> } = { slotsRead: false }
-      const found = Writer.recorded(await this.readJournal(rewrite, latestSlots))
+      let found = Writer.recorded(await this.readJournal(rewrite, latestSlots))
       if (latestSlots.slotsRead) {
         cachedStore.set(rewrite.recordKey, normalizeSlot(latestSlots.v1Stored))
         cachedStore.set(rewrite.v2RecordKey, normalizeSlot(latestSlots.v2Stored))
+      }
+      // When moving to v2 while a pre-existing stale v1 record could neither be
+      // deleted nor neutralized, do not let that unchanged stale v1 cause
+      // `readJournal` to report `'conflict'` against our own v2 checkpoint and
+      // block `markDone` (whose retired done mark strictly overrides v1 in both
+      // 0.1.3 and 0.1.4).
+      if (found === 'conflict' && rewrite.useV2 && !clearedOppositeSlot && stuckV1Captured) {
+        const [v1Slot, v2Slot] = await Promise.all([
+          this.readJournalSlot(rewrite, rewrite.recordKey, rewrite.recordFiles, false),
+          this.readJournalSlot(rewrite, rewrite.v2RecordKey, rewrite.v2RecordFiles, true),
+        ])
+        const latestV1 = v1Slot.found?.journal ?? (v1Slot.torn ? 'torn' : undefined)
+        if (sameJournalSnapshot(latestV1, stuckV1Journal) && v2Slot.found !== undefined && Writer.catchUp(rewrite, v2Slot.found)) {
+          found = v2Slot.found
+        }
       }
       if (found === 'torn' || found === 'conflict' || (found !== undefined && found.journal.size === rewrite.size && !Writer.catchUp(rewrite, found))) {
         this.rewrites.delete(path)
@@ -4453,9 +4856,10 @@ export class Writer {
             for (const key of [rewrite.recordKey, rewrite.v2RecordKey]) {
               try {
                 const stored = await readStoreSlot(key)
-                if (stored !== undefined && !(await protectsLiveChild(stored))) {
+                if ((stored !== undefined || neutralizedKeys.has(key)) && (stored === undefined || !(await protectsLiveChild(stored)))) {
                   await this.io.storeDelete(key)
                   cachedStore.set(key, undefined)
+                  neutralizedKeys.delete(key)
                 }
               } catch {
                 // Leave store key on error.
@@ -4500,6 +4904,208 @@ export class Writer {
       }
       await record()
     }
+    // Phase 3: Materialize pending child reconciliations AFTER the parent's
+    // confirmed outcome is checkpointed in v2 and parent leftovers are written.
+    // Planned replacement names are pre-recorded in `stagedFiles` BEFORE any
+    // part is written to disk so a partial multi-part failure or crash cannot
+    // expose an unpromoted part for premature delivery.
+    if (!finished && (getPendingRefs().length > 0 || getStagedNames().length > 0)) {
+      const removePending = (name: string): void => {
+        const next = (rewrite.pendingReconcile ?? []).filter(r => r.name !== name)
+        rewrite.pendingReconcile = next.length > 0 ? next : undefined
+      }
+      const addReconciled = (ref: ReconciledFile): void => {
+        const existing = rewrite.reconciledFiles ?? []
+        if (!existing.some(r => r.name === ref.name)) {
+          rewrite.reconciledFiles = [...existing, ref]
+        }
+      }
+      const addAdopted = (name: string): void => {
+        const existing = rewrite.adoptedFiles ?? []
+        if (!existing.includes(name)) {
+          rewrite.adoptedFiles = [...existing, name]
+          if (kindOf(name) !== 'rejected') rewrite.waits = true
+        }
+      }
+      const cleanupStaged = async (names: readonly string[]): Promise<string[]> => {
+        const remaining: string[] = []
+        for (const stagedName of names) {
+          const stagedPath = joinPath(rewrite.dir, stagedName)
+          this.uncertainSources.delete(stagedPath)
+          const markPath = doneFileOf(rewrite.dir, stagedName, this.mark)
+          try {
+            if (this.io.exists === undefined || (await this.io.exists(markPath))) {
+              await this.io.writeFile(markPath, '')
+            }
+          } catch {
+            // Best-effort clear of our own uncertain sending mark.
+          }
+          let emptied = false
+          try {
+            if (this.io.exists !== undefined && !(await this.io.exists(stagedPath))) {
+              emptied = true
+            } else {
+              const cur = await this.io.readFile(stagedPath)
+              emptied = cur === '' ? true : await this.emptyCopy(stagedPath)
+            }
+          } catch {
+            emptied = false
+          }
+          if (emptied) parentIndex?.delete(stagedName)
+          else remaining.push(stagedName)
+        }
+        return remaining
+      }
+      if (getStagedNames().length > 0) {
+        if (!(await stillOurs())) return false
+        if (!finished) {
+          const prevStaged = [...getStagedNames()]
+          const remainingStaged = await cleanupStaged(prevStaged)
+          if (remainingStaged.length !== prevStaged.length) {
+            rewrite.stagedFiles = remainingStaged.length > 0 ? remainingStaged : undefined
+            try {
+              await record()
+            } catch {
+              rewrite.stagedFiles = prevStaged
+              rewrite.waits = true
+              return false
+            }
+          }
+        }
+      }
+      let reconcileBlocked = false
+      const pendingSnapshot = [...getPendingRefs()]
+      const latestListing = pendingSnapshot.length > 0 ? await dirListing() : null
+      for (const pending of pendingSnapshot) {
+        if (!(await stillOurs())) return false
+        if (finished) break
+        const sz = latestListing !== null ? (latestListing.get(pending.name) ?? 0) : pending.size
+        if (latestListing !== null && sz <= 0) {
+          removePending(pending.name)
+          await record()
+          continue
+        }
+        const decision = await classifyChild(pending.name, sz, pending, latestListing)
+        if (decision.action === 'skip') {
+          removePending(pending.name)
+          await record()
+          continue
+        }
+        if (decision.action === 'defer') {
+          this.recordError(decision.reason)
+          reconcileBlocked = true
+          continue
+        }
+        if (decision.action === 'reconciled') {
+          removePending(pending.name)
+          addReconciled(decision.ref)
+          await record()
+          continue
+        }
+        if (decision.action === 'adopt') {
+          removePending(pending.name)
+          addAdopted(pending.name)
+          await record()
+          continue
+        }
+        // Mixed child: group remaining non-overlapping rows by kind (plus any
+        // unreadable raw lines in the child's kind), stamp legacy keys if
+        // missing, pre-record all planned replacement filenames in `stagedFiles`
+        // BEFORE writing any part, then atomically promote them to `adopted`.
+        const byKind = new Map<DeadLetterKind, string[]>()
+        for (const item of decision.entries) {
+          const itemKey = keyOf(item.line, pending.name, item.index)
+          const keyedLine: DeadLetterLine = itemKey === item.line.row.event_id ? item.line : { ...item.line, key: itemKey }
+          const targetKind: DeadLetterKind = item.refusedReason !== undefined ? 'rejected' : isDeadLetterKind(item.line.kind) ? item.line.kind : decision.childKind
+          const formatted = lineText(
+            item.refusedReason !== undefined
+              ? { ...keyedLine, kind: 'rejected', reason: item.refusedReason, attempts: keyedLine.attempts + 1 }
+              : { ...keyedLine, kind: targetKind },
+          )
+          const bucket = byKind.get(targetKind)
+          if (bucket) bucket.push(formatted)
+          else byKind.set(targetKind, [formatted])
+        }
+        for (const rawBad of decision.unreadable) {
+          const bucket = byKind.get(decision.childKind)
+          if (bucket) bucket.push(rawBad)
+          else byKind.set(decision.childKind, [rawBad])
+        }
+        const planned: { name: string; path: string; part: string; size: number }[] = []
+        for (const [targetKind, texts] of byKind) {
+          const packed = packFiles(texts, rewrite.name)
+          for (const part of packed) {
+            const replacementName = fileName(targetKind, this.io.now(), this.sessionId(), ++this.seq, this.mark)
+            planned.push({ name: replacementName, path: joinPath(rewrite.dir, replacementName), part, size: utf8Length(part) })
+          }
+        }
+        const plannedNames = planned.map(p => p.name)
+        const prevStaged = [...getStagedNames()]
+        rewrite.stagedFiles = [...prevStaged, ...plannedNames]
+        try {
+          await record()
+        } catch (err) {
+          rewrite.stagedFiles = prevStaged.length > 0 ? prevStaged : undefined
+          this.recordError(`could not stage reconciled replacement for ${pending.name}: ${errorText(err)}`)
+          reconcileBlocked = true
+          break
+        }
+        const touchedReplacements: string[] = []
+        try {
+          for (const item of planned) {
+            touchedReplacements.push(item.name)
+            if (decision.markUncertain) {
+              await this.io.writeFile(
+                doneFileOf(rewrite.dir, item.name, this.mark),
+                sealFile(`${JSON.stringify({ size: item.size, sending: true, uncertain: true, by: this.mark })}\n`),
+              )
+              this.uncertainSources.set(item.path, item.size)
+            }
+            await this.io.writeFile(item.path, item.part)
+            parentIndex?.set(item.name, { size: item.size, parent: rewrite.name })
+          }
+        } catch (err) {
+          this.recordError(`could not write reconciled replacement for ${pending.name}: ${errorText(err)}`)
+          const stillPresent = await cleanupStaged(touchedReplacements)
+          const nextStaged = [...prevStaged, ...stillPresent]
+          rewrite.stagedFiles = nextStaged.length > 0 ? nextStaged : undefined
+          if (stillPresent.length < plannedNames.length) {
+            try {
+              await record()
+            } catch {
+              rewrite.stagedFiles = [...prevStaged, ...plannedNames]
+            }
+          }
+          reconcileBlocked = true
+          break
+        }
+        const prevAdopted = rewrite.adoptedFiles ? [...rewrite.adoptedFiles] : undefined
+        const prevPending = rewrite.pendingReconcile ? [...rewrite.pendingReconcile] : undefined
+        const prevReconciled = rewrite.reconciledFiles ? [...rewrite.reconciledFiles] : undefined
+        const prevWaits = rewrite.waits
+        const stagedAfterWrite = [...prevStaged, ...plannedNames]
+        for (const replacementName of plannedNames) addAdopted(replacementName)
+        rewrite.stagedFiles = prevStaged.length > 0 ? prevStaged : undefined
+        removePending(pending.name)
+        addReconciled(decision.ref)
+        try {
+          await record()
+        } catch (err) {
+          rewrite.adoptedFiles = prevAdopted
+          rewrite.pendingReconcile = prevPending
+          rewrite.reconciledFiles = prevReconciled
+          rewrite.stagedFiles = stagedAfterWrite
+          rewrite.waits = prevWaits
+          this.recordError(`could not record reconciled replacement for ${pending.name}: ${errorText(err)}`)
+          reconcileBlocked = true
+          break
+        }
+      }
+      if (!finished && (reconcileBlocked || getPendingRefs().length > 0)) {
+        rewrite.waits = true
+        return false
+      }
+    }
     if (!(await stillOurs())) return false
     let doneResult: 'wrote' | 'failed-keep' | 'failed-empty-ok' = 'failed-empty-ok'
     if (!finished) {
@@ -4541,18 +5147,33 @@ export class Writer {
     if (done) {
       if (rewrite.useV2) await this.unmark(rewrite)
       if (!clearedOppositeSlot) clearedOppositeSlot = await clearOppositeSlot()
-      for (const base of rewrite.reconciledFiles ?? []) {
-        if (await this.emptyCopy(joinPath(rewrite.dir, base))) {
-          parentIndex?.delete(base)
-          emptiedInRun?.add(base)
+      for (const ref of getReconciledRefs()) {
+        const targetPath = joinPath(rewrite.dir, ref.name)
+        try {
+          const current = await this.io.readFile(targetPath)
+          if (current === '') continue
+          if (utf8Length(current) !== ref.size || fnv1a(current) !== ref.fnv1a) continue
+        } catch {
+          continue
+        }
+        if (await this.emptyCopy(targetPath)) {
+          parentIndex?.delete(ref.name)
+          emptiedInRun?.add(ref.name)
+        }
+      }
+      for (const staged of getStagedNames()) {
+        const targetPath = joinPath(rewrite.dir, staged)
+        if (await this.emptyCopy(targetPath)) {
+          parentIndex?.delete(staged)
+          emptiedInRun?.add(staged)
         }
       }
       for (const key of [rewrite.recordKey, rewrite.v2RecordKey]) {
         try {
           const stored = await readStoreSlot(key)
-          if (stored === undefined) continue
-          if (await protectsLiveChild(stored)) continue
-          if (stored !== 'torn' && stored.size === rewrite.size && key === activeKey && !wroteDone) {
+          if (stored === undefined && !neutralizedKeys.has(key)) continue
+          if (stored !== undefined && (await protectsLiveChild(stored))) continue
+          if (stored !== undefined && stored !== 'torn' && stored.size === rewrite.size && key === activeKey && !wroteDone) {
             const listed = await dirListing()
             const hasDone = listed !== null && [...listed.entries()].some(([n, sz]) => sz > 0 && doneMarkerOf(n, rewrite.name) !== null)
             const hasLiveChild = Array.isArray(stored.files) && listed !== null && stored.files.some(f => typeof f === 'string' && (listed.get(baseOf(f)) ?? 0) > 0)
@@ -4560,6 +5181,7 @@ export class Writer {
           }
           await this.io.storeDelete(key)
           cachedStore.set(key, undefined)
+          neutralizedKeys.delete(key)
         } catch {
           // Leave store key when inspection fails.
         }
@@ -4591,7 +5213,7 @@ export class Writer {
   ): Promise<'wrote' | 'failed-keep' | 'failed-empty-ok'> {
     const anySizeSource: Source = { ...rewrite, size: -1, live: false }
     const currentFiles = [...rewrite.files.map(f => baseOf(f.path)), ...(rewrite.adoptedFiles ?? [])]
-    const seenFiles = new Set([...currentFiles, ...(rewrite.reconciledFiles ?? [])])
+    const seenFiles = new Set(currentFiles)
     const carriedChildren: string[] = []
     let safeWithoutDoneMark = false
     try {
@@ -4602,12 +5224,38 @@ export class Writer {
         entryNames.add(e.name)
         if ((e.kind === undefined || e.kind === 'file') && e.size > 0) liveSizes.set(e.name, e.size)
       }
+      // Never carry aborted staged replacement files into the retired mark.
+      for (const staged of rewrite.stagedFiles ?? []) {
+        if (staged !== '') seenFiles.add(baseOf(staged))
+      }
+      // Only suppress a reconciled filename from `carriedChildren` when the
+      // file is empty or still matches the recorded `{ size, fnv1a }` digest.
+      // If a newer generation repopulated the same name and still names this
+      // parent, preserve it in `carriedChildren` so `parentFate` never drops it.
+      for (const ref of rewrite.reconciledFiles ?? []) {
+        if (seenFiles.has(ref.name)) continue
+        const curSize = liveSizes.get(ref.name)
+        if (curSize === undefined) {
+          seenFiles.add(ref.name)
+          continue
+        }
+        const curRaw = await this.io.readFile(joinPath(rewrite.dir, ref.name))
+        if (curRaw === '' || (utf8Length(curRaw) === ref.size && fnv1a(curRaw) === ref.fnv1a)) {
+          seenFiles.add(ref.name)
+        } else {
+          const parsedNew = parseFile(curRaw)
+          if (parsedNew.complete && parsedNew.parent !== null && baseOf(parsedNew.parent) === rewrite.name) {
+            seenFiles.add(ref.name)
+            carriedChildren.push(ref.name)
+          }
+        }
+      }
       const doneAll = await this.doneMarksAll(anySizeSource, entries)
       let maxSeq = rewrite.seq
       let sawTorn = doneAll.torn
       const priorJournals: Partial<Journal>[] = [...doneAll.records]
       const addStoreEntry = (val: unknown): void => {
-        if (val === undefined) return
+        if (isClearedSlot(val)) return
         if (val === 'torn' || typeof val !== 'object' || val === null || Array.isArray(val)) {
           sawTorn = true
           return
@@ -4868,6 +5516,7 @@ export class Writer {
     parentIndex?: RunParentIndex,
     supersededUnaccounted?: Partial<Journal>,
     emptiedInRun?: Set<string>,
+    parentAccountedKeys?: ReadonlySet<string>,
   ): Promise<boolean> {
     const path = joinPath(dir, name)
     const { lines } = file
@@ -4883,7 +5532,16 @@ export class Writer {
     const reasons: string[] = []
     const refusals: number[] = []
     let kept = 0
+    let skippedByParent = false
     lines.forEach((line, i) => {
+      if (parentAccountedKeys !== undefined) {
+        const identity = childRowIdentity(line)
+        if (identity !== null && parentAccountedKeys.has(identity)) {
+          fates.push('L')
+          skippedByParent = true
+          return
+        }
+      }
       const kind = isDeadLetterKind(line.kind) ? line.kind : fileKind
       if (line.table === table && kinds.includes(kind)) {
         mine.push({ ...line, kind })
@@ -4907,7 +5565,7 @@ export class Writer {
       fates[at[n] as number] = 'R'
       refusals.push(k)
     }
-    let changed = false
+    let changed = skippedByParent
     let marked = false
     const uncertainLines: number[] = []
     const recordUncertain = (first: number, count: number): void => {
@@ -5067,6 +5725,10 @@ export class Writer {
       }
       return true
     }
+    if (!marked) {
+      if (this.replayHalted() || !(await this.markSending(path, source, trigger, report, supersededUnaccounted))) return false
+      marked = true
+    }
     // What is left goes to new files first, each kind to files of its own (a
     // row refused here to a `rejected` file, which no replay that runs by
     // itself reads; rows of an unanswered exit-replay batch to their own
@@ -5093,7 +5755,13 @@ export class Writer {
     // recorded its outcome meanwhile, or finished it: writeOut finds out
     // before it records this one.
     const useV2 = uncertainLines.length > 0
-    const accountedRowKeys = trigger === 'force' ? new Set(lines.map(rowIdentity)) : undefined
+    const accountedRowKeys =
+      trigger === 'force'
+        ? new Set([
+            ...lines.map((line, i) => parentRowIdentity(line, name, i)),
+            ...(parentAccountedKeys ?? []),
+          ])
+        : undefined
     const rewrite: Rewrite = {
       ...source,
       ...outcome,
@@ -5119,7 +5787,7 @@ export class Writer {
     }
     let done = false
     try {
-      done = await this.writeOut(path, rewrite, parentIndex, emptiedInRun)
+      done = await this.writeOut(path, rewrite, c, parentIndex, emptiedInRun)
     } finally {
       if (uncertainFiles.length > 0) {
         if (!done) {

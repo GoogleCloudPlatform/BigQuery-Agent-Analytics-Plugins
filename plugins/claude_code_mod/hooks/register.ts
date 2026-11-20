@@ -993,8 +993,8 @@ export const register: Register = (on, registered) => {
     // here on.
     const start = ++welcomeStarts
     const startResets = resets
-    const startClassicSession = classicSessionSeq
-    const startClassicCwd = classicCwdSeq
+    const startClassicSession = configured ? classicSessionSeq : 0
+    const startClassicCwd = configured ? classicCwdSeq : 0
     const startupIdentity: StartupIdentity = { start, resets: startResets, sessionId: null, cwd: e.cwd ?? null }
     currentStartup = startupIdentity
     startupByResets.set(startResets, startupIdentity)

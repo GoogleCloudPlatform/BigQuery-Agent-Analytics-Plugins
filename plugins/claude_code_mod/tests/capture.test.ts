@@ -1057,6 +1057,32 @@ test('deferred classic SessionStart with mismatched session_id does not inherit 
   expect(json(invRows[0]!.attributes).session_metadata).toMatchObject({ cwd: null, project_name: null })
 })
 
+test('pre-start classic clear with explicit session_id and cwd is not overwritten by native session.start', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.sessionId = 'old-session'
+
+  // Classic clear arrives BEFORE native session.start with newer session_id and cwd.
+  await $.classic.SessionStart({ source: 'clear', session_id: 'new-session', cwd: '/work/new' })
+  // Native session.start arrives reporting stale old directory and old session id.
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/old' })
+
+  // Further native session.id reads are refused.
+  world.sessionIdRefused = true
+  await $.turn.start({ turnId: 'turn-prestart-clear', text: 'hello' })
+  await runStep($, { turnId: 'turn-prestart-clear', index: 0, model: 'claude-sonnet-4-6' })
+  await $.turn.complete({ turnId: 'turn-prestart-clear', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_start === true)
+  expect(starts.length).toBe(1)
+  expect(starts[0]!.session_id).toBe('new-session')
+  expect(json(starts[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/new', project_name: 'new' })
+  const invRows = byType(world.sentRows(), 'INVOCATION_STARTING')
+  expect(invRows.length).toBe(1)
+  expect(invRows[0]!.session_id).toBe('new-session')
+  expect(json(invRows[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/new', project_name: 'new' })
+})
+
 test('a session that runs only /bqaa-status and exits emits and spills no session_start or session_end rows', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)
