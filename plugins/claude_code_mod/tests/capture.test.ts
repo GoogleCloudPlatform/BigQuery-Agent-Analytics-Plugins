@@ -866,6 +866,61 @@ test('pre-start SessionStart without optional session_id or cwd falls back to se
   expect(json(starts[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/my-repo', project_name: 'my-repo' })
 })
 
+test('late startup version lookup applies host version independently without overwriting /clear session_id or cwd', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionId = 'old-startup-session'
+
+  // Start native session.start in old directory; it pauses awaiting $.session.version().
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/old-dir' })
+  await versionReached
+
+  // /clear transitions immediately into a new session and directory before version resolves.
+  world.sessionId = 'cleared-new-session'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'cleared-new-session', cwd: '/work/new-dir' })
+
+  // Release the delayed startup version lookup and deny subsequent $.session.id() reads.
+  releaseVersion()
+  await starting
+  world.sessionIdRefused = true
+
+  await $.turn.start({ turnId: 'turn-after-clear', text: 'hi in new dir' })
+  await runStep($, { turnId: 'turn-after-clear', index: 0, model: 'claude-sonnet-4-6' })
+  await $.turn.complete({ turnId: 'turn-after-clear', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+
+  const invRows = byType(world.sentRows(), 'INVOCATION_STARTING')
+  expect(invRows.length).toBe(1)
+  expect(invRows[0]!.session_id).toBe('cleared-new-session')
+  expect(json(invRows[0]!.attributes).session_metadata).toMatchObject({
+    cwd: '/work/new-dir',
+    project_name: 'new-dir',
+    host_version: '2.9.99',
+  })
+  const llmRows = byType(world.sentRows(), 'LLM_REQUEST')
+  expect(llmRows.length).toBeGreaterThan(0)
+  for (const row of llmRows) {
+    expect(row.session_id).toBe('cleared-new-session')
+  }
+})
+
 test('a session that runs only /bqaa-status and exits emits and spills no session_start or session_end rows', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)

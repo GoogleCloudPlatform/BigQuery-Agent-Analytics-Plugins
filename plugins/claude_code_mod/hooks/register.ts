@@ -92,6 +92,8 @@ let welcomeStarts = 0
 // /resume and /branch, which `classic.SessionStart` reports): a run's
 // welcome card begun before one is neither shown nor taken over after it.
 let resets = 0
+let classicSessionSeq = 0
+let classicCwdSeq = 0
 const RESET_SOURCES: ReadonlySet<string> = new Set(['clear', 'resume', 'fork'])
 let records: CardRecords | null = null
 // Who speaks for the card a session.start run of this load showed (its
@@ -973,11 +975,16 @@ export const register: Register = (on, registered) => {
   config = resolveConfig(registered, {})
   configured = false
   awaitingConfig.length = 0
+  classicSessionSeq = 0
+  classicCwdSeq = 0
 
   on('session.start', async ($, e, next) => {
     // A read for the card by an earlier run of this load is not used from
     // here on.
     const start = ++welcomeStarts
+    const startResets = resets
+    const startClassicSession = classicSessionSeq
+    const startClassicCwd = classicCwdSeq
     cardReady = null
     // Its rank, in a session a person sees (a `-p` run draws no card).
     cardSession = e.isInteractive && e.surface !== null
@@ -1047,7 +1054,17 @@ export const register: Register = (on, registered) => {
       writer.clearStatus()
       for (const held of early.splice(0)) writer.enqueue(held.row, held.redactions)
       const [sessionId, version] = await Promise.all([$.session.id().catch(() => null), $.session.version().catch(() => null)])
-      tracer.setSession({ sessionId, cwd: e.cwd, engineVersion: version?.version ?? null })
+      const engineVersion = version?.version ?? null
+      if (engineVersion) tracer.setSession({ engineVersion })
+      const sessionStillCurrent =
+        start === welcomeStarts &&
+        resets === startResets &&
+        (classicSessionSeq === startClassicSession || (sessionId !== null && tracer.sessionId === sessionId))
+      if (sessionStillCurrent) {
+        const nextSessionId = classicSessionSeq === startClassicSession ? sessionId : null
+        const nextCwd = classicCwdSeq === startClassicCwd ? e.cwd : null
+        if (nextSessionId || nextCwd) tracer.setSession({ sessionId: nextSessionId, cwd: nextCwd })
+      }
       flushTimer?.cancel()
       flushTimer = $.clock.every(config.flushIntervalMs, () => {
         if (ranModCommand && !tracer.hasActivity && writer !== null && writer.hasOnlyUnsentSessionStart(tracer.sessionId)) {
@@ -1124,6 +1141,8 @@ export const register: Register = (on, registered) => {
       resets += 1
       ranModCommand = false
     }
+    if (e.session_id) classicSessionSeq += 1
+    if (e.cwd) classicCwdSeq += 1
     const pending = next(e)
     // Apply session state / lastModel observations synchronously in event order,
     // deferring only row emission until configurationLoaded() supplies host/config metadata.
