@@ -275,10 +275,13 @@ export class Tracer {
     if (this.sessionStartedAt === null) this.sessionStartedAt = this.deps.now()
   }
 
-  // classic.SessionStart (startup, resume, clear, compact or fork), at
-  // `atMs`, the time the event came: its row can be written later, once the
-  // configuration is loaded.
-  sessionStarted(e: { session_id?: string; source: string; model?: string; permission_mode?: string; cwd?: string }, atMs?: number): void {
+  // Observes classic.SessionStart in event order so session state and `lastModel`
+  // update immediately at event arrival before any subsequent turn.start / step
+  // can run while initial configuration is still loading.
+  observeSessionStart(
+    e: { session_id?: string; source: string; model?: string; permission_mode?: string; cwd?: string },
+    atMs?: number,
+  ): { at: number; sessionId: string | null; cwd: string | null; source: string; model: string | null; permissionMode?: string } {
     if (e.session_id) {
       if (this.sessionId !== null && e.session_id !== this.sessionId) {
         if (this.main) remember(this.pastTurns, this.main.turnId, true)
@@ -303,22 +306,44 @@ export class Tracer {
     const model = explicitModel ?? (INHERIT_MODEL_SOURCES.has(e.source) ? this.lastModel : null)
     if (explicitModel !== null) this.lastModel = explicitModel
     else if (!INHERIT_MODEL_SOURCES.has(e.source)) this.lastModel = null
+    return { at, sessionId: this.sessionId, cwd: this.cwd, source: e.source, model, permissionMode: e.permission_mode }
+  }
+
+  emitSessionStart(observed: { at: number; sessionId: string | null; cwd: string | null; source: string; model: string | null; permissionMode?: string }): void {
+    const sessionId = observed.sessionId ?? this.sessionId
+    const cwd = observed.cwd ?? this.cwd
     const written = this.emit({
       eventType: 'STATE_DELTA',
-      timestampMs: at,
+      timestampMs: observed.at,
+      sessionId,
       ids: this.sessionIds(),
       content: { session_start: true },
       attributes: {
         state_delta: {
           source: 'coding_agent_session_start',
-          start_source: e.source,
-          ...(model ? { model } : {}),
-          ...(e.permission_mode ? { permission_mode: e.permission_mode } : {}),
+          start_source: observed.source,
+          ...(observed.model ? { model: observed.model } : {}),
+          ...(observed.permissionMode ? { permission_mode: observed.permissionMode } : {}),
         },
-        session_metadata: this.sessionMetadata(),
+        session_metadata:
+          cwd === this.cwd
+            ? this.sessionMetadata()
+            : {
+                project_name: cwd ? baseName(cwd) : null,
+                cwd,
+                host_version: this.engineVersion,
+                host_name: this.hostName ?? undefined,
+              },
       },
     })
     if (written) this.sessionHasStart = true
+  }
+
+  // classic.SessionStart (startup, resume, clear, compact or fork), at
+  // `atMs`, the time the event came: its row can be written later, once the
+  // configuration is loaded.
+  sessionStarted(e: { session_id?: string; source: string; model?: string; permission_mode?: string; cwd?: string }, atMs?: number): void {
+    this.emitSessionStart(this.observeSessionStart(e, atMs))
   }
 
   sessionEnded(e: { reason: string; sessionId?: string }, opts?: { suppressRow?: boolean }): void {
@@ -402,6 +427,31 @@ export class Tracer {
     // turn of its own. No INVOCATION_STARTING.
     if (e.agentId) {
       this.loopRunStarted(e.agentId, e.turnId)
+      return
+    }
+    if (this.pastTurns.has(e.turnId)) {
+      const existing = this.others.get(e.turnId)
+      const turn: TurnCtx = existing ?? {
+        turnId: e.turnId,
+        traceId: this.deps.ids.traceId(),
+        spanId: this.deps.ids.spanId(),
+        startedAt: this.deps.now(),
+        prompt: e.text,
+        lastStepSpan: null,
+        steps: 0,
+        lastMainToolUseId: null,
+        lastMainToolDecisionSource: null,
+        updatesLastModel: false,
+      }
+      turn.prompt = e.text
+      turn.updatesLastModel = false
+      remember(this.others, e.turnId, turn)
+      this.emit({
+        eventType: 'INVOCATION_STARTING',
+        ids: { traceId: turn.traceId, spanId: turn.spanId, parentSpanId: null, invocationId: e.turnId },
+        content: {},
+        attributes: { session_metadata: this.sessionMetadata() },
+      })
       return
     }
     if (this.main && this.main.turnId !== e.turnId) remember(this.pastTurns, this.main.turnId, true)
@@ -972,6 +1022,7 @@ export class Tracer {
     agent?: string
     unidentifiedLoop?: boolean
     timestampMs?: number
+    sessionId?: string | null
     ids: { traceId: string | null; spanId: string; parentSpanId: string | null; invocationId: string | null }
     content: unknown
     attributes: Record<string, unknown>
@@ -987,7 +1038,7 @@ export class Tracer {
       timestampMs: args.timestampMs ?? this.deps.now(),
       eventId: this.deps.ids.eventId(),
       agent: args.agent ?? config.agentName,
-      sessionId: this.sessionId,
+      sessionId: args.sessionId !== undefined ? args.sessionId : this.sessionId,
       invocationId: args.ids.invocationId,
       userId: config.userId,
       traceId: args.ids.traceId,

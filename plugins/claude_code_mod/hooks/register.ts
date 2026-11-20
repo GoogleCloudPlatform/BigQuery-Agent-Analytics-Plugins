@@ -1125,11 +1125,10 @@ export const register: Register = (on, registered) => {
       ranModCommand = false
     }
     const pending = next(e)
-    // Its row carries what session.start loads (the user, the agent name,
-    // the writer mode, the host version): written now if that is done, else
-    // once it is, at the time the event came.
-    const at = Date.now()
-    whenConfigured(() => tracer.sessionStarted(e, at))
+    // Apply session state / lastModel observations synchronously in event order,
+    // deferring only row emission until configurationLoaded() supplies host/config metadata.
+    const observed = tracer.observeSessionStart(e, Date.now())
+    whenConfigured(() => tracer.emitSessionStart(observed))
     return pending
   }).catch(($, e, next) => next(e))
 

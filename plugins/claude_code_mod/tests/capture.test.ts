@@ -794,6 +794,78 @@ test('a late step from a pre-resume or pre-branch turn arriving before the first
   ])
 })
 
+test('deferred startup SessionStart never overwrites a newer main-loop model once config loads', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_USER_ID: 'analyst-7', BQAA_AGENT_NAME: 'repo-agent' })
+  // startup arrives while configured=false (deferred in whenConfigured):
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'stale-startup-model', cwd: '/work/my-repo' })
+  // main-loop turn step observes newer model before configurationLoaded() fires:
+  await $.turn.start({ turnId: 'turn-early', text: 'hello' })
+  await runStep($, { turnId: 'turn-early', index: 0, model: 'newer-step-model' })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-deferred-clear'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-deferred-clear', cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => {
+      const sd = (json(r.attributes).state_delta ?? {}) as Record<string, unknown>
+      return { source: sd.start_source, model: sd.model }
+    })
+  expect(starts).toEqual([
+    { source: 'startup', model: 'stale-startup-model' },
+    { source: 'clear', model: 'newer-step-model' },
+  ])
+})
+
+test('a delayed turn.start for a past pre-clear turn routes through others and never overwrites lastModel', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'model-before-clear', cwd: '/work/my-repo' })
+  await $.turn.start({ turnId: 'pre-clear-turn', text: 'first' })
+  await runStep($, { turnId: 'pre-clear-turn', index: 0, model: 'model-before-clear' })
+  await $.turn.complete({ turnId: 'pre-clear-turn', answer: 'done', durationMs: 100, isAborted: false, reason: 'answer' })
+
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-clear-a'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-a', model: 'model-after-clear', cwd: '/work/my-repo' })
+
+  // Delayed replay/delivery of pre-clear-turn start & step while main === null:
+  await $.turn.start({ turnId: 'pre-clear-turn', text: 'delayed start' })
+  world.steps.push({ result: { answer: 'delayed', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'pre-clear-turn', index: 1, model: 'stale-pre-clear-model' })
+
+  await $.session.end({ reason: 'clear', sessionId: 'after-clear-a', resume: { id: 'after-clear-a' } })
+  world.sessionId = 'after-clear-b'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-b', cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => {
+      const sd = (json(r.attributes).state_delta ?? {}) as Record<string, unknown>
+      return { source: sd.start_source, model: sd.model }
+    })
+  expect(starts).toEqual([
+    { source: 'startup', model: 'model-before-clear' },
+    { source: 'clear', model: 'model-after-clear' },
+    { source: 'clear', model: 'model-after-clear' },
+  ])
+})
+
+test('pre-start SessionStart without optional session_id or cwd falls back to session.start values when config loads', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_USER_ID: 'analyst-7', BQAA_AGENT_NAME: 'repo-agent' })
+  await $.classic.SessionStart({ source: 'startup' })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_start === true)
+  expect(starts.length).toBe(1)
+  expect(starts[0]!.session_id).toBe(SESSION_ID)
+  expect(json(starts[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/my-repo', project_name: 'my-repo' })
+})
+
 test('a session that runs only /bqaa-status and exits emits and spills no session_start or session_end rows', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)
