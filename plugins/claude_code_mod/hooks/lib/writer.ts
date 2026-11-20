@@ -427,7 +427,7 @@ const dirKey = (dir: string): string => {
 const sameNames = (a: readonly string[], b: readonly string[]): boolean =>
   a.length === b.length && a.every((name, i) => baseOf(name) === baseOf(b[i] ?? ''))
 
-type HeldEntry = { reason: string; mayBeActive: boolean }
+type HeldEntry = { reason: string; mayBeActive: boolean; activeCertain?: boolean }
 type ActiveSendingMark = { path: string; name: string; dir: string; trigger: BackfillReport['trigger']; size: number }
 
 // A record as a writer finds it, and whether one may be in a file beside the
@@ -435,9 +435,10 @@ type ActiveSendingMark = { path: string; name: string; dir: string; trigger: Bac
 // `uncertainLines`, stored under keys/filenames older 0.1.3 readers ignore.
 type Found = { journal: Partial<Journal>; filed: boolean; v2?: boolean }
 // No outcome recorded, and replays' marks (`pending`, the writers that left
-// them; `activeBy`, those without `uncertain: true` whose session may still be
-// running): each sent rows, or is about to, and may yet record one.
-type Pending = { pending: string[]; activeBy?: string[]; uncertain?: boolean }
+// them; `activeBy`, standing marks from non-self sessions; `nonUncertainBy`,
+// complete non-uncertain marks whose owner may still be live): each sent rows,
+// or is about to, and may yet record one.
+type Pending = { pending: string[]; activeBy?: string[]; nonUncertainBy?: string[]; uncertain?: boolean }
 
 // Where the record of the file `name`, `size` long, in `dir` is kept.
 const sourceFor = (dir: string, name: string, size: number, c: Config): Source => {
@@ -675,6 +676,7 @@ export class Writer {
   private activeSendingMarks = new Map<string, ActiveSendingMark>()
   private activeExitMarks: ReplayExitMarks | null = null
   private pendingReplayWakeups = new Set<(marks: ReplayExitMarks) => void>()
+  private pendingCleanupWakeups = new Set<() => void>()
   // Orphaned v2 store keys already verified/deleted for retired sources in this session.
   private cleanedRetiredV2 = new Set<string>()
   // Why rows cannot be written now, if credentials or permission stop them.
@@ -1824,6 +1826,7 @@ export class Writer {
     this.soon = null
     for (const writer of writers) {
       writer.closing = true
+      for (const wake of [...writer.pendingCleanupWakeups]) wake()
       writer.recoveryTimer?.cancel()
       writer.recoveryTimer = null
       writer.pauseTimer?.cancel()
@@ -2230,9 +2233,9 @@ export class Writer {
     return (this.heldActiveCountByDir.get(dirKey(dir)) ?? 0) > 0
   }
 
-  private noteHeld(report: BackfillReport, trigger: BackfillReport['trigger'], message: string, heldPath: string, mayBeActive = false): void {
+  private noteHeld(report: BackfillReport, trigger: BackfillReport['trigger'], message: string, heldPath: string, mayBeActive = false, activeCertain = false): void {
     const cleanMsg = diagnostic(message)
-    const entry: HeldEntry = { reason: cleanMsg, mayBeActive }
+    const entry: HeldEntry = { reason: cleanMsg, mayBeActive, ...(activeCertain ? { activeCertain: true } : {}) }
     this.currentScanHeld.set(heldPath, entry)
     this.setHeldPath(heldPath, entry)
     report.heldFiles = this.currentScanHeld.size
@@ -2274,6 +2277,7 @@ export class Writer {
     const files = paths.size
     if (files <= 0) return { files: 0, reason: null, trigger, mayBeActive: false }
     let mayBeActive = false
+    let certainActiveReason: string | null = null
     let activeReason: string | null = null
     let firstReason: string | null = null
     for (const entry of paths.values()) {
@@ -2281,9 +2285,10 @@ export class Writer {
       if (entry.mayBeActive) {
         mayBeActive = true
         activeReason ??= entry.reason
+        if (entry.activeCertain) certainActiveReason ??= entry.reason
       }
     }
-    return { files, reason: activeReason ?? firstReason, trigger, mayBeActive }
+    return { files, reason: certainActiveReason ?? activeReason ?? firstReason, trigger, mayBeActive }
   }
 
   private async backfillRun(kinds: DeadLetterKind[], trigger: BackfillReport['trigger'], dir: string, parked: number): Promise<BackfillReport> {
@@ -2320,9 +2325,25 @@ export class Writer {
       if (knownHeld > 0) {
         if (mayBeActive) {
           for (const entry of this.currentScanHeld.values()) {
-            if (entry.mayBeActive) {
+            if (entry.activeCertain) {
               reason = entry.reason
               break
+            }
+          }
+          if (reason === null) {
+            for (const entry of this.currentScanHeld.values()) {
+              if (entry.mayBeActive) {
+                reason = entry.reason
+                break
+              }
+            }
+          }
+          if (reason === null) {
+            for (const [p, entry] of this.heldPaths) {
+              if (entry.activeCertain && inDir(p, dir)) {
+                reason = entry.reason
+                break
+              }
             }
           }
           if (reason === null) {
@@ -2387,7 +2408,7 @@ export class Writer {
     // which say the file was done only once read. `companions` indexes every
     // relevant companion per source in O(N), including zero-byte journal files
     // beside a live source (which `readJournalSlot` treats as cut off).
-    const besides = new Map<string, { record: boolean; done: string[] }>()
+    const besides = new Map<string, { record: boolean; done: string[]; zeroDone: boolean }>()
     const companions = new Map<string, { name: string; kind: string; size: number; mtimeMs?: number }[]>()
     const listedPaths = new Set<string>()
     const listedEmpty = new Set<string>()
@@ -2411,8 +2432,16 @@ export class Writer {
         if (list) list.push(x)
         else companions.set(of, [x])
       }
-      if (x.size === 0 || x.name.startsWith('outcome-sending-')) continue
-      const beside = besides.get(of) ?? { record: false, done: [] }
+      if (x.size === 0) {
+        if (doneMarkerOf(x.name, of) !== null) {
+          const beside = besides.get(of) ?? { record: false, done: [], zeroDone: false }
+          beside.zeroDone = true
+          besides.set(of, beside)
+        }
+        continue
+      }
+      if (x.name.startsWith('outcome-sending-')) continue
+      const beside = besides.get(of) ?? { record: false, done: [], zeroDone: false }
       besides.set(of, beside)
       if (x.name.startsWith('outcome-done-')) beside.done.push(x.name)
       else beside.record = true
@@ -2486,15 +2515,16 @@ export class Writer {
       for (const path of [...w.activeSendingMarks.keys()]) if (inDir(path, dir) && !there.has(path)) w.activeSendingMarks.delete(path)
     }
     const emptiedInRun = new Set<string>()
+    const inspectedSkipped = new Map<string, 'covered' | 'handled'>()
     const fileParent = new Map<string, string>()
     const isSourceLive = (n: string): boolean => (listed.get(n) ?? 0) > 0 && !emptiedInRun.has(n)
     const me = this.sessionId() ?? 'unknown'
     for (const name of files) {
       if (report.error || this.replayStops(trigger, tally)) {
         const companionEntries = companions.get(name)
-        if (trigger !== 'force' && companionEntries !== undefined) {
+        if (trigger !== 'force' && (companionEntries !== undefined || !this.replayHalted())) {
           try {
-            await this.seedSkippedHeld(dir, name, sizes.get(name) ?? -1, c, companionEntries, listed, trigger)
+            await this.seedSkippedHeld(dir, name, sizes.get(name) ?? -1, c, companions, listed, trigger, inspectedSkipped)
           } catch {
             // Best-effort held-file seeding on early stop.
           }
@@ -2559,8 +2589,8 @@ export class Writer {
               found === 'conflict'
                 ? `conflicting replay records exist for ${name}; /bqaa-backfill force replays the file afresh`
                 : `the replay record of ${name} is cut off part-way; /bqaa-backfill force replays the file afresh`
-            const hasActiveForeign = await this.hasActiveForeignMark(source)
-            this.noteHeld(report, trigger, msg, path, hasActiveForeign)
+            const foreign = await this.hasActiveForeignMark(source)
+            this.noteHeld(report, trigger, msg, path, foreign.mayBeActive, foreign.activeCertain)
             report.skippedFiles += 1
             if (kindOf(name) !== 'rejected') tally.waiting += 1
             continue
@@ -2575,13 +2605,14 @@ export class Writer {
           // force, for a writer that stopped, replays it afresh. A mark of
           // this writer's own is no other replay's: it would hold the outcome.
           const ownUncertain = this.uncertainSources.get(path) === source.size
-          const hasActiveForeign = (found.activeBy ?? []).some(by => by !== this.mark)
+          const hasForeignActive = (found.activeBy ?? []).some(by => by !== this.mark)
+          const hasCertainActive = (found.nonUncertainBy ?? []).some(by => by !== this.mark)
           if (held === undefined && trigger !== 'force' && found.pending.some(by => by !== this.mark || ownUncertain)) {
             const msg =
-              !hasActiveForeign && (ownUncertain || found.uncertain === true)
+              !hasCertainActive && (ownUncertain || found.uncertain === true)
                 ? `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`
                 : `a replay of ${name} sent rows and has recorded no outcome; if that session stopped, /bqaa-backfill force replays the file afresh`
-            this.noteHeld(report, trigger, msg, path, hasActiveForeign)
+            this.noteHeld(report, trigger, msg, path, hasForeignActive, hasCertainActive)
             report.skippedFiles += 1
             if (kindOf(name) !== 'rejected') tally.waiting += 1
             continue
@@ -2720,218 +2751,295 @@ export class Writer {
         return this.exitReplay.postCutoff.passed() || this.io.now() >= cleanupUntil
       }
       if (!cleanupStopped()) {
-        const doneAt = new Map<string, number | null>()
-        const retiredAt = async (of: string): Promise<number | null> => {
-          const known = doneAt.get(of)
-          if (known !== undefined) return known
-          let at: number | null = null
-          for (const x of companions.get(of) ?? []) {
-            if (cleanupStopped()) return null
-            if (doneMarkerOf(x.name, of) === null || x.size === 0) continue
-            try {
-              const kept = journalOf(await this.io.readFile(joinPath(dir, x.name)))
-              if (kept !== undefined && kept !== 'torn' && typeof kept.retiredAt === 'number') at = Math.max(at ?? kept.retiredAt, kept.retiredAt)
-            } catch {
-              // Not read: no time from it.
+        const CLEANUP_ABORT = Symbol('cleanup abort')
+        let cleanupAborted = false
+        let fireCleanupAbort = (): void => undefined
+        const cleanupAbortPromise = new Promise<typeof CLEANUP_ABORT>(resolve => {
+          fireCleanupAbort = () => {
+            if (cleanupAborted) return
+            cleanupAborted = true
+            resolve(CLEANUP_ABORT)
+          }
+        })
+        let cleanupTimer: Timer | null = null
+        if (!startedAtExit) {
+          this.pendingCleanupWakeups.add(fireCleanupAbort)
+        } else if (this.exitReplay !== null) {
+          void this.exitReplay.postCutoff.at.then(fireCleanupAbort)
+          const wait = Math.max(0, cleanupUntil - this.io.now())
+          if (wait === 0) fireCleanupAbort()
+          else cleanupTimer = this.io.after(wait, fireCleanupAbort)
+        }
+        const cleanupOp = async <T>(work: Promise<T>): Promise<T | typeof CLEANUP_ABORT> => {
+          work.catch(() => undefined)
+          if (cleanupAborted || cleanupStopped()) {
+            fireCleanupAbort()
+            return CLEANUP_ABORT
+          }
+          const result = await Promise.race([work, cleanupAbortPromise])
+          if (cleanupAborted || cleanupStopped()) {
+            fireCleanupAbort()
+            return CLEANUP_ABORT
+          }
+          return result
+        }
+        try {
+          const doneAt = new Map<string, number | null>()
+          const retiredAt = async (of: string): Promise<number | null> => {
+            const known = doneAt.get(of)
+            if (known !== undefined) return known
+            let at: number | null = null
+            for (const x of companions.get(of) ?? []) {
+              if (cleanupStopped()) return null
+              if (doneMarkerOf(x.name, of) === null || x.size === 0) continue
+              try {
+                const raw = await cleanupOp(this.io.readFile(joinPath(dir, x.name)))
+                if (raw === CLEANUP_ABORT) return null
+                const kept = journalOf(raw)
+                if (kept !== undefined && kept !== 'torn' && typeof kept.retiredAt === 'number') at = Math.max(at ?? kept.retiredAt, kept.retiredAt)
+              } catch {
+                // Not read: no time from it.
+              }
             }
+            doneAt.set(of, at)
+            return at
           }
-          doneAt.set(of, at)
-          return at
-        }
-        const hasLiveChild = (stored: unknown): boolean => {
-          if (stored === null || typeof stored !== 'object') return false
-          const fs = (stored as Partial<Journal>).files
-          return Array.isArray(fs) && fs.some(f => typeof f === 'string' && isSourceLive(baseOf(f)))
-        }
-        let liveSourceRemains = false
-        for (const [n, sz] of listed) {
-          if (sz > 0 && kindOf(n) !== null && !emptiedInRun.has(n)) {
-            liveSourceRemains = true
-            break
+          const hasLiveChild = (stored: unknown): boolean => {
+            if (stored === null || typeof stored !== 'object') return false
+            const fs = (stored as Partial<Journal>).files
+            return Array.isArray(fs) && fs.some(f => typeof f === 'string' && isSourceLive(baseOf(f)))
           }
-        }
-        // Lazily inspect remaining live dead-letter files so cleanup never
-        // truncates or deletes parent evidence that any live file on disk still
-        // names as its `parent` (including unlisted children held as ambiguous).
-        let liveParentsChecked = false
-        let liveParentsIncomplete = false
-        const liveParents = new Set<string>()
-        const ensureLiveParents = async (): Promise<void> => {
-          if (liveParentsChecked) return
-          liveParentsChecked = true
-          if (!liveSourceRemains) return
+          let liveSourceRemains = false
           for (const [n, sz] of listed) {
-            if (sz <= 0 || kindOf(n) === null || emptiedInRun.has(n)) continue
-            const known = fileParent.get(n)
-            if (known !== undefined) {
-              if (known !== '') liveParents.add(known)
-              continue
+            if (sz > 0 && kindOf(n) !== null && !emptiedInRun.has(n)) {
+              liveSourceRemains = true
+              break
             }
-            if (sz > HOST_FILE_BYTES || cleanupStopped()) {
-              liveParentsIncomplete = true
-              return
-            }
-            try {
-              const raw = await this.io.readFile(joinPath(dir, n))
-              if (raw === '') continue
-              const parsed = parseFile(raw)
-              if (!parsed.complete) {
+          }
+          // Lazily inspect remaining live dead-letter files so cleanup never
+          // truncates or deletes parent evidence that any live file on disk still
+          // names as its `parent` (including unlisted children held as ambiguous).
+          let liveParentsChecked = false
+          let liveParentsIncomplete = false
+          const liveParents = new Set<string>()
+          const ensureLiveParents = async (): Promise<void> => {
+            if (liveParentsChecked) return
+            liveParentsChecked = true
+            if (!liveSourceRemains) return
+            for (const [n, sz] of listed) {
+              if (sz <= 0 || kindOf(n) === null || emptiedInRun.has(n)) continue
+              const known = fileParent.get(n)
+              if (known !== undefined) {
+                if (known !== '') liveParents.add(known)
+                continue
+              }
+              if (sz > HOST_FILE_BYTES || cleanupStopped()) {
                 liveParentsIncomplete = true
                 return
               }
-              if (parsed.parent !== null) liveParents.add(baseOf(parsed.parent))
-            } catch {
-              liveParentsIncomplete = true
-              return
-            }
-          }
-        }
-        const cleanedParents = new Set<string>()
-        for (const [of, list] of companions) {
-          if (cleanupStopped()) break
-          if ((listed.get(of) ?? 0) > 0) continue
-          const nonEmpty = list.filter(e => e.size > 0)
-          if (nonEmpty.length === 0) continue
-          let allExpired = true
-          for (const e of nonEmpty) {
-            if (cleanupStopped()) {
-              allExpired = false
-              break
-            }
-            const at = e.mtimeMs ? e.mtimeMs : await retiredAt(of)
-            if (at === null || this.io.now() - at < RETIRED_MS) {
-              allExpired = false
-              break
-            }
-          }
-          if (!allExpired || cleanupStopped()) continue
-          await ensureLiveParents()
-          if (liveParentsIncomplete || liveParents.has(of) || cleanupStopped()) continue
-          // Inspect ALL companion files and both store slots for this parent
-          // before deleting or truncating any record: journals and retired
-          // marks that any live child still depends on must stay intact together.
-          let keepParent = false
-          for (const e of nonEmpty) {
-            if (cleanupStopped()) {
-              keepParent = true
-              break
-            }
-            try {
-              const parsed = journalOf(await this.io.readFile(joinPath(dir, e.name)))
-              if (parsed === 'torn') {
-                if (liveSourceRemains) {
-                  keepParent = true
-                  break
+              try {
+                const raw = await cleanupOp(this.io.readFile(joinPath(dir, n)))
+                if (raw === CLEANUP_ABORT) {
+                  liveParentsIncomplete = true
+                  return
                 }
-              } else if (parsed !== undefined && hasLiveChild(parsed)) {
+                if (raw === '') continue
+                const parsed = parseFile(raw)
+                if (!parsed.complete) {
+                  liveParentsIncomplete = true
+                  return
+                }
+                if (parsed.parent !== null) liveParents.add(baseOf(parsed.parent))
+              } catch {
+                liveParentsIncomplete = true
+                return
+              }
+            }
+          }
+          const cleanedParents = new Set<string>()
+          for (const [of, list] of companions) {
+            if (cleanupStopped()) break
+            if ((listed.get(of) ?? 0) > 0) continue
+            const nonEmpty = list.filter(e => e.size > 0)
+            if (nonEmpty.length === 0) continue
+            let allExpired = true
+            for (const e of nonEmpty) {
+              if (cleanupStopped()) {
+                allExpired = false
+                break
+              }
+              const at = e.mtimeMs ? e.mtimeMs : await retiredAt(of)
+              if (at === null || this.io.now() - at < RETIRED_MS) {
+                allExpired = false
+                break
+              }
+            }
+            if (!allExpired || cleanupStopped()) continue
+            await ensureLiveParents()
+            if (liveParentsIncomplete || liveParents.has(of) || cleanupStopped()) continue
+            // Inspect ALL companion files and both store slots for this parent
+            // before deleting or truncating any record: journals and retired
+            // marks that any live child still depends on must stay intact together.
+            let keepParent = false
+            for (const e of nonEmpty) {
+              if (cleanupStopped()) {
                 keepParent = true
                 break
               }
-            } catch {
-              keepParent = true
-              break
-            }
-          }
-          if (keepParent) continue
-          const storeKeys = [`replayed:${dest}/${of}`, `replayed:v2:${dest}/${of}`]
-          const storedKeysPresent: string[] = []
-          for (const key of storeKeys) {
-            if (cleanupStopped()) {
-              keepParent = true
-              break
-            }
-            try {
-              const stored = await this.io.storeGet(key)
-              if (stored !== undefined) {
-                if (hasLiveChild(stored)) {
+              try {
+                const raw = await cleanupOp(this.io.readFile(joinPath(dir, e.name)))
+                if (raw === CLEANUP_ABORT) {
                   keepParent = true
                   break
                 }
-                storedKeysPresent.push(key)
-              }
-            } catch {
-              keepParent = true
-              break
-            }
-          }
-          if (keepParent || cleanupStopped()) continue
-          // Delete store entries BEFORE truncating on-disk companion files so a
-          // store failure or exit-cleanup cutoff never strands an orphaned v2
-          // store key with no remaining done mark on disk to reclaim it.
-          const v2Key = `replayed:v2:${dest}/${of}`
-          let allStoreDeleted = true
-          let v2Clean = !storedKeysPresent.includes(v2Key)
-          for (const key of storedKeysPresent) {
-            if (cleanupStopped()) {
-              allStoreDeleted = false
-              break
-            }
-            try {
-              await this.io.storeDelete(key)
-              if (key === v2Key) v2Clean = true
-            } catch {
-              allStoreDeleted = false
-            }
-          }
-          if (v2Clean) this.cleanedRetiredV2.add(v2Key)
-          if (!allStoreDeleted || cleanupStopped()) continue
-          let allTruncated = true
-          for (const e of nonEmpty) {
-            if (cleanupStopped()) {
-              allTruncated = false
-              break
-            }
-            try {
-              await this.io.writeFile(joinPath(dir, e.name), '')
-            } catch {
-              allTruncated = false
-            }
-          }
-          if (allTruncated) cleanedParents.add(of)
-        }
-        // A legacy writer that retires a source only deletes `replayed:<dest>/<name>`
-        // and leaves `replayed:v2:<dest>/<name>` orphaned in `$.store`. Reclaim any
-        // such orphaned v2 key once a retired done mark stands beside the emptied
-        // or removed source (checked at most once per source per session), while
-        // never deleting a store journal that still names a live child or whose
-        // parent is still referenced by a live dead-letter file on disk.
-        if (!cleanupStopped() && besides.size > 0) {
-          for (const [of, beside] of besides) {
-            if (cleanupStopped()) break
-            if (cleanedParents.has(of) || beside.done.length === 0 || (listed.get(of) ?? 0) > 0) continue
-            const v2Key = `replayed:v2:${dest}/${of}`
-            if (this.cleanedRetiredV2.has(v2Key)) continue
-            try {
-              const stored = await this.io.storeGet(v2Key)
-              if (stored === undefined) {
-                this.cleanedRetiredV2.add(v2Key)
-                continue
-              }
-              if (hasLiveChild(stored)) continue
-              await ensureLiveParents()
-              if (liveParentsIncomplete || liveParents.has(of) || cleanupStopped()) continue
-              let retired = false
-              for (const doneName of beside.done) {
-                if (cleanupStopped()) break
-                const kept = journalOf(await this.io.readFile(joinPath(dir, doneName)).catch(() => ''))
-                if (kept !== undefined && kept !== 'torn' && kept.retired === true) {
-                  retired = true
+                const parsed = journalOf(raw)
+                if (parsed === 'torn') {
+                  if (liveSourceRemains) {
+                    keepParent = true
+                    break
+                  }
+                } else if (parsed !== undefined && hasLiveChild(parsed)) {
+                  keepParent = true
                   break
                 }
+              } catch {
+                keepParent = true
+                break
               }
-              if (!retired || cleanupStopped()) continue
-              await this.io.storeDelete(v2Key)
-              this.cleanedRetiredV2.add(v2Key)
-            } catch {
-              // Best-effort cleanup; next replay retries.
+            }
+            if (keepParent) continue
+            const storeKeys = [`replayed:${dest}/${of}`, `replayed:v2:${dest}/${of}`]
+            const storedKeysPresent: string[] = []
+            for (const key of storeKeys) {
+              if (cleanupStopped()) {
+                keepParent = true
+                break
+              }
+              try {
+                const stored = await cleanupOp(this.io.storeGet(key))
+                if (stored === CLEANUP_ABORT) {
+                  keepParent = true
+                  break
+                }
+                if (stored !== undefined) {
+                  if (hasLiveChild(stored)) {
+                    keepParent = true
+                    break
+                  }
+                  storedKeysPresent.push(key)
+                }
+              } catch {
+                keepParent = true
+                break
+              }
+            }
+            if (keepParent || cleanupStopped()) continue
+            // Delete store entries BEFORE truncating on-disk companion files so a
+            // store failure or exit-cleanup cutoff never strands an orphaned v2
+            // store key with no remaining done mark on disk to reclaim it.
+            const v2Key = `replayed:v2:${dest}/${of}`
+            let allStoreDeleted = true
+            let v2Clean = !storedKeysPresent.includes(v2Key)
+            for (const key of storedKeysPresent) {
+              if (cleanupStopped()) {
+                allStoreDeleted = false
+                break
+              }
+              try {
+                const deleted = await cleanupOp(this.io.storeDelete(key))
+                if (deleted === CLEANUP_ABORT) {
+                  allStoreDeleted = false
+                  break
+                }
+                if (key === v2Key) v2Clean = true
+              } catch {
+                allStoreDeleted = false
+              }
+            }
+            if (v2Clean) this.cleanedRetiredV2.add(v2Key)
+            if (!allStoreDeleted || cleanupStopped()) continue
+            let allTruncated = true
+            for (const e of nonEmpty) {
+              if (cleanupStopped()) {
+                allTruncated = false
+                break
+              }
+              try {
+                const truncated = await cleanupOp(this.io.writeFile(joinPath(dir, e.name), ''))
+                if (truncated === CLEANUP_ABORT) {
+                  allTruncated = false
+                  break
+                }
+              } catch {
+                allTruncated = false
+              }
+            }
+            if (allTruncated) cleanedParents.add(of)
+          }
+          // A legacy writer that retires a source only deletes `replayed:<dest>/<name>`
+          // and leaves `replayed:v2:<dest>/<name>` orphaned in `$.store`. Reclaim any
+          // such orphaned v2 key once a retired done mark (or a zero-byte truncated
+          // done marker with no companion journal files) stands beside the emptied or
+          // removed source, while never deleting a store journal that still names a
+          // live child or whose parent is still referenced by a live file on disk.
+          if (!cleanupStopped() && besides.size > 0) {
+            for (const [of, beside] of besides) {
+              if (cleanupStopped()) break
+              if (cleanedParents.has(of) || (beside.done.length === 0 && !beside.zeroDone) || (listed.get(of) ?? 0) > 0) continue
+              if (beside.done.length === 0 && beside.record) continue
+              const v2Key = `replayed:v2:${dest}/${of}`
+              if (this.cleanedRetiredV2.has(v2Key)) continue
+              try {
+                const stored = await cleanupOp(this.io.storeGet(v2Key))
+                if (stored === CLEANUP_ABORT) break
+                if (stored === undefined) {
+                  this.cleanedRetiredV2.add(v2Key)
+                  continue
+                }
+                if (hasLiveChild(stored)) continue
+                await ensureLiveParents()
+                if (liveParentsIncomplete || liveParents.has(of) || cleanupStopped()) continue
+                let retired = beside.done.length === 0 && beside.zeroDone && !beside.record
+                for (const doneName of beside.done) {
+                  if (cleanupStopped()) break
+                  const raw = await cleanupOp(this.io.readFile(joinPath(dir, doneName)).catch(() => ''))
+                  if (raw === CLEANUP_ABORT) {
+                    retired = false
+                    break
+                  }
+                  const kept = journalOf(raw)
+                  if (kept !== undefined && kept !== 'torn' && kept.retired === true) {
+                    retired = true
+                    break
+                  }
+                }
+                if (!retired || cleanupStopped()) continue
+                const deleted = await cleanupOp(this.io.storeDelete(v2Key))
+                if (deleted === CLEANUP_ABORT) break
+                this.cleanedRetiredV2.add(v2Key)
+              } catch {
+                // Best-effort cleanup; next replay retries.
+              }
             }
           }
+        } finally {
+          this.pendingCleanupWakeups.delete(fireCleanupAbort)
+          cleanupTimer?.cancel()
         }
       }
     }
     if (emptyWaiting.length > 0) report.held ??= diagnostic(`${emptyWaiting[0]} is empty, perhaps still being written; it waits for the next replay`)
     if (parentWaits.length > 0) report.held ??= diagnostic(`${parentWaits[0]} waits until the replay of the file it came from has it as written`)
-    if (leased.length > 0) report.held ??= diagnostic(`another session's lease holds ${leased[0]} (ten minutes at most); it waits for the next replay`)
+    for (const lname of leased) {
+      this.noteHeld(
+        report,
+        trigger,
+        `another session's lease holds ${lname} (ten minutes at most); it waits for the next replay`,
+        joinPath(dir, lname),
+        true,
+        true,
+      )
+    }
     // Another replay of this table follows by itself while rows wait: rows
     // this one left, files it did not read (another session's lease on them
     // included), files not whole or empty that a write still under way may
@@ -3037,35 +3145,68 @@ export class Writer {
     name: string,
     size: number,
     c: Config,
-    companionEntries: readonly { name: string; kind: string; size: number }[],
+    companions: ReadonlyMap<string, readonly { name: string; kind: string; size: number }[]>,
     listed: ReadonlyMap<string, number>,
     trigger: BackfillReport['trigger'],
-  ): Promise<void> {
+    inspectedSkipped: Map<string, 'covered' | 'handled'>,
+  ): Promise<'covered' | 'handled'> {
     const skippedPath = joinPath(dir, name)
-    if (this.heldPaths.has(skippedPath) || this.rewrites.has(skippedPath)) return
+    const cached = inspectedSkipped.get(skippedPath)
+    if (cached !== undefined) return cached
+    if (this.rewrites.has(skippedPath) || this.heldPaths.get(skippedPath)?.activeCertain === true) {
+      inspectedSkipped.set(skippedPath, 'handled')
+      return 'handled'
+    }
+    inspectedSkipped.set(skippedPath, 'handled')
+    const recordHeld = (targetPath: string, message: string, mayBeActive = false, activeCertain = false): void => {
+      const cleanMsg = diagnostic(message)
+      const prev = this.heldPaths.get(targetPath)
+      const prevActive = prev?.mayBeActive === true
+      const prevCertain = prev?.activeCertain === true
+      if (prev !== undefined && ((prevCertain && !activeCertain) || (prevActive && !mayBeActive))) {
+        return
+      }
+      const nextActive = prevActive || mayBeActive
+      const nextCertain = prevCertain || activeCertain
+      const nextMsg = prev !== undefined && !nextActive && !nextCertain ? prev.reason : cleanMsg
+      this.setHeldPath(targetPath, { reason: nextMsg, mayBeActive: nextActive, ...(nextCertain ? { activeCertain: true } : {}) })
+      const active = this.hasActiveHeldIn(dir)
+      this.inProgressHeld = {
+        files: Math.max(this.inProgressHeld.files, this.heldCountIn(dir)),
+        reason: this.inProgressHeld.reason ?? nextMsg,
+        trigger: this.inProgressHeld.trigger ?? trigger,
+        mayBeActive: active,
+      }
+    }
+    const me = this.sessionId() ?? 'unknown'
+    if (!this.exitReplay?.postCutoff.passed()) {
+      try {
+        const lease = (await this.io.storeGet(`lease:${destinationDir(tableRef(c))}/${name}`)) as { by?: string; until?: number } | undefined
+        if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
+          recordHeld(skippedPath, `another session's lease holds ${name} (ten minutes at most); it waits for the next replay`, true, true)
+          return 'handled'
+        }
+      } catch {
+        // Best-effort lease check on skipped files.
+      }
+    }
+    const companionEntries = companions.get(name) ?? []
+    if (companionEntries.length === 0) return 'handled'
     const source = sourceFor(dir, name, size, c)
     const first = await this.doneMarks(source, companionEntries)
-    if (first.done !== undefined) return
+    if (first.done !== undefined) {
+      inspectedSkipped.set(skippedPath, 'covered')
+      return 'covered'
+    }
     const [v1, v2] = await Promise.all([
       this.readJournalSlot(source, source.recordKey, source.recordFiles, false),
       this.readJournalSlot(source, source.v2RecordKey, source.v2RecordFiles, true),
     ])
     const picked = Writer.pickJournalSlots(v1, v2)
-    const recordHeld = (targetPath: string, message: string, mayBeActive = false): void => {
-      const cleanMsg = diagnostic(message)
-      this.setHeldPath(targetPath, { reason: cleanMsg, mayBeActive })
-      const active = this.hasActiveHeldIn(dir)
-      this.inProgressHeld = {
-        files: Math.max(this.inProgressHeld.files, this.heldCountIn(dir)),
-        reason: this.inProgressHeld.reason ?? cleanMsg,
-        trigger: this.inProgressHeld.trigger ?? trigger,
-        mayBeActive: active,
-      }
-    }
     if (picked === 'conflict') {
-      const hasActiveForeign = await this.hasActiveForeignMark(source, companionEntries)
-      recordHeld(skippedPath, `conflicting replay records exist for ${name}; /bqaa-backfill force replays the file afresh`, hasActiveForeign)
-      return
+      const foreign = await this.hasActiveForeignMark(source, companionEntries)
+      recordHeld(skippedPath, `conflicting replay records exist for ${name}; /bqaa-backfill force replays the file afresh`, foreign.mayBeActive, foreign.activeCertain)
+      return 'handled'
     }
     if (picked !== undefined) {
       if (Array.isArray(picked.journal.uncertain) && picked.journal.uncertain.some(Boolean)) {
@@ -3075,11 +3216,21 @@ export class Writer {
         for (let i = 0; i < picked.journal.uncertain.length; i += 1) {
           if (picked.journal.uncertain[i] !== true) continue
           const childName = journalFiles[i] !== undefined ? baseOf(journalFiles[i] as string) : ''
-          if (childName !== '' && (listed.get(childName) ?? 0) > 0) {
-            recordHeld(
-              joinPath(dir, childName),
-              `a replay of ${childName} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
-            )
+          const childSize = childName !== '' ? (listed.get(childName) ?? 0) : 0
+          if (childName !== '' && childSize > 0) {
+            const childPath = joinPath(dir, childName)
+            let childCovered = false
+            try {
+              childCovered = (await this.seedSkippedHeld(dir, childName, childSize, c, companions, listed, trigger, inspectedSkipped)) === 'covered'
+            } catch {
+              // Best-effort child inspection before fallback held seeding.
+            }
+            if (!childCovered && !this.heldPaths.has(childPath) && !this.rewrites.has(childPath)) {
+              recordHeld(
+                childPath,
+                `a replay of ${childName} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`,
+              )
+            }
           } else if (journalWritten[i] !== true) {
             needsParent = true
           }
@@ -3091,23 +3242,26 @@ export class Writer {
           )
         }
       }
-      return
+      inspectedSkipped.set(skippedPath, 'covered')
+      return 'covered'
     }
     if (v1.torn || v2.torn || first.torn) {
-      const hasActiveForeign = await this.hasActiveForeignMark(source, companionEntries)
-      recordHeld(skippedPath, `the replay record of ${name} is cut off part-way; /bqaa-backfill force replays the file afresh`, hasActiveForeign)
-      return
+      const foreign = await this.hasActiveForeignMark(source, companionEntries)
+      recordHeld(skippedPath, `the replay record of ${name} is cut off part-way; /bqaa-backfill force replays the file afresh`, foreign.mayBeActive, foreign.activeCertain)
+      return 'handled'
     }
-    const { by, activeBy, uncertain } = await this.marksDetailed(source, companionEntries)
+    const { by, activeBy, nonUncertainBy, uncertain } = await this.marksDetailed(source, companionEntries)
     const ownUncertain = this.uncertainSources.get(skippedPath) === source.size
-    const hasActiveForeign = activeBy.some(w => w !== this.mark)
+    const hasForeignActive = activeBy.some(w => w !== this.mark)
+    const hasCertainActive = nonUncertainBy.some(w => w !== this.mark)
     if (by.some(w => w !== this.mark || ownUncertain)) {
       const msg =
-        !hasActiveForeign && (ownUncertain || uncertain)
+        !hasCertainActive && (ownUncertain || uncertain)
           ? `a replay of ${name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`
           : `a replay of ${name} sent rows and has recorded no outcome; if that session stopped, /bqaa-backfill force replays the file afresh`
-      recordHeld(skippedPath, msg, hasActiveForeign)
+      recordHeld(skippedPath, msg, hasForeignActive, hasCertainActive)
     }
+    return 'handled'
   }
 
   // Rows one replay request had refused: on the status line, and among the
@@ -3167,7 +3321,7 @@ export class Writer {
     recordKey: string,
     recordFiles: readonly string[],
     v2: boolean,
-  ): Promise<{ found: Found | undefined; torn: boolean }> {
+  ): Promise<{ found: Found | undefined; torn: boolean; rawStored?: Partial<Journal> }> {
     // A record of another size is not this file's (`size` -1: any size).
     const fits = (journal: Partial<Journal> | undefined): journal is Partial<Journal> => journal !== undefined && (source.size < 0 || journal.size === source.size)
     const read = ((await this.io.storeGet(recordKey)) ?? undefined) as Partial<Journal> | undefined
@@ -3185,12 +3339,12 @@ export class Writer {
       else if (fits(kept) && (filed === undefined || seqOf(kept) > seqOf(filed))) filed = kept
     }
     if (stored === undefined) {
-      return { found: filed !== undefined ? { journal: filed, filed: true, ...(v2 ? { v2: true } : {}) } : undefined, torn: slotTorn }
+      return { found: filed !== undefined ? { journal: filed, filed: true, ...(v2 ? { v2: true } : {}) } : undefined, torn: slotTorn, ...(read !== undefined ? { rawStored: read } : {}) }
     }
-    if (filed === undefined) return { found: { journal: stored, filed: slotTorn, ...(v2 ? { v2: true } : {}) }, torn: slotTorn }
+    if (filed === undefined) return { found: { journal: stored, filed: slotTorn, ...(v2 ? { v2: true } : {}) }, torn: slotTorn, rawStored: read }
     // Two outcomes: the file's was written when the store did not take it.
     if (!Array.isArray(stored.files) || !Array.isArray(filed.files) || !sameNames(stored.files, filed.files)) {
-      return { found: { journal: filed, filed: true, ...(v2 ? { v2: true } : {}) }, torn: slotTorn }
+      return { found: { journal: filed, filed: true, ...(v2 ? { v2: true } : {}) }, torn: slotTorn, rawStored: read }
     }
     const a = writtenOf(stored)
     const b = writtenOf(filed)
@@ -3201,6 +3355,7 @@ export class Writer {
         ...(v2 ? { v2: true } : {}),
       },
       torn: slotTorn,
+      rawStored: read,
     }
   }
 
@@ -3235,7 +3390,10 @@ export class Writer {
     return 'conflict'
   }
 
-  private async readJournal(source: Source): Promise<Found | Pending | 'torn' | 'conflict' | undefined> {
+  private async readJournal(
+    source: Source,
+    slots?: { slotsRead: boolean; v1Stored?: Partial<Journal>; v2Stored?: Partial<Journal> },
+  ): Promise<Found | Pending | 'torn' | 'conflict' | undefined> {
     // In files of their own, each writer's, which no write of a record goes
     // to: any whole one stands, whatever another writer's late write does to
     // its own. One cut off part-way, with no other whole record, is cut off
@@ -3250,6 +3408,11 @@ export class Writer {
       this.readJournalSlot(source, source.recordKey, source.recordFiles, false),
       this.readJournalSlot(source, source.v2RecordKey, source.v2RecordFiles, true),
     ])
+    if (slots !== undefined) {
+      slots.slotsRead = true
+      slots.v1Stored = v1.rawStored
+      slots.v2Stored = v2.rawStored
+    }
     const picked = Writer.pickJournalSlots(v1, v2)
     if (picked !== undefined) return picked
     // No record whole in the store or beside the file: a writer may have
@@ -3258,11 +3421,18 @@ export class Writer {
     // go. So the marks are read, and only then the done marks listed
     // again, before none is taken for an answer.
     entries = await this.io.listDir(source.dir)
-    const { by, activeBy, uncertain } = await this.marksDetailed(source, entries)
+    const { by, activeBy, nonUncertainBy, uncertain } = await this.marksDetailed(source, entries)
     const again = await doneIn(await this.io.listDir(source.dir))
     if (again.done !== undefined) return { journal: again.done, filed: true }
     if (v1.torn || v2.torn || doneTorn || again.torn) return 'torn'
-    return by.length === 0 ? undefined : { pending: by, ...(activeBy.length > 0 ? { activeBy } : {}), ...(uncertain ? { uncertain: true } : {}) }
+    return by.length === 0
+      ? undefined
+      : {
+          pending: by,
+          ...(activeBy.length > 0 ? { activeBy } : {}),
+          ...(nonUncertainBy.length > 0 ? { nonUncertainBy } : {}),
+          ...(uncertain ? { uncertain: true } : {}),
+        }
   }
 
   // All whole retired done marks for `source` from `entries` (sorted by mark
@@ -3500,12 +3670,48 @@ export class Writer {
     }
   }
 
+  private async safeStoreDeleteSameSize(key: string, expectedSize: number, dir: string): Promise<void> {
+    try {
+      const stored = (await this.io.storeGet(key)) as Partial<Journal> | undefined
+      if (stored === undefined) return
+      if (expectedSize >= 0 && stored.size !== expectedSize) {
+        if (Array.isArray(stored.files)) {
+          const entries = await this.io.listDir(dir)
+          const liveNames = new Set(entries.filter(e => (e.kind === undefined || e.kind === 'file') && e.size > 0).map(e => e.name))
+          if (stored.files.some(f => typeof f === 'string' && liveNames.has(baseOf(f)))) return
+        }
+      }
+      await this.io.storeDelete(key)
+    } catch {
+      // Best-effort safe delete.
+    }
+  }
+
   // Empties the files beside `source` that held its record: none is read
-  // once the source is empty, or once the record is let go.
+  // once the source is empty, or once the record is let go. Only truncates
+  // entries that match `source.size` or have no remaining live child on disk.
   private async emptyRecordFiles(source: Source): Promise<void> {
+    let liveNames: Set<string> | null = null
+    const getLiveNames = async (): Promise<Set<string> | null> => {
+      if (liveNames !== null) return liveNames
+      try {
+        liveNames = new Set((await this.io.listDir(source.dir)).filter(e => (e.kind === undefined || e.kind === 'file') && e.size > 0).map(e => e.name))
+        return liveNames
+      } catch {
+        return null
+      }
+    }
     for (const file of [...source.recordFiles, ...source.v2RecordFiles]) {
       try {
         if (this.io.exists !== undefined && !(await this.io.exists(file))) continue
+        const text = await this.io.readFile(file)
+        if (text === '') continue
+        const kept = journalOf(text)
+        if (kept === 'torn') continue
+        if (kept !== undefined && source.size >= 0 && kept.size !== source.size && Array.isArray(kept.files)) {
+          const live = await getLiveNames()
+          if (live === null || kept.files.some(f => typeof f === 'string' && live.has(baseOf(f)))) continue
+        }
         await this.io.writeFile(file, '')
       } catch {
         // Left as it is.
@@ -3567,8 +3773,12 @@ export class Writer {
     if (!lines.complete || (source.size >= 0 && utf8Length(text) !== source.size)) return undefined
     const texts = fitsLines(lines, outcome) ? leftoverFiles(lines, fileKind, outcome, source.name) : null
     if (texts === null || texts.length !== paths.length) {
-      // Not this file's outcome after all: replay it afresh.
-      await Promise.allSettled([this.io.storeDelete(source.recordKey), this.io.storeDelete(source.v2RecordKey)])
+      // Not this file's outcome after all: replay it afresh while preserving any
+      // earlier generation record that still protects a live child.
+      await Promise.all([
+        this.safeStoreDeleteSameSize(source.recordKey, source.size, source.dir),
+        this.safeStoreDeleteSameSize(source.v2RecordKey, source.size, source.dir),
+      ])
       await this.emptyRecordFiles(source)
       return held
     }
@@ -3603,7 +3813,19 @@ export class Writer {
   // file of what is left, and before the mark that the file was done.
   private async writeOut(path: string, rewrite: Rewrite): Promise<boolean> {
     this.rewrites.set(path, rewrite)
-    const found = Writer.recorded(await this.readJournal(rewrite))
+    const initialSlots: { slotsRead: boolean; v1Stored?: Partial<Journal>; v2Stored?: Partial<Journal> } = { slotsRead: false }
+    const found = Writer.recorded(await this.readJournal(rewrite, initialSlots))
+    const cachedStore = new Map<string, Partial<Journal> | undefined>()
+    if (initialSlots.slotsRead) {
+      cachedStore.set(rewrite.recordKey, initialSlots.v1Stored)
+      cachedStore.set(rewrite.v2RecordKey, initialSlots.v2Stored)
+    }
+    const readStoreSlot = async (key: string): Promise<Partial<Journal> | undefined> => {
+      if (cachedStore.has(key)) return cachedStore.get(key)
+      const val = ((await this.io.storeGet(key)) ?? undefined) as Partial<Journal> | undefined
+      cachedStore.set(key, val)
+      return val
+    }
     // Finished already (the file left again, by a late copy, say), here or
     // at any check below: the mark that it was done stands as it is, never
     // written again, and only the file is emptied.
@@ -3636,6 +3858,7 @@ export class Writer {
     const otherKey = rewrite.useV2 ? rewrite.recordKey : rewrite.v2RecordKey
     const otherFiles = rewrite.useV2 ? rewrite.recordFiles : rewrite.v2RecordFiles
     const rewriteNames = rewrite.files.map(f => baseOf(f.path))
+    const rewriteNameSet = new Set(rewriteNames)
     const matchesRewrite = (journal: Partial<Journal> | 'torn' | undefined): boolean =>
       journal !== undefined &&
       journal !== 'torn' &&
@@ -3644,6 +3867,44 @@ export class Writer {
       Array.isArray(journal.files) &&
       sameNames(journal.files, rewriteNames) &&
       seqOf(journal) <= rewrite.seq
+    const dirListing = async (): Promise<ReadonlyMap<string, number> | null> => {
+      try {
+        const listed = new Map<string, number>()
+        for (const entry of await this.io.listDir(rewrite.dir)) {
+          if (entry.kind === undefined || entry.kind === 'file') listed.set(entry.name, entry.size)
+        }
+        return listed
+      } catch {
+        return null
+      }
+    }
+    const hasUnownedLiveChild = async (listed: ReadonlyMap<string, number>): Promise<boolean> => {
+      for (const [n, sz] of listed) {
+        if (sz <= 0 || n === rewrite.name || rewriteNameSet.has(n) || kindOf(n) === null) continue
+        if (sz > HOST_FILE_BYTES) return true
+        try {
+          const raw = await this.io.readFile(joinPath(rewrite.dir, n))
+          if (raw === '') continue
+          const parsed = parseFile(raw)
+          if (!parsed.complete) return true
+          if (parsed.parent !== null && baseOf(parsed.parent) === rewrite.name) return true
+        } catch {
+          return true
+        }
+      }
+      return false
+    }
+    const protectsLiveChild = async (journal: Partial<Journal> | 'torn' | undefined): Promise<boolean> => {
+      if (journal === undefined) return false
+      if (journal !== 'torn' && matchesRewrite(journal)) return false
+      const listed = await dirListing()
+      if (listed === null) return true
+      if (journal === 'torn') return hasUnownedLiveChild(listed)
+      if (!Array.isArray(journal.files)) return false
+      return journal.files.some(
+        f => typeof f === 'string' && (listed.get(baseOf(f)) ?? 0) > 0 && (journal.size !== rewrite.size || !rewriteNameSet.has(baseOf(f))),
+      )
+    }
     class StaleRecordClearError extends Error {}
     const failStaleClear = (): never => {
       const message = `could not clear stale replay record for ${path}, so nothing more of what it left is written`
@@ -3658,7 +3919,8 @@ export class Writer {
           if (this.io.exists !== undefined && !(await this.io.exists(file))) continue
           const text = await this.io.readFile(file)
           if (text === '') continue
-          if (matchesRewrite(journalOf(text))) continue
+          const kept = journalOf(text)
+          if (matchesRewrite(kept) || (await protectsLiveChild(kept))) continue
           await this.io.writeFile(file, '')
         } catch {
           failStaleClear()
@@ -3667,8 +3929,11 @@ export class Writer {
     }
     const clearStaleActiveStore = async (): Promise<void> => {
       try {
-        const existing = (await this.io.storeGet(activeKey)) as Partial<Journal> | undefined
-        if (existing !== undefined && !matchesRewrite(existing)) await this.io.storeDelete(activeKey)
+        const existing = await readStoreSlot(activeKey)
+        if (existing !== undefined && !matchesRewrite(existing) && !(await protectsLiveChild(existing))) {
+          await this.io.storeDelete(activeKey)
+          cachedStore.set(activeKey, undefined)
+        }
       } catch {
         failStaleClear()
       }
@@ -3677,15 +3942,20 @@ export class Writer {
     const clearOppositeSlot = async (): Promise<boolean> => {
       let ok = true
       try {
-        const existing = await this.io.storeGet(otherKey)
-        if (existing !== undefined) await this.io.storeDelete(otherKey)
+        const existing = await readStoreSlot(otherKey)
+        if (existing !== undefined && !(await protectsLiveChild(existing))) {
+          await this.io.storeDelete(otherKey)
+          cachedStore.set(otherKey, undefined)
+        }
       } catch {
         ok = false
       }
       for (const file of otherFiles) {
         try {
           if (this.io.exists !== undefined && !(await this.io.exists(file))) continue
-          if ((await this.io.readFile(file)) === '') continue
+          const text = await this.io.readFile(file)
+          if (text === '') continue
+          if (await protectsLiveChild(journalOf(text))) continue
           await this.io.writeFile(file, '')
         } catch {
           ok = false
@@ -3717,20 +3987,49 @@ export class Writer {
         ...(rewrite.files.some(f => f.uncertain === true) ? { uncertain: rewrite.files.map(f => f.uncertain === true) } : {}),
       }
       if (utf8Length(JSON.stringify(journal)) <= STORE_RECORD_BYTES) {
+        let storeSlotBlocked = false
         try {
-          await this.io.storeSet(activeKey, journal)
-          if (!clearedActiveSlot) {
-            await clearStaleActiveFiles()
-            clearedActiveSlot = true
+          const existingStore = await readStoreSlot(activeKey)
+          if (existingStore !== undefined && !matchesRewrite(existingStore) && (await protectsLiveChild(existingStore))) {
+            storeSlotBlocked = true
           }
-          await ensureOppositeSlotCleared()
-          return
-        } catch (err) {
-          if (err instanceof StaleRecordClearError) throw err
-          // Not taken (the store is full, say): a file beside the source.
+        } catch {
+          storeSlotBlocked = true
+        }
+        if (!storeSlotBlocked) {
+          try {
+            await this.io.storeSet(activeKey, journal)
+            cachedStore.set(activeKey, journal)
+            if (!clearedActiveSlot) {
+              await clearStaleActiveFiles()
+              clearedActiveSlot = true
+            }
+            await ensureOppositeSlotCleared()
+            return
+          } catch (err) {
+            if (err instanceof StaleRecordClearError) throw err
+            // Not taken (the store is full, say): a file beside the source.
+          }
         }
       }
-      const activeFile = activeFiles[(seq + 1) % 2] as string
+      const candidates = [activeFiles[(seq + 1) % 2] as string, activeFiles[seq % 2] as string]
+      let activeFile: string | null = null
+      for (const candidate of candidates) {
+        try {
+          const text = this.io.exists !== undefined && !(await this.io.exists(candidate)) ? '' : await this.io.readFile(candidate)
+          if (text === '' || !(await protectsLiveChild(journalOf(text)))) {
+            activeFile = candidate
+            break
+          }
+        } catch {
+          // Do not overwrite an unreadable companion file that may protect a live child.
+        }
+      }
+      if (activeFile === null) {
+        const message = `could not record the replay of ${path}, so nothing more of what it left is written`
+        this.recordError(message)
+        throw new Error(message)
+      }
       try {
         // The two files take the updates in turn: one cut off part-way
         // leaves the record before it whole in the other (or in the store).
@@ -3761,18 +4060,33 @@ export class Writer {
     // at the same time with an outcome of its own, or finished it: the record
     // says. That outcome goes on, at the next replay, and no more of this one.
     const stillOurs = async (): Promise<boolean> => {
-      const found = Writer.recorded(await this.readJournal(rewrite))
+      const latestSlots: { slotsRead: boolean; v1Stored?: Partial<Journal>; v2Stored?: Partial<Journal> } = { slotsRead: false }
+      const found = Writer.recorded(await this.readJournal(rewrite, latestSlots))
+      if (latestSlots.slotsRead) {
+        cachedStore.set(rewrite.recordKey, latestSlots.v1Stored)
+        cachedStore.set(rewrite.v2RecordKey, latestSlots.v2Stored)
+      }
       if (found === 'torn' || found === 'conflict' || (found !== undefined && found.journal.size === rewrite.size && !Writer.catchUp(rewrite, found))) {
         this.rewrites.delete(path)
         // Another outcome superseded or finished the file: release our standing
-        // mark and, if retired, drop any store copy we recorded meanwhile.
+        // mark and, if retired, drop any store copy of this generation we recorded meanwhile.
         if (found !== 'torn' && found !== 'conflict' && found !== undefined) {
           for (const w of [...this.before, this]) w.activeSendingMarks.delete(path)
           await this.unmark(rewrite)
           if (found.journal.retired === true) {
             this.deleteHeldPath(path)
             this.currentScanHeld.delete(path)
-            await Promise.allSettled([this.io.storeDelete(rewrite.recordKey), this.io.storeDelete(rewrite.v2RecordKey)])
+            for (const key of [rewrite.recordKey, rewrite.v2RecordKey]) {
+              try {
+                const stored = await readStoreSlot(key)
+                if (stored !== undefined && !(await protectsLiveChild(stored))) {
+                  await this.io.storeDelete(key)
+                  cachedStore.set(key, undefined)
+                }
+              } catch {
+                // Leave store key on error.
+              }
+            }
           }
         }
         return false
@@ -3842,7 +4156,23 @@ export class Writer {
     if (done) {
       if (rewrite.useV2) await this.unmark(rewrite)
       if (!clearedOppositeSlot) clearedOppositeSlot = await clearOppositeSlot()
-      await Promise.allSettled([this.io.storeDelete(rewrite.recordKey), this.io.storeDelete(rewrite.v2RecordKey)])
+      for (const key of [rewrite.recordKey, rewrite.v2RecordKey]) {
+        try {
+          const stored = await readStoreSlot(key)
+          if (stored === undefined) continue
+          if (await protectsLiveChild(stored)) continue
+          if (stored.size === rewrite.size && key === activeKey && !wroteDone) {
+            const listed = await dirListing()
+            const hasDone = listed !== null && [...listed.entries()].some(([n, sz]) => sz > 0 && doneMarkerOf(n, rewrite.name) !== null)
+            const hasLiveChild = Array.isArray(stored.files) && listed !== null && stored.files.some(f => typeof f === 'string' && (listed.get(baseOf(f)) ?? 0) > 0)
+            if (!hasDone && hasLiveChild) continue
+          }
+          await this.io.storeDelete(key)
+          cachedStore.set(key, undefined)
+        } catch {
+          // Leave store key when inspection fails.
+        }
+      }
     }
     return true
   }
@@ -3858,14 +4188,26 @@ export class Writer {
   // splits, write under `${this.mark}d` so an interrupted or truncated
   // `markDone` never zeros the standing `outcome-done-${this.mark}-` sending
   // guard that 0.1.3 readers rely on; `writeOut` releases the sending mark
-  // only after `markDone` and source truncation succeed. No other writer
-  // writes that file, so no late write of another session's replay takes it
-  // away: a late copy of the file, or of one it left, is known by it, and so
-  // is another session's late outcome for it. Kept a day; the store's copy of
-  // the record goes once the file is emptied. False when it could not be
-  // written.
+  // only after `markDone` and source truncation succeed. Sequence numbers
+  // advance strictly past all prior retired done marks and file records of
+  // any size beside `rewrite.name` so 0.1.3 readers never pick an older
+  // generation's mark across sizes. No other writer writes that file, so no
+  // late write of another session's replay takes it away.
   private async markDone(rewrite: Rewrite): Promise<boolean> {
-    rewrite.seq += 1
+    const anySizeSource: Source = { ...rewrite, size: -1, live: false }
+    try {
+      const entries = await this.io.listDir(rewrite.dir)
+      const doneAll = await this.doneMarksAll(anySizeSource, entries)
+      let maxSeq = rewrite.seq
+      for (const r of doneAll.records) maxSeq = Math.max(maxSeq, seqOf(r))
+      for (const file of [...rewrite.recordFiles, ...rewrite.v2RecordFiles]) {
+        const kept = journalOf(await this.io.readFile(file).catch(() => ''))
+        if (kept !== undefined && kept !== 'torn') maxSeq = Math.max(maxSeq, seqOf(kept))
+      }
+      rewrite.seq = maxSeq + 1
+    } catch {
+      return false
+    }
     const { size, waits, seq } = rewrite
     const { fates, reasons, refusals } = rewrite
     const journal: Journal = { fates, reasons, refusals, size, waits, seq, files: rewrite.files.map(f => baseOf(f.path)), written: rewrite.files.map(() => true), retired: true, retiredAt: this.io.now() }
@@ -3900,21 +4242,23 @@ export class Writer {
       return false
     }
     const donePath = doneFileOf(source.dir, source.name, this.mark)
+    this.activeSendingMarks.set(path, { path, name: source.name, dir: source.dir, trigger, size: source.size })
     try {
       const markPayload = { size: source.size, sending: true, ...(this.exitReplay !== null ? { uncertain: true } : {}), by: this.mark }
       await this.io.writeFile(donePath, sealFile(`${JSON.stringify(markPayload)}\n`))
     } catch (err) {
       const released = await this.unmark(source)
       if (!released) {
-        const remaining = await this.io.readFile(donePath).catch(() => '')
-        if (remaining !== '') {
-          this.activeSendingMarks.set(path, { path, name: source.name, dir: source.dir, trigger, size: source.size })
+        try {
+          const remaining = await this.io.readFile(donePath)
+          if (remaining === '') this.activeSendingMarks.delete(path)
+        } catch {
+          // Keep activeSendingMarks on unreadable/failed release so exit notice fails closed.
         }
       }
       report.held ??= diagnostic(`could not mark the replay of ${source.name} before sending, so none of it is sent: ${errorText(err)}`)
       return false
     }
-    this.activeSendingMarks.set(path, { path, name: source.name, dir: source.dir, trigger, size: source.size })
     try {
       // The marks as readJournal read them, before its last look at the done
       // marks, so no mark let go meanwhile (by a writer that finished the
@@ -3926,17 +4270,20 @@ export class Writer {
       const isOther = (by: string): boolean => by !== this.mark || ownUncertain
       let others: string[] = []
       let othersActive: string[] = []
+      let othersCertain: string[] = []
       let otherUncertain = ownUncertain
       if (read === 'torn' || read === 'conflict') {
         const detailed = await this.marksDetailed(source)
         others = detailed.by.filter(isOther)
         othersActive = detailed.activeBy.filter(by => by !== this.mark)
+        othersCertain = detailed.nonUncertainBy.filter(by => by !== this.mark)
         otherUncertain ||= detailed.uncertain
         const last = await this.doneMarks(source, await this.io.listDir(source.dir))
         if (last.done !== undefined) found = { journal: last.done, filed: true }
       } else if (read !== undefined && 'pending' in read) {
         others = read.pending.filter(isOther)
         othersActive = (read.activeBy ?? []).filter(by => by !== this.mark)
+        othersCertain = (read.nonUncertainBy ?? []).filter(by => by !== this.mark)
         otherUncertain ||= read.uncertain === true
       }
       const another = trigger !== 'force' && others.length > 0
@@ -3949,14 +4296,16 @@ export class Writer {
             `conflicting replay records exist for ${source.name}; /bqaa-backfill force replays the file afresh`,
             path,
             othersActive.length > 0,
+            othersCertain.length > 0,
           )
         } else if (another && (found === undefined || found === 'torn' || found === 'conflict')) {
-          const hasActiveForeign = othersActive.length > 0
+          const hasForeignActive = othersActive.length > 0
+          const hasCertainActive = othersCertain.length > 0
           const msg =
-            !hasActiveForeign && otherUncertain
+            !hasCertainActive && otherUncertain
               ? `a replay of ${source.name} sent rows and has recorded no outcome (no answer before the session ended); /bqaa-backfill force replays the file afresh`
               : `another session is replaying ${source.name}; if it stopped, /bqaa-backfill force replays the file afresh`
-          this.noteHeld(report, trigger, msg, path, hasActiveForeign)
+          this.noteHeld(report, trigger, msg, path, hasForeignActive, hasCertainActive)
         }
         await this.unmark(source)
         return false
@@ -3968,26 +4317,37 @@ export class Writer {
     }
   }
 
-  private async hasActiveForeignMark(source: Source, entries?: readonly { name: string; kind?: string; size: number }[]): Promise<boolean> {
+  private async hasActiveForeignMark(
+    source: Source,
+    entries?: readonly { name: string; kind?: string; size: number }[],
+  ): Promise<{ mayBeActive: boolean; activeCertain: boolean }> {
     try {
-      const { activeBy } = await this.marksDetailed(source, entries)
-      return activeBy.some(by => by !== this.mark)
+      const { activeBy, nonUncertainBy } = await this.marksDetailed(source, entries)
+      return {
+        mayBeActive: activeBy.some(by => by !== this.mark),
+        activeCertain: nonUncertainBy.some(by => by !== this.mark),
+      }
     } catch {
       // Cannot inspect standing marks while holding on torn/conflict: keep
       // the owner-stopped + lease-expired qualification on headless notices.
-      return true
+      return { mayBeActive: true, activeCertain: true }
     }
   }
 
   // The writers whose marks stand beside `source`, read from its directory
-  // (`entries`, when it was just listed), plus which writers hold non-uncertain
-  // marks (whose session may still be running) and whether any standing mark
-  // came from an unanswered exit replay (`uncertain: true`). An emptied mark,
-  // which its writer let go, is not read. A mark that cannot be read, or a
-  // directory that cannot be listed, throws: it is never taken for none.
-  private async marksDetailed(source: Source, entries?: readonly { name: string; kind?: string; size: number }[]): Promise<{ by: string[]; activeBy: string[]; uncertain: boolean }> {
+  // (`entries`, when it was just listed), plus `activeBy` (standing marks from
+  // non-self sessions including pre-dispatch uncertain and torn marks) and
+  // `nonUncertainBy` (complete non-uncertain marks whose owner may still be
+  // live). An emptied mark, which its writer let go, is not read. A mark that
+  // cannot be read, or a directory that cannot be listed, throws: it is never
+  // taken for none.
+  private async marksDetailed(
+    source: Source,
+    entries?: readonly { name: string; kind?: string; size: number }[],
+  ): Promise<{ by: string[]; activeBy: string[]; nonUncertainBy: string[]; uncertain: boolean }> {
     const by: string[] = []
     const activeBy: string[] = []
+    const nonUncertainBy: string[] = []
     let uncertain = false
     for (const entry of entries ?? (await this.io.listDir(source.dir))) {
       if (entry.kind !== undefined && entry.kind !== 'file') continue
@@ -3996,14 +4356,15 @@ export class Writer {
       const raw = await this.io.readFile(joinPath(source.dir, entry.name))
       if (markStands(raw, source.size)) {
         by.push(writer)
+        activeBy.push(writer)
         const parsed = journalOf(raw) as { uncertain?: unknown } | 'torn' | undefined
         if (parsed !== undefined && parsed !== 'torn') {
           if (parsed.uncertain === true) uncertain = true
-          else activeBy.push(writer)
+          else nonUncertainBy.push(writer)
         }
       }
     }
-    return { by, activeBy, uncertain }
+    return { by, activeBy, nonUncertainBy, uncertain }
   }
 
   // This writer's own mark beside `source` let go. Best effort: returns true

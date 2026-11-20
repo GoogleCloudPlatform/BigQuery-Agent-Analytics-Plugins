@@ -5175,3 +5175,408 @@ test('T53-17d: cleanExpiredRecords deletes store keys before truncating companio
   expect(h.store.get(v2Key)).toBeUndefined()
   expect(h.files.get(donePath)).toBe('')
 })
+
+test('T53-18: exit split markDone advances seq past earlier generations of any size so a 0.1.3 reader picks the new mark and delivers leftover rows', async () => {
+  const h = exitReplayHarness({ maxBatchRows: 500 })
+  const w014 = await h.warmWriter('s-18')
+  const name = 'spill-20261013T200102003Z-t53-18.jsonl'
+  const ids = Array.from({ length: 501 }, (_, i) => (70_000 + i).toString(16).padStart(32, '0'))
+  const sourcePath = h.seedSpill(name, ...ids)
+
+  // Prior generation at another size left an unexpired retired done mark (seq: 9) sorting later by writer mark.
+  h.files.set(
+    `${PARTITION_DIR}/outcome-done-zzzzgen001-${name}`,
+    sealFile(`${JSON.stringify({ size: 222, fates: 'L', reasons: [], refusals: [], waits: false, seq: 9, files: [], written: [], retired: true, retiredAt: 1_000 })}\n`),
+  )
+  h.files.set(
+    `${PARTITION_DIR}/outcome-${name}`,
+    sealFile(`${JSON.stringify({ size: 222, fates: 'L', reasons: [], refusals: [], waits: false, seq: 6, files: [], written: [] })}\n`),
+  )
+
+  h.setFetch(() => undefined)
+  const exiting = w014.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(800)
+  await exiting
+
+  expect(h.files.get(sourcePath)).toBe('')
+  const child501 = [...h.files.entries()].find(([p, t]) => p.startsWith(`${PARTITION_DIR}/spill-`) && p !== sourcePath && t !== '' && parseFile(t).lines.some(l => l.row.event_id === ids[500]!))
+  expect(child501).toBeDefined()
+  const child501Name = child501![0].split('/').pop()!
+
+  // Simulate released 0.1.3 doneMarks cross-size seq selection on an emptied parent (size === -1).
+  const marks013 = h
+    .doneMarksFor(name)
+    .filter(m => m.data?.retired === true)
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  let picked013: (typeof marks013)[number]['data'] | undefined
+  for (const m of marks013) {
+    const seq = typeof m.data?.seq === 'number' ? m.data.seq : 0
+    const bestSeq = typeof picked013?.seq === 'number' ? picked013.seq : 0
+    if (picked013 === undefined || seq >= bestSeq) picked013 = m.data
+  }
+  expect(typeof picked013?.seq === 'number' ? picked013.seq : 0).toBeGreaterThan(9)
+  expect(Array.isArray(picked013?.files) ? picked013.files : []).toContain(child501Name)
+
+  h.sent.length = 0
+  h.setFetch(async () => OK_INSERT)
+  await h.advance(600_001)
+  const rFollowup = await h.newWriter('s-18-next').backfill(['spill', 'retry'], 'auto')
+  expect(rFollowup.rowsSent).toBe(1)
+  expect(h.sentOf(ids[500]!)).toBe(1)
+})
+
+test('T53-19: finishing a newer parent never erases an earlier generation journal protecting a live child', async () => {
+  // Subcase A: already-retired newer Gen 2 (store & file variants) preserves earlier Gen 1 live child journal across opposite slot.
+  for (const storage of ['store', 'file'] as const) {
+    const h = exitReplayHarness()
+    const parent = `retry-20261013T190000000Z-t53-19a-${storage}.jsonl`
+    const oldChildName = `spill-20261013T200000000Z-t53-19a-old-${storage}.jsonl`
+    const idNew = 'a'.repeat(32)
+    const idOld = 'b'.repeat(32)
+    const parentPath = h.seedSpill(parent, idNew)
+    const gen2Size = utf8Bytes(h.files.get(parentPath)!)
+    const oldChildPath = `${PARTITION_DIR}/${oldChildName}`
+    const oldChildText = packFiles(
+      [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:00:00.000Z', table: TABLE_REF, row: ownRow(idOld) })],
+      parent,
+    )[0]!
+
+    // Gen 2 is already retired on disk (v2 done mark); Gen 1 (size !== gen2Size) protects live oldChild in v1 store or file.
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-gen2mark01-${parent}`,
+      sealFile(`${JSON.stringify({ size: gen2Size, fates: 'L', reasons: [], refusals: [], waits: false, seq: 3, files: [], written: [], retired: true })}\n`),
+    )
+    const gen1Journal = { size: gen2Size - 32, fates: 'W', reasons: [], refusals: [], waits: true, seq: 2, files: [oldChildName], written: [true] }
+    if (storage === 'store') {
+      h.store.set(`replayed:${TABLE_REF}/${parent}`, gen1Journal)
+    } else {
+      h.files.set(`${PARTITION_DIR}/outcome-${parent}`, sealFile(`${JSON.stringify(gen1Journal)}\n`))
+    }
+    h.files.set(oldChildPath, oldChildText)
+
+    h.setFetch(async () => OK_INSERT)
+    const w = h.newWriter(`s-19a-${storage}`)
+    const r = await w.backfill(['spill', 'retry'], 'auto')
+    expect(h.files.get(parentPath)).toBe('')
+    expect(r.rowsSent).toBe(1)
+    expect(h.sentOf(idOld)).toBe(1)
+    expect(h.files.get(oldChildPath)).toBe('')
+  }
+
+  // Subcase B: Gen 2 actively writing into the SAME v2 slot when Gen 1 live child is protected only by replayed:v2:* (or outcome2-*).
+  for (const storage of ['store', 'file'] as const) {
+    const h = exitReplayHarness({ maxBatchRows: 1 })
+    const w = await h.warmWriter(`s-19b-${storage}`)
+    const parent = `retry-20261013T190000000Z-t53-19b-${storage}.jsonl`
+    const oldChildName = `spill-20261013T200000000Z-t53-19b-old-${storage}.jsonl`
+    const idGen2a = '1'.repeat(32)
+    const idGen2b = '2'.repeat(32)
+    const idOld = '3'.repeat(32)
+    const parentPath = h.seedSpill(parent, idGen2a, idGen2b)
+    const gen2Size = utf8Bytes(h.files.get(parentPath)!)
+    const oldChildPath = `${PARTITION_DIR}/${oldChildName}`
+    const oldChildText = packFiles(
+      [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:00:00.000Z', table: TABLE_REF, row: ownRow(idOld) })],
+      parent,
+    )[0]!
+
+    const gen1V2Journal = { size: gen2Size - 32, fates: 'W', reasons: [], refusals: [], waits: true, seq: 2, files: [oldChildName], written: [true], uncertain: [false] }
+    if (storage === 'store') {
+      h.store.set(`replayed:v2:${TABLE_REF}/${parent}`, gen1V2Journal)
+    } else {
+      h.files.set(`${PARTITION_DIR}/outcome2-${parent}`, sealFile(`${JSON.stringify(gen1V2Journal)}\n`))
+    }
+    h.files.set(oldChildPath, oldChildText)
+
+    h.setFetch(async (_url, ids) => {
+      if (ids.includes(idGen2b)) return UNAVAILABLE
+      return OK_INSERT
+    })
+    const exiting = w.spillForExit(800, { sendQueued: true, replaySpills: true })
+    await h.advance(800)
+    await exiting
+
+    // Deliver all remaining rows with recovery/force: zero rows may be silently truncated (all 3 rows accounted for).
+    h.setFetch(async () => OK_INSERT)
+    await h.advance(600_001)
+    const w2 = h.newWriter(`s-19b-next-${storage}`)
+    await w2.backfill(['spill', 'retry'], 'auto')
+    await w2.backfill(['spill', 'retry'], 'force')
+    expect(h.sentOf(idOld)).toBeGreaterThanOrEqual(1)
+    expect(h.sentOf(idGen2a)).toBeGreaterThanOrEqual(1)
+    expect(h.sentOf(idGen2b)).toBeGreaterThanOrEqual(1)
+  }
+})
+
+test('T53-8g: foreign pre-dispatch uncertain mark qualifies headlessNotice', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  const name = 'spill-20261013T200102003Z-t53-8g-unc.jsonl'
+  const text = parkedFile(parkedLine(TABLE_REF, '1'.repeat(32), 'other-exit'))
+  world.files.set(`${PARTITION_DIR}/${name}`, text)
+  world.files.set(
+    `${PARTITION_DIR}/outcome-done-uncfor001-${name}`,
+    sealFile(`${JSON.stringify({ size: utf8Bytes(text), sending: true, uncertain: true, by: 'uncfor001' })}\n`),
+  )
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  await world.clock.settle()
+  const ending = $.session.end({ reason: 'other', sessionId: 'p-8g-a', resume: { id: 'p-8g-a' } })
+  await world.clock.advance(2000)
+  await ending
+  const notice = world.stderr.find(l => l.includes('dead-letter file(s) held')) ?? ''
+  expect(notice).toMatch(/confirming that session stopped and its lease expired/i)
+  expect(notice.indexOf('confirming that session stopped and its lease expired')).toBeLessThan(notice.indexOf('/bqaa-backfill force'))
+})
+
+test('T53-8h: live foreign lease before sending mark written qualifies headlessNotice', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  const name = 'spill-20261013T200102004Z-t53-8h-lease.jsonl'
+  const text = parkedFile(parkedLine(TABLE_REF, '2'.repeat(32), 'other-lease'))
+  world.files.set(`${PARTITION_DIR}/${name}`, text)
+  world.store.set(`lease:${TABLE_REF}/${name}`, { by: 'other-session', until: Date.now() + 600_000 })
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  await world.clock.advance(5000)
+  await world.clock.settle()
+  const ending = $.session.end({ reason: 'other', sessionId: 'p-8h-b', resume: { id: 'p-8h-b' } })
+  await world.clock.advance(2000)
+  await ending
+  const notice = world.stderr.find(l => l.includes('dead-letter file(s) held')) ?? ''
+  expect(notice).toMatch(/confirming that session stopped and its lease expired/i)
+  expect(notice.indexOf('confirming that session stopped and its lease expired')).toBeLessThan(notice.indexOf('/bqaa-backfill force'))
+})
+
+test('T53-8i: torn foreign sending mark qualifies headlessNotice', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: ACCESS_TOKEN })
+  const name = 'spill-20261013T200102005Z-t53-8i-torn.jsonl'
+  const text = parkedFile(parkedLine(TABLE_REF, '3'.repeat(32), 'other-torn'))
+  world.files.set(`${PARTITION_DIR}/${name}`, text)
+  world.files.set(`${PARTITION_DIR}/outcome-done-tornfor01-${name}`, '{"sending":true')
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
+  await $.tool.call({ tool: 'Read', file_path: 'c.ts' })
+  await world.clock.advance(5000)
+  await world.clock.settle()
+  const ending = $.session.end({ reason: 'other', sessionId: 'p-8i-c', resume: { id: 'p-8i-c' } })
+  await world.clock.advance(2000)
+  await ending
+  const notice = world.stderr.find(l => l.includes('dead-letter file(s) held')) ?? ''
+  expect(notice).toMatch(/confirming that session stopped and its lease expired/i)
+  expect(notice.indexOf('confirming that session stopped and its lease expired')).toBeLessThan(notice.indexOf('/bqaa-backfill force'))
+})
+
+test('T53-15d: hung historical cleanup storeGet aborts at shutdown so fresh exit spill still runs', async () => {
+  const h = exitReplayHarness()
+  h.advanceNow(4 * 60 * 60 * 1000)
+  const w = await h.warmWriter('s-15d')
+  const oldName = 'spill-20261013T180000000Z-hist-hung.jsonl'
+  const donePath = `${PARTITION_DIR}/outcome-done-oldmark15d-${oldName}`
+  const retiredTime = h.ioFor().now() - 2 * 60 * 60 * 1000
+  h.files.set(`${PARTITION_DIR}/${oldName}`, '')
+  h.files.set(donePath, sealFile(`${JSON.stringify({ size: 120, fates: 'L', reasons: [], refusals: [], waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: retiredTime })}\n`))
+  h.mtimes.set(`${PARTITION_DIR}/${oldName}`, retiredTime)
+  h.mtimes.set(donePath, retiredTime)
+
+  let storeLookedUp = false
+  let releaseHungStore = (): void => undefined
+  const hungStore = new Promise<void>(resolve => {
+    releaseHungStore = resolve
+  })
+  h.setStoreGetHook(async key => {
+    if (key === `replayed:v2:${TABLE_REF}/${oldName}`) {
+      storeLookedUp = true
+      await hungStore
+    }
+  })
+
+  const preShutdown = w.backfill(['spill', 'retry'], 'auto')
+  await h.settleMicrotasks()
+  expect(storeLookedUp).toBe(true)
+
+  const freshId = '9'.repeat(32)
+  const freshPath = h.seedSpill('spill-20261013T200102003Z-fresh-15d.jsonl', freshId)
+  h.setFetch(async () => OK_INSERT)
+  const exiting = w.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(800)
+  await exiting
+  releaseHungStore()
+  await preShutdown
+
+  expect(h.sentOf(freshId)).toBe(1)
+  expect(h.files.get(freshPath)).toBe('')
+  expect(h.uncancelledTimers()).toEqual([])
+})
+
+test('T53-17e: zero-byte truncated done marker beside emptied parent reclaims orphaned v2 key when no live child remains and preserves it otherwise', async () => {
+  // Subcase A: live unlisted child referencing parent keeps orphaned v2 key intact even when done marker is 0 bytes.
+  {
+    const h = exitReplayHarness()
+    const parent = 'spill-20261013T200102003Z-t53-17e-a.jsonl'
+    const childName = 'retry-20261013T200102100Z-t53-17e-child.jsonl'
+    const v2Key = `replayed:v2:${TABLE_REF}/${parent}`
+    h.files.set(`${PARTITION_DIR}/${parent}`, '')
+    h.files.set(`${PARTITION_DIR}/outcome-done-truncmark1-${parent}`, '')
+    h.store.set(v2Key, { size: 500, fates: 'W', reasons: [], refusals: [], waits: true, seq: 2, files: [], written: [] })
+    h.files.set(
+      `${PARTITION_DIR}/${childName}`,
+      packFiles([JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.100Z', table: TABLE_REF, row: ownRow('a'.repeat(32)) })], parent)[0]!,
+    )
+    h.setFetch(async () => OK_INSERT)
+    await h.newWriter('s-17e-a').backfill(['spill', 'retry'], 'auto')
+    expect(h.store.get(v2Key)).toBeDefined()
+  }
+
+  // Subcase B: once no live child remains, 0-byte done marker beside emptied parent reclaims orphaned v2 key.
+  {
+    const h = exitReplayHarness()
+    const parent = 'spill-20261013T200102003Z-t53-17e-b.jsonl'
+    const v2Key = `replayed:v2:${TABLE_REF}/${parent}`
+    h.files.set(`${PARTITION_DIR}/${parent}`, '')
+    h.files.set(`${PARTITION_DIR}/outcome-done-truncmark2-${parent}`, '')
+    h.store.set(v2Key, { size: 500, fates: 'L', reasons: [], refusals: [], waits: false, seq: 2, files: [], written: [] })
+    await h.newWriter('s-17e-b').backfill(['spill', 'retry'], 'auto')
+    expect(h.store.get(v2Key)).toBeUndefined()
+  }
+})
+
+test('T53-11i: durable sending mark whose writeFile ack settles after exit still populates heldNoticeInfo', async () => {
+  const h = exitReplayHarness()
+  const w = await h.warmWriter('s-11i')
+  const name = 'spill-20261013T200102003Z-t53-11i.jsonl'
+  h.seedSpill(name, '5'.repeat(32))
+
+  let releaseAck = (): void => undefined
+  const ackGate = new Promise<void>(resolve => {
+    releaseAck = resolve
+  })
+  h.setWriteFileHook(async (path, text) => {
+    if (path.includes('/outcome-done-') && path.endsWith(`-${name}`) && text !== '') {
+      // Simulate bytes durable on disk while async ack finishes past exit budget.
+      h.files.set(path, text)
+      await ackGate
+    }
+  })
+
+  const exiting = w.spillForExit(800, { sendQueued: true, replaySpills: true })
+  await h.advance(800)
+  await exiting
+
+  expect(h.requests.length).toBe(0)
+  expect(h.doneMarksFor(name).length).toBe(1)
+  expect(w.heldNoticeInfo().files).toBe(1)
+
+  releaseAck()
+  await h.settleMicrotasks()
+  expect(h.uncancelledTimers()).toEqual([])
+})
+
+test('T53-14g: seedSkippedHeld preserves active foreign lease and sending mark on uncertain child regardless of parent-child sort order', async () => {
+  // Subcase A: retry- child sorts before spill- parent; parent must not overwrite child's active foreign lease.
+  {
+    const h = exitReplayHarness()
+    const firstName = 'retry-20261013T200102000Z-000-err.jsonl'
+    const childName = 'retry-20261013T200102001Z-001-child.jsonl'
+    const parentName = 'spill-20261013T200102002Z-002-parent.jsonl'
+    h.seedSpill(firstName, '1'.repeat(32))
+    const childPath = h.seedSpill(childName, '2'.repeat(32))
+    const parentPath = h.seedSpill(parentName, '2'.repeat(32), '3'.repeat(32))
+    const parentSize = utf8Bytes(h.files.get(parentPath)!)
+    h.store.set(`lease:${TABLE_REF}/${childName}`, { by: 'other-session-a', until: 601_000 })
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+      fates: 'WW',
+      reasons: [],
+      refusals: [],
+      uncertainLines: [0],
+      size: parentSize,
+      waits: true,
+      seq: 2,
+      files: [childPath],
+      written: [true],
+      uncertain: [true],
+    })
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-w0-${parentName}`,
+      sealFile(`${JSON.stringify({ size: parentSize, sending: true, uncertain: true, by: 'w0' })}\n`),
+    )
+    h.setFetch(async () => UNAVAILABLE)
+    const w = h.newWriter('s-14g-a')
+    await w.backfill(['spill', 'retry'], 'auto')
+    expect(w.heldNoticeInfo().files).toBe(1)
+    expect(w.heldNoticeInfo().mayBeActive).toBe(true)
+    expect(w.heldNoticeInfo().reason ?? '').toContain('lease')
+  }
+
+  // Subcase B: parent sorts before child; child with foreign active sending mark must not be bypassed.
+  {
+    const h = exitReplayHarness()
+    const firstName = 'spill-20261013T200102001Z-000-err.jsonl'
+    const parentName = 'spill-20261013T200102002Z-001-parent.jsonl'
+    const childName = 'spill-20261013T200102003Z-002-child.jsonl'
+    h.seedSpill(firstName, '1'.repeat(32))
+    const parentPath = h.seedSpill(parentName, '2'.repeat(32), '3'.repeat(32))
+    const childPath = h.seedSpill(childName, '2'.repeat(32))
+    const parentSize = utf8Bytes(h.files.get(parentPath)!)
+    const childSize = utf8Bytes(h.files.get(childPath)!)
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+      fates: 'WW',
+      reasons: [],
+      refusals: [],
+      uncertainLines: [0],
+      size: parentSize,
+      waits: true,
+      seq: 2,
+      files: [childPath],
+      written: [true],
+      uncertain: [true],
+    })
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-w0-${parentName}`,
+      sealFile(`${JSON.stringify({ size: parentSize, sending: true, uncertain: true, by: 'w0' })}\n`),
+    )
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-otherw01-${childName}`,
+      sealFile(`${JSON.stringify({ size: childSize, sending: true, by: 'otherw01' })}\n`),
+    )
+    h.setFetch(async () => UNAVAILABLE)
+    const w = h.newWriter('s-14g-b')
+    await w.backfill(['spill', 'retry'], 'auto')
+    expect(w.heldNoticeInfo().files).toBe(1)
+    expect(w.heldNoticeInfo().mayBeActive).toBe(true)
+    expect(w.heldNoticeInfo().reason ?? '').toContain('if that session stopped')
+  }
+
+  // Subcase C: parent sorts before unmarked child holding only a live foreign lease while replay is halted.
+  {
+    const h = exitReplayHarness()
+    const firstName = 'spill-20261013T200102001Z-000-err.jsonl'
+    const parentName = 'spill-20261013T200102002Z-001-parent.jsonl'
+    const childName = 'spill-20261013T200102003Z-002-child.jsonl'
+    h.seedSpill(firstName, '1'.repeat(32))
+    const parentPath = h.seedSpill(parentName, '2'.repeat(32), '3'.repeat(32))
+    const childPath = h.seedSpill(childName, '2'.repeat(32))
+    const parentSize = utf8Bytes(h.files.get(parentPath)!)
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+      fates: 'WW',
+      reasons: [],
+      refusals: [],
+      uncertainLines: [0],
+      size: parentSize,
+      waits: true,
+      seq: 2,
+      files: [childPath],
+      written: [true],
+      uncertain: [true],
+    })
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-w0-${parentName}`,
+      sealFile(`${JSON.stringify({ size: parentSize, sending: true, uncertain: true, by: 'w0' })}\n`),
+    )
+    h.store.set(`lease:${TABLE_REF}/${childName}`, { by: 'other-session-c', until: 601_000 })
+    h.setFetch(async () => UNAVAILABLE)
+    const w = h.newWriter('s-14g-c')
+    await w.backfill(['spill', 'retry'], 'auto')
+    expect(w.heldNoticeInfo().files).toBe(1)
+    expect(w.heldNoticeInfo().mayBeActive).toBe(true)
+    expect(w.heldNoticeInfo().reason ?? '').toContain('lease')
+  }
+})
