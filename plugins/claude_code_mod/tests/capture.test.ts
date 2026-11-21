@@ -607,6 +607,482 @@ test('session_start omits model and permission_mode when classic.SessionStart do
   expect('permission_mode' in delta).toBe(false)
 })
 
+test('session_start carries forward main-loop model across /clear, /compact, and /fork without leaking subagent or out-of-order models', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model-a', cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-clear-1'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-1', cwd: '/work/my-repo' })
+
+  // Main-loop turn step updates model; subagent turn step and out-of-order turn step must not overwrite it.
+  await $.turn.start({ turnId: 'main-1', text: 'hi' })
+  world.steps.push({ result: { answer: 'ok', stopReason: 'end_turn', usage: { ...USAGE, model: 'example-model-b-20260101' } } })
+  await runStep($, { turnId: 'main-1', index: 0, model: 'example-model-b' })
+  // Subagent step with a different model:
+  await $.classic.SubagentStart({ agent_id: 'sub-1', agent_type: 'Explore' })
+  world.steps.push({ result: { answer: 'sub', stopReason: 'end_turn', usage: { ...USAGE, model: 'example-subagent-model' } } })
+  await runStep($, { turnId: 'sub-turn-1', index: 0, model: 'example-subagent-model', agentId: 'sub-1' })
+  // Out-of-order step belonging to an earlier turn (main.turnId !== 'stale-turn'):
+  world.steps.push({ result: { answer: 'stale', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'stale-turn', index: 0, model: 'example-stale-model' })
+  await $.turn.complete({ turnId: 'main-1', answer: 'ok', durationMs: 10, isAborted: false, reason: 'answer' })
+  // Late steps arriving after main-1 completed (while main === null) must not overwrite lastModel either:
+  world.steps.push(
+    { result: { answer: 'late-1', stopReason: 'end_turn', usage: USAGE } },
+    { result: { answer: 'late-2', stopReason: 'end_turn', usage: USAGE } },
+    { result: { answer: 'late-3', stopReason: 'end_turn', usage: USAGE } },
+  )
+  await runStep($, { turnId: 'main-1', index: 1, model: 'example-post-complete-stale-1' })
+  await runStep($, { turnId: 'stale-turn', index: 1, model: 'example-post-complete-stale-2' })
+  await runStep($, { turnId: 'unseen-late-turn', index: 0, model: 'example-post-complete-stale-3' })
+
+  await $.session.end({ reason: 'clear', sessionId: 'after-clear-1', resume: { id: 'after-clear-1' } })
+  world.sessionId = 'after-clear-2'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-2', cwd: '/work/my-repo' })
+
+  // compact and fork without model inherit lastModel:
+  await $.classic.SessionStart({ source: 'compact', session_id: 'after-clear-2', cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'fork', session_id: 'forked-1', cwd: '/work/my-repo' })
+
+  // Explicit model on clear overrides and updates lastModel:
+  await $.session.end({ reason: 'clear', sessionId: 'forked-1', resume: { id: 'forked-1' } })
+  world.sessionId = 'after-clear-3'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-3', model: 'example-model-a', cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'compact', session_id: 'after-clear-3', cwd: '/work/my-repo' })
+
+  // resume clears lastModel (so subsequent clear without model omits model):
+  await $.session.end({ reason: 'resume', sessionId: 'after-clear-3', resume: { id: 'after-clear-3' } })
+  world.sessionId = 'resumed-1'
+  await $.classic.SessionStart({ source: 'resume', session_id: 'resumed-1', cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'clear', sessionId: 'resumed-1', resume: { id: 'resumed-1' } })
+  world.sessionId = 'after-resume-clear'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-resume-clear', cwd: '/work/my-repo' })
+  // startup without model also omits model:
+  await $.classic.SessionStart({ source: 'startup', session_id: 'fresh-no-model', cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'clear', sessionId: 'fresh-no-model', resume: { id: 'fresh-no-model' } })
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-fresh-clear', cwd: '/work/my-repo' })
+  // Mid-turn reload (turn.step before any turn.start in this session) sets lastModel, and a late step after its completion does not clobber it:
+  world.steps.push(
+    { result: { answer: 'mid', stopReason: 'end_turn', usage: USAGE } },
+    { result: { answer: 'mid-late', stopReason: 'end_turn', usage: USAGE } },
+  )
+  await runStep($, { turnId: 'mid-turn-1', index: 0, model: 'example-midturn-model' })
+  await $.turn.complete({ turnId: 'mid-turn-1', answer: 'mid', durationMs: 10, isAborted: false, reason: 'answer' })
+  await runStep($, { turnId: 'mid-turn-1', index: 1, model: 'example-midturn-late-stale' })
+  await $.session.end({ reason: 'clear', sessionId: 'after-fresh-clear', resume: { id: 'after-fresh-clear' } })
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-midturn-clear', cwd: '/work/my-repo' })
+
+  await world.clock.advance(5000)
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => {
+      const sd = (json(r.attributes).state_delta ?? {}) as Record<string, unknown>
+      return { source: sd.start_source, model: sd.model }
+    })
+
+  expect(starts).toEqual([
+    { source: 'startup', model: 'example-model-a' },
+    { source: 'clear', model: 'example-model-a' },
+    { source: 'clear', model: 'example-model-b' },
+    { source: 'compact', model: 'example-model-b' },
+    { source: 'fork', model: 'example-model-b' },
+    { source: 'clear', model: 'example-model-a' },
+    { source: 'compact', model: 'example-model-a' },
+    { source: 'resume', model: undefined },
+    { source: 'clear', model: undefined },
+    { source: 'startup', model: undefined },
+    { source: 'clear', model: undefined },
+    { source: 'clear', model: 'example-midturn-model' },
+  ])
+})
+
+test('a second turn whose turn.start was missed still links its tool rows to that turn without letting late unseen steps overwrite lastModel', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model-init', cwd: '/work/my-repo' })
+
+  // Turn 1 runs normally.
+  await $.turn.start({ turnId: 'turn-1', text: 'first' })
+  world.steps.push({ result: { answer: 'one', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'turn-1', index: 0, model: 'example-model-turn-1' })
+  await $.turn.complete({ turnId: 'turn-1', answer: 'one', durationMs: 20, isAborted: false, reason: 'answer' })
+
+  // Turn 2 misses turn.start: its step and tool call must still share trace_id, parent_span_id, and invocation_id.
+  world.steps.push({ result: { answer: 'two', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'turn-2-missed-start', index: 0, model: 'example-model-turn-2' })
+  await $.tool.call({ tool: 'Read', file_path: 'second-turn.ts' })
+  await $.turn.complete({ turnId: 'turn-2-missed-start', answer: 'two', durationMs: 20, isAborted: false, reason: 'answer' })
+
+  // Clear without explicit model keeps Turn 1's confirmed main-loop model rather than an unstarted turn's model.
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-missed-turn-clear'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-missed-turn-clear', cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+
+  const rows = world.sentRows()
+  const req2 = byType(rows, 'LLM_REQUEST').find(r => r.invocation_id === 'turn-2-missed-start')
+  const toolStart = byType(rows, 'TOOL_STARTING').find(r => json(r.content).args && (json(r.content).args as Record<string, unknown>).file_path === 'second-turn.ts')
+  const toolDone = byType(rows, 'TOOL_COMPLETED').find(r => r.span_id === toolStart?.span_id)
+  const invDone2 = byType(rows, 'INVOCATION_COMPLETED').find(r => r.invocation_id === 'turn-2-missed-start')
+
+  expect(req2?.trace_id).not.toBeNull()
+  expect(toolStart?.invocation_id).toBe('turn-2-missed-start')
+  expect(toolStart?.trace_id).toBe(req2?.trace_id)
+  expect(toolStart?.parent_span_id).toBe(req2?.span_id)
+  expect(toolDone?.invocation_id).toBe('turn-2-missed-start')
+  expect(toolDone?.trace_id).toBe(req2?.trace_id)
+  expect(invDone2?.trace_id).toBe(req2?.trace_id)
+
+  const clearStart = byType(rows, 'STATE_DELTA').find(r => (json(r.attributes).state_delta as Record<string, unknown>)?.start_source === 'clear')
+  expect((json(clearStart?.attributes ?? null).state_delta as Record<string, unknown>)?.model).toBe('example-model-turn-1')
+})
+
+test('a late step from a pre-resume or pre-branch turn arriving before the first new turn does not set lastModel', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model-pre', cwd: '/work/my-repo' })
+
+  // Completed turn + still-open turn before /resume:
+  await $.turn.start({ turnId: 'pre-resume-done', text: 'first' })
+  world.steps.push({ result: { answer: 'ok', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'pre-resume-done', index: 0, model: 'example-model-pre' })
+  await $.turn.complete({ turnId: 'pre-resume-done', answer: 'ok', durationMs: 10, isAborted: false, reason: 'answer' })
+  await $.turn.start({ turnId: 'pre-resume-open', text: 'second' })
+
+  await $.session.end({ reason: 'resume', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'resumed-session'
+  await $.classic.SessionStart({ source: 'resume', session_id: 'resumed-session', cwd: '/work/my-repo' })
+
+  // Late steps from both pre-resume turns arrive while turnCount === 0:
+  world.steps.push(
+    { result: { answer: 'late-done', stopReason: 'end_turn', usage: USAGE } },
+    { result: { answer: 'late-open', stopReason: 'end_turn', usage: USAGE } },
+  )
+  await runStep($, { turnId: 'pre-resume-done', index: 1, model: 'stale-pre-resume-model-1' })
+  await runStep($, { turnId: 'pre-resume-open', index: 0, model: 'stale-pre-resume-model-2' })
+
+  // Subsequent /clear without explicit model must omit model (not inherit stale pre-resume model):
+  await $.session.end({ reason: 'clear', sessionId: 'resumed-session', resume: { id: 'resumed-session' } })
+  world.sessionId = 'post-resume-clear'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'post-resume-clear', cwd: '/work/my-repo' })
+
+  // Sibling check: session switch via setSession (/branch) also retains pastTurns so a late pre-branch step does not set lastModel after startup without model.
+  await $.turn.start({ turnId: 'pre-branch-open', text: 'branching' })
+  world.sessionId = 'branched-session'
+  await $.classic.SessionStart({ source: 'startup', session_id: 'branched-session', cwd: '/work/my-repo' })
+  world.steps.push({ result: { answer: 'late-branch', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'pre-branch-open', index: 0, model: 'stale-pre-branch-model' })
+  await $.session.end({ reason: 'clear', sessionId: 'branched-session', resume: { id: 'branched-session' } })
+  world.sessionId = 'post-branch-clear'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'post-branch-clear', cwd: '/work/my-repo' })
+
+  await world.clock.advance(5000)
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => {
+      const sd = (json(r.attributes).state_delta ?? {}) as Record<string, unknown>
+      return { source: sd.start_source, model: sd.model }
+    })
+
+  expect(starts).toEqual([
+    { source: 'startup', model: 'example-model-pre' },
+    { source: 'resume', model: undefined },
+    { source: 'clear', model: undefined },
+    { source: 'startup', model: undefined },
+    { source: 'clear', model: undefined },
+  ])
+})
+
+test('deferred startup SessionStart never overwrites a newer main-loop model once config loads', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_USER_ID: 'analyst-7', BQAA_AGENT_NAME: 'repo-agent' })
+  // startup arrives while configured=false (deferred in whenConfigured):
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'stale-startup-model', cwd: '/work/my-repo' })
+  // main-loop turn step observes newer model before configurationLoaded() fires:
+  await $.turn.start({ turnId: 'turn-early', text: 'hello' })
+  await runStep($, { turnId: 'turn-early', index: 0, model: 'newer-step-model' })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-deferred-clear'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-deferred-clear', cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => {
+      const sd = (json(r.attributes).state_delta ?? {}) as Record<string, unknown>
+      return { source: sd.start_source, model: sd.model }
+    })
+  expect(starts).toEqual([
+    { source: 'startup', model: 'stale-startup-model' },
+    { source: 'clear', model: 'newer-step-model' },
+  ])
+})
+
+test('a delayed turn.start for a past pre-clear turn routes through others and never overwrites lastModel', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'model-before-clear', cwd: '/work/my-repo' })
+  await $.turn.start({ turnId: 'pre-clear-turn', text: 'first' })
+  await runStep($, { turnId: 'pre-clear-turn', index: 0, model: 'model-before-clear' })
+  await $.turn.complete({ turnId: 'pre-clear-turn', answer: 'done', durationMs: 100, isAborted: false, reason: 'answer' })
+
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-clear-a'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-a', model: 'model-after-clear', cwd: '/work/my-repo' })
+
+  // Delayed replay/delivery of pre-clear-turn start & step while main === null:
+  await $.turn.start({ turnId: 'pre-clear-turn', text: 'delayed start' })
+  world.steps.push({ result: { answer: 'delayed', stopReason: 'end_turn', usage: USAGE } })
+  await runStep($, { turnId: 'pre-clear-turn', index: 1, model: 'stale-pre-clear-model' })
+
+  await $.session.end({ reason: 'clear', sessionId: 'after-clear-a', resume: { id: 'after-clear-a' } })
+  world.sessionId = 'after-clear-b'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-b', cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => {
+      const sd = (json(r.attributes).state_delta ?? {}) as Record<string, unknown>
+      return { source: sd.start_source, model: sd.model }
+    })
+  expect(starts).toEqual([
+    { source: 'startup', model: 'model-before-clear' },
+    { source: 'clear', model: 'model-after-clear' },
+    { source: 'clear', model: 'model-after-clear' },
+  ])
+})
+
+test('pre-start SessionStart without optional session_id or cwd falls back to session.start values when config loads', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_USER_ID: 'analyst-7', BQAA_AGENT_NAME: 'repo-agent' })
+  await $.classic.SessionStart({ source: 'startup' })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_start === true)
+  expect(starts.length).toBe(1)
+  expect(starts[0]!.session_id).toBe(SESSION_ID)
+  expect(json(starts[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/my-repo', project_name: 'my-repo' })
+})
+
+test('late startup version lookup applies host version independently without overwriting /clear session_id or cwd', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionId = 'old-startup-session'
+
+  // Start native session.start in old directory; it pauses awaiting $.session.version().
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/old-dir' })
+  await versionReached
+
+  // /clear transitions immediately into a new session and directory before version resolves.
+  world.sessionId = 'cleared-new-session'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'cleared-new-session', cwd: '/work/new-dir' })
+
+  // Release the delayed startup version lookup and deny subsequent $.session.id() reads.
+  releaseVersion()
+  await starting
+  world.sessionIdRefused = true
+
+  await $.turn.start({ turnId: 'turn-after-clear', text: 'hi in new dir' })
+  await runStep($, { turnId: 'turn-after-clear', index: 0, model: 'claude-sonnet-4-6' })
+  await $.turn.complete({ turnId: 'turn-after-clear', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+
+  const invRows = byType(world.sentRows(), 'INVOCATION_STARTING')
+  expect(invRows.length).toBe(1)
+  expect(invRows[0]!.session_id).toBe('cleared-new-session')
+  expect(json(invRows[0]!.attributes).session_metadata).toMatchObject({
+    cwd: '/work/new-dir',
+    project_name: 'new-dir',
+    host_version: '2.9.99',
+  })
+  const llmRows = byType(world.sentRows(), 'LLM_REQUEST')
+  expect(llmRows.length).toBeGreaterThan(0)
+  for (const row of llmRows) {
+    expect(row.session_id).toBe('cleared-new-session')
+  }
+})
+
+test('deferred startup SessionStart without optional identity keeps its own startup session and cwd when /clear arrives before version resolves', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionId = 'first'
+
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/first' })
+  await versionReached
+
+  // Startup SessionStart omits optional session_id & cwd while version lookup is still pending.
+  await $.classic.SessionStart({ source: 'startup' })
+  // /clear transitions to second session & cwd before version lookup finishes.
+  world.sessionId = 'second'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'second', cwd: '/work/second' })
+
+  releaseVersion()
+  await starting
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => ({
+      sessionId: r.session_id,
+      source: ((json(r.attributes).state_delta ?? {}) as Record<string, unknown>).start_source,
+      cwd: ((json(r.attributes).session_metadata ?? {}) as Record<string, unknown>).cwd,
+      hostVersion: ((json(r.attributes).session_metadata ?? {}) as Record<string, unknown>).host_version,
+    }))
+  expect(starts).toEqual([
+    { sessionId: 'first', source: 'startup', cwd: '/work/first', hostVersion: '2.9.99' },
+    { sessionId: 'second', source: 'clear', cwd: '/work/second', hostVersion: '2.9.99' },
+  ])
+})
+
+test('denied native session.id does not drop native cwd when classic startup omits optional cwd', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionIdRefused = true
+
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/first' })
+  await versionReached
+  await $.classic.SessionStart({ source: 'startup', session_id: 'first' })
+  releaseVersion()
+  await starting
+
+  await $.turn.start({ turnId: 'turn-denied-id', text: 'hello' })
+  await runStep($, { turnId: 'turn-denied-id', index: 0, model: 'claude-sonnet-4-6' })
+  await $.turn.complete({ turnId: 'turn-denied-id', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_start === true)
+  expect(starts.length).toBe(1)
+  expect(starts[0]!.session_id).toBe('first')
+  expect(json(starts[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/first', project_name: 'first' })
+  const invRows = byType(world.sentRows(), 'INVOCATION_STARTING')
+  expect(invRows.length).toBe(1)
+  expect(invRows[0]!.session_id).toBe('first')
+  expect(json(invRows[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/first', project_name: 'first' })
+})
+
+test('deferred classic SessionStart with mismatched session_id does not inherit native startup cwd', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionId = 'first'
+
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/first' })
+  await versionReached
+  world.sessionId = 'second'
+  await $.classic.SessionStart({ source: 'startup', session_id: 'second' })
+  releaseVersion()
+  await starting
+
+  await $.turn.start({ turnId: 'turn-mismatch-id', text: 'hello' })
+  await runStep($, { turnId: 'turn-mismatch-id', index: 0, model: 'claude-sonnet-4-6' })
+  await $.turn.complete({ turnId: 'turn-mismatch-id', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_start === true)
+  expect(starts.length).toBe(1)
+  expect(starts[0]!.session_id).toBe('second')
+  expect(json(starts[0]!.attributes).session_metadata).toMatchObject({ cwd: null, project_name: null })
+  const invRows = byType(world.sentRows(), 'INVOCATION_STARTING')
+  expect(invRows.length).toBe(1)
+  expect(invRows[0]!.session_id).toBe('second')
+  expect(json(invRows[0]!.attributes).session_metadata).toMatchObject({ cwd: null, project_name: null })
+})
+
+test('pre-start classic clear with explicit session_id and cwd is not overwritten by native session.start', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.sessionId = 'old-session'
+
+  // Classic clear arrives BEFORE native session.start with newer session_id and cwd.
+  await $.classic.SessionStart({ source: 'clear', session_id: 'new-session', cwd: '/work/new' })
+  // Native session.start arrives reporting stale old directory and old session id.
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/old' })
+
+  // Further native session.id reads are refused.
+  world.sessionIdRefused = true
+  await $.turn.start({ turnId: 'turn-prestart-clear', text: 'hello' })
+  await runStep($, { turnId: 'turn-prestart-clear', index: 0, model: 'claude-sonnet-4-6' })
+  await $.turn.complete({ turnId: 'turn-prestart-clear', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_start === true)
+  expect(starts.length).toBe(1)
+  expect(starts[0]!.session_id).toBe('new-session')
+  expect(json(starts[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/new', project_name: 'new' })
+  const invRows = byType(world.sentRows(), 'INVOCATION_STARTING')
+  expect(invRows.length).toBe(1)
+  expect(invRows[0]!.session_id).toBe('new-session')
+  expect(json(invRows[0]!.attributes).session_metadata).toMatchObject({ cwd: '/work/new', project_name: 'new' })
+})
+
 test('a session that runs only /bqaa-status and exits emits and spills no session_start or session_end rows', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)

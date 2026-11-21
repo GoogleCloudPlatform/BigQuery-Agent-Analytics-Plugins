@@ -1985,31 +1985,40 @@ def setup_sh_checks():
           solo.returncode == 0 and 'setup.sh --team' in solo.stdout and 'docs/service-account-auth.md' in solo.stdout
           and 'scripts/setup_gcp_prereqs.py' not in solo.stdout,
           f'{solo.returncode} {solo.stdout!r} {solo.stderr!r}')
-    for what, env, wanted in (
-        ('with the variables the docs name', {'BQAA_PROJECT_ID': PROJECT, 'BQAA_DATASET': DATASET},
-         (PROJECT, DATASET, TABLE, '', 'US')),
-        ('with the other variables, and a table, a views dataset and a location of its own',
-         {'GOOGLE_CLOUD_PROJECT': 'other-project', 'BQ_DATASET': 'events', 'BQ_TABLE': 'coding_events',
-          'BQAA_LOCATION': 'EU', 'BQAA_VIEWS_DATASET': 'reports'},
-         ('other-project', 'events', 'coding_events', 'reports', 'EU')),
-    ):
-        result = subprocess.run([bash, str(PLUGIN / 'setup.sh'), '--dry-run', '--team'], capture_output=True, text=True,
-                                env={**clean_environment(), **env}, cwd=tempfile.gettempdir())
-        line = next((line for line in result.stdout.replace('\\\n', ' ').splitlines()
-                     if 'scripts/setup_gcp_prereqs.py' in line), '')
-        words = shlex.split(line)
-        check(f'setup.sh --dry-run --team, {what}: it prints a command that runs the bootstrap of the scripts folder',
-              result.returncode == 0 and len(words) > 2 and words[0] == 'python3'
-              and pathlib.Path(words[1]).resolve() == (SCRIPTS / 'setup_gcp_prereqs.py').resolve()
-              and 'google-cloud-bigquery' in result.stdout and '~/.bqaa-mod/venv' in result.stdout
-              and '.venv' not in result.stdout,
-              f'{result.returncode} {line!r} {result.stderr!r}')
-        args = parsed(*words[2:])
-        check('  ... naming the project, dataset, table, views dataset and location it was given',
-              args is not None and (args.project, args.dataset, args.table, args.views_dataset, args.location) == wanted,
-              args and (args.project, args.dataset, args.table, args.views_dataset, args.location))
-        status, out, err = attempt(*words[2:])
-        check('  ... which the bootstrap takes: a dry run, exit 0', status == 0 and 'DRY RUN' in out, f'{status} {err!r}')
+    for flags in (['--dry-run', '--team'], ['--team']):
+        for what, env, wanted in (
+            ('with the variables the docs name', {'BQAA_PROJECT_ID': PROJECT, 'BQAA_DATASET': DATASET},
+             (PROJECT, DATASET, TABLE, '', 'US')),
+            ('with the other variables, and a table, a views dataset and a location of its own',
+             {'GOOGLE_CLOUD_PROJECT': 'other-project', 'BQ_DATASET': 'events', 'BQ_TABLE': 'coding_events',
+              'BQAA_LOCATION': 'EU', 'BQAA_VIEWS_DATASET': 'reports'},
+             ('other-project', 'events', 'coding_events', 'reports', 'EU')),
+        ):
+            with tempfile.TemporaryDirectory() as fake_bin:
+                # Place a failing bq stub on PATH (or rely on clean_environment having no bq) to prove --team never invokes bq.
+                bq_stub = pathlib.Path(fake_bin) / 'bq'
+                bq_stub.write_text('#!/bin/sh\necho "unexpected bq call" >&2\nexit 99\n', encoding='utf-8')
+                bq_stub.chmod(0o755)
+                test_env = {**clean_environment(), **env, 'PATH': f'{fake_bin}:{clean_environment()["PATH"]}'}
+                result = subprocess.run([bash, str(PLUGIN / 'setup.sh'), *flags], capture_output=True, text=True,
+                                        env=test_env, cwd=tempfile.gettempdir())
+            flag_str = ' '.join(flags)
+            line = next((line for line in result.stdout.replace('\\\n', ' ').splitlines()
+                         if 'scripts/setup_gcp_prereqs.py' in line), '')
+            words = shlex.split(line)
+            check(f'setup.sh {flag_str}, {what}: prints setup_gcp_prereqs.py without invoking bq',
+                  result.returncode == 0 and 'unexpected bq call' not in result.stderr
+                  and len(words) > 2 and words[0] == 'python3'
+                  and pathlib.Path(words[1]).resolve() == (SCRIPTS / 'setup_gcp_prereqs.py').resolve()
+                  and 'google-cloud-bigquery' in result.stdout and '~/.bqaa-mod/venv' in result.stdout
+                  and '.venv' not in result.stdout,
+                  f'{result.returncode} {line!r} {result.stderr!r}')
+            args = parsed(*words[2:])
+            check('  ... naming the project, dataset, table, views dataset and location it was given',
+                  args is not None and (args.project, args.dataset, args.table, args.views_dataset, args.location) == wanted,
+                  args and (args.project, args.dataset, args.table, args.views_dataset, args.location))
+            status, out, err = attempt(*words[2:])
+            check('  ... which the bootstrap takes: a dry run, exit 0', status == 0 and 'DRY RUN' in out, f'{status} {err!r}')
 
 
 # ---------------------------------------------------------------------------
@@ -2658,6 +2667,28 @@ def clean_dead_letter_checks():
               status_ld == 0 and err_ld == '' and not (d / 'spill-listdir.jsonl').exists()
               and len(listdir_fds) == 2 and all(isinstance(fd, int) for fd in listdir_fds),
               f'{status_ld} listdir_fds={listdir_fds!r} {err_ld!r}')
+
+        v2_empty = d / 'spill-v2-done.jsonl'
+        v2_empty.write_bytes(b'')
+        v2_out_a = d / 'outcome2-spill-v2-done.jsonl'
+        v2_out_b = d / 'outcome2-b-spill-v2-done.jsonl'
+        v2_out_a.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        v2_out_b.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        v2_live = d / 'spill-v2-live.jsonl'
+        v2_live.write_text(seal('{"row":1}\n'), encoding='utf-8')
+        v2_live_out = d / 'outcome2-spill-v2-live.jsonl'
+        v2_live_out.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        check('13n. record_of recognizes outcome2- and outcome2-b- versioned split journals',
+              clean.record_of('outcome2-spill-v2-done.jsonl') == 'spill-v2-done.jsonl'
+              and clean.record_of('outcome2-b-spill-v2-done.jsonl') == 'spill-v2-done.jsonl'
+              and clean.plan_deletions(d) == [v2_out_b, v2_out_a, v2_empty],
+              f'{clean.plan_deletions(d)!r}')
+        status_v2, _out_v2, err_v2 = call(clean.main, '--dir', str(base), '--execute')
+        check('13o. --execute removes outcome2-* beside 0-byte source while keeping outcome2-* beside live source',
+              status_v2 == 0 and err_v2 == ''
+              and not v2_empty.exists() and not v2_out_a.exists() and not v2_out_b.exists()
+              and v2_live.exists() and v2_live_out.exists(),
+              f'{status_v2} {err_v2!r}')
 
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
