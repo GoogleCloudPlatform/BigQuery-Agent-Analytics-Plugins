@@ -465,6 +465,20 @@ export function buildCleanupCommand(c: Config, root: string | undefined): string
   return shownWhole(`python3 ${shellQuote(script)}${c.deadLetterDirIsDefault ? '' : ` ${shellQuote(c.deadLetterDir)}`}`)
 }
 
+// Prefix for deterministic fallback `event_id` values synthesized for legacy
+// dead-letter rows that lacked `row.event_id`. Giving such rows a stable
+// `event_id` ensures BigQuery `insertAll` carries a consistent `insertId` and
+// the SQL daily views deduplicate them across both 0.1.3 and 0.1.4 replays.
+const FALLBACK_EVENT_ID_PREFIX = 'dl:'
+const fallbackEventId = (itemKey: string): string => {
+  const full = `${FALLBACK_EVENT_ID_PREFIX}${itemKey}`
+  if (utf8Length(full) <= 120) return full
+  const asciiPrefix = itemKey.replace(/[^\x20-\x7e]/g, '').slice(0, 64)
+  const h1 = fnv1a(itemKey)
+  const h2 = fnv1a(`${itemKey}\0${itemKey.length}`)
+  return asciiPrefix ? `${FALLBACK_EVENT_ID_PREFIX}${h1}${h2}:${asciiPrefix}` : `${FALLBACK_EVENT_ID_PREFIX}${h1}${h2}`
+}
+
 // How the refused and parked counts know a line's row: its event_id; for one
 // with none (in a file another writer made), the key a replay gave the line
 // as it rewrote it, else the file (`name`) and the line's place there, which
@@ -472,8 +486,24 @@ export function buildCleanupCommand(c: Config, root: string | undefined): string
 // and rows alike in two files count as two.
 const keyOf = (line: DeadLetterLine, name: string, index: number): string => {
   const id = line.row.event_id
-  if (typeof id === 'string' && id !== '') return id
+  if (typeof id === 'string' && id !== '') {
+    if (id.startsWith(FALLBACK_EVENT_ID_PREFIX) && id.length > FALLBACK_EVENT_ID_PREFIX.length) {
+      if (typeof line.key === 'string' && line.key !== '') return line.key
+      return id.slice(FALLBACK_EVENT_ID_PREFIX.length)
+    }
+    return id
+  }
   return typeof line.key === 'string' && line.key !== '' ? line.key : `${name}#${index}`
+}
+
+// Preserves existing `row.event_id` unchanged; for ID-less dead-letter rows,
+// stamps both envelope `key` and deterministic `row.event_id` so BigQuery
+// `insertAll` (`insertId`) and daily views deduplicate across versions.
+const ensureRowEventId = (line: DeadLetterLine, name: string, index: number): DeadLetterLine => {
+  const id = line.row.event_id
+  if (typeof id === 'string' && id !== '') return line
+  const itemKey = keyOf(line, name, index)
+  return { ...line, key: itemKey, row: { ...line.row, event_id: fallbackEventId(itemKey) } }
 }
 
 // Whether an outcome is one for these lines: a letter for each, and a reason
@@ -749,14 +779,26 @@ const coversAllAttempts = (journal: Partial<Journal>, required: readonly string[
 // identical payloads are never dropped.
 const parentRowIdentity = (line: DeadLetterLine, parentName: string, index: number): string => {
   const id = line.row.event_id
-  if (typeof id === 'string' && id !== '') return `id:${line.table}\0${id}`
+  if (typeof id === 'string' && id !== '') {
+    if (id.startsWith(FALLBACK_EVENT_ID_PREFIX) && id.length > FALLBACK_EVENT_ID_PREFIX.length) {
+      const k = typeof line.key === 'string' && line.key !== '' ? line.key : id.slice(FALLBACK_EVENT_ID_PREFIX.length)
+      return `key:${line.table}\0${k}`
+    }
+    return `id:${line.table}\0${id}`
+  }
   const key = typeof line.key === 'string' && line.key !== '' ? line.key : `${parentName}#${index}`
   return `key:${line.table}\0${key}`
 }
 
 const childRowIdentity = (line: DeadLetterLine): string | null => {
   const id = line.row.event_id
-  if (typeof id === 'string' && id !== '') return `id:${line.table}\0${id}`
+  if (typeof id === 'string' && id !== '') {
+    if (id.startsWith(FALLBACK_EVENT_ID_PREFIX) && id.length > FALLBACK_EVENT_ID_PREFIX.length) {
+      const k = typeof line.key === 'string' && line.key !== '' ? line.key : id.slice(FALLBACK_EVENT_ID_PREFIX.length)
+      return `key:${line.table}\0${k}`
+    }
+    return `id:${line.table}\0${id}`
+  }
   if (typeof line.key === 'string' && line.key !== '') return `key:${line.table}\0${line.key}`
   return null
 }
@@ -815,7 +857,7 @@ function leftoverFiles(
     else target.set(kind, [text])
   }
   const kindOfLine = (line: DeadLetterLine): DeadLetterKind => (isDeadLetterKind(line.kind) ? line.kind : fileKind)
-  const keyed = (line: DeadLetterLine, i: number): DeadLetterLine => (keyOf(line, name, i) === line.row.event_id ? line : { ...line, key: keyOf(line, name, i) })
+  const keyed = (line: DeadLetterLine, i: number): DeadLetterLine => ensureRowEventId(line, name, i)
   let refused = 0
   file.lines.forEach((line, i) => {
     const fate = outcome.fates[i]
@@ -2651,6 +2693,7 @@ export class Writer {
     // Only this table's subdirectory (`dir`): rows parked for another table
     // wait for a session configured with that table.
     let entries: readonly { name: string; kind: string; size: number; mtimeMs?: number }[] = []
+    const initialListedAt = this.io.now()
     try {
       entries = await this.io.listDir(dir)
     } catch (err) {
@@ -3871,10 +3914,17 @@ export class Writer {
           let liveParentsChecked = false
           let liveParentsIncomplete = false
           const liveParents = new Set<string>()
+          const verifiedLiveFiles = new Set<string>()
+          const verifiedMarkFiles = new Set<string>()
+          let freshListedAt = 0
+          const RACY_MTIME_MS = 2_000
+          const isMtimeSettledAt = (mtimeMs: number | undefined, anchorMs: number): boolean =>
+            mtimeMs !== undefined && mtimeMs > 0 && mtimeMs <= anchorMs - RACY_MTIME_MS
           const ensureFreshListing = async (): Promise<boolean> => {
             if (freshListed !== null) return true
             if (freshListFailed) return false
             try {
+              const listedAt = this.io.now()
               const latest = await cleanupOp(this.io.listDir(dir))
               if (latest === CLEANUP_ABORT) {
                 freshListFailed = true
@@ -3899,6 +3949,7 @@ export class Writer {
                   }
                 }
               }
+              freshListedAt = listedAt
               freshListed = map
               freshMtimes = mtimes
               freshMarksBySource = marks
@@ -3927,18 +3978,22 @@ export class Writer {
               return
             }
             if (!liveSourceRemains && freshMarksBySource.size === 0) return
+            const initialAnchor = Math.min(initialListedAt, freshListedAt)
             for (const [n, sz] of freshListed) {
               if (sz <= 0 || kindOf(n) === null) continue
               let sealResolved = false
               const preSize = listed.get(n)
-              if (preSize === sz && !emptiedInRun.has(n)) {
+              const freshMtime = freshMtimes.get(n)
+              const stampUnchanged =
+                stamps.get(n) === freshMtime && isMtimeSettledAt(freshMtime, initialAnchor)
+              if (preSize === sz && !emptiedInRun.has(n) && stampUnchanged) {
                 const known = fileParent.get(n)
                 if (known !== undefined) {
                   if (known !== '') liveParents.add(known)
                   sealResolved = true
                 }
               }
-              if (!sealResolved) {
+              if (!sealResolved && stampUnchanged) {
                 const indexed = parentIndex.get(n)
                 if (indexed !== undefined && indexed.size === sz) {
                   if (indexed.parent !== null) liveParents.add(indexed.parent)
@@ -3969,6 +4024,7 @@ export class Writer {
                   return
                 }
               }
+              if (isMtimeSettledAt(freshMtime, freshListedAt)) verifiedLiveFiles.add(n)
               for (const markName of freshMarksBySource.get(n) ?? []) {
                 if (cleanupStopped()) {
                   liveParentsIncomplete = true
@@ -3990,6 +4046,7 @@ export class Writer {
                     if (typeof parsedMark.stagedFor === 'string' && parsedMark.stagedFor !== '') liveParents.add(baseOf(parsedMark.stagedFor))
                     if (typeof parsedMark.replaces === 'string' && parsedMark.replaces !== '') liveParents.add(baseOf(parsedMark.replaces))
                   }
+                  if (isMtimeSettledAt(freshMtimes.get(markName), freshListedAt)) verifiedMarkFiles.add(markName)
                 } catch {
                   liveParentsIncomplete = true
                   return
@@ -4023,6 +4080,7 @@ export class Writer {
                   if (parsedMark !== undefined && parsedMark.childGuard === true && typeof parsedMark.stagedFor === 'string' && parsedMark.stagedFor !== '') {
                     liveParents.add(baseOf(parsedMark.stagedFor))
                   }
+                  if (isMtimeSettledAt(freshMtimes.get(markName), freshListedAt)) verifiedMarkFiles.add(markName)
                 } catch {
                   liveParentsIncomplete = true
                   return
@@ -4031,19 +4089,25 @@ export class Writer {
             }
           }
           // Re-verify per parent right before deleting its store/companion
-          // records that no new, resized, mtime-changed, or same-size
-          // re-parented live dead-letter file or standing mark now points to
-          // `parentName`, while capping per-pass cleanups to a small constant so
-          // directory scans stay O(1) per backfill pass instead of O(N^2).
+          // records that no new, resized, mtime-changed, or racy-window
+          // same-size re-parented live dead-letter file or standing mark now
+          // points to `parentName`. Settled live files/marks already verified in
+          // `ensureLiveParents()` with unchanged size and `mtimeMs <= freshListedAt - 2s`
+          // skip redundant full-file re-reads so a pass stays O(live files).
           const MAX_CLEANUP_PARENTS_PER_PASS = 8
           const confirmDirStable = async (parentName: string): Promise<boolean> => {
             if (freshListed === null) return false
             try {
               const nowEntries = await cleanupOp(this.io.listDir(dir))
               if (nowEntries === CLEANUP_ABORT) return false
-              const liveNow: { name: string; size: number }[] = []
+              const settleAnchor = Math.min(freshListedAt, this.io.now())
+              const isSettled = (name: string, size: number, mtimeMs: number | undefined): boolean =>
+                freshListed!.get(name) === size &&
+                freshMtimes.get(name) === mtimeMs &&
+                isMtimeSettledAt(mtimeMs, settleAnchor)
+              const liveNow: { name: string; size: number; mtimeMs?: number }[] = []
               const liveNowSet = new Set<string>()
-              const marksNow = new Map<string, string[]>()
+              const marksNow = new Map<string, { name: string; size: number; mtimeMs?: number }[]>()
               for (const entry of nowEntries) {
                 if (entry.kind !== undefined && entry.kind !== 'file') continue
                 if (entry.name === parentName && entry.size > 0) return false
@@ -4056,30 +4120,37 @@ export class Writer {
                     if (prevMtime !== undefined && entry.mtimeMs !== undefined && prevMtime !== entry.mtimeMs) {
                       return false
                     }
-                    liveNow.push({ name: entry.name, size: entry.size })
+                    liveNow.push({ name: entry.name, size: entry.size, mtimeMs: entry.mtimeMs })
                     liveNowSet.add(entry.name)
                   }
                 } else if (entry.size > 0) {
                   const of = recordOf(entry.name)
                   if (of !== null && markerOf(entry.name, of) !== null) {
                     const list = marksNow.get(of)
-                    if (list) list.push(entry.name)
-                    else marksNow.set(of, [entry.name])
+                    const item = { name: entry.name, size: entry.size, mtimeMs: entry.mtimeMs }
+                    if (list) list.push(item)
+                    else marksNow.set(of, [item])
                   }
                 }
               }
               for (const live of liveNow) {
                 if (live.size > HOST_FILE_BYTES || cleanupStopped()) return false
-                const raw = await cleanupOp(this.io.readFile(joinPath(dir, live.name)))
-                if (raw === CLEANUP_ABORT) return false
-                if (raw !== '') {
-                  const parsed = parseFile(raw)
-                  if (!parsed.complete) return false
-                  if (parsed.parent !== null && baseOf(parsed.parent) === parentName) return false
+                if (!(verifiedLiveFiles.has(live.name) && isSettled(live.name, live.size, live.mtimeMs))) {
+                  const raw = await cleanupOp(this.io.readFile(joinPath(dir, live.name)))
+                  if (raw === CLEANUP_ABORT) return false
+                  if (raw !== '') {
+                    const parsed = parseFile(raw)
+                    if (!parsed.complete) return false
+                    if (parsed.parent !== null && baseOf(parsed.parent) === parentName) return false
+                  }
                 }
-                for (const markName of marksNow.get(live.name) ?? []) {
+                for (const mark of marksNow.get(live.name) ?? []) {
                   if (cleanupStopped()) return false
-                  const rawMark = await cleanupOp(this.io.readFile(joinPath(dir, markName)))
+                  if (!freshListed.has(mark.name) || freshListed.get(mark.name) !== mark.size) return false
+                  const prevMarkMtime = freshMtimes.get(mark.name)
+                  if (prevMarkMtime !== undefined && mark.mtimeMs !== undefined && prevMarkMtime !== mark.mtimeMs) return false
+                  if (verifiedMarkFiles.has(mark.name) && isSettled(mark.name, mark.size, mark.mtimeMs)) continue
+                  const rawMark = await cleanupOp(this.io.readFile(joinPath(dir, mark.name)))
                   if (rawMark === CLEANUP_ABORT) return false
                   if (rawMark === '') continue
                   const parsedMark = journalOf(rawMark) as { stagedFor?: unknown; replaces?: unknown } | 'torn' | undefined
@@ -4090,13 +4161,17 @@ export class Writer {
                   }
                 }
               }
-              for (const [of, markNames] of marksNow) {
+              for (const [of, markList] of marksNow) {
                 if (liveNowSet.has(of)) continue
-                for (const markName of markNames) {
-                  const by = markerOf(markName, of)
+                for (const mark of markList) {
+                  const by = markerOf(mark.name, of)
                   if (by === null || !by.endsWith('g')) continue
                   if (cleanupStopped()) return false
-                  const rawMark = await cleanupOp(this.io.readFile(joinPath(dir, markName)))
+                  if (!freshListed.has(mark.name) || freshListed.get(mark.name) !== mark.size) return false
+                  const prevMarkMtime = freshMtimes.get(mark.name)
+                  if (prevMarkMtime !== undefined && mark.mtimeMs !== undefined && prevMarkMtime !== mark.mtimeMs) return false
+                  if (verifiedMarkFiles.has(mark.name) && isSettled(mark.name, mark.size, mark.mtimeMs)) continue
+                  const rawMark = await cleanupOp(this.io.readFile(joinPath(dir, mark.name)))
                   if (rawMark === CLEANUP_ABORT) return false
                   if (rawMark === '') continue
                   const parsedMark = journalOf(rawMark) as { childGuard?: unknown; stagedFor?: unknown } | 'torn' | undefined
@@ -6651,7 +6726,7 @@ export class Writer {
           this.recordError(`could not guard live children of ${path} before persisting v2 outcome; retrying later`)
           return false
         }
-        const backupResult = await this.stageChildBackups(rewrite.dir, rewrite.name, rewrite.size, c, guardTargets, attemptToken, rewrite.backupFiles)
+        const backupResult = await this.stageChildBackups(rewrite.dir, rewrite.name, rewrite.size, c, guardTargets, attemptToken, rewrite.backupFiles, entriesBeforeRecord)
         if (backupResult === null) {
           const guardMark = `${this.mark}g`
           for (const guardedPath of placedResult.newlyPlaced) {
@@ -6665,8 +6740,8 @@ export class Writer {
           return false
         }
         const prevAttempts = rewrite.guardAttempts ?? []
-        const nextAttempts = normalizeAttempts(attemptToken, [...prevAttempts, ...placedResult.priorAttempts])
-        if (nextAttempts.length !== prevAttempts.length || backupResult.newlyStaged.length > 0) {
+        const nextAttempts = normalizeAttempts(attemptToken, [...prevAttempts, ...placedResult.priorAttempts, ...backupResult.priorAttempts])
+        if (nextAttempts.length !== prevAttempts.length || backupResult.newlyStaged.length > 0 || backupResult.backups.length !== (rewrite.backupFiles?.length ?? 0)) {
           recorded = false
         }
         rewrite.guardAttempt = attemptToken
@@ -6938,15 +7013,24 @@ export class Writer {
       }
     }
     // Safe staged/backup truncation: verify no unexpired foreign lease holds the
-    // basename AND verify the file bytes still match the recorded `{ size, fnv1a }`
-    // (or, for legacy digest-less string entries, still carry this parent's header
-    // or non-foreign `stagedFor` mark) before emptying anything.
+    // basename BEFORE reading the file, then verify the bytes still match the
+    // recorded `{ size, fnv1a }` (or, for legacy digest-less string entries,
+    // still carry this parent's header or non-foreign `stagedFor` mark, with a
+    // re-read after any async mark lookup) before emptying anything.
     const safeTruncateStaged = async (
       ref: StagedFile,
       markSuffix: '' | 'g' = '',
       markToClear = `${this.mark}${markSuffix}`,
     ): Promise<'emptied' | 'foreign-live' | 'retry'> => {
       const targetPath = joinPath(rewrite.dir, ref.name)
+      try {
+        const lease = (await this.io.storeGet(`lease:${dest}/${ref.name}`)) as { by?: string; until?: number } | undefined
+        if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
+          return 'retry'
+        }
+      } catch {
+        return 'retry'
+      }
       let targetExists = true
       let cur = ''
       try {
@@ -6961,16 +7045,9 @@ export class Writer {
       }
       let emptiedNonEmpty = false
       if (cur !== '') {
-        try {
-          const lease = (await this.io.storeGet(`lease:${dest}/${ref.name}`)) as { by?: string; until?: number } | undefined
-          if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
-            return 'retry'
-          }
-        } catch {
-          return 'retry'
-        }
         const curSize = utf8Length(cur)
         let matchesPart = false
+        let awaitedSinceRead = false
         if (ref.fnv1a !== '' && ref.size >= 0) {
           matchesPart = curSize === ref.size && fnv1a(cur) === ref.fnv1a
         } else {
@@ -6980,6 +7057,7 @@ export class Writer {
             if (curParent === rewrite.name) {
               matchesPart = true
             } else if (parsedCur.complete && curParent === null) {
+              awaitedSinceRead = true
               const m = await this.marksDetailed(sourceFor(rewrite.dir, ref.name, curSize, c))
               matchesPart =
                 m.stagedFor === rewrite.name &&
@@ -7009,10 +7087,24 @@ export class Writer {
           rewrite.tempMarks?.delete(targetPath)
           return 'foreign-live'
         }
-        if (!(await this.emptyCopy(targetPath))) return 'retry'
-        emptiedNonEmpty = true
-        this.retiredEmpty.add(targetPath)
-        emptiedInRun?.add(ref.name)
+        if (awaitedSinceRead) {
+          try {
+            const curAgain = await this.io.readFile(targetPath)
+            if (curAgain === '') {
+              cur = ''
+            } else if (curAgain !== cur) {
+              return 'retry'
+            }
+          } catch {
+            return 'retry'
+          }
+        }
+        if (cur !== '') {
+          if (!(await this.emptyCopy(targetPath))) return 'retry'
+          emptiedNonEmpty = true
+          this.retiredEmpty.add(targetPath)
+          emptiedInRun?.add(ref.name)
+        }
       }
       parentIndex?.delete(ref.name)
       this.uncertainSources.delete(targetPath)
@@ -7124,8 +7216,7 @@ export class Writer {
         // in `stagedFiles` BEFORE writing any part, then atomically promote them to `adopted`.
         const byKind = new Map<DeadLetterKind, string[]>()
         for (const item of decision.entries) {
-          const itemKey = keyOf(item.line, pending.name, item.index)
-          const keyedLine: DeadLetterLine = itemKey === item.line.row.event_id ? item.line : { ...item.line, key: itemKey }
+          const keyedLine = ensureRowEventId(item.line, pending.name, item.index)
           const targetKind: DeadLetterKind = item.refusedReason !== undefined ? 'rejected' : isDeadLetterKind(item.line.kind) ? item.line.kind : decision.childKind
           const formatted = lineText(
             item.refusedReason !== undefined
@@ -7677,10 +7768,23 @@ export class Writer {
       }
       for (const r of priorJournals) {
         maxSeq = Math.max(maxSeq, seqOf(r))
-        if ((r.size !== rewrite.size || r.retired === true) && Array.isArray(r.files)) {
+        const differentDigest =
+          rewrite.sourceFnv1a !== undefined &&
+          typeof r.sourceFnv1a === 'string' &&
+          r.sourceFnv1a !== '' &&
+          r.sourceFnv1a !== rewrite.sourceFnv1a
+        if (r.size !== rewrite.size || r.retired === true || differentDigest) {
           const priorReconciled = new Map(normalizeReconciled(r.reconciled).map(rec => [rec.name, rec]))
-          for (const entry of r.files) {
-            const base = typeof entry === 'string' ? baseOf(entry) : ''
+          const candidates: string[] = []
+          if (Array.isArray(r.files)) {
+            for (const entry of r.files) {
+              if (typeof entry === 'string') candidates.push(baseOf(entry))
+            }
+          }
+          for (const pend of normalizeReconciled(r.pendingReconcile, true)) {
+            if (pend.name !== '') candidates.push(baseOf(pend.name))
+          }
+          for (const base of candidates) {
             if (base === '' || base === rewrite.name || seenFiles.has(base) || !liveSizes.has(base)) continue
             const rec = priorReconciled.get(base)
             if (rec !== undefined) {
@@ -8293,11 +8397,15 @@ export class Writer {
   // persistence), guarded by a `0.1.3`-honored sending mark carrying
   // `stagedFor`, `replaces`, `backup: true`, `backupForSize`, `backupForFnv1a`,
   // `backupFnv1a`, and `attempt`. `0.1.3 auto` holds the backup; `0.1.3 force`
-  // delivers it (deduped by `event_id`) even if `0.1.3` drops the original child
-  // via `parentFate`; `0.1.4` defers it behind the original child and drops it
-  // once superseded. Skips children currently held by an unexpired foreign lease
-  // so another session's active replay is not duplicated. On any error, rolls
-  // back newly staged backups (verifying digest & lease) and returns `null`.
+  // delivers it (deduped by `event_id` / `insertId`) even if `0.1.3` drops the
+  // original child via `parentFate`; `0.1.4` defers it behind the original child
+  // and drops it once superseded. Fails closed when a non-empty guarded child
+  // not already backed up in `existing` is held by an unexpired foreign lease so
+  // force waits until the lease clears instead of dispatching without backup.
+  // Reuses intact on-disk backups matching `(parentName, parentSize, childName,
+  // childSize, childDigest, partDigest)` across repeated crash-before-record
+  // force runs so backups never multiply. On any error, rolls back newly staged
+  // backups (verifying digest & lease) and returns `null`.
   private async stageChildBackups(
     dir: string,
     parentName: string,
@@ -8306,20 +8414,68 @@ export class Writer {
     targets: ReadonlyMap<string, number>,
     attempt: string,
     existing?: readonly BackupFile[],
-  ): Promise<{ backups: BackupFile[]; newlyStaged: BackupFile[] } | null> {
+    entries?: readonly { name: string; kind?: string; size: number }[],
+  ): Promise<{ backups: BackupFile[]; newlyStaged: BackupFile[]; priorAttempts: string[] } | null> {
     const dest = destinationDir(tableRef(c))
     const me = this.sessionId() ?? 'unknown'
     const guardMark = `${this.mark}g`
     const backups: BackupFile[] = [...(existing ?? [])]
     const newlyStaged: BackupFile[] = []
+    const priorAttemptsSet = new Set<string>()
+    let diskScanLoaded = false
+    let dirEntriesCache: readonly { name: string; kind?: string; size: number }[] | null = null
+    const diskCandidatesByKey = new Map<string, { name: string; size: number; fnv1a: string; attempts: string[] }[]>()
+    const usedDiskBackups = new Set<string>(backups.map(b => b.name))
+    const loadDiskBackups = async (): Promise<void> => {
+      if (diskScanLoaded) return
+      diskScanLoaded = true
+      dirEntriesCache = entries ?? (await this.io.listDir(dir))
+      const liveFiles = new Map<string, number>()
+      const gMarked = new Set<string>()
+      for (const entry of dirEntriesCache) {
+        if (entry.kind !== undefined && entry.kind !== 'file') continue
+        if (entry.size > 0 && kindOf(entry.name) !== null) {
+          liveFiles.set(entry.name, entry.size)
+        } else if (entry.size > 0) {
+          const of = recordOf(entry.name)
+          const by = of !== null ? doneMarkerOf(entry.name, of) : null
+          if (of !== null && by !== null && by.endsWith('g')) gMarked.add(of)
+        }
+      }
+      for (const liveName of gMarked) {
+        if (liveName === parentName || usedDiskBackups.has(liveName)) continue
+        const liveSize = liveFiles.get(liveName) ?? 0
+        if (liveSize <= 0 || liveSize > HOST_FILE_BYTES) continue
+        const liveSource = sourceFor(dir, liveName, liveSize, c)
+        const m = await this.marksDetailed(liveSource, dirEntriesCache)
+        if (
+          m.backup !== true ||
+          m.stagedFor !== parentName ||
+          m.stagedForSize !== parentSize ||
+          m.replaces === undefined ||
+          m.replaces === '' ||
+          m.backupForSize === undefined ||
+          m.backupForFnv1a === undefined ||
+          m.backupForFnv1a === '' ||
+          m.backupFnv1a === undefined ||
+          m.backupFnv1a === '' ||
+          m.nonStagedBy.length > 0
+        ) {
+          continue
+        }
+        const liveDone = await this.doneMarksAll(liveSource, dirEntriesCache)
+        if (liveDone.torn || liveDone.records.length > 0) continue
+        const key = `${m.replaces}\0${m.backupForSize}\0${m.backupForFnv1a}\0${liveSize}\0${m.backupFnv1a}`
+        const list = diskCandidatesByKey.get(key)
+        const item = { name: liveName, size: liveSize, fnv1a: m.backupFnv1a, attempts: m.attempts ?? [] }
+        if (list) list.push(item)
+        else diskCandidatesByKey.set(key, [item])
+      }
+    }
     try {
       for (const [childPath, childSize] of targets) {
         if (childSize <= 0 || childSize > HOST_FILE_BYTES) continue
         const childName = baseOf(childPath)
-        const lease = (await this.io.storeGet(`lease:${dest}/${childName}`)) as { by?: string; until?: number } | undefined
-        if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
-          continue
-        }
         const raw = await this.io.readFile(childPath)
         if (raw === '') continue
         if (utf8Length(raw) !== childSize) throw new Error(`child ${childName} changed size while staging backups`)
@@ -8327,34 +8483,72 @@ export class Writer {
         if (!parsed.complete) throw new Error(`child ${childName} became incomplete while staging backups`)
         if (parsed.parent === null || baseOf(parsed.parent) !== parentName) continue
         const childDigest = fnv1a(raw)
-        if (
-          backups.some(
-            b =>
-              b.replaces === childName &&
-              b.replacesSize === childSize &&
-              (b.replacesFnv1a === undefined || b.replacesFnv1a === childDigest),
-          )
-        ) {
-          continue
-        }
         const childKind = kindOf(childName) ?? 'retry'
         const texts: string[] = []
         parsed.lines.forEach((line, i) => {
-          const itemKey = keyOf(line, childName, i)
-          const keyedLine: DeadLetterLine = itemKey === line.row.event_id ? line : { ...line, key: itemKey }
+          const keyedLine = ensureRowEventId(line, childName, i)
           const lineKind: DeadLetterKind = isDeadLetterKind(line.kind) ? line.kind : childKind
           texts.push(lineText({ ...keyedLine, kind: lineKind }))
         })
         for (const rawBad of parsed.unreadable) texts.push(rawBad)
         if (texts.length === 0) continue
         const packed = packFiles(texts)
+        const missingParts: { part: string; size: number; digest: string }[] = []
         for (const part of packed) {
-          const bName = fileName(childKind, this.io.now(), this.sessionId(), ++this.seq, this.mark)
-          const bPath = joinPath(dir, bName)
           const bSize = utf8Length(part)
           const bDigest = fnv1a(part)
+          let covered = false
+          for (const b of backups) {
+            if (
+              b.replaces !== childName ||
+              b.replacesSize !== childSize ||
+              b.replacesFnv1a !== childDigest ||
+              b.size !== bSize ||
+              b.fnv1a !== bDigest
+            ) {
+              continue
+            }
+            const curExisting = await this.io.readFile(joinPath(dir, b.name))
+            if (curExisting === '' || utf8Length(curExisting) !== bSize || fnv1a(curExisting) !== bDigest) continue
+            if (entries !== undefined) {
+              const bDone = await this.doneMarksAll(sourceFor(dir, b.name, bSize, c), entries)
+              if (bDone.torn || bDone.records.length > 0) continue
+            }
+            covered = true
+            break
+          }
+          if (!covered) missingParts.push({ part, size: bSize, digest: bDigest })
+        }
+        if (missingParts.length === 0) continue
+        const lease = (await this.io.storeGet(`lease:${dest}/${childName}`)) as { by?: string; until?: number } | undefined
+        if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
+          throw new Error(`another session's lease holds ${childName}`)
+        }
+        await loadDiskBackups()
+        for (const { part, size: bSize, digest: bDigest } of missingParts) {
+          const diskKey = `${childName}\0${childSize}\0${childDigest}\0${bSize}\0${bDigest}`
+          let reused: BackupFile | null = null
+          for (const cand of diskCandidatesByKey.get(diskKey) ?? []) {
+            if (usedDiskBackups.has(cand.name)) continue
+            const bLease = (await this.io.storeGet(`lease:${dest}/${cand.name}`)) as { by?: string; until?: number } | undefined
+            if (bLease && typeof bLease.until === 'number' && bLease.until > this.io.now() && bLease.by !== me) continue
+            const curLive = await this.io.readFile(joinPath(dir, cand.name))
+            if (curLive !== '' && utf8Length(curLive) === bSize && fnv1a(curLive) === bDigest) {
+              usedDiskBackups.add(cand.name)
+              for (const a of cand.attempts) priorAttemptsSet.add(a)
+              reused = { name: cand.name, size: bSize, fnv1a: bDigest, replaces: childName, replacesSize: childSize, replacesFnv1a: childDigest }
+              break
+            }
+          }
+          if (reused !== null) {
+            backups.push(reused)
+            continue
+          }
+          const bName = fileName(childKind, this.io.now(), this.sessionId(), ++this.seq, this.mark)
+          const bPath = joinPath(dir, bName)
           const ref: BackupFile = { name: bName, size: bSize, fnv1a: bDigest, replaces: childName, replacesSize: childSize, replacesFnv1a: childDigest }
           newlyStaged.push(ref)
+          usedDiskBackups.add(bName)
           await this.io.writeFile(
             doneFileOf(dir, bName, guardMark),
             sealFile(
@@ -8377,7 +8571,7 @@ export class Writer {
           backups.push(ref)
         }
       }
-      return { backups, newlyStaged }
+      return { backups, newlyStaged, priorAttempts: [...priorAttemptsSet] }
     } catch {
       for (const ref of newlyStaged) {
         const bPath = joinPath(dir, ref.name)
@@ -8468,7 +8662,8 @@ export class Writer {
       }
       const kind = isDeadLetterKind(line.kind) ? line.kind : fileKind
       if (line.table === table && kinds.includes(kind)) {
-        mine.push({ ...line, kind })
+        const keyedLine = ensureRowEventId(line, name, i)
+        mine.push({ ...keyedLine, kind })
         at.push(i)
         fates.push('W')
       } else {
@@ -8563,7 +8758,7 @@ export class Writer {
             return false
           }
           guardAttempt = attemptToken
-          guardAttempts = normalizeAttempts(attemptToken, placedResult.priorAttempts)
+          guardAttempts = normalizeAttempts(attemptToken, [...placedResult.priorAttempts, ...backupResult.priorAttempts])
           prePlacedChildGuards = placedResult.placed
           newlyPlacedChildGuards = placedResult.newlyPlaced
           prevChildGuardMarks = placedResult.prevMarks

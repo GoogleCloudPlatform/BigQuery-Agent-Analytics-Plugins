@@ -62,6 +62,7 @@ import json
 import os
 import re
 import stat
+import struct
 import sys
 import time
 from pathlib import Path
@@ -114,13 +115,25 @@ def _open_nofollow_read(path: Path, dir_fd: int | None = None):
     return open(path, "rb", opener=_opener)
 
 
+MAX_MARK_BYTES = 4 * 1024 * 1024 + 4096
+
+
+def _fnv1a_utf16(text: str) -> str:
+    """FNV-1a 32-bit checksum over UTF-16 code units, matching deadletter.ts `fnv1a`."""
+    h = 0x811C9DC5
+    for (code_unit,) in struct.iter_unpack("<H", text.encode("utf-16-le")):
+        h ^= code_unit
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return f"{h:08x}"
+
+
 def _read_completion_parent_checked(
     path: Path,
     expected_st: os.stat_result | None = None,
     dir_fd: int | None = None,
     euid: int | None = None,
 ) -> tuple[bool, str | None, str]:
-    """Read and validate the completion record at the end of a non-empty file."""
+    """Read and validate the completion record and full FNV-1a seal of a non-empty file."""
     if euid is None:
         euid = os.geteuid()
     try:
@@ -136,29 +149,37 @@ def _read_completion_parent_checked(
                     return False, None, f"unexpected owner uid {fst.st_uid}"
                 if expected_st is not None and (fst.st_dev, fst.st_ino) != (expected_st.st_dev, expected_st.st_ino):
                     return False, None, "file replaced while reading"
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            if size == 0:
-                return False, None, "empty while reading completion record"
-            chunk = min(size, 4096)
-            f.seek(-chunk, os.SEEK_END)
-            tail = f.read()
-        if chunk < size:
-            tail = tail[tail.find(b"\n") + 1:]
-        text = tail.decode("utf-8")
+                if fst.st_size > MAX_MARK_BYTES:
+                    return False, None, "incomplete (file exceeds maximum readable size)"
+            raw = f.read(MAX_MARK_BYTES + 1)
+        if len(raw) > MAX_MARK_BYTES:
+            return False, None, "incomplete (file exceeds maximum readable size)"
+        if not raw:
+            return False, None, "empty while reading completion record"
+        text = raw.decode("utf-8")
     except OSError as exc:
         return False, None, f"incomplete or unreadable ({exc})"
     except UnicodeDecodeError:
         return False, None, "incomplete or invalid UTF-8 completion record"
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
+    if not text.endswith("\n"):
+        return False, None, "incomplete (missing trailing newline)"
+    start = text.rfind("\n", 0, len(text) - 1) + 1
+    body = text[:start]
+    seal_line = text[start:-1]
+    if not seal_line.strip():
         return False, None, "incomplete (missing completion record)"
     try:
-        record = json.loads(lines[-1])
+        record = json.loads(seal_line)
     except json.JSONDecodeError:
         return False, None, "incomplete (truncated or invalid trailing JSON line)"
-    if not isinstance(record, dict) or record.get("complete") is not True:
+    if not isinstance(record, dict) or record.get("complete") is not True or "row" in record:
         return False, None, "incomplete (missing \"complete\": true completion record)"
+    seal_lines = record.get("lines")
+    seal_fnv1a = record.get("fnv1a")
+    if isinstance(seal_lines, bool) or not isinstance(seal_lines, int) or not isinstance(seal_fnv1a, str):
+        return False, None, "incomplete (missing valid lines/fnv1a fields)"
+    if seal_lines != body.count("\n") or seal_fnv1a != _fnv1a_utf16(body):
+        return False, None, "incomplete (failed line-count or checksum verification)"
     parent = record.get("parent")
     if parent is not None and not isinstance(parent, str):
         return False, None, "incomplete (invalid parent field)"
@@ -169,9 +190,6 @@ def _read_completion_parent(path: Path) -> tuple[bool, str | None]:
     """Read the completion record that ends a non-empty file."""
     ok, parent, _reason = _read_completion_parent_checked(path)
     return ok, parent
-
-
-MAX_MARK_BYTES = 4 * 1024 * 1024 + 4096
 
 
 def _read_mark_staged_for_checked(
@@ -208,16 +226,30 @@ def _read_mark_staged_for_checked(
         return False, [], f"unreadable mark ({exc})"
     except UnicodeDecodeError:
         return False, [], "invalid UTF-8 in mark"
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) < 2:
-        return False, [], "unsealed or truncated mark"
+    if not text.endswith("\n"):
+        return False, [], "unsealed mark (missing trailing newline)"
+    start = text.rfind("\n", 0, len(text) - 1) + 1
+    body = text[:start]
+    seal_line = text[start:-1]
     try:
-        tail = json.loads(lines[-1])
-        record = json.loads(lines[0])
+        tail = json.loads(seal_line)
+    except json.JSONDecodeError:
+        return False, [], "truncated or invalid JSON in mark seal"
+    if not isinstance(tail, dict) or tail.get("complete") is not True or "row" in tail:
+        return False, [], "unsealed mark missing completion record"
+    seal_lines = tail.get("lines")
+    seal_fnv1a = tail.get("fnv1a")
+    if isinstance(seal_lines, bool) or not isinstance(seal_lines, int) or not isinstance(seal_fnv1a, str):
+        return False, [], "unsealed mark missing valid lines/fnv1a fields"
+    if seal_lines != body.count("\n") or seal_fnv1a != _fnv1a_utf16(body):
+        return False, [], "unsealed mark failed line-count or checksum verification"
+    body_lines = [line for line in body.split("\n") if line.strip() != ""]
+    if len(body_lines) != 1:
+        return False, [], "unsealed or malformed mark"
+    try:
+        record = json.loads(body_lines[0])
     except json.JSONDecodeError:
         return False, [], "truncated or invalid JSON in mark"
-    if not isinstance(tail, dict) or tail.get("complete") is not True:
-        return False, [], "unsealed mark missing completion record"
     if not isinstance(record, dict):
         return False, [], "unexpected non-object mark JSON"
     refs: list[str] = []

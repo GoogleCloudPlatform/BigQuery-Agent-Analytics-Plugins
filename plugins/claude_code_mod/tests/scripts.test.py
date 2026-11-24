@@ -2139,8 +2139,8 @@ def clean_dead_letter_checks():
         return d
 
     def seal(text: str, parent: str | None = None) -> str:
-        """A dead-letter file: its content lines, then a completion record."""
-        record = {"v": 1, "complete": True, "lines": text.count("\n"), "fnv1a": "deadbeef"}
+        """A dead-letter file: its content lines, then a real FNV-1a completion record."""
+        record = {"v": 1, "complete": True, "lines": text.count("\n"), "fnv1a": clean._fnv1a_utf16(text)}
         if parent is not None:
             record["parent"] = parent
         return text + json.dumps(record) + "\n"
@@ -2752,6 +2752,59 @@ def clean_dead_letter_checks():
         check('13p3. unsealed mark beside live file fails closed and skips directory',
               status_sf_unsealed == 1 and 'skipping' in err_sf_unsealed and sf_parent_unrelated.exists(),
               f'{status_sf_unsealed} {err_sf_unsealed!r}')
+
+        # Bad FNV-1a checksum in a mark seal must fail closed.
+        sf_mark_body = json.dumps({'size': sf_repl2.stat().st_size, 'sending': True, 'by': 'w1g', 'stagedFor': 'spill-sf-orphan.jsonl', 'childGuard': True}) + '\n'
+        sf_repl2_mark.write_text(
+            sf_mark_body + json.dumps({'v': 1, 'complete': True, 'lines': 1, 'fnv1a': '00000000'}) + '\n',
+            encoding='utf-8',
+        )
+        status_sf_badsum, _out_sf_badsum, err_sf_badsum = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p4. mark beside live file with wrong fnv1a checksum fails closed and skips directory',
+              status_sf_badsum == 1 and 'skipping' in err_sf_badsum and sf_parent_unrelated.exists(),
+              f'{status_sf_badsum} {err_sf_badsum!r}')
+
+        # Wrong line count in a mark seal must fail closed.
+        sf_repl2_mark.write_text(
+            sf_mark_body + json.dumps({'v': 1, 'complete': True, 'lines': 2, 'fnv1a': clean._fnv1a_utf16(sf_mark_body)}) + '\n',
+            encoding='utf-8',
+        )
+        status_sf_badlines, _out_sf_badlines, err_sf_badlines = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p5. mark beside live file with wrong seal line count fails closed and skips directory',
+              status_sf_badlines == 1 and 'skipping' in err_sf_badlines and sf_parent_unrelated.exists(),
+              f'{status_sf_badlines} {err_sf_badlines!r}')
+
+        # Missing trailing newline on a mark seal must fail closed.
+        sf_repl2_mark.write_text(seal(sf_mark_body).rstrip('\n'), encoding='utf-8')
+        status_sf_nonl, _out_sf_nonl, err_sf_nonl = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p6. mark beside live file missing trailing newline fails closed and skips directory',
+              status_sf_nonl == 1 and 'skipping' in err_sf_nonl and sf_parent_unrelated.exists(),
+              f'{status_sf_nonl} {err_sf_nonl!r}')
+
+        # Verify UTF-16 FNV-1a matches JS charCodeAt (including astral surrogate pair U+1F600).
+        check('13p7. _fnv1a_utf16 matches deadletter.ts fnv1a on ASCII and astral Unicode',
+              clean._fnv1a_utf16('{"row":1}\n') == '49fc8000' and clean._fnv1a_utf16('😀\n') == '9158a436',
+              f"{clean._fnv1a_utf16('{\"row\":1}\\n')} {clean._fnv1a_utf16('😀\\n')}")
+
+        # Restore valid mark, then test >4096-byte live dead-letter file seal verification.
+        sf_repl2_mark.write_text(seal(sf_mark_body), encoding='utf-8')
+        big_body = ('{"row":"' + 'x' * 600 + '"}\n') * 8  # >4800 bytes (>4096 tail window)
+        sf_big = sf_dir / 'retry-sf-big.jsonl'
+        sf_big.write_text(
+            big_body + json.dumps({'v': 1, 'complete': True, 'lines': 8, 'fnv1a': '00000000', 'parent': 'spill-sf-parent.jsonl'}) + '\n',
+            encoding='utf-8',
+        )
+        status_big_bad, _out_big_bad, err_big_bad = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p8. >4096-byte live dead-letter file with bad fnv1a seal fails closed and skips directory',
+              status_big_bad == 1 and 'skipping' in err_big_bad and sf_parent_unrelated.exists(),
+              f'{status_big_bad} {err_big_bad!r}')
+        sf_big.write_text(seal(big_body, parent='spill-sf-parent.jsonl'), encoding='utf-8')
+        status_big_ok, _out_big_ok, err_big_ok = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p9. >4096-byte properly sealed live dead-letter file protects its parent while cleaning unrelated groups',
+              status_big_ok == 0 and err_big_ok == '' and sf_parent.exists() and not sf_parent_unrelated.exists(),
+              f'{status_big_ok} {err_big_ok!r}')
+        sf_big.write_bytes(b'')
+        sf_parent_unrelated.write_bytes(b'')
 
         # Once both standalone replacements are emptied (0 bytes), all protected groups are cleaned up.
         sf_repl.write_bytes(b'')

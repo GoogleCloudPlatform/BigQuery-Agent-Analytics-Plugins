@@ -1650,3 +1650,57 @@ test('with an earlier writer still unanswered past the exit wait cutoff, a 404 t
   expect(world.stderr[0] ?? '').toContain(TABLE_NOTICE)
   world.releaseHung(OK_INSERT.status, OK_INSERT.text)
 })
+
+test('deferred /clear without session_id picks up the same session ID from its next turn without leaking across session switches', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionId = 'first'
+
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/first' })
+  await versionReached
+
+  // Startup without optional session_id, then /clear WITHOUT session_id while config is still loading.
+  await $.classic.SessionStart({ source: 'startup' })
+  await $.session.end({ reason: 'clear', sessionId: 'first', resume: { id: 'first' } })
+  world.sessionId = 'second'
+  await $.classic.SessionStart({ source: 'clear' })
+  // Same session's next turn supplies 'second' via $.session.id() before configurationLoaded() fires.
+  await $.turn.start({ turnId: 'turn-in-second', text: 'hello' })
+  // A subsequent /clear into 'third' before configurationLoaded() must NOT overwrite 'second' on the first /clear!
+  await $.session.end({ reason: 'clear', sessionId: 'second', resume: { id: 'second' } })
+  world.sessionId = 'third'
+  await $.classic.SessionStart({ source: 'clear', session_id: 'third' })
+
+  releaseVersion()
+  await starting
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA')
+    .filter(r => json(r.content).session_start === true)
+    .map(r => ({
+      sessionId: r.session_id,
+      source: ((json(r.attributes).state_delta ?? {}) as Record<string, unknown>).start_source,
+    }))
+  expect(starts).toEqual([
+    { sessionId: 'first', source: 'startup' },
+    { sessionId: 'second', source: 'clear' },
+    { sessionId: 'third', source: 'clear' },
+  ])
+})

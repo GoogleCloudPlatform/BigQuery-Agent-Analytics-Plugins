@@ -600,3 +600,209 @@ test('interop: equal-size repopulation after dist fallback record and current co
   expect(h.count('Q')).toBe(1)
   expect(h.files.get(pPath)).toBe('')
 })
+
+test('interop: foreign lease on guarded child fails closed before dispatch, and once cleared backup protects 0.1.3 force recovery in both file orders', async () => {
+  const idA = 'a'.repeat(32)
+  const idB = 'b'.repeat(32)
+  const idC = 'c'.repeat(32)
+
+  for (const order of ORDERS) {
+    // Arm A: pre-existing foreign lease on child C -> current force fails closed
+    // (0 rows sent, 0 guards left, 0 backups written, P and C untouched). Once
+    // lease expires, current force stages the backup; even if it crashes before
+    // record(), 0.1.3 force delivers A/B/C with zero loss in both file orders.
+    {
+      const h = makeInteropHarness()
+      const { pName, cName } = pairNames(order, `foreign-lease-${order}`)
+      const pPath = `${PART_DIR}/${pName}`
+      const cPath = `${PART_DIR}/${cName}`
+      const pText = packFiles([dlLine('spill', idA, 'A'), dlLine('spill', idB, 'B')])[0]!
+      const cText = packFiles([dlLine('retry', idB, 'B'), dlLine('retry', idC, 'C')], pName)[0]!
+      h.files.set(pPath, pText)
+      h.files.set(cPath, cText)
+      const pSize = utf8Length(pText)
+      const v1Key = `replayed:${TABLE}/${pName}`
+      const v2Key = `replayed:v2:${TABLE}/${pName}`
+      h.store.set(v1Key, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+      h.store.set(v2Key, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [cName], written: [true] })
+      h.store.set(`lease:${TABLE}/${cName}`, { by: 'other-session', until: h.io.now() + 5 * 60 * 1000 })
+
+      const rLeased = await h.newCurrent(`cur-lease-1-${order}`).backfill(['spill', 'retry'], 'force')
+      expect(rLeased.error ?? '').toContain('standalone backups')
+      expect(h.count('A')).toBe(0)
+      expect(h.count('B')).toBe(0)
+      expect(h.count('C')).toBe(0)
+      expect(h.files.get(pPath)).toBe(pText)
+      expect(h.files.get(cPath)).toBe(cText)
+      expect(h.liveDataFiles().sort()).toEqual([cPath, pPath].sort())
+      const standingChildGuards = [...h.files.entries()].filter(([p, t]) => p.includes('/outcome-done-') && p.endsWith(`-${cName}`) && t !== '')
+      expect(standingChildGuards.length).toBe(0)
+
+      // Lease expires -> current force stages guard + backup, dispatches P, and crashes before record().
+      h.advance(15 * 60 * 1000)
+      h.setStoreSet(async k => {
+        if (k === v1Key || k === v2Key) throw new Error('crash before record')
+      })
+      h.setStoreDelete(async k => {
+        if (k === v1Key) throw new Error('v1 stuck')
+      })
+      h.setWrite(async p => {
+        if (p.includes('/outcome2-')) throw new Error('crash before record file')
+      })
+      await h.newCurrent(`cur-lease-2-${order}`).backfill(['spill', 'retry'], 'force')
+      expect(h.count('A')).toBe(1)
+      expect(h.count('B')).toBe(1)
+      expect(h.liveDataFiles().length).toBe(3)
+
+      // Lease expires -> dist 0.1.3 force runs and delivers all rows (deduped by event_id/insertId) with zero loss.
+      h.advance(15 * 60 * 1000)
+      h.setStoreSet(null)
+      h.setStoreDelete(null)
+      h.setWrite(null)
+      await h.newDist(`dist-lease-1-${order}`).backfill(['spill', 'retry'], 'force')
+      await h.newDist(`dist-lease-2-${order}`).backfill(['spill', 'retry'], 'force')
+      await h.newCurrent(`cur-lease-3-${order}`).backfill(['spill', 'retry'], 'auto')
+      expect(h.count('A') >= 1).toBe(true)
+      expect(h.count('B') >= 1).toBe(true)
+      expect(h.count('C') >= 1).toBe(true)
+      expect(new Set(h.sentInsertIds)).toEqual(new Set([idA, idB, idC]))
+      expect(h.liveDataFiles()).toEqual([])
+    }
+
+    // Arm B: ID-less rows staged in standalone backup receive deterministic fallback
+    // event_id + insertId so 0.1.3 force replays carry matching insertIds across
+    // parent dispatch, leftover child, and standalone backup (dedupable by BigQuery & views).
+    {
+      const h = makeInteropHarness()
+      const { pName, cName } = pairNames(order, `idless-backup-${order}`)
+      const pPath = `${PART_DIR}/${pName}`
+      const cPath = `${PART_DIR}/${cName}`
+      const pText = packFiles([dlLine('spill', null, 'A'), dlLine('spill', null, 'B')])[0]!
+      const cText = packFiles(
+        [
+          dlLine('retry', `dl:${pName}#1`, 'B', `${pName}#1`),
+          dlLine('retry', `dl:${cName}#1`, 'C', `${cName}#1`),
+        ],
+        pName,
+      )[0]!
+      h.files.set(pPath, pText)
+      h.files.set(cPath, cText)
+      const pSize = utf8Length(pText)
+      const v1Key = `replayed:${TABLE}/${pName}`
+      const v2Key = `replayed:v2:${TABLE}/${pName}`
+      h.store.set(v1Key, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+      h.store.set(v2Key, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [cName], written: [true] })
+
+      h.setStoreSet(async k => {
+        if (k === v1Key || k === v2Key) throw new Error('crash before record')
+      })
+      h.setStoreDelete(async k => {
+        if (k === v1Key) throw new Error('v1 stuck')
+      })
+      h.setWrite(async p => {
+        if (p.includes('/outcome2-')) throw new Error('crash before record file')
+      })
+      await h.newCurrent(`cur-idless-1-${order}`).backfill(['spill', 'retry'], 'force')
+
+      h.advance(15 * 60 * 1000)
+      h.setStoreSet(null)
+      h.setStoreDelete(null)
+      h.setWrite(null)
+      await h.newDist(`dist-idless-1-${order}`).backfill(['spill', 'retry'], 'force')
+      await h.newDist(`dist-idless-2-${order}`).backfill(['spill', 'retry'], 'force')
+      await h.newCurrent(`cur-idless-2-${order}`).backfill(['spill', 'retry'], 'auto')
+      expect(h.count('A') >= 1).toBe(true)
+      expect(h.count('B') >= 1).toBe(true)
+      expect(h.count('C') >= 1).toBe(true)
+      // Every single sent row must have a non-empty deterministic fallback insertId.
+      expect(h.sentInsertIds.every(id => id !== '')).toBe(true)
+      expect(new Set(h.sentInsertIds)).toEqual(new Set([`dl:${pName}#0`, `dl:${pName}#1`, `dl:${cName}#1`]))
+      expect(h.liveDataFiles()).toEqual([])
+    }
+  }
+
+  // Arm C: pre-existing ID-less child on disk (no row.event_id, only envelope key) in
+  // parent-first order -> current parent dispatch and backup copy share identical `dl:<key>`
+  // insertIds so 0.1.3 force delivers C and deduplicates B cleanly.
+  {
+    const h = makeInteropHarness()
+    const { pName, cName } = pairNames('parent-first', 'idless-preexisting')
+    const pPath = `${PART_DIR}/${pName}`
+    const cPath = `${PART_DIR}/${cName}`
+    const pText = packFiles([dlLine('spill', null, 'A'), dlLine('spill', null, 'B')])[0]!
+    const cText = packFiles([dlLine('retry', null, 'B', `${pName}#1`), dlLine('retry', null, 'C')], pName)[0]!
+    h.files.set(pPath, pText)
+    h.files.set(cPath, cText)
+    const pSize = utf8Length(pText)
+    const v1Key = `replayed:${TABLE}/${pName}`
+    const v2Key = `replayed:v2:${TABLE}/${pName}`
+    h.store.set(v1Key, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(v2Key, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [cName], written: [true] })
+    h.setStoreSet(async k => {
+      if (k === v1Key || k === v2Key) throw new Error('crash before record')
+    })
+    h.setStoreDelete(async k => {
+      if (k === v1Key) throw new Error('v1 stuck')
+    })
+    h.setWrite(async p => {
+      if (p.includes('/outcome2-')) throw new Error('crash before record file')
+    })
+    await h.newCurrent('cur-idless-pre-1').backfill(['spill', 'retry'], 'force')
+
+    h.advance(15 * 60 * 1000)
+    h.setStoreSet(null)
+    h.setStoreDelete(null)
+    h.setWrite(null)
+    await h.newDist('dist-idless-pre-1').backfill(['spill', 'retry'], 'force')
+    await h.newCurrent('cur-idless-pre-2').backfill(['spill', 'retry'], 'auto')
+    expect(h.count('A')).toBe(1)
+    expect(h.count('B') >= 1).toBe(true)
+    expect(h.count('C')).toBe(1)
+    expect(h.sentInsertIds.every(id => id !== '')).toBe(true)
+    expect(new Set(h.sentInsertIds)).toEqual(new Set([`dl:${pName}#0`, `dl:${pName}#1`, `dl:${cName}#1`]))
+    expect(h.liveDataFiles()).toEqual([])
+  }
+})
+
+test('interop: same-length parent retirement carries live child from unretired earlier-digest journal so 0.1.3 force never empties it', async () => {
+  const idA = 'e'.repeat(32)
+  const idB = 'f'.repeat(32)
+  const idC = '1'.repeat(32)
+  const h = makeInteropHarness()
+  const pName = 'spill-20261013T200102001Z-same-len-gen-p.jsonl'
+  const cName = 'retry-20261013T200102002Z-same-len-gen-c.jsonl'
+  const pPath = `${PART_DIR}/${pName}`
+  const cPath = `${PART_DIR}/${cName}`
+  const pGen1 = packFiles([dlLine('spill', idA, 'A')])[0]!
+  const pGen2 = packFiles([dlLine('spill', idB, 'B')])[0]!
+  expect(utf8Length(pGen2)).toBe(utf8Length(pGen1))
+  const cText = packFiles([dlLine('retry', idC, 'C')], pName)[0]!
+  h.files.set(pPath, pGen2)
+  h.files.set(cPath, cText)
+  const pSize = utf8Length(pGen2)
+  // Unretired earlier-generation v2 journal at the exact same byte size with a different sourceFnv1a.
+  h.store.set(`replayed:v2:${TABLE}/${pName}`, {
+    fates: 'W',
+    reasons: [],
+    refusals: [],
+    size: pSize,
+    sourceFnv1a: '11111111',
+    waits: true,
+    seq: 4,
+    files: [cName],
+    written: [true],
+  })
+  // Lease child C so current writer retires P_gen2 first without yet replaying C.
+  h.store.set(`lease:${TABLE}/${cName}`, { by: 'other-session', until: h.io.now() + 5 * 60 * 1000 })
+
+  await h.newCurrent('cur-gen2-1').backfill(['spill'], 'auto')
+  expect(h.count('B')).toBe(1)
+  expect(h.files.get(pPath)).toBe('')
+  expect(h.files.get(cPath)).toBe(cText)
+
+  // Lease expires -> dist 0.1.3 force sees C carried in P's new retired done mark and delivers C instead of dropping it!
+  h.advance(15 * 60 * 1000)
+  await h.newDist('dist-gen2-1').backfill(['spill', 'retry'], 'force')
+  expect(h.count('C')).toBe(1)
+  expect(h.files.get(cPath)).toBe('')
+})

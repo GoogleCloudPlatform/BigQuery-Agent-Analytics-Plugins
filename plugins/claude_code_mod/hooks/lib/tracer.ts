@@ -151,6 +151,8 @@ const UNIDENTIFIED_LOOP = 'unidentified_loop'
 const RESERVED_TOOL_KEYS = new Set(['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent'])
 // SessionStart sources that inherit the previous main-loop model when the host omits `e.model`.
 const INHERIT_MODEL_SOURCES = new Set(['clear', 'compact', 'fork'])
+// SessionStart sources that always begin a new session epoch even if the previous session ID was null.
+const RESET_SESSION_SOURCES = new Set(['clear', 'resume', 'fork'])
 
 // Payload objects list their small identifying fields first: the copy is
 // built within one character budget, so a long `args`, `result` or
@@ -220,6 +222,7 @@ export class Tracer {
   // keeps classic hooks from a user plugin raises no classic.SessionStart.
   private sessionHasStart = false
   private sessionEpoch = 0
+  private sessionIdByEpoch = new Map<number, string>()
   private main: TurnCtx | null = null
   // Turns seen only through their model requests (this module loaded after
   // their turn.start), kept apart so they never replace the current turn.
@@ -270,6 +273,7 @@ export class Tracer {
         this.decisions.clear()
       }
       this.sessionId = info.sessionId
+      remember(this.sessionIdByEpoch, this.sessionEpoch, info.sessionId)
     }
     if (info.cwd) this.cwd = info.cwd
     if (info.engineVersion) this.engineVersion = info.engineVersion
@@ -294,18 +298,23 @@ export class Tracer {
     invocationId: string | null
     epoch: number
   } {
+    const isResetSource = RESET_SESSION_SOURCES.has(e.source)
+    const idChanged = Boolean(e.session_id) && this.sessionId !== null && e.session_id !== this.sessionId
+    if (idChanged || isResetSource) {
+      if (this.main) remember(this.pastTurns, this.main.turnId, true)
+      for (const id of this.others.keys()) remember(this.pastTurns, id, true)
+      this.sessionHasStart = false
+      this.sessionEpoch += 1
+      this.main = null
+      this.others.clear()
+      this.loops.clear()
+      this.inflightTools.clear()
+      this.decisions.clear()
+      if (!e.session_id) this.sessionId = null
+    }
     if (e.session_id) {
-      if (this.sessionId !== null && e.session_id !== this.sessionId) {
-        if (this.main) remember(this.pastTurns, this.main.turnId, true)
-        for (const id of this.others.keys()) remember(this.pastTurns, id, true)
-        this.sessionEpoch += 1
-        this.main = null
-        this.others.clear()
-        this.loops.clear()
-        this.inflightTools.clear()
-        this.decisions.clear()
-      }
       this.sessionId = e.session_id
+      remember(this.sessionIdByEpoch, this.sessionEpoch, e.session_id)
     }
     if (e.cwd) this.cwd = e.cwd
     const at = atMs ?? this.deps.now()
@@ -346,7 +355,8 @@ export class Tracer {
     },
     fallback?: { sessionId?: string | null; cwd?: string | null },
   ): void {
-    const sessionId = observed.sessionId ?? fallback?.sessionId ?? null
+    const epochSessionId = observed.epoch !== undefined ? (this.sessionIdByEpoch.get(observed.epoch) ?? null) : this.sessionId
+    const sessionId = observed.sessionId ?? fallback?.sessionId ?? epochSessionId ?? null
     const cwd = observed.cwd ?? fallback?.cwd ?? null
     const written = this.emit({
       eventType: 'STATE_DELTA',
@@ -390,7 +400,10 @@ export class Tracer {
   }
 
   sessionEnded(e: { reason: string; sessionId?: string }, opts?: { suppressRow?: boolean }): void {
-    if (e.sessionId) this.sessionId = e.sessionId
+    if (e.sessionId) {
+      this.sessionId = e.sessionId
+      if (!this.sessionIdByEpoch.has(this.sessionEpoch)) remember(this.sessionIdByEpoch, this.sessionEpoch, e.sessionId)
+    }
     // Calls still waiting for their decision are written first, without it.
     this.writeAwaiting()
     if (!opts?.suppressRow) {
