@@ -1057,6 +1057,102 @@ test('deferred classic SessionStart with mismatched session_id does not inherit 
   expect(json(invRows[0]!.attributes).session_metadata).toMatchObject({ cwd: null, project_name: null })
 })
 
+test('deferred classic SessionStart keeps its captured null trace and invocation ids after /clear and a new turn in session B', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionId = 'session-a'
+
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/a' })
+  await versionReached
+  // Session A's classic.SessionStart arrives while session.version is pending, so its emission is deferred.
+  const classicA = $.classic.SessionStart({ source: 'startup', session_id: 'session-a', cwd: '/work/a' })
+  // Before session.version resolves, user runs /clear into session-b and starts an active turn there!
+  world.sessionId = 'session-b'
+  const classicB = $.classic.SessionStart({ source: 'clear', session_id: 'session-b', cwd: '/work/b' })
+  await $.turn.start({ turnId: 'turn-session-b', text: 'hello from session b' })
+  // Now session.version resolves and both deferred session_start rows emit while session-b's turn is active!
+  releaseVersion()
+  await Promise.all([starting, classicA, classicB])
+  await runStep($, { turnId: 'turn-session-b', index: 0, model: 'claude-sonnet-4-6' })
+  await $.turn.complete({ turnId: 'turn-session-b', answer: 'ok', durationMs: 50, isAborted: false, reason: 'answer' })
+  await world.clock.advance(5000)
+
+  const starts = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_start === true)
+  const startA = starts.find(r => r.session_id === 'session-a')
+  const startB = starts.find(r => r.session_id === 'session-b')
+  const invB = byType(world.sentRows(), 'INVOCATION_STARTING')[0]
+  expect(startA).toBeDefined()
+  expect(startB).toBeDefined()
+  expect(invB).toBeDefined()
+  expect(startA!.trace_id).toBeNull()
+  expect(startA!.invocation_id).toBeNull()
+  expect(startB!.trace_id).toBeNull()
+  expect(startB!.invocation_id).toBeNull()
+  expect(invB!.session_id).toBe('session-b')
+  expect(invB!.trace_id).not.toBeNull()
+  expect(invB!.invocation_id).toBe('turn-session-b')
+})
+
+test('deferred classic SessionStart resolving after /clear while tracer.sessionId is null does not poison sessionHasStart for managed session B', { options: OPTIONS }, async ($, on) => {
+  let releaseVersion = (): void => undefined
+  const versionGate = new Promise<void>(resolve => {
+    releaseVersion = resolve
+  })
+  let versionStarted = (): void => undefined
+  const versionReached = new Promise<void>(resolve => {
+    versionStarted = resolve
+  })
+  const wrappedOn = ((event: string, ...rest: unknown[]) => {
+    if (event === 'session.version') {
+      return on('session.version', async () => {
+        versionStarted()
+        await versionGate
+        return { value: { version: '2.9.99', base: '2.9.99' } }
+      })
+    }
+    return (on as (...args: unknown[]) => unknown)(event, ...rest)
+  }) as typeof on
+  const world = setUp(wrappedOn)
+  world.sessionId = 'session-a'
+
+  const starting = $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/a' })
+  await versionReached
+  const classicA = $.classic.SessionStart({ source: 'startup', session_id: 'session-a', cwd: '/work/a' })
+  // User runs /clear BEFORE session.version resolves, resetting tracer.sessionId to null and sessionHasStart to false.
+  await $.session.end({ reason: 'clear', sessionId: 'session-a', resume: { id: 'session-a' } })
+  // Now session.version resolves while tracer.sessionId === null (no session-b classic.SessionStart on managed CLI).
+  releaseVersion()
+  await Promise.all([starting, classicA])
+
+  // Managed session-b runs only /bqaa-status and exits without any classic.SessionStart or turns.
+  world.sessionId = 'session-b'
+  await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'session-b', resume: { id: 'session-b' } })
+  await world.clock.advance(5000)
+
+  const endsB = byType(world.sentRows(), 'STATE_DELTA').filter(r => r.session_id === 'session-b' && json(r.content).session_end === true)
+  const spilledB = deadLetterRows(world).filter(r => r.session_id === 'session-b')
+  expect(endsB.length).toBe(0)
+  expect(spilledB).toEqual([])
+})
+
 test('pre-start classic clear with explicit session_id and cwd is not overwritten by native session.start', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.sessionId = 'old-session'

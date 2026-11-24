@@ -219,6 +219,7 @@ export class Tracer {
   // Whether this session wrote its session_start row: a managed CLI that
   // keeps classic hooks from a user plugin raises no classic.SessionStart.
   private sessionHasStart = false
+  private sessionEpoch = 0
   private main: TurnCtx | null = null
   // Turns seen only through their model requests (this module loaded after
   // their turn.start), kept apart so they never replace the current turn.
@@ -261,6 +262,7 @@ export class Tracer {
         this.sawTurnInSession = false
         this.sessionHasActivity = false
         this.sessionHasStart = false
+        this.sessionEpoch += 1
         this.main = null
         this.others.clear()
         this.loops.clear()
@@ -281,11 +283,22 @@ export class Tracer {
   observeSessionStart(
     e: { session_id?: string; source: string; model?: string; permission_mode?: string; cwd?: string },
     atMs?: number,
-  ): { at: number; sessionId: string | null; cwd: string | null; source: string; model: string | null; permissionMode?: string } {
+  ): {
+    at: number
+    sessionId: string | null
+    cwd: string | null
+    source: string
+    model: string | null
+    permissionMode?: string
+    traceId: string | null
+    invocationId: string | null
+    epoch: number
+  } {
     if (e.session_id) {
       if (this.sessionId !== null && e.session_id !== this.sessionId) {
         if (this.main) remember(this.pastTurns, this.main.turnId, true)
         for (const id of this.others.keys()) remember(this.pastTurns, id, true)
+        this.sessionEpoch += 1
         this.main = null
         this.others.clear()
         this.loops.clear()
@@ -306,11 +319,31 @@ export class Tracer {
     const model = explicitModel ?? (INHERIT_MODEL_SOURCES.has(e.source) ? this.lastModel : null)
     if (explicitModel !== null) this.lastModel = explicitModel
     else if (!INHERIT_MODEL_SOURCES.has(e.source)) this.lastModel = null
-    return { at, sessionId: this.sessionId, cwd: this.cwd, source: e.source, model, permissionMode: e.permission_mode }
+    return {
+      at,
+      sessionId: this.sessionId,
+      cwd: this.cwd,
+      source: e.source,
+      model,
+      permissionMode: e.permission_mode,
+      traceId: this.main?.traceId ?? null,
+      invocationId: this.main?.turnId ?? null,
+      epoch: this.sessionEpoch,
+    }
   }
 
   emitSessionStart(
-    observed: { at: number; sessionId: string | null; cwd: string | null; source: string; model: string | null; permissionMode?: string },
+    observed: {
+      at: number
+      sessionId: string | null
+      cwd: string | null
+      source: string
+      model: string | null
+      permissionMode?: string
+      traceId?: string | null
+      invocationId?: string | null
+      epoch?: number
+    },
     fallback?: { sessionId?: string | null; cwd?: string | null },
   ): void {
     const sessionId = observed.sessionId ?? fallback?.sessionId ?? null
@@ -319,7 +352,12 @@ export class Tracer {
       eventType: 'STATE_DELTA',
       timestampMs: observed.at,
       sessionId,
-      ids: this.sessionIds(),
+      ids: {
+        traceId: observed.traceId ?? null,
+        spanId: this.deps.ids.spanId(),
+        parentSpanId: null,
+        invocationId: observed.invocationId ?? null,
+      },
       content: { session_start: true },
       attributes: {
         state_delta: {
@@ -339,7 +377,9 @@ export class Tracer {
               },
       },
     })
-    if (written) this.sessionHasStart = true
+    if (written && (observed.epoch === undefined || observed.epoch === this.sessionEpoch) && (this.sessionId === null || sessionId === this.sessionId)) {
+      this.sessionHasStart = true
+    }
   }
 
   // classic.SessionStart (startup, resume, clear, compact or fork), at
@@ -373,6 +413,7 @@ export class Tracer {
     for (const id of this.others.keys()) remember(this.pastTurns, id, true)
     this.sessionHasActivity = false
     this.sessionHasStart = false
+    this.sessionEpoch += 1
     this.main = null
     this.others.clear()
     this.loops.clear()

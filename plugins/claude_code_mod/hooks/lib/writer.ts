@@ -225,7 +225,7 @@ type Source = {
 // Exact content identity of a reconciled or pending-reconciliation child file,
 // validated by byte length and FNV-1a checksum before any truncation so a newer
 // generation repopulating the same basename is never emptied.
-type ReconciledFile = { name: string; size: number; fnv1a: string }
+type ReconciledFile = { name: string; size: number; fnv1a: string; skipIndices?: number[] }
 
 // Snapshot fingerprint of a stale unretired v1 record that could neither be
 // deleted nor neutralized in place when a v2 checkpoint took over, allowing
@@ -241,8 +241,9 @@ type Rewrite = Outcome &
     adoptedFiles?: string[]
     // Earlier same-size live children whose rows are already fully accounted
     // for by this forced rewrite (or moved into replacement adopted files),
-    // omitted from the retired mark and emptied only after retirement is durable
-    // and content still matches `{ size, fnv1a }`.
+    // kept in retired `files` (so 0.1.3 preserves repopulated children) with
+    // exact `{ size, fnv1a }` digests in `reconciled` (so 0.1.4 drops unchanged
+    // stale copies and empties them only while content still matches).
     reconciledFiles?: ReconciledFile[]
     // Earlier same-size live children that must be reconciled before parent
     // retirement (mixed children awaiting replacement writes, or children held
@@ -257,6 +258,10 @@ type Rewrite = Outcome &
     // temporary `doneFileOf(..., this.mark)` sending mark until parent
     // retirement or reconciled-child cleanup settles.
     tempMarks?: Set<string>
+    // Live children guarded by `0.1.3`-honored `childGuard` sending marks
+    // (`childPath -> guardedSize`) placed before forced parent replay or v2
+    // persistence so 0.1.3 neither drops nor resends them across restarts.
+    childGuardMarks?: Map<string, number>
     supersedesV1?: SupersededV1
     accountedRowKeys?: ReadonlySet<string>
     waits: boolean
@@ -284,8 +289,8 @@ type Journal = Outcome & {
   reconciled?: ReconciledFile[]
   pendingReconcile?: ReconciledFile[]
   stagedFiles?: string[]
+  accountedKeys?: string[]
   supersedesV1?: SupersededV1
-  v2Guard?: boolean
   uncertain?: boolean[]
   waits: boolean
   seq: number
@@ -500,6 +505,9 @@ type Pending = {
   nonStagedBy?: string[]
   uncertain?: boolean
   stagedFor?: string
+  stagedForSize?: number
+  childGuard?: boolean
+  replaces?: string
 }
 
 // Where the record of the file `name`, `size` long, in `dir` is kept.
@@ -597,21 +605,31 @@ const normalizeReconciled = (value: unknown, allowEmptyChecksum = false): Reconc
   const out: ReconciledFile[] = []
   for (const item of value) {
     if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
-    const rec = item as { name?: unknown; size?: unknown; fnv1a?: unknown }
+    const rec = item as { name?: unknown; size?: unknown; fnv1a?: unknown; skipIndices?: unknown }
     if (typeof rec.name !== 'string' || rec.name === '') continue
     const name = baseOf(rec.name)
     if (seen.has(name)) continue
     const size = typeof rec.size === 'number' && Number.isFinite(rec.size) && rec.size >= 0 ? rec.size : -1
     const digest = typeof rec.fnv1a === 'string' ? rec.fnv1a : ''
     if (size < 0 || (!allowEmptyChecksum && (size === 0 || digest === ''))) continue
+    const skipIndices = Array.isArray(rec.skipIndices)
+      ? [...new Set(rec.skipIndices.filter((n): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0))].sort((x, y) => x - y)
+      : []
     seen.add(name)
-    out.push({ name, size, fnv1a: digest })
+    out.push({ name, size, fnv1a: digest, ...(skipIndices.length > 0 ? { skipIndices } : {}) })
   }
   return out
 }
 
+const sameSkipIndices = (a: readonly number[] | undefined, b: readonly number[] | undefined): boolean => {
+  const la = a ?? []
+  const lb = b ?? []
+  return la.length === lb.length && la.every((v, i) => v === lb[i])
+}
+
 const sameReconciled = (a: readonly ReconciledFile[], b: readonly ReconciledFile[]): boolean =>
-  a.length === b.length && a.every((x, i) => x.name === b[i]?.name && x.size === b[i]?.size && x.fnv1a === b[i]?.fnv1a)
+  a.length === b.length &&
+  a.every((x, i) => x.name === b[i]?.name && x.size === b[i]?.size && x.fnv1a === b[i]?.fnv1a && sameSkipIndices(x.skipIndices, b[i]?.skipIndices))
 
 const normalizeStaged = (value: unknown): string[] => {
   if (!Array.isArray(value)) return []
@@ -2703,26 +2721,63 @@ export class Writer {
     const pendingLiveFiles = new Set(files)
     const deferredChildren = new Set<string>()
     const isSourceLive = (n: string): boolean => (listed.get(n) ?? 0) > 0 && !emptiedInRun.has(n)
-    const stagedGuardState = async (parentName: string, targetName: string): Promise<'go' | 'wait' | 'hold' | 'drop'> => {
+    const stagedGuardState = async (
+      parentName: string,
+      parentSize: number | undefined,
+      targetName: string,
+      targetPath: string,
+      isChildGuard: boolean,
+      replaces?: string,
+    ): Promise<
+      | { action: 'go'; skipIndices?: readonly number[]; accountedKeys?: ReadonlySet<string> }
+      | { action: 'wait'; parentRetired?: boolean }
+      | { action: 'hold' | 'drop' }
+    > => {
+      const checkTargetDigest = async (ref: ReconciledFile): Promise<'empty' | 'match' | 'mismatch' | 'error'> => {
+        try {
+          const curRaw = await this.io.readFile(targetPath)
+          if (curRaw === '') return 'empty'
+          if (ref.fnv1a !== '' && utf8Length(curRaw) === ref.size && fnv1a(curRaw) === ref.fnv1a) return 'match'
+          return 'mismatch'
+        } catch {
+          return 'error'
+        }
+      }
+      let liveParentRetired = false
       if (isSourceLive(parentName)) {
         const pSize = listed.get(parentName) ?? 0
-        if (pSize <= 0) return 'hold'
+        if (pSize <= 0) return { action: 'hold' }
         let pj: Found | Pending | 'torn' | 'conflict' | undefined
         try {
           pj = await this.readJournal(sourceFor(dir, parentName, pSize, c))
         } catch {
-          return 'hold'
+          return { action: 'hold' }
         }
-        if (pj === undefined) return 'wait'
-        if (pj === 'torn' || pj === 'conflict' || 'pending' in pj) return 'hold'
+        if (pj === undefined) return { action: 'wait' }
+        if (pj === 'torn' || pj === 'conflict' || 'pending' in pj) return { action: 'hold' }
         if (pj.journal.retired === true) {
-          const jFiles = Array.isArray(pj.journal.files) ? pj.journal.files : []
-          return jFiles.some(f => typeof f === 'string' && baseOf(f) === targetName) ? 'go' : 'hold'
+          const rec = normalizeReconciled(pj.journal.reconciled).find(entry => entry.name === targetName)
+          if (rec !== undefined) {
+            const d = await checkTargetDigest(rec)
+            if (d === 'error') return { action: 'hold' }
+            return d === 'empty' || d === 'match' ? { action: 'drop' } : { action: 'go' }
+          }
+          if (!isChildGuard) {
+            const jFiles = Array.isArray(pj.journal.files) ? pj.journal.files : []
+            return jFiles.some(f => typeof f === 'string' && baseOf(f) === targetName) ? { action: 'go' } : { action: 'hold' }
+          }
+          // When `isChildGuard` is true and the live parent's retired record has
+          // no `reconciled` digest (e.g. 0.1.3 retired `P` from stale `v1` and
+          // failed to truncate `P`), fall through to consult same-size `v2`
+          // (`reconciled`, `pendingReconcile` `skipIndices`/`accountedKeys`,
+          // and `overlapRefs`) instead of blindly returning `'go'`.
+          liveParentRetired = true
+        } else {
+          // Parent is still live and unretired in this pass (even after deferral):
+          // hold guarded files just like normal `parent: P` children so
+          // `/bqaa-backfill force` cannot replay them while P or C is still live.
+          return { action: 'hold' }
         }
-        // Parent is still live and unretired in this pass (even after deferral):
-        // hold guarded standalone files just like normal `parent: P` children so
-        // `/bqaa-backfill force` cannot replay them while P or C is still live.
-        return 'hold'
       }
       try {
         const anySource = { ...sourceFor(dir, parentName, -1, c), live: false }
@@ -2738,13 +2793,9 @@ export class Writer {
           ...[v1All.stored, ...v1All.filed, v2All.stored, ...v2All.filed].filter((r): r is Partial<Journal> => r !== undefined && r.retired === true),
         ]
         const anyTorn = doneAll.torn || v1All.tornSizes.length > 0 || v2All.tornSizes.length > 0
-        // Check retired records FIRST so a stale lower-seq v2 store entry from a
-        // quota fallback cannot block a promoted replacement named in a retired mark.
-        if (allRetired.some(r => Array.isArray(r.files) && r.files.some(f => typeof f === 'string' && baseOf(f) === targetName))) {
-          return 'go'
-        }
+        const matchesParentSize = (r: Partial<Journal>): boolean => parentSize === undefined || r.size === undefined || r.size === parentSize
         // Select the highest-seq v2 checkpoint per parent size (preferring filed
-        // on equal seq) before evaluating `stagedFiles`, `written`, and overlap.
+        // on equal seq) before evaluating childGuard / stagedFiles / overlap.
         const latestV2BySize = new Map<number, { journal: Partial<Journal>; filed: boolean }>()
         const considerV2 = (r: Partial<Journal> | undefined, filed: boolean): void => {
           if (r === undefined) return
@@ -2757,60 +2808,158 @@ export class Writer {
         considerV2(v2All.stored, false)
         for (const f of v2All.filed) considerV2(f, true)
         const latestV2 = [...latestV2BySize.values()].map(v => v.journal)
-        const stagedRecord = latestV2.find(r => normalizeStaged(r.stagedFiles).includes(targetName))
+        // Step 1: Check explicit reconciled digests on retired records FIRST so
+        // an unchanged reconciled child (listed in `files` for 0.1.3 safety) is
+        // dropped while a repopulated child is delivered.
+        for (const r of allRetired) {
+          if (!matchesParentSize(r)) continue
+          const rec = normalizeReconciled(r.reconciled).find(entry => entry.name === targetName)
+          if (rec !== undefined) {
+            const d = await checkTargetDigest(rec)
+            if (d === 'error') return { action: 'wait' }
+            return d === 'empty' || d === 'match' ? { action: 'drop' } : { action: 'go' }
+          }
+        }
+        // Step 2: For a child guarded by `childGuard: true` (placed before forced
+        // parent replay), consult same-size v2 BEFORE checking `allRetired.files`
+        // so a stale 0.1.3 retirement naming `C` cannot bypass v2 reconciliation,
+        // `skipIndices`, or `accountedKeys`, and a stale 0.1.3 retirement with
+        // `files: []` cannot strand an adopted or pending child.
+        if (isChildGuard) {
+          for (const r of latestV2) {
+            if (!matchesParentSize(r)) continue
+            const allV2LeftoversWritten = writtenOf(r).every(Boolean)
+            const rec = normalizeReconciled(r.reconciled).find(entry => entry.name === targetName)
+            if (rec !== undefined) {
+              const d = await checkTargetDigest(rec)
+              if (d === 'error') return { action: 'wait' }
+              if (d === 'empty') return { action: 'drop' }
+              if (d === 'match' && allV2LeftoversWritten) return { action: 'drop' }
+              return { action: 'go' }
+            }
+            const pend = normalizeReconciled(r.pendingReconcile, true).find(entry => entry.name === targetName)
+            if (pend !== undefined) {
+              if (pend.fnv1a !== '') {
+                const d = await checkTargetDigest(pend)
+                if (d === 'error') return { action: 'wait' }
+                if (d === 'empty') return { action: 'drop' }
+                if (d === 'mismatch') return { action: 'go' }
+              }
+              if (allV2LeftoversWritten) {
+                if (Array.isArray(pend.skipIndices) && pend.skipIndices.length > 0) {
+                  return { action: 'go', skipIndices: pend.skipIndices }
+                }
+                if (Array.isArray(r.accountedKeys) && r.accountedKeys.length > 0) {
+                  return { action: 'go', accountedKeys: new Set(r.accountedKeys.filter((k): k is string => typeof k === 'string')) }
+                }
+              }
+              return { action: 'go' }
+            }
+          }
+        }
+        // Step 3: Check retired records naming `targetName` FIRST (after
+        // reconciled/childGuard checks above) so a stale lower-seq v2 store entry
+        // from a quota fallback cannot block a promoted deliverable named in a
+        // retired mark.
+        if (allRetired.some(r => matchesParentSize(r) && Array.isArray(r.files) && r.files.some(f => typeof f === 'string' && baseOf(f) === targetName))) {
+          return { action: 'go' }
+        }
+        const stagedRecord = latestV2.find(r => matchesParentSize(r) && normalizeStaged(r.stagedFiles).includes(targetName))
         if (stagedRecord !== undefined) {
           // If the emptied parent was already retired at this size by an outcome
           // covering EVERY pending child (either named in `files`, e.g. 0.1.3
-          // preserved/replayed them, or recorded in `reconciled`, e.g. 0.1.4
-          // completed reconciliation without this aborted stage), drop cleanly.
-          const pendingNames = new Set(normalizeReconciled(stagedRecord.pendingReconcile, true).map(ref => ref.name))
+          // preserved/replayed them, recorded in `reconciled`, e.g. 0.1.4
+          // completed reconciliation without this aborted stage, or the pending
+          // child itself already retired at its recorded byte size and was
+          // emptied), drop this aborted stage cleanly.
+          const pendingRefs = normalizeReconciled(stagedRecord.pendingReconcile, true)
           const sameSizeRetired = allRetired.filter(ret => stagedRecord.size === undefined || ret.size === stagedRecord.size)
-          if (
-            !anyTorn &&
-            sameSizeRetired.length > 0 &&
-            pendingNames.size > 0 &&
-            [...pendingNames].every(pn =>
-              sameSizeRetired.some(
+          if (!anyTorn && sameSizeRetired.length > 0) {
+            let allPendingCovered = true
+            for (const ref of pendingRefs) {
+              const coveredByParent = sameSizeRetired.some(
                 ret =>
-                  (Array.isArray(ret.files) && ret.files.some(f => typeof f === 'string' && baseOf(f) === pn)) ||
-                  normalizeReconciled(ret.reconciled).some(ref => ref.name === pn),
-              ),
-            )
-          ) {
-            return 'drop'
+                  (Array.isArray(ret.files) && ret.files.some(f => typeof f === 'string' && baseOf(f) === ref.name)) ||
+                  normalizeReconciled(ret.reconciled).some(rec => rec.name === ref.name),
+              )
+              if (coveredByParent) continue
+              if (!liveNow.has(ref.name) && ref.size > 0) {
+                const childDone = await this.doneMarksAll({ ...sourceFor(dir, ref.name, ref.size, c), live: false }, entries)
+                if (!childDone.torn && childDone.records.length > 0) continue
+              }
+              allPendingCovered = false
+              break
+            }
+            if (allPendingCovered) return { action: 'drop' }
           }
-          if ([...pendingNames].some(pn => liveNow.has(pn))) return 'hold'
-          return 'wait'
+          if (pendingRefs.some(ref => liveNow.has(ref.name))) return { action: 'hold' }
+          return { action: 'wait' }
         }
         for (const r of latestV2) {
+          if (!matchesParentSize(r)) continue
           const jFiles = Array.isArray(r.files) ? r.files : []
           const idx = jFiles.findIndex(f => typeof f === 'string' && baseOf(f) === targetName)
           if (idx === -1) continue
-          const overlapRefs = [
+          const allOverlapRefs = [
             ...normalizeReconciled(r.reconciled),
             ...normalizeReconciled(r.pendingReconcile, true),
           ]
-          if (overlapRefs.some(ref => liveNow.has(ref.name))) return 'hold'
-          // If a same-size retired record (e.g. 0.1.3 retiring P from v1=[C] or
-          // v2Guard=[C]) named every reconciled child of an adopted replacement
-          // R_c AND each of those children actually completed its own replay at
-          // its reconciled byte size (has a non-torn same-size retired done mark,
-          // rather than having been emptied by 0.1.4's `failed-keep` cleanup or
-          // matching an older generation's size), drop redundant R_c rather than
-          // duplicating C's rows.
+          // When `replaces` identifies the exact child that this synthesized
+          // standalone replacement replaced, scope live-hold and dedup-drop to
+          // that child alone; never hold or drop an unmodified adopted child
+          // (`isChildGuard` or `replaces === undefined`) just because a sibling
+          // reconciled child completed its own replay.
+          const scopedOverlapRefs = replaces !== undefined ? allOverlapRefs.filter(ref => ref.name === replaces) : allOverlapRefs
+          if (!isChildGuard && scopedOverlapRefs.some(ref => liveNow.has(ref.name))) return { action: 'hold' }
           const adoptedNames = Array.isArray(r.adopted)
             ? r.adopted.filter((x): x is string => typeof x === 'string' && x !== '').map(baseOf)
             : []
-          if (adoptedNames.includes(targetName) && overlapRefs.length > 0 && !anyTorn) {
+          // A standalone parent leftover (`!isChildGuard && !adoptedNames.includes(targetName)`)
+          // that was not named in any same-size retired record (Step 3 already
+          // returned `'go'` if any same-size retired record named it) is
+          // superseded once a same-size retired outcome exists that already
+          // emitted its own fresh leftover files (not overlapping `reconciled`,
+          // `pendingReconcile`, or `adopted`) covering every non-'L' row fate in
+          // `r.fates` (e.g. 0.1.3 finished an unwritten stale v1 journal and
+          // retired P). Do NOT drop when `ret.files` names a reconciled/pending
+          // child `C` that 0.1.4 drops or skips in reliance on `L_p`, or when a
+          // stale `files: []` / `fates: 'LL'` retirement contradicts `r.fates`.
+          const allV2LeftoversWritten = writtenOf(r).every(Boolean)
+          const nonFreshRetNames = new Set([...(allV2LeftoversWritten ? allOverlapRefs.map(ref => ref.name) : []), ...adoptedNames])
+          const retiredCoversLeftover = (ret: Partial<Journal>): boolean => {
+            if (r.size !== undefined && ret.size !== r.size) return false
+            if (!Array.isArray(ret.files) || ret.files.length === 0) return false
+            if (ret.files.some(f => typeof f !== 'string' || f === '' || nonFreshRetNames.has(baseOf(f)))) return false
+            if (typeof r.fates !== 'string' || typeof ret.fates !== 'string' || r.fates === '' || ret.fates.length !== r.fates.length) {
+              return false
+            }
+            let hasNonLanded = false
+            for (let i = 0; i < r.fates.length; i += 1) {
+              if (r.fates[i] !== 'L') {
+                hasNonLanded = true
+                if (ret.fates[i] !== r.fates[i]) return false
+              }
+            }
+            return hasNonLanded
+          }
+          if (
+            !isChildGuard &&
+            !adoptedNames.includes(targetName) &&
+            !anyTorn &&
+            allRetired.some(retiredCoversLeftover)
+          ) {
+            return { action: 'drop' }
+          }
+          if (!isChildGuard && replaces !== undefined && adoptedNames.includes(targetName) && scopedOverlapRefs.length > 0 && !anyTorn) {
             const sameSizeRetired = allRetired.filter(ret => r.size === undefined || ret.size === r.size)
             if (
               sameSizeRetired.length > 0 &&
-              overlapRefs.every(ref =>
+              scopedOverlapRefs.every(ref =>
                 sameSizeRetired.some(ret => Array.isArray(ret.files) && ret.files.some(f => typeof f === 'string' && baseOf(f) === ref.name)),
               )
             ) {
               let allChildrenReplayed = true
-              for (const ref of overlapRefs) {
+              for (const ref of scopedOverlapRefs) {
                 if (ref.size <= 0) {
                   allChildrenReplayed = false
                   break
@@ -2821,26 +2970,27 @@ export class Writer {
                   break
                 }
               }
-              if (allChildrenReplayed) return 'drop'
+              if (allChildrenReplayed) return { action: 'drop' }
             }
           }
-          return 'go'
+          return { action: 'go' }
         }
-        // If 0.1.4 already retired P with reconciled digests and cleaned up all
-        // unretired v2 checkpoints without naming `targetName`, `targetName` is
-        // a superseded aborted stage. Never drop if any slot is torn or any
-        // unretired v2 checkpoint still exists (e.g. a newer generation
-        // repopulated P after an older generation retired).
+        // If 0.1.4 already retired P at this size with reconciled digests and
+        // cleaned up all unretired v2 checkpoints without naming standalone
+        // `targetName`, `targetName` is a superseded aborted stage. Never drop
+        // a `childGuard` original child here or if any slot is torn or any
+        // matching-size unretired v2 checkpoint still exists.
         if (
+          !isChildGuard &&
           !anyTorn &&
-          !latestV2.some(r => r.retired !== true) &&
-          allRetired.some(ret => normalizeReconciled(ret.reconciled).length > 0)
+          !latestV2.some(r => matchesParentSize(r) && r.retired !== true) &&
+          allRetired.some(ret => matchesParentSize(ret) && normalizeReconciled(ret.reconciled).length > 0)
         ) {
-          return 'drop'
+          return { action: 'drop' }
         }
-        return 'wait'
+        return liveParentRetired ? { action: 'wait', parentRetired: true } : { action: 'wait' }
       } catch {
-        return 'wait'
+        return { action: 'wait' }
       }
     }
     const me = this.sessionId() ?? 'unknown'
@@ -2936,6 +3086,9 @@ export class Writer {
         }
         let stagedForParent: string | undefined
         let allowStagedFor: string | undefined
+        let guardApprovedParent: string | undefined
+        let guardSkipIndices: ReadonlySet<number> | undefined
+        let guardAccountedKeys: ReadonlySet<string> | undefined
         if (found !== undefined && 'pending' in found) {
           // A replay sent rows of it, or was about to, and recorded no
           // outcome: its writer may yet (still at it, or unable to write its
@@ -2953,22 +3106,53 @@ export class Writer {
               files.push(name)
               continue
             }
-            const guard = await stagedGuardState(found.stagedFor, name)
-            if (guard === 'drop') {
+            const guard = await stagedGuardState(found.stagedFor, found.stagedForSize, name, path, found.childGuard === true, found.replaces)
+            if (guard.action === 'drop') {
               if (await this.emptyCopy(path)) {
                 emptiedInRun.add(name)
                 parentIndex.delete(name)
                 this.uncertainSources.delete(path)
+                for (const ownMark of [doneFileOf(dir, name, this.mark), doneFileOf(dir, name, `${this.mark}g`)]) {
+                  try {
+                    if (this.io.exists === undefined || (await this.io.exists(ownMark))) {
+                      await this.io.writeFile(ownMark, '')
+                    }
+                  } catch {
+                    // Best-effort clear of our own guard mark after truncation.
+                  }
+                }
               } else {
                 tally.waiting += 1
               }
               continue
             }
-            if (guard === 'hold' || (stagedGuardClearable && guard === 'wait' && trigger !== 'force')) {
-              parentWaits.push(name)
+            if (guard.action === 'hold' && pendingLiveFiles.size > 0 && !deferredChildren.has(name)) {
+              deferredChildren.add(name)
+              files.push(name)
+              continue
+            }
+            const parentEmptyOrRetired = !isSourceLive(found.stagedFor) || (guard.action === 'wait' && guard.parentRetired === true)
+            if (guard.action === 'hold' || (stagedGuardClearable && guard.action === 'wait' && trigger !== 'force')) {
+              if (found.childGuard === true && guard.action === 'wait' && parentEmptyOrRetired) {
+                this.noteHeld(
+                  report,
+                  trigger,
+                  `parent ${found.stagedFor} retired without accounting for guarded child ${name}; /bqaa-backfill force replays the file afresh`,
+                  path,
+                )
+              } else {
+                parentWaits.push(name)
+              }
               report.skippedFiles += 1
               if (kindOf(name) !== 'rejected') tally.waiting += 1
               continue
+            }
+            if (guard.action === 'go') {
+              if (found.childGuard === true) guardApprovedParent = found.stagedFor
+              if (guard.skipIndices !== undefined && guard.skipIndices.length > 0) guardSkipIndices = new Set(guard.skipIndices)
+              if (guard.accountedKeys !== undefined && guard.accountedKeys.size > 0) guardAccountedKeys = guard.accountedKeys
+            } else if (trigger === 'force' && found.childGuard === true && guard.action === 'wait' && parentEmptyOrRetired) {
+              guardApprovedParent = found.stagedFor
             }
             if (stagedGuardClearable) {
               allowStagedFor = found.stagedFor
@@ -2992,7 +3176,7 @@ export class Writer {
             found = undefined
           }
         }
-        const known = await this.resumeRewrite(path, source, kindOf(name) ?? 'retry', held, found)
+        const known = await this.resumeRewrite(path, source, kindOf(name) ?? 'retry', held, found, trigger)
         let emptied = true
         if (known === 'unaccounted' && trigger !== 'force') {
           const foreign = await this.hasActiveForeignMark(source)
@@ -3111,7 +3295,10 @@ export class Writer {
               }
             }
             const parentSize = parentName !== null && isSourceLive(parentName) ? (listed.get(parentName) ?? 0) : 0
-            const rawFate = parentName === null ? 'go' : await this.parentFate(dir, parentName, path, parentSize, c)
+            const rawFate =
+              parentName === null || guardApprovedParent === parentName
+                ? 'go'
+                : await this.parentFate(dir, parentName, path, parentSize, c)
             const hasLiveOrWrittenGrandchild =
               supersededUnaccounted !== undefined &&
               Array.isArray(supersededUnaccounted.files) &&
@@ -3171,6 +3358,10 @@ export class Writer {
               if (kindOf(name) !== 'rejected') tally.waiting += 1
             } else {
               if (trigger === 'force') this.uncertainSources.delete(path)
+              const mergedAccountedKeys =
+                parentAccountedKeys !== undefined && guardAccountedKeys !== undefined
+                  ? new Set([...parentAccountedKeys, ...guardAccountedKeys])
+                  : (parentAccountedKeys ?? guardAccountedKeys)
               emptied = await this.backfillFile(
                 dir,
                 name,
@@ -3184,8 +3375,9 @@ export class Writer {
                 parentIndex,
                 supersededUnaccounted,
                 emptiedInRun,
-                parentAccountedKeys,
+                mergedAccountedKeys,
                 allowStagedFor,
+                guardSkipIndices,
               )
               if (this.retiredEmpty.has(path)) {
                 emptiedInRun.add(name)
@@ -3330,8 +3522,12 @@ export class Writer {
           const isFreshLive = (n: string): boolean => (freshListed !== null ? (freshListed.get(n) ?? 0) > 0 : isSourceLive(n))
           const hasLiveChild = (stored: unknown): boolean => {
             if (stored === null || typeof stored !== 'object') return false
-            const fs = (stored as Partial<Journal>).files
-            return Array.isArray(fs) && fs.some(f => typeof f === 'string' && isFreshLive(baseOf(f)))
+            const j = stored as Partial<Journal>
+            if (Array.isArray(j.files) && j.files.some(f => typeof f === 'string' && isFreshLive(baseOf(f)))) return true
+            if (normalizeStaged(j.stagedFiles).some(f => isFreshLive(f))) return true
+            if (normalizeReconciled(j.reconciled).some(r => isFreshLive(r.name))) return true
+            if (normalizeReconciled(j.pendingReconcile, true).some(r => isFreshLive(r.name))) return true
+            return false
           }
           const ensureLiveParents = async (): Promise<void> => {
             if (liveParentsChecked) return
@@ -3379,20 +3575,20 @@ export class Writer {
               }
             }
           }
-          // Re-verify in a single directory scan before deleting a batch of
-          // store/companion records that no new or grown live dead-letter file
-          // appeared and none of the batch's parents became live after
-          // `freshListed` was captured (O(1) listings per cleanup pass instead
-          // of O(N^2) per-parent scans).
-          const MAX_CLEANUP_PARENTS_PER_PASS = 64
-          const confirmDirStable = async (parentNames: ReadonlySet<string>): Promise<boolean> => {
-            if (freshListed === null || parentNames.size === 0) return false
+          // Re-verify per parent right before deleting its store/companion
+          // records that no new or grown live dead-letter file appeared and the
+          // parent did not become live while earlier deletions ran, while
+          // capping per-pass cleanups to a small constant so directory scans
+          // stay O(1) per backfill pass instead of O(N^2).
+          const MAX_CLEANUP_PARENTS_PER_PASS = 8
+          const confirmDirStable = async (parentName: string): Promise<boolean> => {
+            if (freshListed === null) return false
             try {
               const nowEntries = await cleanupOp(this.io.listDir(dir))
               if (nowEntries === CLEANUP_ABORT) return false
               for (const entry of nowEntries) {
                 if (entry.kind !== undefined && entry.kind !== 'file') continue
-                if (parentNames.has(entry.name) && entry.size > 0) return false
+                if (entry.name === parentName && entry.size > 0) return false
                 if (kindOf(entry.name) !== null && (!freshListed.has(entry.name) || (entry.size > 0 && freshListed.get(entry.name) !== entry.size))) {
                   return false
                 }
@@ -3487,9 +3683,10 @@ export class Writer {
             if (keepParent || cleanupStopped()) continue
             readyExpired.push({ of, nonEmpty, storedKeysPresent })
           }
-          if (readyExpired.length > 0 && !cleanupStopped() && (await confirmDirStable(new Set(readyExpired.map(x => x.of))))) {
+          if (readyExpired.length > 0 && !cleanupStopped()) {
             for (const { of, nonEmpty, storedKeysPresent } of readyExpired) {
               if (cleanupStopped()) break
+              if (!(await confirmDirStable(of))) break
               // Delete store entries BEFORE truncating on-disk companion files so a
               // store failure or exit-cleanup cutoff never strands an orphaned v2
               // store key with no remaining done mark on disk to reclaim it.
@@ -3579,9 +3776,10 @@ export class Writer {
                 // Best-effort cleanup; next replay retries.
               }
             }
-            if (readyOrphanedV2.length > 0 && !cleanupStopped() && (await confirmDirStable(new Set(readyOrphanedV2.map(x => x.of))))) {
-              for (const { v2Key } of readyOrphanedV2) {
+            if (readyOrphanedV2.length > 0 && !cleanupStopped()) {
+              for (const { of, v2Key } of readyOrphanedV2) {
                 if (cleanupStopped()) break
+                if (!(await confirmDirStable(of))) break
                 try {
                   const deleted = await cleanupOp(this.io.storeDelete(v2Key))
                   if (deleted === CLEANUP_ABORT) break
@@ -4018,13 +4216,6 @@ export class Writer {
         }
       }
     }
-    // Pre-retirement v1 guard file written beside `outcome-` to prevent 0.1.3
-    // readers from dropping pending/adopted children when stale v1 cannot be
-    // cleared: prefer the authoritative same-size v2 checkpoint cleanly even if
-    // a forced retry updated `fates` and failed to rewrite `v2Guard`.
-    if (a.size === b.size && a.v2Guard === true && v1.found.filed && a.retired !== true) {
-      return v2.found
-    }
     // If this v2 checkpoint explicitly recorded that it superseded this exact
     // stale unretired v1 snapshot (which could neither be deleted nor
     // neutralized in place), resume v2 cleanly across session restarts instead
@@ -4067,7 +4258,7 @@ export class Writer {
     // go. So the marks are read, and only then the done marks listed
     // again, before none is taken for an answer.
     entries = await this.io.listDir(source.dir)
-    const { by, activeBy, nonUncertainBy, nonStagedBy, uncertain, stagedFor } = await this.marksDetailed(source, entries)
+    const { by, activeBy, nonUncertainBy, nonStagedBy, uncertain, stagedFor, stagedForSize, childGuard, replaces } = await this.marksDetailed(source, entries)
     const again = await doneIn(await this.io.listDir(source.dir))
     if (again.done !== undefined) return { journal: again.done, filed: true }
     if (v1.torn || v2.torn || doneTorn || again.torn) return 'torn'
@@ -4080,6 +4271,9 @@ export class Writer {
           ...(nonStagedBy.length > 0 ? { nonStagedBy } : {}),
           ...(uncertain ? { uncertain: true } : {}),
           ...(stagedFor !== undefined ? { stagedFor } : {}),
+          ...(stagedForSize !== undefined ? { stagedForSize } : {}),
+          ...(childGuard ? { childGuard: true } : {}),
+          ...(replaces !== undefined ? { replaces } : {}),
         }
   }
 
@@ -4171,30 +4365,37 @@ export class Writer {
       }
       if (found === 'torn' || found === 'conflict' || (found !== undefined && 'pending' in found)) return 'wait'
       if (found === undefined) return 'go'
-      const at = (Array.isArray(found.journal.files) ? found.journal.files : []).findIndex(entry => entry === path || baseOf(entry) === targetName)
-      if (at !== -1) return writtenOf(found.journal)[at] === true ? 'go' : 'wait'
-      if (found.journal.retired !== true && normalizeStaged(found.journal.stagedFiles).includes(targetName)) return 'wait'
       const reconciledEntry = normalizeReconciled(found.journal.reconciled).find(entry => entry.name === targetName)
-      if (reconciledEntry !== undefined && found.journal.retired !== true) {
-        if (reconciledEntry.fnv1a === '') return 'wait'
-        try {
-          const curRaw = await this.io.readFile(path)
-          if (curRaw === '' || (utf8Length(curRaw) === reconciledEntry.size && fnv1a(curRaw) === reconciledEntry.fnv1a)) return 'wait'
-        } catch {
-          return 'wait'
+      const at = (Array.isArray(found.journal.files) ? found.journal.files : []).findIndex(entry => entry === path || baseOf(entry) === targetName)
+      if (found.journal.retired === true) {
+        // Retired markers keep reconciled basenames in `files` so 0.1.3 never
+        // drops a repopulated child; fall through to the multi-generation
+        // digest check whenever `targetName` is either reconciled or unnamed.
+        if (at !== -1 && reconciledEntry === undefined) return 'go'
+      } else {
+        if (at !== -1) return writtenOf(found.journal)[at] === true ? 'go' : 'wait'
+        if (normalizeStaged(found.journal.stagedFiles).includes(targetName)) return 'wait'
+        if (reconciledEntry !== undefined) {
+          if (reconciledEntry.fnv1a === '') return 'wait'
+          try {
+            const curRaw = await this.io.readFile(path)
+            if (curRaw === '' || (utf8Length(curRaw) === reconciledEntry.size && fnv1a(curRaw) === reconciledEntry.fnv1a)) return 'wait'
+          } catch {
+            return 'wait'
+          }
         }
-      }
-      const pendingEntry = normalizeReconciled(found.journal.pendingReconcile, true).find(entry => entry.name === targetName)
-      if (pendingEntry !== undefined && found.journal.retired !== true) {
-        if (pendingEntry.fnv1a === '') return 'wait-pending'
-        try {
-          const curRaw = await this.io.readFile(path)
-          if (curRaw === '' || (utf8Length(curRaw) === pendingEntry.size && fnv1a(curRaw) === pendingEntry.fnv1a)) return 'wait-pending'
-        } catch {
-          return 'wait'
+        const pendingEntry = normalizeReconciled(found.journal.pendingReconcile, true).find(entry => entry.name === targetName)
+        if (pendingEntry !== undefined) {
+          if (pendingEntry.fnv1a === '') return 'wait-pending'
+          try {
+            const curRaw = await this.io.readFile(path)
+            if (curRaw === '' || (utf8Length(curRaw) === pendingEntry.size && fnv1a(curRaw) === pendingEntry.fnv1a)) return 'wait-pending'
+          } catch {
+            return 'wait'
+          }
         }
+        return 'go'
       }
-      if (found.journal.retired !== true) return 'go'
       // Never authorize `drop` from a single-size lookup alone: fall through to
       // the multi-generation inspection below so another parent-size generation
       // that owns `path` is not overlooked.
@@ -4270,14 +4471,6 @@ export class Writer {
           bucket.v1Filed = f
         } else if (bucket.v1Filed.retired === true && f.retired !== true && seqOf(bucket.v1Filed) > seqOf(f)) {
           // Keep the higher-seq retired v1 shadow over an unretired stale companion.
-        } else if (
-          f.v2Guard === true &&
-          bucket.v1Filed.v2Guard === true &&
-          f.retired !== true &&
-          bucket.v1Filed.retired !== true &&
-          seqOf(f) !== seqOf(bucket.v1Filed)
-        ) {
-          if (seqOf(f) > seqOf(bucket.v1Filed)) bucket.v1Filed = f
         } else {
           bucket.v1Conflict = true
         }
@@ -4309,13 +4502,63 @@ export class Writer {
     let hasConflict = false
     for (const group of bySize.values()) {
       if (group.done !== undefined) {
-        resolved.push({ journal: group.done, canAuthorizeDrop: true })
+        const v2Merged = mergeSlot(group.v2Stored, group.v2Filed, group.v2Conflict, true)
+        let doneJournal = group.done
+        if (v2Merged !== undefined && v2Merged !== 'conflict' && normalizeReconciled(group.done.reconciled).length === 0) {
+          const v2AllWritten = writtenOf(v2Merged).every(Boolean)
+          const v2Reconciled = v2AllWritten ? normalizeReconciled(v2Merged.reconciled) : []
+          const v2Pending = normalizeReconciled(v2Merged.pendingReconcile, true)
+          const v2Adopted = Array.isArray(v2Merged.adopted)
+            ? v2Merged.adopted.filter((f): f is string => typeof f === 'string' && f !== '').map(baseOf)
+            : []
+          const v2NonFresh = new Set([...v2Reconciled.map(r => r.name), ...v2Pending.map(p => p.name), ...v2Adopted])
+          const doneCoversV2Leftovers = (): boolean => {
+            if (!Array.isArray(doneJournal.files) || doneJournal.files.length === 0) return false
+            if (doneJournal.files.some(f => typeof f !== 'string' || f === '' || v2NonFresh.has(baseOf(f)))) return false
+            if (
+              typeof v2Merged.fates !== 'string' ||
+              typeof doneJournal.fates !== 'string' ||
+              v2Merged.fates === '' ||
+              doneJournal.fates.length !== v2Merged.fates.length
+            ) {
+              return false
+            }
+            let hasNonLanded = false
+            for (let i = 0; i < v2Merged.fates.length; i += 1) {
+              if (v2Merged.fates[i] !== 'L') {
+                hasNonLanded = true
+                if (doneJournal.fates[i] !== v2Merged.fates[i]) return false
+              }
+            }
+            return hasNonLanded
+          }
+          const v2Written = writtenOf(v2Merged)
+          const v2WrittenLeftovers =
+            v2AllWritten && !doneCoversV2Leftovers() && Array.isArray(v2Merged.files)
+              ? v2Merged.files
+                  .map((f, i) => (v2Written[i] === true && typeof f === 'string' && f !== '' ? baseOf(f) : ''))
+                  .filter(n => n !== '' && !v2Adopted.includes(n))
+              : []
+          const extraFiles = [...v2Adopted, ...v2Pending.map(p => p.name), ...v2WrittenLeftovers].filter(
+            n => !(Array.isArray(doneJournal.files) && doneJournal.files.some(f => typeof f === 'string' && baseOf(f) === n)),
+          )
+          if (v2Reconciled.length > 0 || extraFiles.length > 0) {
+            doneJournal = {
+              ...doneJournal,
+              ...(v2Reconciled.length > 0 ? { reconciled: v2Reconciled } : {}),
+              ...(extraFiles.length > 0
+                ? { files: [...(Array.isArray(doneJournal.files) ? doneJournal.files : []), ...extraFiles] }
+                : {}),
+            }
+          }
+        }
+        resolved.push({ journal: doneJournal, canAuthorizeDrop: true })
         continue
       }
       const v1Merged =
         !group.v1Conflict &&
         group.v1Filed !== undefined &&
-        (group.v1Filed.retired === true || group.v1Filed.v2Guard === true) &&
+        group.v1Filed.retired === true &&
         (group.v1Stored === undefined || (group.v1Stored.retired !== true && seqOf(group.v1Filed) > seqOf(group.v1Stored)))
           ? group.v1Filed
           : mergeSlot(group.v1Stored, group.v1Filed, group.v1Conflict)
@@ -4335,14 +4578,13 @@ export class Writer {
             normalizeSupersededV1(v2Merged.supersedesV1) !== undefined
           const canAuthorizeDrop =
             picked.journal.retired === true ||
-            (v1Merged.v2Guard !== true &&
-              !v2PendingOrSuperseded &&
+            (!v2PendingOrSuperseded &&
               v1Merged.fates === v2Merged.fates &&
               sameNames(Array.isArray(v1Merged.files) ? v1Merged.files : [], Array.isArray(v2Merged.files) ? v2Merged.files : []))
           resolved.push({ journal: picked.journal, canAuthorizeDrop })
         }
       } else if (v1Merged !== undefined) {
-        resolved.push({ journal: v1Merged, canAuthorizeDrop: v1Merged.v2Guard !== true })
+        resolved.push({ journal: v1Merged, canAuthorizeDrop: true })
       } else if (v2Merged !== undefined) {
         // A v2 split never empties its parent without writing a retired done
         // mark, so a bare v2 journal beside an emptied parent cannot prove
@@ -4353,14 +4595,13 @@ export class Writer {
     if (bySize.size === 1) {
       if (hasConflict || resolved.length === 0) return 'ambiguous'
       const only = resolved[0]!
-      if (namesTarget(only.journal)) return 'go'
       const unexplainedTorn = [...v1.tornSizes, ...v2.tornSizes].some(
         sz => sz === null || sz !== only.journal.size || only.journal.retired !== true,
       )
-      if (doneAll.torn || unexplainedTorn || !only.canAuthorizeDrop) return 'ambiguous'
-      // If this parent's retired record explicitly reconciled `targetName` at a
-      // specific `{ size, fnv1a }` digest, never drop a newer generation that
-      // repopulated the same basename with different content.
+      // Check reconciled digests BEFORE `namesTarget` because retired markers
+      // also keep reconciled basenames in `files` so 0.1.3 never drops a child
+      // repopulated after retirement. An unchanged reconciled child drops; a
+      // repopulated child (size or FNV-1a mismatch) proceeds (`go`).
       const reconciledEntry = normalizeReconciled(only.journal.reconciled).find(entry => entry.name === targetName)
       if (reconciledEntry !== undefined) {
         try {
@@ -4371,7 +4612,11 @@ export class Writer {
         } catch {
           return 'wait'
         }
+        if (doneAll.torn || unexplainedTorn || !only.canAuthorizeDrop) return 'ambiguous'
+        return only.journal.retired === true || writtenOf(only.journal).every(Boolean) ? 'drop' : 'go'
       }
+      if (namesTarget(only.journal)) return 'go'
+      if (doneAll.torn || unexplainedTorn || !only.canAuthorizeDrop) return 'ambiguous'
       // Not named: a late copy of another session's outcome, where the record
       // is the mark the parent was done, or a whole one of an emptied parent
       // with every file it names written (its done mark lost, or never written:
@@ -4379,26 +4624,41 @@ export class Writer {
       return only.journal.retired === true || writtenOf(only.journal).every(Boolean) ? 'drop' : 'go'
     }
     // Multiple distinct parent-size generations coexist (e.g. a legacy 0.1.3
-    // rewrite alongside a stale v2 slot): never drop a child named by any
-    // resolved generation. If an unambiguous retired generation explicitly
-    // recorded `targetName` in `reconciled` with a `{ size, fnv1a }` digest
-    // that still matches the live file, authorize `'drop'` so reconciled rows
-    // are not re-sent; preserve the child as `'ambiguous'` otherwise.
-    if (resolved.some(r => namesTarget(r.journal))) return 'go'
-    if (!hasConflict && !doneAll.torn) {
-      const reconciledEntries = resolved
-        .filter(r => r.canAuthorizeDrop && r.journal.retired === true)
-        .flatMap(r => normalizeReconciled(r.journal.reconciled).filter(entry => entry.name === targetName))
-      if (reconciledEntries.length > 0) {
-        try {
-          const curRaw = await this.io.readFile(path)
-          if (curRaw === '' || reconciledEntries.some(entry => utf8Length(curRaw) === entry.size && fnv1a(curRaw) === entry.fnv1a)) {
-            return 'drop'
-          }
-        } catch {
-          return 'wait'
-        }
+    // rewrite alongside a stale v2 slot): never drop a child genuinely named by
+    // any resolved generation (ignoring reconciled-only basename entries whose
+    // digest still matches the live file). If an unambiguous retired generation
+    // explicitly recorded `targetName` in `reconciled` with a `{ size, fnv1a }`
+    // digest that still matches the live file, authorize `'drop'` so reconciled
+    // rows are not re-sent; preserve the child as `'ambiguous'` otherwise.
+    let cachedRaw: string | undefined
+    const readCur = async (): Promise<string | null> => {
+      if (cachedRaw !== undefined) return cachedRaw
+      try {
+        cachedRaw = await this.io.readFile(path)
+        return cachedRaw
+      } catch {
+        return null
       }
+    }
+    const matchesReconciledIn = async (journal: Partial<Journal>): Promise<'match' | 'mismatch' | 'none' | 'error'> => {
+      const entry = normalizeReconciled(journal.reconciled).find(e => e.name === targetName)
+      if (entry === undefined) return 'none'
+      const curRaw = await readCur()
+      if (curRaw === null) return 'error'
+      return curRaw === '' || (utf8Length(curRaw) === entry.size && fnv1a(curRaw) === entry.fnv1a) ? 'match' : 'mismatch'
+    }
+    let hasMatchingRetiredReconciled = false
+    for (const r of resolved) {
+      const recState = await matchesReconciledIn(r.journal)
+      if (recState === 'error') return 'wait'
+      if (recState === 'match') {
+        if (r.canAuthorizeDrop && r.journal.retired === true) hasMatchingRetiredReconciled = true
+        continue
+      }
+      if (namesTarget(r.journal)) return 'go'
+    }
+    if (!hasConflict && !doneAll.torn && hasMatchingRetiredReconciled) {
+      return 'drop'
     }
     return 'ambiguous'
   }
@@ -4548,6 +4808,9 @@ export class Writer {
     }
     const foundSupersededV1 = normalizeSupersededV1(found.journal.supersedesV1)
     if (foundSupersededV1 !== undefined) rewrite.supersedesV1 = foundSupersededV1
+    if (rewrite.accountedRowKeys === undefined && Array.isArray(found.journal.accountedKeys) && found.journal.accountedKeys.length > 0) {
+      rewrite.accountedRowKeys = new Set(found.journal.accountedKeys.filter((k): k is string => typeof k === 'string'))
+    }
     rewrite.filed ||= found.filed
     rewrite.seq = Math.max(rewrite.seq, seqOf(found.journal))
     return true
@@ -4564,9 +4827,22 @@ export class Writer {
     fileKind: DeadLetterKind,
     held: Rewrite | undefined,
     found: Found | undefined,
+    trigger?: BackfillReport['trigger'],
   ): Promise<Rewrite | 'unaccounted' | undefined> {
-    if (found === undefined) return held
-    if (held !== undefined && Writer.catchUp(held, found)) return held
+    const prepareHeldForForce = async (h: Rewrite): Promise<Rewrite | undefined> => {
+      if (trigger !== 'force' || found?.journal.retired === true) return h
+      h.force = true
+      if (h.accountedRowKeys === undefined) {
+        const text = await this.io.readFile(path)
+        if (text === '') return undefined
+        const lines = parseFile(text)
+        if (!lines.complete || (source.size >= 0 && utf8Length(text) !== source.size)) return undefined
+        h.accountedRowKeys = new Set(lines.lines.map((line, i) => parentRowIdentity(line, source.name, i)))
+      }
+      return h
+    }
+    if (found === undefined) return held !== undefined ? prepareHeldForForce(held) : undefined
+    if (held !== undefined && Writer.catchUp(held, found)) return prepareHeldForForce(held)
     const { journal } = found
     const paths = Array.isArray(journal.files) ? journal.files : []
     const written = writtenOf(journal)
@@ -4590,6 +4866,10 @@ export class Writer {
     const stagedList = normalizeStaged(journal.stagedFiles)
     const stagedFiles = stagedList.length > 0 ? stagedList : undefined
     const supersedesV1 = normalizeSupersededV1(journal.supersedesV1)
+    const savedAccountedKeys =
+      Array.isArray(journal.accountedKeys) && journal.accountedKeys.length > 0
+        ? new Set(journal.accountedKeys.filter((k): k is string => typeof k === 'string'))
+        : undefined
     const outcome: Outcome = {
       fates: typeof journal.fates === 'string' ? journal.fates : '',
       reasons: Array.isArray(journal.reasons) ? journal.reasons : [],
@@ -4616,10 +4896,19 @@ export class Writer {
       ...(pendingReconcile ? { pendingReconcile } : {}),
       ...(stagedFiles ? { stagedFiles } : {}),
       ...(supersedesV1 ? { supersedesV1 } : {}),
+      ...(savedAccountedKeys ? { accountedRowKeys: savedAccountedKeys } : {}),
+      ...(trigger === 'force' && journal.retired !== true ? { force: true } : {}),
       ...(useV2 ? { useV2: true } : {}),
     }
     const needsPendingReconcile = pendingReconcile !== undefined && pendingReconcile.length > 0
-    if (written.every(Boolean) && !needsPendingReconcile) return rewrite
+    const needsForceChildAudit = trigger === 'force' && journal.retired !== true
+    if (written.every(Boolean) && !needsPendingReconcile && !needsForceChildAudit) {
+      if (source.size >= 0) {
+        const current = await this.io.readFile(path)
+        if (current === '' || utf8Length(current) !== source.size) return undefined
+      }
+      return rewrite
+    }
     const text = await this.io.readFile(path)
     // Emptied meanwhile (another writer finished it): nothing to resume, and
     // its record is left as that writer left it.
@@ -4629,7 +4918,7 @@ export class Writer {
     // one since): the record is kept, and the file waits, as one with no
     // record does, until it reads whole.
     if (!lines.complete || (source.size >= 0 && utf8Length(text) !== source.size)) return undefined
-    if (needsPendingReconcile) {
+    if (needsPendingReconcile || needsForceChildAudit) {
       rewrite.accountedRowKeys = new Set(lines.lines.map((line, i) => parentRowIdentity(line, source.name, i)))
     }
     if (written.every(Boolean)) return rewrite
@@ -4712,6 +5001,8 @@ export class Writer {
     // at any check below: the mark that it was done stands as it is, never
     // written again, and only the file is emptied.
     let finished = found !== undefined && found !== 'torn' && found !== 'conflict' && found.journal.retired === true
+    let finishedJournal: Partial<Journal> | undefined =
+      finished && found !== undefined && found !== 'torn' && found !== 'conflict' ? found.journal : undefined
     let recorded = false
     if (found !== undefined && found !== 'torn' && found !== 'conflict') {
       if (rewrite.force && !finished && Writer.sameUnaccounted(found.journal, rewrite.supersededUnaccounted)) {
@@ -4777,6 +5068,7 @@ export class Writer {
       sz: number,
       fallbackRef?: ReconciledFile,
       currentListing?: ReadonlyMap<string, number> | null,
+      forceStandalone = false,
     ): Promise<ChildClassification> => {
       const childPath = joinPath(rewrite.dir, base)
       const fallback: ReconciledFile = fallbackRef ?? { name: base, size: Math.max(0, sz), fnv1a: '' }
@@ -4798,16 +5090,40 @@ export class Writer {
       }
       if (childFound !== undefined && childFound !== 'torn' && childFound !== 'conflict' && !('pending' in childFound) && childFound.journal.retired === true) {
         // Child already completed its own replay and wrote its retired marker
-        // (e.g. failed to truncate): never copy its rows into a replacement.
+        // (e.g. failed to truncate): never copy its rows into a replacement,
+        // and verify the bytes just read still match the generation that
+        // `childFound` describes before recording them as reconciled.
         try {
           const raw = await this.io.readFile(childPath)
           if (raw === '') return { action: 'skip' }
-          return { action: 'reconciled', ref: { name: base, size: utf8Length(raw), fnv1a: fnv1a(raw) } }
+          const actualSize = utf8Length(raw)
+          const actualDigest = fnv1a(raw)
+          if (actualSize !== sz || childFound.journal.size !== actualSize) {
+            return { action: 'defer', ref: fallback, reason: `${base} changed size while checking its retired record; deferring reconciliation` }
+          }
+          const parsedRetired = parseFile(raw)
+          if (!parsedRetired.complete) {
+            return { action: 'defer', ref: fallback, reason: `${base} is incomplete while checking its retired record; deferring reconciliation` }
+          }
+          const currentParent = parsedRetired.parent === null ? null : baseOf(parsedRetired.parent)
+          if (currentParent !== rewrite.name) return { action: 'skip' }
+          if (fallbackRef !== undefined && fallbackRef.fnv1a !== '' && (actualSize !== fallbackRef.size || actualDigest !== fallbackRef.fnv1a)) {
+            return { action: 'defer', ref: fallback, reason: `${base} changed content while checking its retired record; deferring reconciliation` }
+          }
+          const retiredOutcome: Outcome = {
+            fates: typeof childFound.journal.fates === 'string' ? childFound.journal.fates : '',
+            reasons: Array.isArray(childFound.journal.reasons) ? childFound.journal.reasons : [],
+            refusals: Array.isArray(childFound.journal.refusals) ? childFound.journal.refusals : [],
+          }
+          if (!fitsLines(parsedRetired, retiredOutcome)) {
+            return { action: 'defer', ref: fallback, reason: `${base} no longer matches its retired record; deferring reconciliation` }
+          }
+          return { action: 'reconciled', ref: { name: base, size: actualSize, fnv1a: actualDigest } }
         } catch {
           return { action: 'defer', ref: fallback, reason: `cannot read retired child ${base}; deferring reconciliation` }
         }
       }
-      if (rewrite.accountedRowKeys === undefined || sz > HOST_FILE_BYTES) {
+      if ((!forceStandalone && rewrite.accountedRowKeys === undefined) || sz > HOST_FILE_BYTES) {
         return { action: 'adopt' }
       }
       let raw: string
@@ -4824,12 +5140,26 @@ export class Writer {
       if (!parsed.complete) {
         return { action: 'defer', ref, reason: `${base} is incomplete; deferring reconciliation` }
       }
+      if (actualSize !== sz) {
+        return { action: 'defer', ref: fallback, reason: `${base} changed size while reading; deferring reconciliation` }
+      }
+      const currentParent = parsed.parent === null ? null : baseOf(parsed.parent)
+      if (currentParent !== null && currentParent !== rewrite.name) return { action: 'skip' }
       if (fallbackRef !== undefined && fallbackRef.fnv1a !== '' && (actualSize !== fallbackRef.size || actualDigest !== fallbackRef.fnv1a)) {
-        const currentParent = parsed.parent === null ? null : baseOf(parsed.parent)
         if (currentParent !== rewrite.name) return { action: 'skip' }
       }
-      let isChildPendingOrBad = childFound === 'torn' || childFound === 'conflict' || (childFound !== undefined && 'pending' in childFound)
-      let childOutcome: Outcome | null = null
+      const isOnlyOwnParentGuard =
+        childFound !== undefined &&
+        childFound !== 'torn' &&
+        childFound !== 'conflict' &&
+        'pending' in childFound &&
+        childFound.stagedFor === rewrite.name &&
+        childFound.uncertain !== true &&
+        (childFound.nonStagedBy ?? []).length === 0
+      let isChildPendingOrBad =
+        childFound === 'torn' ||
+        childFound === 'conflict' ||
+        (childFound !== undefined && 'pending' in childFound && !isOnlyOwnParentGuard)
       if (childFound !== undefined && childFound !== 'torn' && childFound !== 'conflict' && !('pending' in childFound)) {
         const cj = childFound.journal
         const hasLiveOrWrittenGrandchild =
@@ -4853,45 +5183,52 @@ export class Writer {
           // delivery status as uncertain rather than deadlocking parent and child.
           isChildPendingOrBad = true
         } else {
-          childOutcome = candidate
+          // Shipped 0.1.3 resumes a child with a valid unretired journal ahead
+          // of `marksOn` (`childGuard`), so defer reconciling `base` until its
+          // own unretired replay completes rather than racing to emit a replacement.
+          return { action: 'defer', ref, reason: `${base} has an active unretired replay record; deferring reconciliation` }
         }
       }
       const remainingEntries: { line: DeadLetterLine; index: number; refusedReason?: string }[] = []
-      let childRefusedIdx = 0
+      const skipIndices: number[] = []
       for (let i = 0; i < parsed.lines.length; i += 1) {
         const line = parsed.lines[i] as DeadLetterLine
-        const childFate = childOutcome ? childOutcome.fates[i] : undefined
-        let refusedReason: string | undefined
-        if (childFate === 'R' && childOutcome) {
-          refusedReason = childOutcome.reasons[childOutcome.refusals[childRefusedIdx] ?? -1] ?? ''
-          childRefusedIdx += 1
-        }
-        if (childFate === 'L') continue
         const identity = childRowIdentity(line)
-        if (identity !== null && rewrite.accountedRowKeys.has(identity)) continue
-        remainingEntries.push({ line, index: i, ...(refusedReason !== undefined ? { refusedReason } : {}) })
+        if (identity !== null && rewrite.accountedRowKeys?.has(identity) === true) {
+          skipIndices.push(i)
+          continue
+        }
+        remainingEntries.push({ line, index: i })
       }
       if (remainingEntries.length === 0 && parsed.unreadable.length === 0) {
         return { action: 'reconciled', ref }
       }
-      if (remainingEntries.length === parsed.lines.length && childOutcome === null) {
+      if (!forceStandalone && remainingEntries.length === parsed.lines.length) {
         return { action: 'adopt' }
       }
+      const pendingRef: ReconciledFile = skipIndices.length > 0 ? { ...ref, skipIndices } : ref
       return {
         action: 'replace',
-        ref,
+        ref: pendingRef,
         childKind: kindOf(base) ?? 'retry',
-        markUncertain: isChildPendingOrBad || (childOutcome?.uncertainLines?.length ?? 0) > 0,
+        markUncertain: isChildPendingOrBad,
         entries: remainingEntries,
         unreadable: parsed.unreadable,
       }
     }
     if (rewrite.force && !finished) {
+      const prevChildCount = (rewrite.adoptedFiles?.length ?? 0) + (rewrite.reconciledFiles?.length ?? 0) + (rewrite.pendingReconcile?.length ?? 0)
       const listed = await dirListing()
-      if (listed !== null) {
+      if (listed === null) {
+        this.recordError(`could not list ${rewrite.dir} during forced child audit for ${path}; retrying later`)
+        rewrite.waits = true
+        return false
+      }
+      {
         const adopted = new Set([...rewrite.files.map(f => baseOf(f.path)), ...(rewrite.adoptedFiles ?? [])])
         const reconciled = new Set((rewrite.reconciledFiles ?? []).map(r => r.name))
         const pendingSet = new Set((rewrite.pendingReconcile ?? []).map(r => r.name))
+        const stagedSet = new Set((rewrite.stagedFiles ?? []).map(baseOf))
         const entries = [...listed.entries()].map(([n, sz]) => ({ name: n, size: sz }))
         const candidateJournals: (Partial<Journal> | 'torn')[] = []
         for (const key of [rewrite.recordKey, rewrite.v2RecordKey]) {
@@ -4926,7 +5263,7 @@ export class Writer {
         // `pendingReconcile` so the parent's confirmed outcome is checkpointed
         // in v2 FIRST and a replacement write error never adopts landed rows.
         const inspectCandidate = async (base: string, sz: number): Promise<void> => {
-          if (base === '' || base === rewrite.name || adopted.has(base) || reconciled.has(base) || pendingSet.has(base) || sz <= 0) return
+          if (base === '' || base === rewrite.name || adopted.has(base) || reconciled.has(base) || pendingSet.has(base) || stagedSet.has(base) || sz <= 0) return
           const decision = await classifyChild(base, sz, undefined, listed)
           if (decision.action === 'skip') return
           if (decision.action === 'reconciled') {
@@ -4944,28 +5281,71 @@ export class Writer {
           ;(rewrite.adoptedFiles ??= []).push(base)
           if (kindOf(base) !== 'rejected') rewrite.waits = true
         }
-        let sawTorn = false
+        const maxAdoptedSeq = new Map<string, number>()
+        const maxStagedSeq = new Map<string, number>()
+        for (const n of adopted) maxAdoptedSeq.set(n, rewrite.seq)
+        for (const n of stagedSet) maxStagedSeq.set(n, rewrite.seq)
         for (const j of candidateJournals) {
-          if (j === 'torn') {
-            sawTorn = true
-            continue
+          if (j === 'torn' || j.size !== rewrite.size) continue
+          const jSeq = seqOf(j)
+          for (const staged of normalizeStaged(j.stagedFiles)) {
+            maxStagedSeq.set(staged, Math.max(maxStagedSeq.get(staged) ?? -1, jSeq))
           }
-          if (j.size !== rewrite.size || !Array.isArray(j.files)) continue
-          for (const entry of j.files) {
-            const base = typeof entry === 'string' ? baseOf(entry) : ''
+          if (Array.isArray(j.files)) {
+            for (const f of j.files) if (typeof f === 'string' && f !== '') maxAdoptedSeq.set(baseOf(f), Math.max(maxAdoptedSeq.get(baseOf(f)) ?? -1, jSeq))
+          }
+          if (Array.isArray(j.adopted)) {
+            for (const f of j.adopted) if (typeof f === 'string' && f !== '') maxAdoptedSeq.set(baseOf(f), Math.max(maxAdoptedSeq.get(baseOf(f)) ?? -1, jSeq))
+          }
+        }
+        stagedSet.clear()
+        for (const [staged, sSeq] of maxStagedSeq) {
+          if (sSeq > (maxAdoptedSeq.get(staged) ?? -1)) stagedSet.add(staged)
+        }
+        for (const j of candidateJournals) {
+          if (j === 'torn') continue
+          if (j.size !== rewrite.size) continue
+          const names = new Set<string>()
+          if (Array.isArray(j.files)) {
+            for (const entry of j.files) {
+              if (typeof entry === 'string' && entry !== '') names.add(baseOf(entry))
+            }
+          }
+          if (Array.isArray(j.adopted)) {
+            for (const entry of j.adopted) {
+              if (typeof entry === 'string' && entry !== '') names.add(baseOf(entry))
+            }
+          }
+          for (const ref of normalizeReconciled(j.pendingReconcile, true)) names.add(ref.name)
+          for (const ref of normalizeReconciled(j.reconciled)) names.add(ref.name)
+          for (const base of names) {
             await inspectCandidate(base, listed.get(base) ?? 0)
           }
         }
-        if (sawTorn) {
-          for (const [n, sz] of listed) {
-            if (sz <= 0 || n === rewrite.name || adopted.has(n) || reconciled.has(n) || pendingSet.has(n) || kindOf(n) === null || sz > HOST_FILE_BYTES) continue
-            const info = await this.readParentInfo(rewrite.dir, n, sz, parentIndex)
-            if (info.state === 'ok' && info.complete && info.parent === rewrite.name) {
-              await inspectCandidate(n, sz)
-            }
+        // Always scan live dead-letter files under `force` so children pointing
+        // to this parent are never dropped even after a conflict, fresh parent
+        // replay, or stale v1 journal with `files: []`.
+        for (const [n, sz] of listed) {
+          if (
+            sz <= 0 ||
+            n === rewrite.name ||
+            adopted.has(n) ||
+            reconciled.has(n) ||
+            pendingSet.has(n) ||
+            stagedSet.has(n) ||
+            kindOf(n) === null ||
+            sz > HOST_FILE_BYTES
+          ) {
+            continue
+          }
+          const info = await this.readParentInfo(rewrite.dir, n, sz, parentIndex)
+          if (info.state === 'ok' && info.complete && info.parent === rewrite.name) {
+            await inspectCandidate(n, sz)
           }
         }
       }
+      const nextChildCount = (rewrite.adoptedFiles?.length ?? 0) + (rewrite.reconciledFiles?.length ?? 0) + (rewrite.pendingReconcile?.length ?? 0)
+      if (nextChildCount > prevChildCount) recorded = false
     }
     const getAdoptedNames = (): string[] => rewrite.adoptedFiles ?? []
     const getReconciledRefs = (): ReconciledFile[] => rewrite.reconciledFiles ?? []
@@ -5107,11 +5487,6 @@ export class Writer {
           if (text === '') continue
           const kept = journalOf(text)
           if (kept !== undefined && kept !== 'torn' && kept.retired === true && !rewrite.wroteDone) continue
-          if (kept !== undefined && kept !== 'torn' && kept.v2Guard === true && kept.size === rewrite.size) {
-            if (!ok && !rewrite.wroteDone) continue
-            await this.io.writeFile(file, '')
-            continue
-          }
           if (await protectsLiveChild(kept)) continue
           await this.io.writeFile(file, '')
         } catch {
@@ -5140,6 +5515,10 @@ export class Writer {
       const pendingNow = getPendingRefs()
       const stagedNow = getStagedNames()
       const namesNow = getRewriteNames()
+      const needsAccountedKeys =
+        pendingNow.some(p => p.skipIndices === undefined || p.skipIndices.length === 0) &&
+        rewrite.accountedRowKeys !== undefined &&
+        rewrite.accountedRowKeys.size > 0
       const journal: Journal = {
         fates,
         reasons,
@@ -5154,6 +5533,7 @@ export class Writer {
         ...(reconciledNow.length > 0 ? { reconciled: reconciledNow } : {}),
         ...(pendingNow.length > 0 ? { pendingReconcile: pendingNow } : {}),
         ...(stagedNow.length > 0 ? { stagedFiles: stagedNow } : {}),
+        ...(needsAccountedKeys ? { accountedKeys: [...rewrite.accountedRowKeys!] } : {}),
         ...(rewrite.supersedesV1 !== undefined ? { supersedesV1: rewrite.supersedesV1 } : {}),
         ...(rewrite.files.some(f => f.uncertain === true)
           ? { uncertain: [...rewrite.files.map(f => f.uncertain === true), ...adoptedNow.map(() => false)] }
@@ -5221,6 +5601,70 @@ export class Writer {
       }
       await ensureOppositeSlotCleared()
     }
+    const clearChildGuardMarks = async (onlyNamed?: ReadonlySet<string>, exceptNamed?: ReadonlySet<string>): Promise<void> => {
+      if (rewrite.childGuardMarks === undefined || rewrite.childGuardMarks.size === 0) return
+      for (const guardedPath of [...rewrite.childGuardMarks.keys()]) {
+        const guardedName = baseOf(guardedPath)
+        if (onlyNamed !== undefined && !onlyNamed.has(guardedName)) continue
+        if (exceptNamed !== undefined && exceptNamed.has(guardedName)) continue
+        try {
+          await this.io.writeFile(doneFileOf(rewrite.dir, guardedName, `${this.mark}g`), '')
+          rewrite.childGuardMarks.delete(guardedPath)
+        } catch {
+          // Best-effort clear of child guard mark.
+        }
+      }
+    }
+    if (!finished && (getPendingRefs().length > 0 || getAdoptedNames().length > 0 || getReconciledRefs().length > 0)) {
+      const listedBeforeRecord = await dirListing()
+      if (listedBeforeRecord === null) {
+        this.recordError(`could not list ${rewrite.dir} before guarding children of ${path}; retrying later`)
+        return false
+      }
+      const guardTargets = new Map<string, number>()
+      const entriesBeforeRecord = [...listedBeforeRecord.entries()].map(([n, sz]) => ({ name: n, size: sz }))
+      const candidateNames = new Set([
+        ...getPendingRefs().map(r => r.name),
+        ...getAdoptedNames(),
+        ...getReconciledRefs().map(r => r.name),
+      ])
+      for (const childName of candidateNames) {
+        const childSize = listedBeforeRecord.get(childName) ?? 0
+        if (childSize <= 0 || childName === rewrite.name) continue
+        const childPath = joinPath(rewrite.dir, childName)
+        if (rewrite.tempMarks?.has(childPath)) continue
+        if (childSize <= HOST_FILE_BYTES) {
+          const info = await this.readParentInfo(rewrite.dir, childName, childSize, parentIndex)
+          if (info.state === 'error') {
+            this.recordError(`could not inspect parent header for child ${childName} of ${path}; retrying later`)
+            return false
+          }
+          if (info.state === 'ok' && info.complete && info.parent !== null && info.parent !== rewrite.name) continue
+        }
+        try {
+          const childSource = sourceFor(rewrite.dir, childName, childSize, c)
+          const childDone = await this.doneMarks(childSource, entriesBeforeRecord)
+          if (childDone.done !== undefined && !childDone.torn) continue
+          // Standalone replacements created in an earlier session already carry
+          // a non-`childGuard` `stagedFor` sending mark for this parent: never
+          // stamp `childGuard: true` onto them on resume.
+          const existingMarks = await this.marksDetailed(childSource, entriesBeforeRecord)
+          if (existingMarks.stagedFor === rewrite.name && existingMarks.childGuard !== true) continue
+        } catch {
+          this.recordError(`could not inspect replay record for child ${childName} of ${path}; retrying later`)
+          return false
+        }
+        guardTargets.set(childPath, childSize)
+      }
+      if (guardTargets.size > 0) {
+        const placedResult = await this.placeChildGuards(rewrite.dir, rewrite.name, rewrite.size, guardTargets, rewrite.childGuardMarks)
+        if (placedResult === null) {
+          this.recordError(`could not guard live children of ${path} before persisting v2 outcome; retrying later`)
+          return false
+        }
+        rewrite.childGuardMarks = placedResult.placed
+      }
+    }
     if (!recorded) await record()
     if (!finished) {
       if (!clearedActiveSlot) {
@@ -5244,19 +5688,9 @@ export class Writer {
     }
     if (!finished && rewrite.useV2 && !clearedOppositeSlot) {
       const v1Now = await this.readJournalSlot(rewrite, rewrite.recordKey, rewrite.recordFiles, false)
-      const rawV1Stored =
-        v1Now.rawStored !== undefined && (v1Now.rawStored.size === rewrite.size || rewrite.size < 0)
-          ? v1Now.rawStored
-          : undefined
-      if (v1Now.found?.journal.v2Guard === true) {
-        rewrite.seq = Math.max(rewrite.seq, seqOf(v1Now.found.journal))
-      }
-      stuckV1Journal =
-        v1Now.found?.journal.v2Guard === true
-          ? (rawV1Stored ?? v1Now.found.journal)
-          : (v1Now.found?.journal ?? (v1Now.torn ? 'torn' : undefined))
+      stuckV1Journal = v1Now.found?.journal ?? (v1Now.torn ? 'torn' : undefined)
       stuckV1Captured = true
-      if (stuckV1Journal !== undefined && stuckV1Journal !== 'torn' && stuckV1Journal.retired !== true && stuckV1Journal.v2Guard !== true) {
+      if (stuckV1Journal !== undefined && stuckV1Journal !== 'torn' && stuckV1Journal.retired !== true) {
         rewrite.seq = Math.max(rewrite.seq, seqOf(stuckV1Journal))
         const nextSuperseded: SupersededV1 = {
           size: typeof stuckV1Journal.size === 'number' ? stuckV1Journal.size : rewrite.size,
@@ -5327,8 +5761,18 @@ export class Writer {
           await this.unmark(rewrite)
           if (found.journal.retired === true) {
             if (Array.isArray(found.journal.files)) {
-              const retiredNames = new Set(found.journal.files.filter((f): f is string => typeof f === 'string').map(baseOf))
-              await clearTempMarks(retiredNames)
+              const stagedSet = new Set(getStagedNames())
+              const reconciledSet = new Set(normalizeReconciled(found.journal.reconciled).map(r => r.name))
+              const ownPendingSet = new Set(getPendingRefs().map(r => r.name))
+              const ownReconciledSet = new Set(getReconciledRefs().map(r => r.name))
+              const safeToRelease = new Set(
+                found.journal.files
+                  .filter((f): f is string => typeof f === 'string')
+                  .map(baseOf)
+                  .filter(n => !stagedSet.has(n) && !reconciledSet.has(n) && !ownPendingSet.has(n) && !ownReconciledSet.has(n)),
+              )
+              await clearTempMarks(safeToRelease)
+              if (!v1ShadowNeeded()) await clearChildGuardMarks(safeToRelease)
             }
             this.deleteHeldPath(path)
             this.currentScanHeld.delete(path)
@@ -5348,7 +5792,10 @@ export class Writer {
         }
         return false
       }
-      if (found !== undefined && found.journal.retired === true) finished = true
+      if (found !== undefined && found.journal.retired === true) {
+        finished = true
+        finishedJournal = found.journal
+      }
       return true
     }
     for (const file of rewrite.files) {
@@ -5367,14 +5814,14 @@ export class Writer {
         await this.io.writeFile(
           doneFileOf(rewrite.dir, baseOf(file.path), this.mark),
           sealFile(
-            `${JSON.stringify({ size: writtenSize, sending: true, uncertain: true, by: this.mark, ...(standalone ? { stagedFor: rewrite.name } : {}) })}\n`,
+            `${JSON.stringify({ size: writtenSize, sending: true, uncertain: true, by: this.mark, ...(standalone ? { stagedFor: rewrite.name, stagedForSize: rewrite.size } : {}) })}\n`,
           ),
         )
         this.uncertainSources.set(file.path, writtenSize)
       } else if (needsTempLeftoverMark) {
         await this.io.writeFile(
           doneFileOf(rewrite.dir, baseOf(file.path), this.mark),
-          sealFile(`${JSON.stringify({ size: writtenSize, sending: true, by: this.mark, stagedFor: rewrite.name })}\n`),
+          sealFile(`${JSON.stringify({ size: writtenSize, sending: true, by: this.mark, stagedFor: rewrite.name, stagedForSize: rewrite.size })}\n`),
         )
         ;(rewrite.tempMarks ??= new Set()).add(file.path)
       }
@@ -5397,73 +5844,72 @@ export class Writer {
       }
       await record()
     }
+    // When a stale v1 record could not be cleared and omits an unmodified
+    // adopted child still carrying `parent: rewrite.name`, queue that child for
+    // Phase 3 standalone materialization (`parent: null`) so even a subsequent
+    // `0.1.3` `/bqaa-backfill force` after `failed-keep` cannot truncate it.
+    const stuckV1Files =
+      stuckV1Journal !== undefined && stuckV1Journal !== 'torn' && Array.isArray(stuckV1Journal.files)
+        ? new Set(stuckV1Journal.files.filter((f): f is string => typeof f === 'string').map(baseOf))
+        : null
+    if (!finished && v1ShadowNeeded() && getAdoptedNames().length > 0) {
+      const hasOmittedAdopted = getAdoptedNames().some(n => stuckV1Files === null || !stuckV1Files.has(n))
+      const listedForAdopt = await dirListing()
+      if (listedForAdopt === null) {
+        if (hasOmittedAdopted) {
+          this.recordError(`could not list ${rewrite.dir} to materialize adopted children for ${path}; retrying later`)
+          rewrite.waits = true
+          return false
+        }
+      } else {
+        const toStandalone: ReconciledFile[] = []
+        const keepAdopted: string[] = []
+        for (const adoptedName of getAdoptedNames()) {
+          if (stuckV1Files !== null && stuckV1Files.has(adoptedName)) {
+            keepAdopted.push(adoptedName)
+            continue
+          }
+          const sz = listedForAdopt.get(adoptedName) ?? 0
+          if (sz <= 0 || sz > HOST_FILE_BYTES) {
+            keepAdopted.push(adoptedName)
+            continue
+          }
+          const info = await this.readParentInfo(rewrite.dir, adoptedName, sz, parentIndex)
+          if (info.state === 'error') {
+            this.recordError(`could not inspect parent header for adopted child ${adoptedName} of ${path}; retrying later`)
+            rewrite.waits = true
+            return false
+          }
+          if (info.state === 'ok' && info.complete && info.parent === rewrite.name) {
+            if (!getPendingRefs().some(r => r.name === adoptedName) && !getReconciledRefs().some(r => r.name === adoptedName)) {
+              toStandalone.push({ name: adoptedName, size: sz, fnv1a: '' })
+            }
+          } else {
+            keepAdopted.push(adoptedName)
+          }
+        }
+        if (toStandalone.length > 0) {
+          const prevAdopted = rewrite.adoptedFiles ? [...rewrite.adoptedFiles] : undefined
+          const prevPending = rewrite.pendingReconcile ? [...rewrite.pendingReconcile] : undefined
+          rewrite.adoptedFiles = keepAdopted.length > 0 ? keepAdopted : undefined
+          rewrite.pendingReconcile = [...getPendingRefs(), ...toStandalone]
+          rewrite.waits = true
+          try {
+            await record()
+          } catch (err) {
+            rewrite.adoptedFiles = prevAdopted
+            rewrite.pendingReconcile = prevPending
+            this.recordError(`could not queue adopted children for standalone materialization on ${path}: ${errorText(err)}`)
+            return false
+          }
+        }
+      }
+    }
     // Phase 3: Materialize pending child reconciliations AFTER the parent's
     // confirmed outcome is checkpointed in v2 and parent leftovers are written.
     // Planned replacement names are pre-recorded in `stagedFiles` BEFORE any
     // part is written to disk so a partial multi-part failure or crash cannot
     // expose an unpromoted part for premature delivery.
-    if (!finished && v1ShadowNeeded() && (getPendingRefs().length > 0 || getStagedNames().length > 0) && rewrite.files.every(f => f.text === null)) {
-      // When stale v1 in `$.store` omits any pending or adopted child and could
-      // not be cleared, write an unretired `v2Guard` companion in `outcome-`
-      // BEFORE Phase 3 so a 0.1.3 reader arriving mid-Phase-3 (e.g., after a
-      // partial multi-part failure or foreign lease defer) never drops them or
-      // shrinks protection for live non-reconciled children already listed in
-      // `stuckV1Journal`.
-      const stuckFiles =
-        stuckV1Journal !== undefined && stuckV1Journal !== 'torn' && Array.isArray(stuckV1Journal.files)
-          ? new Set(stuckV1Journal.files.filter((f): f is string => typeof f === 'string').map(baseOf))
-          : new Set<string>()
-      const reconciledSet = new Set(getReconciledRefs().map(r => r.name))
-      const stagedSet = new Set(getStagedNames())
-      const preservedStuck = [...stuckFiles].filter(n => !reconciledSet.has(n) && !stagedSet.has(n))
-      const guardNames = [...new Set([...preservedStuck, ...getPendingRefs().map(r => r.name), ...getAdoptedNames()])]
-      if (guardNames.length > 0 && guardNames.some(n => !stuckFiles.has(n))) {
-        const guardSet = new Set(guardNames)
-        const guardSeq =
-          Math.max(rewrite.seq, stuckV1Journal !== undefined && stuckV1Journal !== 'torn' ? seqOf(stuckV1Journal) : 0) + 1
-        const guardJournal: Journal = {
-          fates: rewrite.fates,
-          reasons: rewrite.reasons,
-          refusals: rewrite.refusals,
-          size: rewrite.size,
-          waits: true,
-          seq: guardSeq,
-          files: guardNames,
-          written: guardNames.map(() => true),
-          v2Guard: true,
-        }
-        for (const candidate of rewrite.recordFiles) {
-          try {
-            const existingText =
-              this.io.exists !== undefined && !(await this.io.exists(candidate)) ? '' : await this.io.readFile(candidate)
-            if (existingText !== '') {
-              const existing = journalOf(existingText)
-              if (existing === 'torn') continue
-              if (existing !== undefined && existing.retired === true) continue
-              if (existing !== undefined && existing.v2Guard === true && existing.size === rewrite.size) {
-                const existingFiles = Array.isArray(existing.files)
-                  ? existing.files.filter((f): f is string => typeof f === 'string').map(baseOf)
-                  : []
-                if (existing.fates === rewrite.fates && sameNames(existingFiles, guardNames)) {
-                  rewrite.seq = Math.max(rewrite.seq, seqOf(existing))
-                  break
-                }
-                if (existingFiles.some(n => !guardSet.has(n) && !reconciledSet.has(n))) {
-                  if (await protectsLiveChild(existing)) continue
-                }
-              } else if (await protectsLiveChild(existing)) {
-                continue
-              }
-            }
-            await this.io.writeFile(candidate, journalText(guardJournal))
-            rewrite.seq = Math.max(rewrite.seq, guardSeq)
-            break
-          } catch {
-            // Try next v1 companion slot (best-effort pre-retirement guard).
-          }
-        }
-      }
-    }
     if (!finished && (getPendingRefs().length > 0 || getStagedNames().length > 0)) {
       const removePending = (name: string): void => {
         const next = (rewrite.pendingReconcile ?? []).filter(r => r.name !== name)
@@ -5472,7 +5918,7 @@ export class Writer {
       const addReconciled = (ref: ReconciledFile): void => {
         const existing = rewrite.reconciledFiles ?? []
         if (!existing.some(r => r.name === ref.name)) {
-          rewrite.reconciledFiles = [...existing, ref]
+          rewrite.reconciledFiles = [...existing, { name: ref.name, size: ref.size, fnv1a: ref.fnv1a }]
         }
       }
       const addAdopted = (name: string): void => {
@@ -5544,7 +5990,8 @@ export class Writer {
           await record()
           continue
         }
-        const decision = await classifyChild(pending.name, sz, pending, latestListing)
+        const needsStandalone = v1ShadowNeeded() && (stuckV1Files === null || !stuckV1Files.has(pending.name))
+        const decision = await classifyChild(pending.name, sz, pending, latestListing, needsStandalone)
         if (decision.action === 'skip') {
           removePending(pending.name)
           await record()
@@ -5625,14 +6072,14 @@ export class Writer {
               await this.io.writeFile(
                 doneFileOf(rewrite.dir, item.name, this.mark),
                 sealFile(
-                  `${JSON.stringify({ size: item.size, sending: true, uncertain: true, by: this.mark, ...(omitParentHeader ? { stagedFor: rewrite.name } : {}) })}\n`,
+                  `${JSON.stringify({ size: item.size, sending: true, uncertain: true, by: this.mark, ...(omitParentHeader ? { stagedFor: rewrite.name, stagedForSize: rewrite.size, replaces: pending.name } : {}) })}\n`,
                 ),
               )
               this.uncertainSources.set(item.path, item.size)
             } else if (needsTempStageMark) {
               await this.io.writeFile(
                 doneFileOf(rewrite.dir, item.name, this.mark),
-                sealFile(`${JSON.stringify({ size: item.size, sending: true, by: this.mark, stagedFor: rewrite.name })}\n`),
+                sealFile(`${JSON.stringify({ size: item.size, sending: true, by: this.mark, stagedFor: rewrite.name, stagedForSize: rewrite.size, replaces: pending.name })}\n`),
               )
               ;(rewrite.tempMarks ??= new Set()).add(item.path)
             }
@@ -5698,41 +6145,111 @@ export class Writer {
       }
     }
     const done = finished || wroteDone
-    if (done || doneResult === 'shadow-wrote') {
-      await clearTempMarks()
-    }
-    if (!done && (rewrite.useV2 || doneResult === 'failed-keep')) {
-      // If neither `outcome-done-<mark>d-` nor a v1 retired shadow file could
-      // be written while stale v1 remains stuck in `$.store`, and all parent
-      // leftovers and child-only rows are durably sealed in standalone files,
-      // empty the unchanged reconciled children first so a 0.1.3 reader
-      // visiting them ahead of (or alongside) the parent cannot re-send
-      // overlapped rows, then release the temporary standalone guards once
-      // every reconciled child is empty.
-      if (doneResult === 'failed-keep' && v1ShadowNeeded() && rewrite.files.every(f => f.text === null)) {
-        let allReconciledEmptied = true
-        for (const ref of getReconciledRefs()) {
-          const targetPath = joinPath(rewrite.dir, ref.name)
-          try {
-            const current = await this.io.readFile(targetPath)
-            if (current === '' || utf8Length(current) !== ref.size || fnv1a(current) !== ref.fnv1a) continue
-          } catch {
-            allReconciledEmptied = false
+    const cleanupReconciledAndStaged = async (
+      releaseRepopulatedChildGuards: boolean,
+    ): Promise<{ allReconciledEmptied: boolean; remainingStaged: Set<string>; unemptiedReconciled: Set<string> }> => {
+      let allReconciledEmptied = true
+      const unemptiedReconciled = new Set<string>()
+      for (const ref of getReconciledRefs()) {
+        const targetPath = joinPath(rewrite.dir, ref.name)
+        try {
+          const current = await this.io.readFile(targetPath)
+          if (current === '') {
+            await clearChildGuardMarks(new Set([ref.name]))
             continue
           }
-          if (await this.emptyCopy(targetPath)) {
-            parentIndex?.delete(ref.name)
-            emptiedInRun?.add(ref.name)
-          } else {
+          if (utf8Length(current) !== ref.size || fnv1a(current) !== ref.fnv1a) {
             allReconciledEmptied = false
+            const repopulated = parseFile(current)
+            const repopulatedOtherParent =
+              repopulated.complete && (repopulated.parent === null || baseOf(repopulated.parent) !== rewrite.name)
+            if (releaseRepopulatedChildGuards || repopulatedOtherParent) await clearChildGuardMarks(new Set([ref.name]))
+            else unemptiedReconciled.add(ref.name)
+            continue
           }
+        } catch {
+          allReconciledEmptied = false
+          unemptiedReconciled.add(ref.name)
+          continue
         }
-        if (allReconciledEmptied) await clearTempMarks()
+        if (await this.emptyCopy(targetPath)) {
+          parentIndex?.delete(ref.name)
+          emptiedInRun?.add(ref.name)
+          await clearChildGuardMarks(new Set([ref.name]))
+        } else {
+          allReconciledEmptied = false
+          unemptiedReconciled.add(ref.name)
+        }
+      }
+      const remainingStaged = new Set<string>()
+      for (const staged of getStagedNames()) {
+        const targetPath = joinPath(rewrite.dir, staged)
+        let emptiedStaged = false
+        try {
+          if (this.io.exists !== undefined && !(await this.io.exists(targetPath))) {
+            emptiedStaged = true
+          } else {
+            const cur = await this.io.readFile(targetPath)
+            emptiedStaged = cur === '' ? true : await this.emptyCopy(targetPath)
+          }
+        } catch {
+          emptiedStaged = false
+        }
+        if (emptiedStaged) {
+          parentIndex?.delete(staged)
+          emptiedInRun?.add(staged)
+          this.uncertainSources.delete(targetPath)
+          rewrite.tempMarks?.delete(targetPath)
+          const markPath = doneFileOf(rewrite.dir, staged, this.mark)
+          try {
+            if (this.io.exists === undefined || (await this.io.exists(markPath))) {
+              await this.io.writeFile(markPath, '')
+            }
+          } catch {
+            // Best-effort clear of our own sending mark after file truncation.
+          }
+        } else {
+          remainingStaged.add(staged)
+        }
+      }
+      return { allReconciledEmptied, remainingStaged, unemptiedReconciled }
+    }
+    if (!done && (rewrite.useV2 || doneResult === 'failed-keep')) {
+      if (doneResult === 'shadow-wrote') {
+        const { allReconciledEmptied, remainingStaged } = await cleanupReconciledAndStaged(false)
+        if (allReconciledEmptied && remainingStaged.size === 0) {
+          const promotedNames = new Set(getRewriteNames())
+          await clearTempMarks(promotedNames)
+        }
+      } else if (doneResult === 'failed-keep' && v1ShadowNeeded() && rewrite.files.every(f => f.text === null)) {
+        // Empty unchanged reconciled children and abandoned staged parts first;
+        // release promoted standalone `tempMarks` ONLY once every reconciled
+        // child is confirmed empty (never on digest mismatch / repopulation)
+        // and no abandoned staged part remains un-emptied. When stale v1 still
+        // has unwritten files (or is torn), keep `tempMarks` on `rewrite.files`
+        // so 0.1.3 resuming stale v1 cannot duplicate parent leftovers. Keep
+        // `childGuard` marks on unmodified adopted children so 0.1.3 resuming
+        // stale v1 never truncates them.
+        const { allReconciledEmptied, remainingStaged } = await cleanupReconciledAndStaged(false)
+        if (allReconciledEmptied && remainingStaged.size === 0) {
+          const v1AllWritten =
+            stuckV1Journal !== 'torn' && (stuckV1Journal === undefined || writtenOf(stuckV1Journal).every(Boolean))
+          const releasableNames = new Set(v1AllWritten ? getRewriteNames() : getAdoptedNames())
+          await clearTempMarks(releasableNames)
+        }
       }
       this.recordError(`could not record completion mark for ${path}; keeping parent sending mark until retried`)
       return false
     }
     try {
+      if (rewrite.size >= 0) {
+        const currentRaw = await this.io.readFile(path)
+        if (currentRaw !== '' && utf8Length(currentRaw) !== rewrite.size) {
+          this.rewrites.delete(path)
+          this.recordError(`${path} changed size before it could be emptied; keeping newer content for the next replay`)
+          return false
+        }
+      }
       await this.io.writeFile(path, '')
       parentIndex?.delete(rewrite.name)
     } catch (err) {
@@ -5752,46 +6269,49 @@ export class Writer {
     if (done) {
       if (rewrite.useV2) await this.unmark(rewrite)
       if (!clearedOppositeSlot) clearedOppositeSlot = await clearOppositeSlot()
-      for (const ref of getReconciledRefs()) {
-        const targetPath = joinPath(rewrite.dir, ref.name)
-        try {
-          const current = await this.io.readFile(targetPath)
-          if (current === '') continue
-          if (utf8Length(current) !== ref.size || fnv1a(current) !== ref.fnv1a) continue
-        } catch {
-          continue
-        }
-        if (await this.emptyCopy(targetPath)) {
-          parentIndex?.delete(ref.name)
-          emptiedInRun?.add(ref.name)
-        }
-      }
-      for (const staged of getStagedNames()) {
-        const targetPath = joinPath(rewrite.dir, staged)
-        if (await this.emptyCopy(targetPath)) {
-          parentIndex?.delete(staged)
-          emptiedInRun?.add(staged)
-          this.uncertainSources.delete(targetPath)
-          rewrite.tempMarks?.delete(targetPath)
-          const markPath = doneFileOf(rewrite.dir, staged, this.mark)
-          try {
-            if (this.io.exists === undefined || (await this.io.exists(markPath))) {
-              await this.io.writeFile(markPath, '')
-            }
-          } catch {
-            // Best-effort clear of our own sending mark after file truncation.
-          }
-        }
+      const { remainingStaged, unemptiedReconciled } = await cleanupReconciledAndStaged(wroteDone)
+      const keepChildGuards = new Set([...remainingStaged, ...unemptiedReconciled])
+      if (wroteDone) {
+        const promotedNames = new Set(getRewriteNames().filter(n => !remainingStaged.has(n)))
+        await clearTempMarks(promotedNames)
+        await clearChildGuardMarks(undefined, keepChildGuards)
+      } else if (finishedJournal !== undefined && Array.isArray(finishedJournal.files)) {
+        const stagedSet = new Set(getStagedNames())
+        const reconciledSet = new Set(normalizeReconciled(finishedJournal.reconciled).map(r => r.name))
+        const ownPendingSet = new Set(getPendingRefs().map(r => r.name))
+        const ownReconciledSet = new Set(getReconciledRefs().map(r => r.name))
+        const safeToRelease = new Set(
+          finishedJournal.files
+            .filter((f): f is string => typeof f === 'string')
+            .map(baseOf)
+            .filter(
+              n =>
+                !stagedSet.has(n) &&
+                !remainingStaged.has(n) &&
+                !reconciledSet.has(n) &&
+                !ownPendingSet.has(n) &&
+                !ownReconciledSet.has(n),
+            ),
+        )
+        await clearTempMarks(safeToRelease)
+        if (!v1ShadowNeeded()) await clearChildGuardMarks(safeToRelease, keepChildGuards)
       }
       for (const key of [rewrite.recordKey, rewrite.v2RecordKey]) {
         try {
           const stored = await readStoreSlot(key)
           if (stored === undefined && !neutralizedKeys.has(key)) continue
+          if (
+            key === rewrite.v2RecordKey &&
+            (remainingStaged.size > 0 || (!wroteDone && (unemptiedReconciled.size > 0 || getPendingRefs().length > 0)))
+          ) {
+            continue
+          }
           if (stored !== undefined && (await protectsLiveChild(stored))) continue
           if (stored !== undefined && stored !== 'torn' && stored.size === rewrite.size && key === activeKey && !wroteDone) {
             const listed = await dirListing()
-            const hasDone = listed !== null && [...listed.entries()].some(([n, sz]) => sz > 0 && doneMarkerOf(n, rewrite.name) !== null)
-            const hasLiveChild = Array.isArray(stored.files) && listed !== null && stored.files.some(f => typeof f === 'string' && (listed.get(baseOf(f)) ?? 0) > 0)
+            if (listed === null) continue
+            const hasDone = [...listed.entries()].some(([n, sz]) => sz > 0 && doneMarkerOf(n, rewrite.name) !== null)
+            const hasLiveChild = Array.isArray(stored.files) && stored.files.some(f => typeof f === 'string' && (listed.get(baseOf(f)) ?? 0) > 0)
             if (!hasDone && hasLiveChild) continue
           }
           await this.io.storeDelete(key)
@@ -5896,9 +6416,18 @@ export class Writer {
       for (const r of priorJournals) {
         maxSeq = Math.max(maxSeq, seqOf(r))
         if ((r.size !== rewrite.size || r.retired === true) && Array.isArray(r.files)) {
+          const priorReconciled = new Map(normalizeReconciled(r.reconciled).map(rec => [rec.name, rec]))
           for (const entry of r.files) {
             const base = typeof entry === 'string' ? baseOf(entry) : ''
             if (base === '' || base === rewrite.name || seenFiles.has(base) || !liveSizes.has(base)) continue
+            const rec = priorReconciled.get(base)
+            if (rec !== undefined) {
+              const curRaw = await this.io.readFile(joinPath(rewrite.dir, base))
+              if (curRaw === '' || (utf8Length(curRaw) === rec.size && fnv1a(curRaw) === rec.fnv1a)) {
+                seenFiles.add(base)
+                continue
+              }
+            }
             seenFiles.add(base)
             carriedChildren.push(base)
           }
@@ -5928,9 +6457,14 @@ export class Writer {
     } catch {
       return 'failed-keep'
     }
-    const allFiles = [...currentFiles, ...carriedChildren]
+    const deliverableFiles = [...currentFiles, ...carriedChildren]
     const reconciledMarks = (rewrite.reconciledFiles ?? []).filter(r => !currentFiles.includes(r.name) && !carriedChildren.includes(r.name))
-    if (allFiles.some(n => kindOf(n) !== 'rejected')) rewrite.waits = true
+    // Keep reconciled basenames in `files` alongside exact `{ size, fnv1a }`
+    // digests in `reconciled`: 0.1.3 readers then never drop a child repopulated
+    // after retirement, while 0.1.4 readers revalidate the digest to drop an
+    // unchanged stale copy and deliver a repopulated one.
+    const allFiles = [...deliverableFiles, ...reconciledMarks.map(r => r.name)]
+    if (deliverableFiles.some(n => kindOf(n) !== 'rejected')) rewrite.waits = true
     const { size, waits, seq } = rewrite
     const { fates, reasons, refusals } = rewrite
     const journal: Journal = {
@@ -6144,6 +6678,9 @@ export class Writer {
     nonStagedBy: string[]
     uncertain: boolean
     stagedFor?: string
+    stagedForSize?: number
+    childGuard?: boolean
+    replaces?: string
   }> {
     const by: string[] = []
     const activeBy: string[] = []
@@ -6151,6 +6688,10 @@ export class Writer {
     const nonStagedBy: string[] = []
     let uncertain = false
     let stagedFor: string | undefined
+    let stagedForSize: number | undefined
+    let childGuard = false
+    let replaces: string | undefined
+    let replacesConflict = false
     let stagedConflict = false
     for (const entry of entries ?? (await this.io.listDir(source.dir))) {
       if (entry.kind !== undefined && entry.kind !== 'file') continue
@@ -6160,14 +6701,28 @@ export class Writer {
       if (markStands(raw, source.size)) {
         by.push(writer)
         activeBy.push(writer)
-        const parsed = journalOf(raw) as { uncertain?: unknown; stagedFor?: unknown } | 'torn' | undefined
+        const parsed = journalOf(raw) as
+          | { uncertain?: unknown; stagedFor?: unknown; stagedForSize?: unknown; childGuard?: unknown; replaces?: unknown }
+          | 'torn'
+          | undefined
         if (parsed !== undefined && parsed !== 'torn') {
+          const isStagedMark = typeof parsed.stagedFor === 'string' && parsed.stagedFor !== ''
           if (parsed.uncertain === true) uncertain = true
-          else nonUncertainBy.push(writer)
-          if (typeof parsed.stagedFor === 'string' && parsed.stagedFor !== '') {
-            const p = baseOf(parsed.stagedFor)
+          else if (!isStagedMark) nonUncertainBy.push(writer)
+          if (isStagedMark) {
+            const p = baseOf(parsed.stagedFor as string)
             if (stagedFor === undefined) stagedFor = p
             else if (stagedFor !== p) stagedConflict = true
+            if (typeof parsed.stagedForSize === 'number' && Number.isFinite(parsed.stagedForSize) && parsed.stagedForSize > 0) {
+              if (stagedForSize === undefined) stagedForSize = parsed.stagedForSize
+              else if (stagedForSize !== parsed.stagedForSize) stagedConflict = true
+            }
+            if (parsed.childGuard === true) childGuard = true
+            if (typeof parsed.replaces === 'string' && parsed.replaces !== '') {
+              const rep = baseOf(parsed.replaces)
+              if (replaces === undefined) replaces = rep
+              else if (replaces !== rep) replacesConflict = true
+            }
           } else {
             nonStagedBy.push(writer)
           }
@@ -6177,6 +6732,8 @@ export class Writer {
       }
     }
     const cleanStagedFor = stagedConflict ? undefined : stagedFor
+    const cleanStagedForSize = stagedConflict ? undefined : stagedForSize
+    const cleanReplaces = stagedConflict || replacesConflict ? undefined : replaces
     return {
       by,
       activeBy,
@@ -6184,6 +6741,195 @@ export class Writer {
       nonStagedBy,
       uncertain,
       ...(cleanStagedFor !== undefined ? { stagedFor: cleanStagedFor } : {}),
+      ...(cleanStagedFor !== undefined && cleanStagedForSize !== undefined ? { stagedForSize: cleanStagedForSize } : {}),
+      ...(cleanStagedFor !== undefined && childGuard ? { childGuard: true } : {}),
+      ...(cleanStagedFor !== undefined && cleanReplaces !== undefined ? { replaces: cleanReplaces } : {}),
+    }
+  }
+
+  // Discovers every live child that a forced replay of `source` may reconcile,
+  // adopt, or defer, so `placeChildGuards` can protect them with 0.1.3-honored
+  // sending marks BEFORE `backfillFile` dispatches any HTTP request. Returns
+  // `null` on any listing or read error so the caller fails closed.
+  private async discoverLiveChildrenForForce(
+    source: Source,
+    c: Config,
+    parentIndex?: RunParentIndex,
+    includeUnreferencedChildren = false,
+  ): Promise<Map<string, number> | null> {
+    let entries: readonly { name: string; kind?: string; size: number }[]
+    try {
+      entries = await this.io.listDir(source.dir)
+    } catch {
+      return null
+    }
+    const listed = new Map<string, number>()
+    for (const e of entries) {
+      if (e.kind === undefined || e.kind === 'file') listed.set(e.name, e.size)
+    }
+    const candidateJournals: (Partial<Journal> | 'torn')[] = []
+    for (const key of [source.recordKey, source.v2RecordKey]) {
+      try {
+        const val = await this.io.storeGet(key)
+        if (isClearedSlot(val)) continue
+        if (typeof val === 'object' && val !== null && !Array.isArray(val)) candidateJournals.push(val as Partial<Journal>)
+        else candidateJournals.push('torn')
+      } catch {
+        return null
+      }
+    }
+    for (const file of [...source.recordFiles, ...source.v2RecordFiles]) {
+      const fileName = baseOf(file)
+      if ((listed.get(fileName) ?? 0) === 0) continue
+      try {
+        const txt = await this.io.readFile(file)
+        if (txt !== '') {
+          const kept = journalOf(txt)
+          if (kept !== undefined) candidateJournals.push(kept)
+        }
+      } catch {
+        return null
+      }
+    }
+    try {
+      const doneAll = await this.doneMarksAll({ ...source, live: false }, entries)
+      for (const d of doneAll.records) candidateJournals.push(d)
+      if (doneAll.torn) candidateJournals.push('torn')
+    } catch {
+      return null
+    }
+    const candidateNames = new Set<string>()
+    const maxAdoptedSeq = new Map<string, number>()
+    const maxStagedSeq = new Map<string, number>()
+    let sawTorn = false
+    for (const j of candidateJournals) {
+      if (j === 'torn') {
+        sawTorn = true
+        continue
+      }
+      if (j.size !== source.size) continue
+      const jSeq = seqOf(j)
+      for (const staged of normalizeStaged(j.stagedFiles)) {
+        maxStagedSeq.set(staged, Math.max(maxStagedSeq.get(staged) ?? -1, jSeq))
+      }
+      if (Array.isArray(j.files)) {
+        for (const f of j.files) {
+          if (typeof f === 'string' && f !== '') {
+            const base = baseOf(f)
+            candidateNames.add(base)
+            maxAdoptedSeq.set(base, Math.max(maxAdoptedSeq.get(base) ?? -1, jSeq))
+          }
+        }
+      }
+      if (Array.isArray(j.adopted)) {
+        for (const f of j.adopted) {
+          if (typeof f === 'string' && f !== '') {
+            const base = baseOf(f)
+            candidateNames.add(base)
+            maxAdoptedSeq.set(base, Math.max(maxAdoptedSeq.get(base) ?? -1, jSeq))
+          }
+        }
+      }
+      for (const ref of normalizeReconciled(j.pendingReconcile, true)) candidateNames.add(ref.name)
+      for (const ref of normalizeReconciled(j.reconciled)) candidateNames.add(ref.name)
+    }
+    const stagedNames = new Set<string>()
+    for (const [staged, sSeq] of maxStagedSeq) {
+      if (sSeq > (maxAdoptedSeq.get(staged) ?? -1)) stagedNames.add(staged)
+    }
+    if (sawTorn || includeUnreferencedChildren) {
+      for (const [n, sz] of listed) {
+        if (sz <= 0 || n === source.name || candidateNames.has(n) || stagedNames.has(n) || kindOf(n) === null || sz > HOST_FILE_BYTES) continue
+        const info = await this.readParentInfo(source.dir, n, sz, parentIndex)
+        if (info.state === 'error') return null
+        if (info.state === 'ok' && info.complete && info.parent === source.name) candidateNames.add(n)
+      }
+    }
+    const targets = new Map<string, number>()
+    for (const childName of candidateNames) {
+      if (childName === source.name || stagedNames.has(childName)) continue
+      const childSize = listed.get(childName) ?? 0
+      if (childSize <= 0) continue
+      if (childSize <= HOST_FILE_BYTES) {
+        const info = await this.readParentInfo(source.dir, childName, childSize, parentIndex)
+        if (info.state === 'error') return null
+        if (info.state === 'ok' && info.complete && info.parent !== null && info.parent !== source.name) continue
+      }
+      try {
+        const childSource = sourceFor(source.dir, childName, childSize, c)
+        const childDone = await this.doneMarks(childSource, entries)
+        if (childDone.done !== undefined && !childDone.torn) continue
+        const existingMarks = await this.marksDetailed(childSource, entries)
+        if (existingMarks.stagedFor === source.name && existingMarks.childGuard !== true) continue
+      } catch {
+        return null
+      }
+      targets.set(joinPath(source.dir, childName), childSize)
+    }
+    return targets
+  }
+
+  // Places 0.1.3-honored `outcome-done-${this.mark}g-<child>` sending guards on
+  // each live child in `targets` before a forced parent replay sends rows or
+  // checkpoints a v2 journal. Using a dedicated `g` suffix ensures guards never
+  // overwrite the writer's own retired or uncertain marks on the child while
+  // still matching 0.1.3's `markerOf` (`[0-9a-z]+`). On any write failure, rolls
+  // back newly placed guards and returns `null` so the caller fails closed.
+  private async placeChildGuards(
+    dir: string,
+    parentName: string,
+    parentSize: number,
+    targets: ReadonlyMap<string, number>,
+    existing?: Map<string, number>,
+  ): Promise<{ placed: Map<string, number>; newlyPlaced: string[] } | null> {
+    const placed = new Map<string, number>(existing ?? [])
+    const newlyPlaced: string[] = []
+    const guardMark = `${this.mark}g`
+    try {
+      for (const [childPath, childSize] of targets) {
+        if (childSize <= 0) continue
+        if (placed.get(childPath) === childSize) continue
+        const childName = baseOf(childPath)
+        const markPath = doneFileOf(dir, childName, guardMark)
+        // Preserve any pre-existing standing childGuard mark for this exact
+        // parent/size from an earlier attempt in the same writer without adding
+        // it to `newlyPlaced`, so rollback or a no-op retry never clears it.
+        if (this.io.exists === undefined || (await this.io.exists(markPath))) {
+          const curRaw = await this.io.readFile(markPath)
+          if (curRaw !== '' && markStands(curRaw, childSize)) {
+            const parsed = journalOf(curRaw) as { stagedFor?: unknown; stagedForSize?: unknown; childGuard?: unknown } | 'torn' | undefined
+            if (
+              parsed !== undefined &&
+              parsed !== 'torn' &&
+              parsed.childGuard === true &&
+              typeof parsed.stagedFor === 'string' &&
+              baseOf(parsed.stagedFor) === parentName &&
+              parsed.stagedForSize === parentSize
+            ) {
+              placed.set(childPath, childSize)
+              continue
+            }
+          }
+        }
+        await this.io.writeFile(
+          markPath,
+          sealFile(
+            `${JSON.stringify({ size: childSize, sending: true, by: guardMark, stagedFor: parentName, stagedForSize: parentSize, childGuard: true })}\n`,
+          ),
+        )
+        placed.set(childPath, childSize)
+        newlyPlaced.push(childPath)
+      }
+      return { placed, newlyPlaced }
+    } catch {
+      for (const childPath of newlyPlaced) {
+        try {
+          await this.io.writeFile(doneFileOf(dir, baseOf(childPath), guardMark), '')
+        } catch {
+          // Best-effort rollback of newly placed child guards.
+        }
+      }
+      return null
     }
   }
 
@@ -6217,6 +6963,7 @@ export class Writer {
     emptiedInRun?: Set<string>,
     parentAccountedKeys?: ReadonlySet<string>,
     allowStagedFor?: string,
+    parentSkipIndices?: ReadonlySet<number>,
   ): Promise<boolean> {
     const path = joinPath(dir, name)
     const { lines } = file
@@ -6234,6 +6981,11 @@ export class Writer {
     let kept = 0
     let skippedByParent = false
     lines.forEach((line, i) => {
+      if (parentSkipIndices?.has(i)) {
+        fates.push('L')
+        skippedByParent = true
+        return
+      }
       if (parentAccountedKeys !== undefined) {
         const identity = childRowIdentity(line)
         if (identity !== null && parentAccountedKeys.has(identity)) {
@@ -6267,6 +7019,9 @@ export class Writer {
     }
     let changed = skippedByParent
     let marked = false
+    let prePlacedChildGuards: Map<string, number> | undefined
+    let newlyPlacedChildGuards: string[] = []
+    let preGuardChecked = false
     const uncertainLines: number[] = []
     const recordUncertain = (first: number, count: number): void => {
       for (let i = 0; i < count; i += 1) uncertainLines.push(at[first + i] as number)
@@ -6299,6 +7054,25 @@ export class Writer {
       if (!marked) {
         if (!(await this.markSending(path, source, trigger, report, supersededUnaccounted, allowStagedFor))) break
         marked = true
+      }
+      if (trigger === 'force' && !preGuardChecked) {
+        preGuardChecked = true
+        const guardTargets = await this.discoverLiveChildrenForForce(source, c, parentIndex, true)
+        if (guardTargets === null) {
+          await this.unmark(source)
+          report.error = diagnostic(`could not inspect live children of ${name} before forced replay; retrying later`)
+          return false
+        }
+        if (guardTargets.size > 0) {
+          const placedResult = await this.placeChildGuards(dir, name, source.size, guardTargets)
+          if (placedResult === null) {
+            await this.unmark(source)
+            report.error = diagnostic(`could not guard live children of ${name} before forced replay; retrying later`)
+            return false
+          }
+          prePlacedChildGuards = placedResult.placed
+          newlyPlacedChildGuards = placedResult.newlyPlaced
+        }
       }
       if (this.replayHalted()) break
       const body = insertAllBody(chunk.map(l => l.row))
@@ -6421,6 +7195,16 @@ export class Writer {
           this.activeSendingMarks.delete(path)
         } else {
           await this.unmark(source)
+          if (newlyPlacedChildGuards.length > 0) {
+            const guardMark = `${this.mark}g`
+            for (const guardedPath of newlyPlacedChildGuards) {
+              try {
+                await this.io.writeFile(doneFileOf(dir, baseOf(guardedPath), guardMark), '')
+              } catch {
+                // Best-effort clear of newly placed child guard mark when nothing was sent.
+              }
+            }
+          }
         }
       }
       return true
@@ -6473,6 +7257,7 @@ export class Writer {
       ...(trigger === 'force' ? { force: true } : {}),
       ...(accountedRowKeys !== undefined ? { accountedRowKeys } : {}),
       ...(supersededUnaccounted !== undefined ? { supersededUnaccounted } : {}),
+      ...(prePlacedChildGuards !== undefined && prePlacedChildGuards.size > 0 ? { childGuardMarks: prePlacedChildGuards } : {}),
     }
     const uncertainFiles = rewrite.files.filter(f => f.uncertain)
     const hadHeldReason = report.held !== null
@@ -6526,6 +7311,16 @@ export class Writer {
     // `writeOut` already released the sending mark after writing the
     // separate retired mark and emptying `path`.
     if (done && !rewrite.wroteDone) await this.unmark(source)
+    if (done && allowStagedFor !== undefined) {
+      const ownGuard = doneFileOf(dir, name, `${this.mark}g`)
+      try {
+        if (this.io.exists === undefined || (await this.io.exists(ownGuard))) {
+          await this.io.writeFile(ownGuard, '')
+        }
+      } catch {
+        // Best-effort clear of our own child guard mark once the child is done.
+      }
+    }
     return done
   }
 

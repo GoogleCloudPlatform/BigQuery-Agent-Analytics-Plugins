@@ -2690,6 +2690,81 @@ def clean_dead_letter_checks():
               and v2_live.exists() and v2_live_out.exists(),
               f'{status_v2} {err_v2!r}')
 
+        # 13p & 13q: a live standalone replacement (parent: null) with a non-empty stagedFor sending mark
+        # must protect the referenced retired parent's outcome group (0-byte parent, outcome2-*, outcome-done-*,
+        # and >24h orphans), fail closed on corrupt marks beside live files, and allow cleanup once emptied.
+        sf_dir = base / 'my-proj.ds.staged_for_tbl'
+        sf_dir.mkdir(mode=0o700)
+        sf_parent = sf_dir / 'spill-sf-parent.jsonl'
+        sf_parent.write_bytes(b'')
+        sf_parent_done = sf_dir / 'outcome-done-w1-spill-sf-parent.jsonl'
+        sf_parent_done.write_text(seal('{"retired":true,"files":["retry-sf-repl.jsonl"]}\n'), encoding='utf-8')
+        sf_parent_v2 = sf_dir / 'outcome2-spill-sf-parent.jsonl'
+        sf_parent_v2.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        sf_orphan_old = sf_dir / 'outcome-done-w0-spill-sf-orphan.jsonl'
+        sf_orphan_old.write_text(seal('{"retired":true,"files":["retry-sf-repl2.jsonl"]}\n'), encoding='utf-8')
+        old_ts = time.time() - 48 * 3600
+        os.utime(sf_orphan_old, (old_ts, old_ts))
+        sf_replaced = sf_dir / 'retry-sf-replaced.jsonl'
+        sf_replaced.write_bytes(b'')
+        sf_replaced_done = sf_dir / 'outcome-done-w0-retry-sf-replaced.jsonl'
+        sf_replaced_done.write_text(seal('{"retired":true,"files":[]}\n'), encoding='utf-8')
+        sf_repl = sf_dir / 'retry-sf-repl.jsonl'
+        sf_repl.write_text(seal('{"row":1}\n'), encoding='utf-8')
+        sf_repl_mark = sf_dir / 'outcome-done-w1-retry-sf-repl.jsonl'
+        sf_repl_mark.write_text(
+            seal(json.dumps({
+                'size': sf_repl.stat().st_size,
+                'sending': True,
+                'by': 'w1',
+                'stagedFor': 'spill-sf-parent.jsonl',
+                'replaces': 'retry-sf-replaced.jsonl',
+            }) + '\n'),
+            encoding='utf-8',
+        )
+        sf_repl2 = sf_dir / 'retry-sf-repl2.jsonl'
+        sf_repl2.write_text(seal('{"row":2}\n'), encoding='utf-8')
+        sf_repl2_mark = sf_dir / 'outcome-done-w1g-retry-sf-repl2.jsonl'
+        sf_repl2_mark.write_text(
+            seal(json.dumps({'size': sf_repl2.stat().st_size, 'sending': True, 'by': 'w1g', 'stagedFor': 'spill-sf-orphan.jsonl', 'childGuard': True}) + '\n'),
+            encoding='utf-8',
+        )
+        status_sf, _out_sf, err_sf = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p. --execute protects retired parent, replaced sibling child, and >24h orphan while live standalone replacement has stagedFor/replaces mark',
+              status_sf == 0 and err_sf == ''
+              and sf_parent.exists() and sf_parent_done.exists() and sf_parent_v2.exists()
+              and sf_replaced.exists() and sf_replaced_done.exists()
+              and sf_orphan_old.exists() and sf_repl.exists() and sf_repl2.exists(),
+              f'{status_sf} {err_sf!r}')
+
+        # Corrupt mark beside a live file must fail closed (skip directory, delete nothing).
+        sf_repl2_mark.write_text('{corrupt\n', encoding='utf-8')
+        sf_parent_unrelated = sf_dir / 'spill-sf-unrelated.jsonl'
+        sf_parent_unrelated.write_bytes(b'')
+        status_sf_bad, _out_sf_bad, err_sf_bad = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p2. corrupt mark beside live file fails closed and skips directory',
+              status_sf_bad == 1 and 'skipping' in err_sf_bad and sf_parent_unrelated.exists(),
+              f'{status_sf_bad} {err_sf_bad!r}')
+
+        # Unsealed mark (valid JSON line 1 without completion seal line 2) must also fail closed.
+        sf_repl2_mark.write_text('{"sending":true}\n', encoding='utf-8')
+        status_sf_unsealed, _out_sf_unsealed, err_sf_unsealed = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p3. unsealed mark beside live file fails closed and skips directory',
+              status_sf_unsealed == 1 and 'skipping' in err_sf_unsealed and sf_parent_unrelated.exists(),
+              f'{status_sf_unsealed} {err_sf_unsealed!r}')
+
+        # Once both standalone replacements are emptied (0 bytes), all protected groups are cleaned up.
+        sf_repl.write_bytes(b'')
+        sf_repl2.write_bytes(b'')
+        status_sf_done, _out_sf_done, err_sf_done = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13q. once standalone replacements are emptied, --execute removes the parent outcome group, replaced child, and old orphan cleanly',
+              status_sf_done == 0 and err_sf_done == ''
+              and not sf_parent.exists() and not sf_parent_done.exists() and not sf_parent_v2.exists()
+              and not sf_replaced.exists() and not sf_replaced_done.exists()
+              and not sf_orphan_old.exists() and not sf_repl.exists() and not sf_repl2.exists()
+              and not sf_parent_unrelated.exists(),
+              f'{status_sf_done} {err_sf_done!r}')
+
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,
           writer_grants_checks, row_writer_role_checks, resources_checks, readers_checks, api_checks,

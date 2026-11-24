@@ -26,7 +26,8 @@ This helper removes a ``(outcome-*, source)`` group **only** when:
 - the source file matches ``^(spill|retry|rejected)-[A-Za-z0-9._-]+\\.jsonl$``
   and is an owned, single-link, **0-byte** regular file, and
 - **no** non-empty mod file in the directory names that source as ``parent``
-  in its completion record.
+  in its completion record or in a non-empty ``stagedFor`` sending mark beside
+  a live file.
 
 Within each group, ``outcome-*`` files are deleted first (only after
 re-verifying ``source.lstat()``) and ``<source>`` is deleted last, so an
@@ -170,6 +171,66 @@ def _read_completion_parent(path: Path) -> tuple[bool, str | None]:
     return ok, parent
 
 
+MAX_MARK_BYTES = 4 * 1024 * 1024 + 4096
+
+
+def _read_mark_staged_for_checked(
+    path: Path,
+    expected_st: os.stat_result | None = None,
+    dir_fd: int | None = None,
+    euid: int | None = None,
+) -> tuple[bool, list[str], str]:
+    """Read a non-empty outcome-done/sending mark beside a live file for ``stagedFor`` and ``replaces``."""
+    if euid is None:
+        euid = os.geteuid()
+    try:
+        with _open_nofollow_read(path, dir_fd=dir_fd) as f:
+            fileno = f.fileno() if hasattr(f, "fileno") else None
+            if fileno is not None:
+                fst = os.fstat(fileno)
+                if not stat.S_ISREG(fst.st_mode):
+                    return False, [], "not a regular file"
+                if fst.st_nlink > 1:
+                    return False, [], f"hardlinked (nlink={fst.st_nlink})"
+                if euid != 0 and fst.st_uid != euid:
+                    return False, [], f"unexpected owner uid {fst.st_uid}"
+                if expected_st is not None and (fst.st_dev, fst.st_ino) != (expected_st.st_dev, expected_st.st_ino):
+                    return False, [], "file replaced while reading"
+                if fst.st_size > MAX_MARK_BYTES:
+                    return False, [], "mark exceeds maximum readable size"
+            raw = f.read(MAX_MARK_BYTES + 1)
+        if len(raw) > MAX_MARK_BYTES:
+            return False, [], "mark exceeds maximum readable size"
+        if not raw:
+            return True, [], ""
+        text = raw.decode("utf-8")
+    except OSError as exc:
+        return False, [], f"unreadable mark ({exc})"
+    except UnicodeDecodeError:
+        return False, [], "invalid UTF-8 in mark"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False, [], "unsealed or truncated mark"
+    try:
+        tail = json.loads(lines[-1])
+        record = json.loads(lines[0])
+    except json.JSONDecodeError:
+        return False, [], "truncated or invalid JSON in mark"
+    if not isinstance(tail, dict) or tail.get("complete") is not True:
+        return False, [], "unsealed mark missing completion record"
+    if not isinstance(record, dict):
+        return False, [], "unexpected non-object mark JSON"
+    refs: list[str] = []
+    for field in ("stagedFor", "replaces"):
+        val = record.get(field)
+        if val is None:
+            continue
+        if not isinstance(val, str) or not val:
+            return False, [], f"invalid {field} field in mark"
+        refs.append(val)
+    return True, refs, ""
+
+
 def _dir_safety_error(
     path: Path,
     euid: int,
@@ -303,6 +364,7 @@ def _scan_single_dir(
 
         sources: dict[str, tuple[Path, int]] = {}
         outcomes_by_source: dict[str, list[tuple[Path, float]]] = {}
+        marks_by_source: dict[str, list[tuple[Path, os.stat_result]]] = {}
         non_empty_parents: set[str] = set()
 
         for entry in entries:
@@ -347,6 +409,24 @@ def _scan_single_dir(
                 if euid != 0 and st.st_uid != euid:
                     return [], [], [f"refusing outcome file {rel} owned by uid {st.st_uid}; skipping {_rel_label(directory, base)}"]
                 outcomes_by_source.setdefault(of, []).append((entry, st.st_mtime))
+                if st.st_size > 0 and MARKED_RE.match(name) is not None:
+                    marks_by_source.setdefault(of, []).append((entry, st))
+
+        # Protect any parent or replaced sibling child referenced by a live
+        # standalone file's `stagedFor`/`replaces` sending mark so `--execute`
+        # never deletes outcome groups needed for cross-version dedup/recovery.
+        for live_name, (_live_path, live_size) in sources.items():
+            if live_size <= 0:
+                continue
+            for mark_entry, mark_st in marks_by_source.get(live_name, ()):
+                ok, mark_refs, reason = _read_mark_staged_for_checked(mark_entry, expected_st=mark_st, dir_fd=dfd, euid=euid)
+                if not ok:
+                    return [], [], [f"{_rel_label(mark_entry, base)}: {reason}; skipping {_rel_label(directory, base)}"]
+                for ref_name in mark_refs:
+                    non_empty_parents.add(ref_name)
+                    ref_base = ref_name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                    if ref_base:
+                        non_empty_parents.add(ref_base)
 
         groups: list[tuple[Path, list[Path]]] = []
         for name in sorted(sources):
