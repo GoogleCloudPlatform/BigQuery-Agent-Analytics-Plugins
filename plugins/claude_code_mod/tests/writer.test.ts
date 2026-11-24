@@ -6428,10 +6428,14 @@ test('T53-16n: replacement write failure holds mixed child without reauthorizing
   h.store.set(`replayed:${TABLE_REF}/${parentName}`, { fates: 'LL', reasons: [], refusals: [], size: parentSize, waits: false, seq: 2, files: [], written: [] })
   h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, { fates: 'WW', reasons: [], refusals: [], size: parentSize, waits: true, seq: 9, files: [childName], written: [true] })
 
-  h.setFetch(async () => OK_INSERT)
+  let parentFetched = false
+  h.setFetch(async () => {
+    parentFetched = true
+    return OK_INSERT
+  })
   let failedOnce = false
   h.setWriteFileHook(async (p, text) => {
-    if (!failedOnce && p.includes('/retry-') && p !== childPath && text !== '') {
+    if (parentFetched && !failedOnce && p.includes('/retry-') && p !== childPath && text !== '') {
       failedOnce = true
       throw new Error('EIO writing replacement child')
     }
@@ -8034,11 +8038,15 @@ test('T53-16u: failed v1 clear plus markDone failure guards 0.1.3 via v1 shadow 
     h.setStoreSetHook(async key => {
       if (key === v1Key) throw new Error('v1 set blocked')
     })
-    // Block Phase 3 replacement writes so childName stays live in pendingReconcile with its childGuard intact.
+    // Block Phase 3 replacement writes (after parent HTTP fetch) so childName stays live in pendingReconcile with its childGuard intact.
+    let parentFetched = false
     h.setWriteFileHook(async (p, text) => {
-      if (!p.includes('/outcome') && p !== parentPath && p !== childPath && text !== '') throw new Error('replacement write EIO')
+      if (parentFetched && !p.includes('/outcome') && p !== parentPath && p !== childPath && text !== '') throw new Error('replacement write EIO')
     })
-    h.setFetch(async () => OK_INSERT)
+    h.setFetch(async () => {
+      parentFetched = true
+      return OK_INSERT
+    })
 
     await h.newWriter('s-16u-p2-1').backfill(['spill', 'retry'], 'force')
     const guards = [...h.files.entries()].filter(([k, v]) => k.includes('outcome-done-') && k.endsWith(`-${childName}`) && v !== '')
@@ -8622,14 +8630,18 @@ test('T53-16z: abandoned staged part keeps its guard mark on failed truncation, 
     h.setStoreSetHook(async key => {
       if (key === v1Key) throw new Error('v1 stuck')
     })
-    h.setFetch(async () => OK_INSERT)
+    let parentFetched = false
+    h.setFetch(async () => {
+      parentFetched = true
+      return OK_INSERT
+    })
 
     let partWrites = 0
     let abandonedPath: string | null = null
     let failPart2 = true
     let failAbandonedTruncate = true
     h.setWriteFileHook(async (p, text) => {
-      if (p.includes('/outcome') || p === parentPath || p === childPath) return
+      if (!parentFetched || p.includes('/outcome') || p === parentPath || p === childPath) return
       if (failAbandonedTruncate && text === '' && p === abandonedPath) throw new Error('EIO truncating abandoned stage')
       if (failPart2 && text !== '' && (p.includes('/retry-') || p.includes('/spill-'))) {
         partWrites += 1
@@ -9706,5 +9718,1598 @@ test('T53-16aa: forced unreferenced child discovery, live-parent v2 skipIndices,
     expect(deliveredUnkeyed).toBe(1)
     expect(h.files.get(childPath)).toBe('')
     expect(h.files.get(lp1Path)).toBe('')
+  }
+})
+
+test('T53-16ab: pre-dispatch backup rollback, attempt-bound child guards, and multi-attempt backup cleanup', async () => {
+  const rowA = 'a'.repeat(32)
+  const rowB = 'b'.repeat(32)
+  const rowC = 'c'.repeat(32)
+
+  // Subcase A: stageChildBackups EIO before parent HTTP dispatch fails closed, rolls back childGuard and parent sending mark, and sends 0 rows.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ab-a-parent.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ab-a-child.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    h.files.set(
+      childPath,
+      packFiles(
+        [
+          JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+          JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) }),
+        ],
+        parentName,
+      )[0]!,
+    )
+    h.setFetch(async () => OK_INSERT)
+    h.setWriteFileHook(async (p, text) => {
+      if (!p.includes('/outcome') && p !== parentPath && p !== childPath && text !== '') {
+        throw new Error('EIO staging pre-dispatch backup')
+      }
+    })
+    const r = await h.newWriter('s-16ab-a').backfill(['spill', 'retry'], 'force')
+    expect(r.error).not.toBeNull()
+    expect(h.sent.length).toBe(0)
+    expect(h.files.get(parentPath)).not.toBe('')
+    expect([...h.files.entries()].filter(([k, v]) => k.includes('outcome-done-') && v !== '').length).toBe(0)
+  }
+
+  // Subcase B: when all parent rows receive 503 (!changed && !needsSplit), newly staged backups and childGuards roll back cleanly.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ab-b-parent.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ab-b-child.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    h.files.set(
+      childPath,
+      packFiles(
+        [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) })],
+        parentName,
+      )[0]!,
+    )
+    h.setFetch(async () => UNAVAILABLE)
+    await h.newWriter('s-16ab-b').backfill(['spill'], 'force')
+    expect(h.files.get(parentPath)).not.toBe('')
+    expect([...h.files.entries()].filter(([p, v]) => p.startsWith(`${PARTITION_DIR}/`) && !p.includes('/outcome') && p !== parentPath && p !== childPath && v !== '').length).toBe(0)
+    expect([...h.files.entries()].filter(([k, v]) => k.includes('g-') && k.endsWith(`-${childName}`) && v !== '').length).toBe(0)
+    expect([...h.files.entries()].filter(([k, v]) => k.includes('g-') && v.includes('"sending":true')).length).toBe(0)
+    // Subsequent fresh session auto replay must NOT emit false "is empty, perhaps still being written" on the rolled-back backup.
+    h.setFetch(async () => OK_INSERT)
+    const rAfterRollback = await h.newWriter('s-16ab-b2').backfill(['retry'], 'auto')
+    expect(rAfterRollback.skippedFiles).toBe(0)
+    expect(rAfterRollback.held).toBeNull()
+  }
+
+  // Subcase C: two crashed attempts (A1 wrote v2(attempt: A1), then A2 crashed before record()): auto MUST NOT accept A1's stale v2 because A2 is uncovered; later A3 cleans up prior-attempt backup B_c1.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ab-c-parent.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ab-c-child.jsonl'
+    const priorBackupName = 'retry-20261013T200102003Z-t53-16ab-c-backup1.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const priorBackupPath = `${PARTITION_DIR}/${priorBackupName}`
+    const cText = packFiles(
+      [
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) }),
+      ],
+      parentName,
+    )[0]!
+    const b1Text = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ])[0]!
+    h.files.set(childPath, cText)
+    h.files.set(priorBackupPath, b1Text)
+    const pSize = utf8Bytes(h.files.get(parentPath)!)
+    const cSize = utf8Bytes(cText)
+    const b1Size = utf8Bytes(b1Text)
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-a1oldg-${childName}`,
+      sealFile(`${JSON.stringify({ size: cSize, sending: true, by: 'a1oldg', stagedFor: parentName, stagedForSize: pSize, childGuard: true, attempt: 'attempt-1' })}\n`),
+    )
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-a2oldg-${childName}`,
+      sealFile(`${JSON.stringify({ size: cSize, sending: true, by: 'a2oldg', stagedFor: parentName, stagedForSize: pSize, childGuard: true, attempt: 'attempt-2' })}\n`),
+    )
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-a1oldg-${priorBackupName}`,
+      sealFile(
+        `${JSON.stringify({ size: b1Size, sending: true, by: 'a1oldg', stagedFor: parentName, stagedForSize: pSize, replaces: childName, backup: true, backupForSize: cSize, backupFnv1a: fnv1a(b1Text), attempt: 'attempt-1' })}\n`,
+      ),
+    )
+    // Stale v2 covers only attempt-1 (NOT attempt-2!), and 0.1.3 already retired P.
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+      fates: 'LW',
+      reasons: [],
+      refusals: [],
+      size: pSize,
+      waits: true,
+      seq: 5,
+      files: [childName],
+      written: [true],
+      attempt: 'attempt-1',
+      attempts: ['attempt-1'],
+    })
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-old013-${parentName}`,
+      sealFile(`${JSON.stringify({ fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 2, files: [childName], written: [true], retired: true })}\n`),
+    )
+    h.files.set(parentPath, '')
+    h.setFetch(async () => OK_INSERT)
+
+    const rAuto = await h.newWriter('s-16ab-c1').backfill(['spill', 'retry'], 'auto')
+    expect(rAuto.held ?? '').toContain('/bqaa-backfill force')
+    expect(h.sent.length).toBe(0)
+    expect(h.files.get(childPath)).toBe(cText)
+    expect(h.files.get(priorBackupPath)).toBe(b1Text)
+
+    // Now test A3 replaying live P afresh (conflicting v1 vs v2) retires P covering attempt-1 and attempt-2 and cleans up prior-attempt live backup too.
+    h.files.set(parentPath, h.seedSpill(parentName, rowA, rowB) && h.files.get(parentPath)!)
+    h.files.delete(`${PARTITION_DIR}/outcome-done-old013-${parentName}`)
+    h.store.set(`replayed:${TABLE_REF}/${parentName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    await h.newWriter('s-16ab-c2').backfill(['spill', 'retry'], 'force')
+    await h.newWriter('s-16ab-c3').backfill(['spill', 'retry'], 'auto')
+    expect(h.files.get(parentPath)).toBe('')
+    expect(h.files.get(childPath)).toBe('')
+    expect(h.files.get(priorBackupPath)).toBe('')
+    expect(h.sentOf(rowA)).toBe(1)
+    expect(h.sentOf(rowB)).toBe(1)
+    expect(h.sentOf(rowC)).toBe(1)
+  }
+
+  // Subcase D: multi-child stageChildBackups rolls back child 1's staged backup when child 2 changes size mid-staging (0 HTTP requests, no orphaned live backup or standing sending mark).
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ab-d-parent.jsonl'
+    const c1Name = 'retry-20261013T200102002Z-t53-16ab-d-c1.jsonl'
+    const c2Name = 'retry-20261013T200102003Z-t53-16ab-d-c2.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const c1Path = `${PARTITION_DIR}/${c1Name}`
+    const c2Path = `${PARTITION_DIR}/${c2Name}`
+    const rowD = 'd'.repeat(32)
+    h.files.set(
+      c1Path,
+      packFiles([JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) })], parentName)[0]!,
+    )
+    h.files.set(
+      c2Path,
+      packFiles([JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowD) })], parentName)[0]!,
+    )
+    let mutatedC2 = false
+    h.setWriteFileHook(async (p, text) => {
+      // As soon as child 1's backup data file is written, mutate child 2's size so stageChildBackups aborts on child 2.
+      if (!mutatedC2 && !p.includes('/outcome') && p !== parentPath && p !== c1Path && p !== c2Path && text !== '') {
+        mutatedC2 = true
+        h.files.set(
+          c2Path,
+          packFiles(
+            [
+              JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowD) }),
+              JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.004Z', table: TABLE_REF, row: ownRow(rowB) }),
+            ],
+            parentName,
+          )[0]!,
+        )
+      }
+    })
+    h.setFetch(async () => OK_INSERT)
+    const r = await h.newWriter('s-16ab-d').backfill(['spill', 'retry'], 'force')
+    expect(mutatedC2).toBe(true)
+    expect(r.error).not.toBeNull()
+    expect(h.sent.length).toBe(0)
+    expect([...h.files.entries()].filter(([p, v]) => p.startsWith(`${PARTITION_DIR}/`) && !p.includes('/outcome') && p !== parentPath && p !== c1Path && p !== c2Path && v !== '').length).toBe(0)
+    expect([...h.files.entries()].filter(([k, v]) => k.includes('g-') && v.includes('"sending":true')).length).toBe(0)
+  }
+
+  // Subcase E: standalone backup B_c MUST stay held (even under `force`) while parent P is still live and unretired (`pj === undefined`).
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ab-e-parent.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ab-e-child.jsonl'
+    const backupName = 'retry-20261013T200102003Z-t53-16ab-e-backup.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const backupPath = `${PARTITION_DIR}/${backupName}`
+    const cText = packFiles(
+      [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) })],
+      parentName,
+    )[0]!
+    const bText = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ])[0]!
+    h.files.set(childPath, cText)
+    h.files.set(backupPath, bText)
+    const pSize = utf8Bytes(h.files.get(parentPath)!)
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-w14g-${childName}`,
+      sealFile(`${JSON.stringify({ size: utf8Bytes(cText), sending: true, by: 'w14g', stagedFor: parentName, stagedForSize: pSize, childGuard: true, attempt: 'a1' })}\n`),
+    )
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-w14g-${backupName}`,
+      sealFile(
+        `${JSON.stringify({ size: utf8Bytes(bText), sending: true, by: 'w14g', stagedFor: parentName, stagedForSize: pSize, replaces: childName, backup: true, backupForSize: utf8Bytes(cText), backupForFnv1a: fnv1a(cText), backupFnv1a: fnv1a(bText), attempt: 'a1' })}\n`,
+      ),
+    )
+    // Parent P is live with no journal (`pj === undefined`); forcing only ['retry'] MUST NOT prematurely deliver C or B_c!
+    h.setFetch(async () => OK_INSERT)
+    await h.newWriter('s-16ab-e1').backfill(['retry'], 'force')
+    expect(h.sentOf(rowC)).toBe(0)
+    expect(h.files.get(childPath)).toBe(cText)
+    expect(h.files.get(backupPath)).toBe(bText)
+  }
+
+  // Subcase F: failed-keep WITHOUT stuck v1 (`v1ShadowNeeded() === false`, so replacement carries `parent: P`) MUST keep standalone backup B_c live until P retires on disk.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ab-f-parent.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ab-f-child.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const cText = packFiles(
+      [
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+      ],
+      parentName,
+    )[0]!
+    h.files.set(childPath, cText)
+    h.setFetch(async () => OK_INSERT)
+    h.setWriteFileHook(async (p, text) => {
+      if (p.includes('/outcome-done-') && p.endsWith(`-${parentName}`) && text.includes('"retired":true')) {
+        throw new Error('EIO on parent retired done mark')
+      }
+    })
+    await h.newWriter('s-16ab-f1').backfill(['spill', 'retry'], 'force')
+    // P did not retire (`failed-keep`, `v1ShadowNeeded() === false`): child C and standalone backup B_c must BOTH remain live.
+    expect(h.files.get(parentPath)).not.toBe('')
+    expect(h.files.get(childPath)).toBe(cText)
+    const liveBackups = [...h.files.entries()].filter(([p, txt]) => {
+      if (p.includes('/outcome') || p === parentPath || p === childPath || txt === '') return false
+      const parsed = parseFile(txt)
+      return parsed.complete && parsed.parent === null
+    })
+    expect(liveBackups.length).toBe(1)
+    // Once disk recovers, auto retires P, empties C and B_c, and delivers rowC once.
+    h.setWriteFileHook(null)
+    await h.newWriter('s-16ab-f2').backfill(['spill', 'retry'], 'auto')
+    await h.newWriter('s-16ab-f3').backfill(['spill', 'retry'], 'auto')
+    expect(h.sentOf(rowA)).toBe(1)
+    expect(h.sentOf(rowB)).toBe(1)
+    expect(h.sentOf(rowC)).toBe(1)
+    expect(h.files.get(parentPath)).toBe('')
+    expect(h.files.get(childPath)).toBe('')
+    expect(h.files.get(liveBackups[0]![0])).toBe('')
+  }
+
+  // Subcase G: superseded digest-less 0.1.3 done mark + higher-seq 0.1.4 done mark for C_old MUST NOT be unmasked by stagedGuardState or cleanupBackups when C_new (equal size, new digest) is emptied unsent.
+  {
+    const rowNew = 'n'.repeat(32)
+    // Arm 1: stagedGuardState on standalone backup B_c after P retires and C_new is emptied unsent -> MUST deliver rowNew (never drop B_c via superseded 0.1.3 done mark).
+    {
+      const h = exitReplayHarness()
+      const parentName = 'spill-20261013T200102001Z-t53-16ab-g1-parent.jsonl'
+      const childName = 'retry-20261013T200102002Z-t53-16ab-g1-child.jsonl'
+      const backupName = 'retry-20261013T200102003Z-t53-16ab-g1-backup.jsonl'
+      const parentPath = h.seedSpill(parentName, rowA, rowB)
+      const childPath = `${PARTITION_DIR}/${childName}`
+      const backupPath = `${PARTITION_DIR}/${backupName}`
+      const oldC = packFiles(
+        [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) })],
+        parentName,
+      )[0]!
+      const newC = packFiles(
+        [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowNew) })],
+        parentName,
+      )[0]!
+      const bText = packFiles([
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowNew) }),
+      ])[0]!
+      expect(utf8Bytes(newC)).toBe(utf8Bytes(oldC))
+      const pSize = utf8Bytes(h.files.get(parentPath)!)
+      const cSize = utf8Bytes(newC)
+      // Parent retired by 0.1.3 force with files: [], C_new emptied unsent; C has both seq:1 digest-less 0.1.3 done mark and seq:2 0.1.4 done mark for oldC.
+      h.files.set(parentPath, '')
+      h.files.set(childPath, '')
+      h.files.set(backupPath, bText)
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-dist1-${parentName}`,
+        sealFile(`${JSON.stringify({ fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-dist1-${childName}`,
+        sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: cSize, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-cur1d-${childName}`,
+        sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: cSize, sourceFnv1a: fnv1a(oldC), waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-cur2g-${backupName}`,
+        sealFile(
+          `${JSON.stringify({ size: utf8Bytes(bText), sending: true, by: 'cur2g', stagedFor: parentName, stagedForSize: pSize, replaces: childName, backup: true, backupForSize: cSize, backupForFnv1a: fnv1a(newC), backupFnv1a: fnv1a(bText), attempt: 'a1' })}\n`,
+        ),
+      )
+      h.setFetch(async () => OK_INSERT)
+      const rAuto = await h.newWriter('s-16ab-g1').backfill(['retry'], 'auto')
+      expect(rAuto.held ?? '').toContain('/bqaa-backfill force')
+      expect(h.files.get(backupPath)).toBe(bText)
+      expect(h.sentOf(rowNew)).toBe(0)
+      await h.newWriter('s-16ab-g1-force').backfill(['retry'], 'force')
+      expect(h.sentOf(rowNew)).toBe(1)
+      expect(h.files.get(backupPath)).toBe('')
+    }
+
+    // Arm 2: cleanupBackups(true) when P adopts C_new and C_new is concurrently emptied unsent before P finishes -> MUST keep B_c alive and deliver rowNew on auto.
+    {
+      const h = exitReplayHarness()
+      const parentName = 'spill-20261013T200102001Z-t53-16ab-g2-parent.jsonl'
+      const childName = 'retry-20261013T200102002Z-t53-16ab-g2-child.jsonl'
+      const parentPath = h.seedSpill(parentName, rowA)
+      const childPath = `${PARTITION_DIR}/${childName}`
+      const oldC = packFiles(
+        [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) })],
+        parentName,
+      )[0]!
+      const newC = packFiles(
+        [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowNew) })],
+        parentName,
+      )[0]!
+      expect(utf8Bytes(newC)).toBe(utf8Bytes(oldC))
+      const cSize = utf8Bytes(newC)
+      h.files.set(childPath, newC)
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-dist1-${childName}`,
+        sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: cSize, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-cur1d-${childName}`,
+        sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: cSize, sourceFnv1a: fnv1a(oldC), waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      let emptiedC = false
+      h.setWriteFileHook(async (p, text) => {
+        // Right after P writes its retired done mark (before cleanupBackups), simulate concurrent 0.1.3 emptying C_new unsent.
+        if (!emptiedC && p.includes('/outcome-done-') && p.endsWith(`-${parentName}`) && text.includes('"retired":true')) {
+          emptiedC = true
+          h.files.set(childPath, '')
+        }
+      })
+      h.setFetch(async () => OK_INSERT)
+      await h.newWriter('s-16ab-g2-1').backfill(['spill'], 'force')
+      expect(emptiedC).toBe(true)
+      await h.newWriter('s-16ab-g2-2').backfill(['spill', 'retry'], 'auto')
+      expect(h.sentOf(rowA)).toBe(1)
+      expect(h.sentOf(rowNew)).toBe(1)
+    }
+  }
+})
+
+test('T53-16ac: emptied reconciled child retains its size-pinned childGuard without false empty-waiting notices and drops exact late copies', async () => {
+  const rowA = 'a'.repeat(32)
+  const rowB = 'b'.repeat(32)
+  const rowD = 'd'.repeat(32)
+  const h = exitReplayHarness()
+  const parentName = 'spill-20261013T200102001Z-t53-16ac-parent.jsonl'
+  const childName = 'retry-20261013T200102002Z-t53-16ac-child.jsonl'
+  const parentPath = h.seedSpill(parentName, rowA, rowB)
+  const childPath = `${PARTITION_DIR}/${childName}`
+  const oldC = packFiles(
+    [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) })],
+    parentName,
+  )[0]!
+  const newC = packFiles(
+    [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowD) })],
+    parentName,
+  )[0]!
+  expect(utf8Bytes(newC)).toBe(utf8Bytes(oldC))
+  h.files.set(childPath, oldC)
+  const pSize = utf8Bytes(h.files.get(parentPath)!)
+  h.store.set(`replayed:${TABLE_REF}/${parentName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+  h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 9, files: [childName], written: [true] })
+  h.setFetch(async () => OK_INSERT)
+
+  await h.newWriter('s-16ac-1').backfill(['spill', 'retry'], 'force')
+  expect(h.files.get(parentPath)).toBe('')
+  expect(h.files.get(childPath)).toBe('')
+  // Size-pinned childGuard mark remains standing beside emptied reconciled child C.
+  const standingGuards = [...h.files.entries()].filter(([k, v]) => k.includes('g-') && k.endsWith(`-${childName}`) && v !== '')
+  expect(standingGuards.length).toBe(1)
+
+  // Fresh writer within WRITE_PENDING_MS must NOT emit a false "is empty, perhaps still being written" held notice.
+  const rEmpty = await h.newWriter('s-16ac-2').backfill(['spill', 'retry'], 'auto')
+  expect(rEmpty.held).toBeNull()
+
+  // Late exact copy of oldC is dropped cleanly while keeping the guard standing.
+  h.files.set(childPath, oldC)
+  await h.newWriter('s-16ac-3').backfill(['spill', 'retry'], 'auto')
+  expect(h.sentOf(rowB)).toBe(1)
+  expect(h.files.get(childPath)).toBe('')
+  expect([...h.files.entries()].filter(([k, v]) => k.includes('g-') && k.endsWith(`-${childName}`) && v !== '').length).toBe(1)
+
+  // Same-size different-content repopulation newC is delivered once on auto.
+  h.files.set(childPath, newC)
+  await h.newWriter('s-16ac-4').backfill(['spill', 'retry'], 'auto')
+  expect(h.sentOf(rowD)).toBe(1)
+  expect(h.files.get(childPath)).toBe('')
+
+  // Retention lifecycle across no-mtimes, cap-8, and mtimeMs skew: retention
+  // MUST NEVER delete P's retired records while emptied C's childGuard mark
+  // still stands, and MUST expire C's childGuard cleanly without deadlocking a
+  // future same-size file at C.
+  for (const mode of ['no-mtimes', 'cap8', 'mtime-skew'] as const) {
+    const h2 = exitReplayHarness()
+    const pName = `retry-20261013T200102001Z-t53-16ac-${mode}-p.jsonl`
+    const cName = `spill-20261013T200102002Z-t53-16ac-${mode}-c.jsonl`
+    const pPath = `${PARTITION_DIR}/${pName}`
+    const cPath = `${PARTITION_DIR}/${cName}`
+    const pContent = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowA) }),
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowB) }),
+    ])[0]!
+    const cOld = packFiles(
+      [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) })],
+      pName,
+    )[0]!
+    const cNew = packFiles(
+      [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowD) })],
+      pName,
+    )[0]!
+    expect(utf8Bytes(cNew)).toBe(utf8Bytes(cOld))
+    h2.files.set(pPath, pContent)
+    h2.files.set(cPath, cOld)
+    const pSz = utf8Bytes(pContent)
+    h2.store.set(`replayed:${TABLE_REF}/${pName}`, { fates: 'LL', reasons: [], refusals: [], size: pSz, waits: false, seq: 2, files: [], written: [] })
+    h2.store.set(`replayed:v2:${TABLE_REF}/${pName}`, { fates: 'LW', reasons: [], refusals: [], size: pSz, waits: true, seq: 9, files: [cName], written: [true] })
+    h2.setFetch(async () => OK_INSERT)
+    await h2.newWriter(`s-16ac-${mode}-init`).backfill(['spill', 'retry'], 'force')
+
+    const cGuardPath = [...h2.files.entries()].find(([k, v]) => k.includes('g-') && k.endsWith(`-${cName}`) && v !== '')?.[0]
+    const pDonePath = [...h2.files.entries()].find(([k, v]) => k.includes('outcome-done-') && k.endsWith(`-${pName}`) && v.includes('"retired":true'))?.[0]
+    expect(cGuardPath).toBeDefined()
+    expect(pDonePath).toBeDefined()
+    if (mode !== 'no-mtimes') {
+      for (const p of h2.files.keys()) h2.mtimes.set(p, 1000)
+    }
+
+    if (mode === 'cap8') {
+      for (let i = 0; i < 8; i += 1) {
+        const filler = `retry-20261013T20010100${i}Z-t53-16ac-filler-${i}.jsonl`
+        const fPath = `${PARTITION_DIR}/${filler}`
+        const fDone = `${PARTITION_DIR}/outcome-done-old${i}-${filler}`
+        h2.files.set(fPath, '')
+        h2.mtimes.set(fPath, 1000)
+        h2.files.set(
+          fDone,
+          sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: 100, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+        )
+        h2.mtimes.set(fDone, 1000)
+      }
+    }
+
+    h2.advanceNow(25 * 60 * 60_000)
+    if (mode === 'mtime-skew') {
+      h2.mtimes.set(cGuardPath!, h2.ioFor().now() - 23 * 60 * 60_000)
+    }
+    const baseIo = h2.ioFor()
+    const runIo =
+      mode === 'no-mtimes'
+        ? {
+            ...baseIo,
+            listDir: async (d: string) => (await baseIo.listDir(d)).map(({ mtimeMs: _omit, ...rest }) => rest),
+          }
+        : baseIo
+    await new Writer(runIo, () => h2.config, () => `s-16ac-${mode}-ret1`).backfill(['spill', 'retry'], 'auto')
+
+    // Invariant: whenever cGuardPath still stands, pDonePath MUST still stand too!
+    if ((h2.files.get(cGuardPath!) ?? '') !== '') {
+      expect(h2.files.get(pDonePath!)).not.toBe('')
+    }
+
+    // Same-size newC arriving right after pass 1 MUST deliver on auto without deadlocking!
+    h2.files.set(cPath, cNew)
+    const rDeliver = await new Writer(runIo, () => h2.config, () => `s-16ac-${mode}-deliver`).backfill(['spill', 'retry'], 'auto')
+    if (mode !== 'no-mtimes') expect(rDeliver.held).toBeNull()
+    else expect(rDeliver.held ?? '').not.toContain(cName)
+    expect(h2.sentOf(rowD)).toBe(1)
+    expect(h2.files.get(cPath)).toBe('')
+
+    // After another 25h (2 passes), both C's guard and P's retired marker expire cleanly!
+    h2.advanceNow(25 * 60 * 60_000)
+    await new Writer(runIo, () => h2.config, () => `s-16ac-${mode}-ret2`).backfill(['spill', 'retry'], 'auto')
+    await new Writer(runIo, () => h2.config, () => `s-16ac-${mode}-ret3`).backfill(['spill', 'retry'], 'auto')
+    expect(h2.files.get(cGuardPath!)).toBe('')
+    expect(h2.files.get(pDonePath!)).toBe('')
+  }
+})
+
+test('T53-16ad: equal-size replacement of a retired child is delivered instead of recorded as the old generation', async () => {
+  const rowA = 'a'.repeat(32)
+  const rowB = 'b'.repeat(32)
+  const rowD = 'd'.repeat(32)
+
+  // Subcase A: 0.1.4 retired oldC (persisting sourceFnv1a), then equal-size newC (same parent & row count) replaced childPath BEFORE force runs on P.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'retry-20261013T200102001Z-t53-16ad-a-parent.jsonl'
+    const childName = 'spill-20261013T200102002Z-t53-16ad-a-child.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const oldC = packFiles(
+      [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) })],
+      parentName,
+    )[0]!
+    const newC = packFiles(
+      [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowD) })],
+      parentName,
+    )[0]!
+    expect(utf8Bytes(newC)).toBe(utf8Bytes(oldC))
+    h.files.set(childPath, oldC)
+    h.setFetch(async () => OK_INSERT)
+    // First retire oldC via 0.1.4 so its retired done mark carries sourceFnv1a = fnv1a(oldC).
+    await h.newWriter('s-16ad-a0').backfill(['spill'], 'auto')
+    expect(h.sentOf(rowB)).toBe(1)
+    expect(h.files.get(childPath)).toBe('')
+    const cDone = h.doneMarksFor(childName).find(m => m.complete && m.data?.retired === true)
+    expect(cDone?.data?.sourceFnv1a).toBe(fnv1a(oldC))
+
+    // Equal-size replacement newC now occupies childPath, and forced replay runs on P.
+    h.files.set(childPath, newC)
+    const pSize = utf8Bytes(h.files.get(parentPath)!)
+    h.store.set(`replayed:${TABLE_REF}/${parentName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 9, files: [childName], written: [true] })
+    await h.newWriter('s-16ad-a1').backfill(['spill', 'retry'], 'force')
+    await h.newWriter('s-16ad-a2').backfill(['spill', 'retry'], 'auto')
+    expect(h.sentOf(rowA)).toBe(1)
+    expect(h.sentOf(rowD)).toBe(1)
+    expect(h.files.get(parentPath)).toBe('')
+    expect(h.files.get(childPath)).toBe('')
+    const pDone = h.doneMarksFor(parentName).find(m => m.complete && m.data?.retired === true)
+    expect((pDone?.data?.reconciled as { name: string }[] | undefined) ?? []).toEqual([])
+  }
+
+  // Subcase B: legacy digest-less retired mark on childPath with equal-size replacement newC -> classifyChild MUST NOT fabricate fnv1a(newC) into P.reconciled or truncate newC.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'retry-20261013T200102001Z-t53-16ad-b-parent.jsonl'
+    const childName = 'spill-20261013T200102002Z-t53-16ad-b-child.jsonl'
+    const parentPath = `${PARTITION_DIR}/${parentName}`
+    h.files.set(
+      parentPath,
+      packFiles([
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowA) }),
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowB) }),
+      ])[0]!,
+    )
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const newC = packFiles(
+      [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowD) })],
+      parentName,
+    )[0]!
+    h.files.set(childPath, newC)
+    const cSize = utf8Bytes(newC)
+    const pSize = utf8Bytes(h.files.get(parentPath)!)
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-old013-${childName}`,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: cSize, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+    )
+    h.store.set(`replayed:${TABLE_REF}/${parentName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 9, files: [childName], written: [true] })
+    h.setFetch(async () => OK_INSERT)
+
+    await h.newWriter('s-16ad-b1').backfill(['retry'], 'force')
+    expect(h.files.get(parentPath)).toBe('')
+    expect(h.files.get(childPath)).toBe(newC)
+    const pDone = h.doneMarksFor(parentName).find(m => m.complete && m.data?.retired === true)
+    expect((pDone?.data?.reconciled as { name: string }[] | undefined) ?? []).toEqual([])
+  }
+
+  // Subcase C: equal-size swap between readBefore and readAfter inside classifyChild defers instead of reconciling the new bytes.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'retry-20261013T200102001Z-t53-16ad-c-parent.jsonl'
+    const childName = 'spill-20261013T200102002Z-t53-16ad-c-child.jsonl'
+    const parentPath = `${PARTITION_DIR}/${parentName}`
+    h.files.set(
+      parentPath,
+      packFiles([
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowA) }),
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowB) }),
+      ])[0]!,
+    )
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const oldC = packFiles(
+      [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) })],
+      parentName,
+    )[0]!
+    const newC = packFiles(
+      [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowD) })],
+      parentName,
+    )[0]!
+    expect(utf8Bytes(newC)).toBe(utf8Bytes(oldC))
+    h.files.set(childPath, oldC)
+    const cDonePath = `${PARTITION_DIR}/outcome-done-oldc-${childName}`
+    h.files.set(
+      cDonePath,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: utf8Bytes(oldC), sourceFnv1a: fnv1a(oldC), waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+    )
+    const pSize = utf8Bytes(h.files.get(parentPath)!)
+    h.store.set(`replayed:${TABLE_REF}/${parentName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 9, files: [childName], written: [true] })
+    h.setFetch(async () => OK_INSERT)
+
+    let sawDone = false
+    let swapped = false
+    const baseIo = h.ioFor()
+    const swapIo = {
+      ...baseIo,
+      readFile: async (p: string) => {
+        if (p === cDonePath) sawDone = true
+        if (p === childPath && sawDone && !swapped) {
+          swapped = true
+          h.files.set(childPath, newC)
+        }
+        return baseIo.readFile(p)
+      },
+    }
+    await new Writer(swapIo, () => h.config, () => 's-16ad-c1').backfill(['retry'], 'force')
+    expect(swapped).toBe(true)
+    expect(h.files.get(childPath)).toBe(newC)
+    await h.newWriter('s-16ad-c2').backfill(['spill', 'retry'], 'auto')
+    expect(h.sentOf(rowD)).toBe(1)
+    expect(h.files.get(childPath)).toBe('')
+  }
+
+  // Subcase D: equal-size generation 2 with stale v1(sourceFnv1a: D1) and active v2(sourceFnv1a: D2) disambiguates `'conflict'` via live digest and resumes v2 on auto.
+  {
+    const h = exitReplayHarness()
+    const fileName = 'spill-20261013T200102001Z-t53-16ad-d-gen2.jsonl'
+    const filePath = `${PARTITION_DIR}/${fileName}`
+    const gen1 = packFiles([
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowA) }),
+    ])[0]!
+    const gen2 = packFiles([
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowD) }),
+    ])[0]!
+    expect(utf8Bytes(gen2)).toBe(utf8Bytes(gen1))
+    const sz = utf8Bytes(gen2)
+    h.files.set(filePath, gen2)
+    h.store.set(`replayed:${TABLE_REF}/${fileName}`, {
+      fates: 'W',
+      reasons: [],
+      refusals: [],
+      size: sz,
+      sourceFnv1a: fnv1a(gen1),
+      waits: true,
+      seq: 2,
+      files: ['retry-gen1-leftover.jsonl'],
+      written: [true],
+    })
+    h.store.set(`replayed:v2:${TABLE_REF}/${fileName}`, {
+      fates: 'L',
+      reasons: [],
+      refusals: [],
+      size: sz,
+      sourceFnv1a: fnv1a(gen2),
+      waits: false,
+      seq: 1,
+      files: [],
+      written: [],
+    })
+    h.setFetch(async () => OK_INSERT)
+    const rAuto = await h.newWriter('s-16ad-d1').backfill(['spill'], 'auto')
+    expect(rAuto.held).toBeNull()
+    expect(h.sentOf(rowD)).toBe(0)
+    expect(h.files.get(filePath)).toBe('')
+  }
+
+  // Subcase E: `'conflict'` involving a digest-less 0.1.3 v1 record (fates 'L') and a mismatched 0.1.4 v2 record (sourceFnv1a: D1) MUST stay `'conflict'` on equal-size gen2 (D2) instead of unmasking digest-less v1 to drop D2.
+  {
+    const h = exitReplayHarness()
+    const fileName = 'spill-20261013T200102001Z-t53-16ad-e-conflict.jsonl'
+    const filePath = `${PARTITION_DIR}/${fileName}`
+    const gen1 = packFiles([
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowA) }),
+    ])[0]!
+    const gen2 = packFiles([
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowD) }),
+    ])[0]!
+    expect(utf8Bytes(gen2)).toBe(utf8Bytes(gen1))
+    const sz = utf8Bytes(gen2)
+    h.files.set(filePath, gen2)
+    h.store.set(`replayed:${TABLE_REF}/${fileName}`, { fates: 'L', reasons: [], refusals: [], size: sz, waits: false, seq: 1, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE_REF}/${fileName}`, {
+      fates: 'W',
+      reasons: [],
+      refusals: [],
+      size: sz,
+      sourceFnv1a: fnv1a(gen1),
+      waits: true,
+      seq: 2,
+      files: ['retry-gen1.jsonl'],
+      written: [true],
+    })
+    h.setFetch(async () => OK_INSERT)
+    const rAuto = await h.newWriter('s-16ad-e1').backfill(['spill'], 'auto')
+    expect(rAuto.held ?? '').toContain('/bqaa-backfill force')
+    expect(h.files.get(filePath)).toBe(gen2)
+    await h.newWriter('s-16ad-e2').backfill(['spill'], 'force')
+    expect(h.sentOf(rowD)).toBe(1)
+    expect(h.files.get(filePath)).toBe('')
+  }
+
+  // Subcase F: genuine 0.1.3 (digest-less v1, fates 'L') vs 0.1.4 (v2 with sourceFnv1a === fnv1a(gen2), fates 'W', no supersedesV1) split-brain conflict on the SAME generation MUST stay `'conflict'` on auto instead of silently adopting v2.
+  {
+    const h = exitReplayHarness()
+    const fileName = 'spill-20261013T200102001Z-t53-16ad-f-splitbrain.jsonl'
+    const filePath = `${PARTITION_DIR}/${fileName}`
+    const gen2 = packFiles([
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowD) }),
+    ])[0]!
+    const sz = utf8Bytes(gen2)
+    h.files.set(filePath, gen2)
+    h.store.set(`replayed:${TABLE_REF}/${fileName}`, { fates: 'L', reasons: [], refusals: [], size: sz, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE_REF}/${fileName}`, {
+      fates: 'W',
+      reasons: [],
+      refusals: [],
+      size: sz,
+      sourceFnv1a: fnv1a(gen2),
+      waits: true,
+      seq: 1,
+      files: ['retry-gen2-v2.jsonl'],
+      written: [false],
+    })
+    h.setFetch(async () => OK_INSERT)
+    const rAuto = await h.newWriter('s-16ad-f1').backfill(['spill'], 'auto')
+    expect(rAuto.held ?? '').toContain('/bqaa-backfill force')
+    expect(h.files.get(filePath)).toBe(gen2)
+    expect(h.sentOf(rowD)).toBe(0)
+    await h.newWriter('s-16ad-f2').backfill(['spill'], 'force')
+    expect(h.sentOf(rowD)).toBe(1)
+    expect(h.files.get(filePath)).toBe('')
+  }
+
+  // Subcase G: equal-seq tie where a digest-less 0.1.3 done mark (`zdist`) sorts AFTER a 0.1.4 `sourceFnv1a` done mark (`acur`) MUST still prefer `acur` so equal-size `cNew` is delivered (both standalone `backfillRun` auto and `classifyChild` under parent `force`).
+  {
+    const rowNew = 'n'.repeat(32)
+    // Arm 1: standalone auto replay on `cNew`.
+    {
+      const h = exitReplayHarness()
+      const fileName = 'spill-20261013T200102001Z-t53-16ad-g1.jsonl'
+      const filePath = `${PARTITION_DIR}/${fileName}`
+      const cOld = packFiles([
+        JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowA) }),
+      ])[0]!
+      const cNew = packFiles([
+        JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowNew) }),
+      ])[0]!
+      expect(utf8Bytes(cNew)).toBe(utf8Bytes(cOld))
+      const sz = utf8Bytes(cNew)
+      h.files.set(filePath, cNew)
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-acur-${fileName}`,
+        sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: sz, sourceFnv1a: fnv1a(cOld), waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-zdist-${fileName}`,
+        sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: sz, waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.setFetch(async () => OK_INSERT)
+      const r = await h.newWriter('s-16ad-g1').backfill(['spill'], 'auto')
+      expect(r.held).toBeNull()
+      expect(h.sentOf(rowNew)).toBe(1)
+      expect(h.files.get(filePath)).toBe('')
+    }
+
+    // Arm 2: `classifyChild` under parent `force` with `zdist` sorting after `acur` at equal `seq: 2`.
+    {
+      const h = exitReplayHarness()
+      const parentName = 'retry-20261013T200102001Z-t53-16ad-g2-parent.jsonl'
+      const childName = 'spill-20261013T200102002Z-t53-16ad-g2-child.jsonl'
+      const parentPath = `${PARTITION_DIR}/${parentName}`
+      const childPath = `${PARTITION_DIR}/${childName}`
+      h.files.set(
+        parentPath,
+        packFiles([JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowA) })])[0]!,
+      )
+      const cOld = packFiles(
+        [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) })],
+        parentName,
+      )[0]!
+      const cNew = packFiles(
+        [JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowNew) })],
+        parentName,
+      )[0]!
+      expect(utf8Bytes(cNew)).toBe(utf8Bytes(cOld))
+      const sz = utf8Bytes(cNew)
+      h.files.set(childPath, cNew)
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-acur-${childName}`,
+        sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: sz, sourceFnv1a: fnv1a(cOld), waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-zdist-${childName}`,
+        sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: sz, waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.setFetch(async () => OK_INSERT)
+      await h.newWriter('s-16ad-g2-1').backfill(['retry'], 'force')
+      await h.newWriter('s-16ad-g2-2').backfill(['spill', 'retry'], 'auto')
+      expect(h.sentOf(rowA)).toBe(1)
+      expect(h.sentOf(rowNew)).toBe(1)
+      expect(h.files.get(parentPath)).toBe('')
+      expect(h.files.get(childPath)).toBe('')
+    }
+  }
+
+  // Subcase H: `parentFate` equal-seq tie where `zdist` (`files: []`) sorts AFTER `acur` (`sourceFnv1a`, `files: [C]`) beside emptied `P` MUST deliver `C` instead of dropping it, and refuse to drop an unlisted sibling `U`.
+  {
+    const rowChild = 'e'.repeat(32)
+    const rowUnlisted = 'f'.repeat(32)
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ad-h-parent.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ad-h-child.jsonl'
+    const unlistedName = 'retry-20261013T200102003Z-t53-16ad-h-unlisted.jsonl'
+    const parentPath = `${PARTITION_DIR}/${parentName}`
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const unlistedPath = `${PARTITION_DIR}/${unlistedName}`
+    const cText = packFiles(
+      [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowChild) })],
+      parentName,
+    )[0]!
+    const uText = packFiles(
+      [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowUnlisted) })],
+      parentName,
+    )[0]!
+    h.files.set(parentPath, '')
+    h.files.set(childPath, cText)
+    h.files.set(unlistedPath, uText)
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-acur-${parentName}`,
+      sealFile(`${JSON.stringify({ fates: 'W', reasons: [], refusals: [], size: 256, sourceFnv1a: 'deadbeef', waits: true, seq: 2, files: [childName], written: [true], retired: true, retiredAt: 1000 })}\n`),
+    )
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-zdist-${parentName}`,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: 256, waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+    )
+    h.setFetch(async () => OK_INSERT)
+    const r = await h.newWriter('s-16ad-h1').backfill(['retry'], 'auto')
+    expect(h.sentOf(rowChild)).toBe(1)
+    expect(h.files.get(childPath)).toBe('')
+    // Unlisted child on a disagreeing equal-seq parent tie must stay held (ambiguous), never dropped unsent.
+    expect(h.sentOf(rowUnlisted)).toBe(0)
+    expect(h.files.get(unlistedPath)).toBe(uText)
+    expect(r.held ?? '').toContain('/bqaa-backfill force')
+  }
+
+  // Subcase I: `seedSkippedHeld` MUST NOT suppress the held notice for an equal-size replacement `cNew` locked by a foreign sending mark just because `cOld` has a mismatched `sourceFnv1a` done mark (even alongside a same-seq digest-less `zdist` mark).
+  {
+    const rowNew = 'm'.repeat(32)
+    const h = exitReplayHarness()
+    const firstName = 'spill-20261013T200102001Z-t53-16ad-i-first.jsonl'
+    const secondName = 'spill-20261013T200102002Z-t53-16ad-i-second.jsonl'
+    const firstPath = h.seedSpill(firstName, rowA)
+    const secondPath = `${PARTITION_DIR}/${secondName}`
+    const cOld = packFiles([
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+    ])[0]!
+    const cNew = packFiles([
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowNew) }),
+    ])[0]!
+    expect(utf8Bytes(cNew)).toBe(utf8Bytes(cOld))
+    const sz = utf8Bytes(cNew)
+    h.files.set(secondPath, cNew)
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-acur-${secondName}`,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: sz, sourceFnv1a: fnv1a(cOld), waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+    )
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-zdist-${secondName}`,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: sz, waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+    )
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-other1-${secondName}`,
+      sealFile(`${JSON.stringify({ size: sz, sending: true, uncertain: true, by: 'other1' })}\n`),
+    )
+    // Earlier file hits 503 UNAVAILABLE so the scan stops before `secondPath` and inspects `secondPath` via `seedSkippedHeld`.
+    h.setFetch(async () => UNAVAILABLE)
+    const w = h.newWriter('s-16ad-i1')
+    const r = await w.backfill(['spill'], 'auto')
+    expect(h.files.get(firstPath)).not.toBe('')
+    expect(h.files.get(secondPath)).toBe(cNew)
+    expect(r.held ?? w.heldNoticeInfo()?.reason ?? '').toContain('/bqaa-backfill force')
+    expect(w.heldNoticeInfo()?.files).toBe(1)
+  }
+
+  // Subcase J: equal-size parent repopulation (`P_old` retired with `sourceFnv1a: H1, files: []` vs `P_new` `sourceFnv1a: H2` writing child `C_new`) MUST NOT let `parentFate` drop `C_new` (both while `P_new` is live and after `P_new` is emptied).
+  {
+    const rowX = 'x'.repeat(32)
+    const rowY = 'y'.repeat(32)
+    // Arm 1: `P_new` is live and leased while its v1 journal (`H2`, `written: [false]`) names `C_new`.
+    {
+      const h = exitReplayHarness()
+      const parentName = 'spill-20261013T200102001Z-t53-16ad-j1-parent.jsonl'
+      const childName = 'retry-20261013T200102002Z-t53-16ad-j1-child.jsonl'
+      const parentPath = `${PARTITION_DIR}/${parentName}`
+      const childPath = `${PARTITION_DIR}/${childName}`
+      const pOld = packFiles([
+        JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowA) }),
+        JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+      ])[0]!
+      const pNew = packFiles([
+        JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowX) }),
+        JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowY) }),
+      ])[0]!
+      const cNew = packFiles(
+        [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowY) })],
+        parentName,
+      )[0]!
+      expect(utf8Bytes(pNew)).toBe(utf8Bytes(pOld))
+      const pSize = utf8Bytes(pNew)
+      h.files.set(parentPath, pNew)
+      h.files.set(childPath, cNew)
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-old1d-${parentName}`,
+        sealFile(`${JSON.stringify({ fates: 'LL', reasons: [], refusals: [], size: pSize, sourceFnv1a: fnv1a(pOld), waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.store.set(`replayed:${TABLE_REF}/${parentName}`, {
+        fates: 'LW',
+        reasons: [],
+        refusals: [],
+        size: pSize,
+        sourceFnv1a: fnv1a(pNew),
+        waits: true,
+        seq: 1,
+        files: [childName],
+        written: [false],
+      })
+      h.store.set(`lease:${TABLE_REF}/${parentName}`, { by: 'other-session', until: h.ioFor().now() + 60_000 })
+      h.setFetch(async () => OK_INSERT)
+      await h.newWriter('s-16ad-j1-auto').backfill(['spill', 'retry'], 'auto')
+      // `C_new` must NOT be dropped while `P_new` is live and `written[0] === false`.
+      expect(h.files.get(childPath)).toBe(cNew)
+      expect(h.sentOf(rowY)).toBe(0)
+      // Once `P_new` finishes (`written: [true]` and emptied), `C_new` delivers rowY once.
+      h.store.set(`replayed:${TABLE_REF}/${parentName}`, {
+        fates: 'LW',
+        reasons: [],
+        refusals: [],
+        size: pSize,
+        sourceFnv1a: fnv1a(pNew),
+        waits: true,
+        seq: 1,
+        files: [childName],
+        written: [true],
+      })
+      h.files.set(parentPath, '')
+      await h.newWriter('s-16ad-j1-finish').backfill(['spill', 'retry'], 'auto')
+      expect(h.sentOf(rowY)).toBe(1)
+      expect(h.files.get(childPath)).toBe('')
+    }
+
+    // Arm 2: `P_new` already emptied while `P_old`'s retired done mark (`H1`, `files: []`) coexists with `P_new`'s `v1` record (`H2`, `files: [C_new]`).
+    {
+      const h = exitReplayHarness()
+      const parentName = 'spill-20261013T200102001Z-t53-16ad-j2-parent.jsonl'
+      const childName = 'retry-20261013T200102002Z-t53-16ad-j2-child.jsonl'
+      const parentPath = `${PARTITION_DIR}/${parentName}`
+      const childPath = `${PARTITION_DIR}/${childName}`
+      const cNew = packFiles(
+        [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowY) })],
+        parentName,
+      )[0]!
+      h.files.set(parentPath, '')
+      h.files.set(childPath, cNew)
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-old1d-${parentName}`,
+        sealFile(`${JSON.stringify({ fates: 'LL', reasons: [], refusals: [], size: 512, sourceFnv1a: '11111111', waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.store.set(`replayed:${TABLE_REF}/${parentName}`, {
+        fates: 'LW',
+        reasons: [],
+        refusals: [],
+        size: 512,
+        sourceFnv1a: '22222222',
+        waits: true,
+        seq: 1,
+        files: [childName],
+        written: [true],
+      })
+      h.setFetch(async () => OK_INSERT)
+      await h.newWriter('s-16ad-j2').backfill(['retry'], 'auto')
+      expect(h.sentOf(rowY)).toBe(1)
+      expect(h.files.get(childPath)).toBe('')
+    }
+  }
+
+  // Subcase K: equal-size repopulated live unretired `P_new` (`H2`) beside `P_old`'s retired done mark (`H1`) MUST keep guarded `C` and standalone backup `B_c` held on BOTH `auto` (no false parent-retired notice) and `force`.
+  {
+    const rowX = 'x'.repeat(32)
+    const rowY = 'y'.repeat(32)
+    const rowC = 'c'.repeat(32)
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ad-k-parent.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ad-k-child.jsonl'
+    const backupName = 'retry-20261013T200102003Z-t53-16ad-k-backup.jsonl'
+    const parentPath = `${PARTITION_DIR}/${parentName}`
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const backupPath = `${PARTITION_DIR}/${backupName}`
+    const pOld = packFiles([
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowA) }),
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+    ])[0]!
+    const pNew = packFiles([
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.001Z', table: TABLE_REF, row: ownRow(rowX) }),
+      JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowY) }),
+    ])[0]!
+    const cText = packFiles(
+      [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) })],
+      parentName,
+    )[0]!
+    const bText = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ])[0]!
+    expect(utf8Bytes(pNew)).toBe(utf8Bytes(pOld))
+    const pSize = utf8Bytes(pNew)
+    h.files.set(parentPath, pNew)
+    h.files.set(childPath, cText)
+    h.files.set(backupPath, bText)
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-old1d-${parentName}`,
+      sealFile(`${JSON.stringify({ fates: 'LL', reasons: [], refusals: [], size: pSize, sourceFnv1a: fnv1a(pOld), waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+    )
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-cur2g-${childName}`,
+      sealFile(`${JSON.stringify({ size: utf8Bytes(cText), sending: true, by: 'cur2g', stagedFor: parentName, stagedForSize: pSize, childGuard: true, attempt: 'A2' })}\n`),
+    )
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-cur2g-${backupName}`,
+      sealFile(
+        `${JSON.stringify({ size: utf8Bytes(bText), sending: true, by: 'cur2g', stagedFor: parentName, stagedForSize: pSize, replaces: childName, backup: true, backupForSize: utf8Bytes(cText), backupForFnv1a: fnv1a(cText), backupFnv1a: fnv1a(bText), attempt: 'A2' })}\n`,
+      ),
+    )
+    h.setFetch(async () => OK_INSERT)
+    const rAuto = await h.newWriter('s-16ad-k1').backfill(['retry'], 'auto')
+    expect(rAuto.held ?? '').not.toContain('retired without accounting')
+    expect(rAuto.held ?? '').not.toContain('/bqaa-backfill force')
+    expect(h.sentOf(rowC)).toBe(0)
+    await h.newWriter('s-16ad-k2').backfill(['retry'], 'force')
+    expect(h.sentOf(rowC)).toBe(0)
+    expect(h.files.get(childPath)).toBe(cText)
+    expect(h.files.get(backupPath)).toBe(bText)
+  }
+
+  // Subcase L: (1) `seedSkippedHeld` validates `sourceFnv1a` on unretired `v2` slots even with 0 done marks; (2) `parentFate` 3-mark equal-seq tie preserves merged `files` when a 3rd mark matches the winning digest; (3) transient `readFile` error in `stagedGuardState` `pendingReconcile` returns `'hold'` so neither `auto` emits a false parent-retired notice nor `force` bypasses `skipIndices`.
+  {
+    const rowNew = 'q'.repeat(32)
+    // Arm 1: 0 done marks + stale unretired v2 (`sourceFnv1a: cOld`) + foreign sending mark on equal-size `cNew` -> `seedSkippedHeld` reports held notice.
+    {
+      const h = exitReplayHarness()
+      const firstName = 'spill-20261013T200102001Z-t53-16ad-l1-first.jsonl'
+      const secondName = 'spill-20261013T200102002Z-t53-16ad-l1-second.jsonl'
+      h.seedSpill(firstName, rowA)
+      const secondPath = `${PARTITION_DIR}/${secondName}`
+      const cOld = packFiles([
+        JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+      ])[0]!
+      const cNew = packFiles([
+        JSON.stringify({ v: 1, kind: 'spill', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowNew) }),
+      ])[0]!
+      expect(utf8Bytes(cNew)).toBe(utf8Bytes(cOld))
+      const sz = utf8Bytes(cNew)
+      h.files.set(secondPath, cNew)
+      h.store.set(`replayed:v2:${TABLE_REF}/${secondName}`, {
+        fates: 'L',
+        reasons: [],
+        refusals: [],
+        size: sz,
+        sourceFnv1a: fnv1a(cOld),
+        waits: false,
+        seq: 1,
+        files: [],
+        written: [],
+      })
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-other1-${secondName}`,
+        sealFile(`${JSON.stringify({ size: sz, sending: true, uncertain: true, by: 'other1' })}\n`),
+      )
+      h.setFetch(async () => UNAVAILABLE)
+      const w = h.newWriter('s-16ad-l1')
+      const r = await w.backfill(['spill'], 'auto')
+      expect(r.held ?? w.heldNoticeInfo()?.reason ?? '').toContain('/bqaa-backfill force')
+      expect(w.heldNoticeInfo()?.files).toBe(1)
+    }
+
+    // Arm 2: 3-mark equal-seq tie `acur1 (D1, [])` + `bdist (no digest, [C])` + `zcur1b (D1, [])` keeps `C` in merged files and delivers it 1x.
+    {
+      const rowChild = 'r'.repeat(32)
+      const h = exitReplayHarness()
+      const parentName = 'spill-20261013T200102001Z-t53-16ad-l2-parent.jsonl'
+      const childName = 'retry-20261013T200102002Z-t53-16ad-l2-child.jsonl'
+      h.files.set(`${PARTITION_DIR}/${parentName}`, '')
+      const childPath = `${PARTITION_DIR}/${childName}`
+      h.files.set(
+        childPath,
+        packFiles([JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowChild) })], parentName)[0]!,
+      )
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-acur1-${parentName}`,
+        sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: 256, sourceFnv1a: '11111111', waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-bdist-${parentName}`,
+        sealFile(`${JSON.stringify({ fates: 'W', reasons: [], refusals: [], size: 256, waits: true, seq: 2, files: [childName], written: [true], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-zcur1b-${parentName}`,
+        sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: 256, sourceFnv1a: '11111111', waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.setFetch(async () => OK_INSERT)
+      await h.newWriter('s-16ad-l2').backfill(['retry'], 'auto')
+      expect(h.sentOf(rowChild)).toBe(1)
+      expect(h.files.get(childPath)).toBe('')
+    }
+
+    // Arm 3: transient `readFile` error in `stagedGuardState` `pendingReconcile` returns `'hold'` (no false parent-retired notice on `auto` and no un-skipped duplicate delivery on `force` when `!stagedGuardClearable`).
+    {
+      const rowC = 'c'.repeat(32)
+      const h = exitReplayHarness()
+      const parentName = 'spill-20261013T200102001Z-t53-16ad-l3-parent.jsonl'
+      const childName = 'retry-20261013T200102002Z-t53-16ad-l3-child.jsonl'
+      h.files.set(`${PARTITION_DIR}/${parentName}`, '')
+      const childPath = `${PARTITION_DIR}/${childName}`
+      const cText = packFiles(
+        [
+          JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+          JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+        ],
+        parentName,
+      )[0]!
+      const cSize = utf8Bytes(cText)
+      h.files.set(childPath, cText)
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-old013-${parentName}`,
+        sealFile(`${JSON.stringify({ fates: 'LL', reasons: [], refusals: [], size: 512, waits: false, seq: 2, files: [], written: [], retired: true, retiredAt: 1000 })}\n`),
+      )
+      h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+        fates: 'LL',
+        reasons: [],
+        refusals: [],
+        size: 512,
+        waits: false,
+        seq: 5,
+        files: [],
+        written: [],
+        attempt: 'A1',
+        attempts: ['A1'],
+        pendingReconcile: [{ name: childName, size: cSize, fnv1a: fnv1a(cText), skipIndices: [0] }],
+      })
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-cur1g-${childName}`,
+        sealFile(`${JSON.stringify({ size: cSize, sending: true, by: 'cur1g', stagedFor: parentName, stagedForSize: 512, childGuard: true, attempt: 'A1' })}\n`),
+      )
+      // Additional foreign non-staged sending mark makes `stagedGuardClearable === false`.
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-foreign1-${childName}`,
+        sealFile(`${JSON.stringify({ size: cSize, sending: true, by: 'foreign1' })}\n`),
+      )
+      h.setFetch(async () => OK_INSERT)
+      let failChildRead = true
+      const baseIo = h.ioFor()
+      const flakyIo = {
+        ...baseIo,
+        readFile: async (p: string) => {
+          if (p === childPath && failChildRead) {
+            failChildRead = false
+            throw new Error('EIO transient')
+          }
+          return baseIo.readFile(p)
+        },
+      }
+      // On auto: transient EIO holds cleanly without false parent-retired notice.
+      const rAuto = await new Writer(flakyIo, () => h.config, () => 's-16ad-l3-auto').backfill(['retry'], 'auto')
+      expect(rAuto.held ?? '').not.toContain('retired without accounting')
+      expect(rAuto.held ?? '').not.toContain('/bqaa-backfill force')
+      expect(h.sent.length).toBe(0)
+      // On force with transient EIO on `checkTargetDigest`: MUST hold (`0` rows sent, never bypass `skipIndices` to duplicate rowB).
+      failChildRead = true
+      await new Writer(flakyIo, () => h.config, () => 's-16ad-l3-force1').backfill(['retry'], 'force')
+      expect(h.sent.length).toBe(0)
+      // Clean force after EIO clears skips index 0 (rowB) and delivers only rowC once.
+      await h.newWriter('s-16ad-l3-force2').backfill(['retry'], 'force')
+      expect(h.sentOf(rowB)).toBe(0)
+      expect(h.sentOf(rowC)).toBe(1)
+      expect(h.files.get(childPath)).toBe('')
+    }
+  }
+})
+
+test('T53-16ae: positional skipIndices are revalidated against the replayed buffer digest so an equal-size swap never skips an undelivered row', async () => {
+  const rowB = 'b'.repeat(32)
+  const rowC = 'c'.repeat(32)
+  const rowD = 'd'.repeat(32)
+  const rowE = 'e'.repeat(32)
+  const h = exitReplayHarness()
+  const parentName = 'spill-20261013T200102001Z-t53-16ae-parent.jsonl'
+  const childName = 'retry-20261013T200102002Z-t53-16ae-child.jsonl'
+  const parentPath = `${PARTITION_DIR}/${parentName}`
+  const childPath = `${PARTITION_DIR}/${childName}`
+  const oldC = packFiles(
+    [
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ],
+    parentName,
+  )[0]!
+  const swappedC = packFiles(
+    [
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowD) }),
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowE) }),
+    ],
+    parentName,
+  )[0]!
+  expect(utf8Bytes(swappedC)).toBe(utf8Bytes(oldC))
+  const pSize = 700
+  const cSize = utf8Bytes(oldC)
+  h.files.set(parentPath, '')
+  h.files.set(childPath, oldC)
+  h.files.set(
+    `${PARTITION_DIR}/outcome-done-old013-${parentName}`,
+    sealFile(`${JSON.stringify({ fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 2, files: [childName], written: [true], retired: true })}\n`),
+  )
+  h.files.set(
+    `${PARTITION_DIR}/outcome-done-w14g-${childName}`,
+    sealFile(`${JSON.stringify({ size: cSize, sending: true, by: 'w14g', stagedFor: parentName, stagedForSize: pSize, childGuard: true, attempt: 'att-ae' })}\n`),
+  )
+  h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+    fates: 'LL',
+    reasons: [],
+    refusals: [],
+    size: pSize,
+    waits: false,
+    seq: 5,
+    files: [],
+    written: [],
+    attempt: 'att-ae',
+    attempts: ['att-ae'],
+    pendingReconcile: [{ name: childName, size: cSize, fnv1a: fnv1a(oldC), skipIndices: [0] }],
+  })
+  h.setFetch(async () => OK_INSERT)
+
+  // First read of childPath is inside stagedGuardState (sees oldC -> returns skipIndices:[0], skipFnv1a: fnv1a(oldC));
+  // swap childPath to equal-size swappedC BEFORE backfillRun's second read!
+  let childReads = 0
+  const baseIo = h.ioFor()
+  const swapIo = {
+    ...baseIo,
+    readFile: async (p: string) => {
+      if (p === childPath) {
+        childReads += 1
+        if (childReads === 2) h.files.set(childPath, swappedC)
+      }
+      return baseIo.readFile(p)
+    },
+  }
+  await new Writer(swapIo, () => h.config, () => 's-16ae').backfill(['retry'], 'auto')
+  expect(childReads >= 2).toBe(true)
+  // Digest revalidation clears positional skipIndices so BOTH rowD (index 0) and rowE (index 1) are delivered!
+  expect(h.sentOf(rowD)).toBe(1)
+  expect(h.sentOf(rowE)).toBe(1)
+  expect(h.files.get(childPath)).toBe('')
+})
+
+test('T53-16af: abandoned staged-part cleanup checks byte digest and foreign leases on both retry and retirement paths', async () => {
+  const rowA = 'a'.repeat(32)
+  const rowB = 'b'.repeat(32)
+  const rowC = 'c'.repeat(32)
+  const rowForeign = 'f'.repeat(32)
+
+  // Subcase A: retry path (cleanupStaged) and retirement path (cleanupReconciledAndStaged) leave another writer's live file untouched on digest mismatch (equal-size and different-size).
+  for (const mode of ['retry-equal', 'retry-diff', 'retire-equal'] as const) {
+    const h = exitReplayHarness()
+    const parentName = `spill-20261013T200102001Z-t53-16af-${mode}-parent.jsonl`
+    const childName = `retry-20261013T200102002Z-t53-16af-${mode}-child.jsonl`
+    const stagedName = `retry-20261013T200102003Z-t53-16af-${mode}-staged.jsonl`
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const stagedPath = `${PARTITION_DIR}/${stagedName}`
+    const oldStagedText = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ])[0]!
+    const foreignText =
+      mode === 'retry-diff'
+        ? packFiles([
+            JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowForeign) }),
+            JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.004Z', table: TABLE_REF, row: ownRow('e'.repeat(32)) }),
+          ])[0]!
+        : packFiles([
+            JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowForeign) }),
+          ])[0]!
+    if (mode !== 'retry-diff') expect(utf8Bytes(foreignText)).toBe(utf8Bytes(oldStagedText))
+    const pSize = utf8Bytes(h.files.get(parentPath)!)
+    h.files.set(stagedPath, foreignText)
+    if (mode === 'retire-equal') {
+      // No pendingReconcile, already retired-ready except for abandoned stagedFiles entry -> hits retirement cleanupReconciledAndStaged directly.
+      h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+        fates: 'LL',
+        reasons: [],
+        refusals: [],
+        size: pSize,
+        waits: true,
+        seq: 5,
+        files: [],
+        written: [],
+        stagedFiles: [{ name: stagedName, size: utf8Bytes(oldStagedText), fnv1a: fnv1a(oldStagedText) }],
+      })
+    } else {
+      const cText = packFiles(
+        [
+          JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+          JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowC) }),
+        ],
+        parentName,
+      )[0]!
+      h.files.set(childPath, cText)
+      h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+        fates: 'LL',
+        reasons: [],
+        refusals: [],
+        size: pSize,
+        waits: true,
+        seq: 5,
+        files: [],
+        written: [],
+        pendingReconcile: [{ name: childName, size: utf8Bytes(cText), fnv1a: fnv1a(cText), skipIndices: [0] }],
+        stagedFiles: [{ name: stagedName, size: utf8Bytes(oldStagedText), fnv1a: fnv1a(oldStagedText) }],
+      })
+    }
+    h.setFetch(async () => OK_INSERT)
+    // Run spill only first so P cleans up stagedFiles and retires without replaying stagedPath yet.
+    await h.newWriter(`s-16af-${mode}-1`).backfill(['spill'], 'auto')
+    expect(h.files.get(parentPath)).toBe('')
+    // Foreign live file at stagedPath MUST be completely untouched!
+    expect(h.files.get(stagedPath)).toBe(foreignText)
+
+    // Next auto delivers foreignText cleanly!
+    await h.newWriter(`s-16af-${mode}-2`).backfill(['retry'], 'auto')
+    expect(h.sentOf(rowForeign)).toBe(1)
+    if (mode !== 'retire-equal') expect(h.sentOf(rowC)).toBe(1)
+    expect(h.files.get(stagedPath)).toBe('')
+  }
+
+  // Subcase B: matching abandoned staged part held by an unexpired foreign lease is NOT truncated during retry or retirement until the lease expires.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16af-lease-parent.jsonl'
+    const stagedName = 'retry-20261013T200102003Z-t53-16af-lease-staged.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const stagedPath = `${PARTITION_DIR}/${stagedName}`
+    const stagedText = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ])[0]!
+    const pSize = utf8Bytes(h.files.get(parentPath)!)
+    h.files.set(stagedPath, stagedText)
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-w14-${stagedName}`,
+      sealFile(`${JSON.stringify({ size: utf8Bytes(stagedText), sending: true, by: 'w14', stagedFor: parentName, stagedForSize: pSize })}\n`),
+    )
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+      fates: 'LL',
+      reasons: [],
+      refusals: [],
+      size: pSize,
+      waits: true,
+      seq: 5,
+      files: [],
+      written: [],
+      stagedFiles: [{ name: stagedName, size: utf8Bytes(stagedText), fnv1a: fnv1a(stagedText) }],
+    })
+    h.store.set(`lease:${TABLE_REF}/${stagedName}`, { by: 'other-session', until: h.ioFor().now() + 5 * 60_000 })
+    h.setFetch(async () => OK_INSERT)
+
+    await h.newWriter('s-16af-lease-1').backfill(['spill'], 'auto')
+    expect(h.files.get(parentPath)).toBe('')
+    // Still held by foreign lease: NOT truncated, and v2 key kept so auto drops it once lease expires.
+    expect(h.files.get(stagedPath)).toBe(stagedText)
+    expect(h.store.get(`replayed:v2:${TABLE_REF}/${parentName}`)).toBeDefined()
+
+    await h.advance(10 * 60_000)
+    await h.newWriter('s-16af-lease-2').backfill(['retry'], 'auto')
+    expect(h.files.get(stagedPath)).toBe('')
+    expect(h.sentOf(rowC)).toBe(0)
+  }
+})
+
+test('T53-16ag: retention protects stagedFor/replaces in live marks and confirmDirStable catches same-size re-parented children', async () => {
+  const rowC = 'c'.repeat(32)
+
+  // Subcase A (Item 6): after 25 hours with standalone replacement R_c leased, retention MUST preserve BOTH parent P and replaced sibling C's done mark so duplicate row C is still suppressed once lease expires.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ag-a-parent.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ag-a-child.jsonl'
+    const replName = 'retry-20261013T200102003Z-t53-16ag-a-repl.jsonl'
+    const replPath = `${PARTITION_DIR}/${replName}`
+    const replText = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ])[0]!
+    const pSize = 700
+    const cSize = 350
+    const oldTs = 1_000
+    h.files.set(`${PARTITION_DIR}/${parentName}`, '')
+    h.files.set(`${PARTITION_DIR}/${childName}`, '')
+    h.files.set(replPath, replText)
+    const pDonePath = `${PARTITION_DIR}/outcome-done-old013-${parentName}`
+    const cDonePath = `${PARTITION_DIR}/outcome-done-oldc-${childName}`
+    h.files.set(
+      pDonePath,
+      sealFile(`${JSON.stringify({ fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 2, files: [childName], written: [true], retired: true, retiredAt: oldTs })}\n`),
+    )
+    h.files.set(
+      cDonePath,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: cSize, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: oldTs })}\n`),
+    )
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-w14-${replName}`,
+      sealFile(`${JSON.stringify({ size: utf8Bytes(replText), sending: true, by: 'w14', stagedFor: parentName, stagedForSize: pSize, replaces: childName })}\n`),
+    )
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+      fates: 'LL',
+      reasons: [],
+      refusals: [],
+      size: pSize,
+      waits: true,
+      seq: 5,
+      files: [replName],
+      written: [true],
+      adopted: [replName],
+      reconciled: [{ name: childName, size: cSize, fnv1a: '12345678' }],
+    })
+    h.mtimes.set(pDonePath, oldTs)
+    h.mtimes.set(cDonePath, oldTs)
+    h.advanceNow(25 * 60 * 60_000)
+    // Replacement is currently leased by another session while retention runs after 25h.
+    h.store.set(`lease:${TABLE_REF}/${replName}`, { by: 'other-session', until: h.ioFor().now() + 5 * 60_000 })
+    h.setFetch(async () => OK_INSERT)
+
+    await h.newWriter('s-16ag-a1').backfill(['spill', 'retry'], 'auto')
+    // BOTH parent P's done mark/v2 AND replaced sibling C's done mark MUST survive retention!
+    expect(h.files.get(pDonePath)).not.toBe('')
+    expect(h.files.get(cDonePath)).not.toBe('')
+    expect(h.store.get(`replayed:v2:${TABLE_REF}/${parentName}`)).toBeDefined()
+
+    // Once lease expires, stagedGuardState sees C's preserved done mark and drops R_c (0 duplicates!).
+    await h.advance(10 * 60_000)
+    await h.newWriter('s-16ag-a2').backfill(['spill', 'retry'], 'auto')
+    expect(h.files.get(replPath)).toBe('')
+    expect(h.sentOf(rowC)).toBe(0)
+  }
+
+  // Subcase B (Item 7): confirmDirStable catches a live child switching parent seal to parent2 at the exact same byte size and mtimeMs between freshListed and parent2's deletion.
+  {
+    const h = exitReplayHarness()
+    const parent1 = 'spill-20261013T200102001Z-t53-16ag-p1.jsonl'
+    const parent2 = 'spill-20261013T200102002Z-t53-16ag-p2.jsonl'
+    const childName = 'retry-20261013T200102003Z-t53-16ag-child.jsonl'
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const p1DonePath = `${PARTITION_DIR}/outcome-done-old1-${parent1}`
+    const p2DonePath = `${PARTITION_DIR}/outcome-done-old2-${parent2}`
+    const oldTs = 1_000
+    const childForP1 = packFiles(
+      [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) })],
+      parent1,
+    )[0]!
+    const childForP2 = packFiles(
+      [JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) })],
+      parent2,
+    )[0]!
+    expect(utf8Bytes(childForP2)).toBe(utf8Bytes(childForP1))
+    h.files.set(`${PARTITION_DIR}/${parent1}`, '')
+    h.files.set(`${PARTITION_DIR}/${parent2}`, '')
+    h.files.set(childPath, childForP1)
+    h.mtimes.set(childPath, 50_000)
+    // Add an unrelated expired parent0 (sorts before parent2) whose deletion runs first so parent2 is deleted second.
+    const parent0 = 'spill-20261013T200102000Z-t53-16ag-p0.jsonl'
+    const p0DonePath = `${PARTITION_DIR}/outcome-done-old0-${parent0}`
+    h.files.set(`${PARTITION_DIR}/${parent0}`, '')
+    h.files.set(
+      p0DonePath,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: 200, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: oldTs })}\n`),
+    )
+    h.files.set(
+      p1DonePath,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: 200, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: oldTs })}\n`),
+    )
+    h.files.set(
+      p2DonePath,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: 200, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: oldTs })}\n`),
+    )
+    h.store.set(`replayed:v2:${TABLE_REF}/${parent2}`, { fates: 'L', reasons: [], refusals: [], size: 200, waits: false, seq: 1, files: [], written: [], retired: true })
+    h.mtimes.set(p0DonePath, oldTs)
+    h.mtimes.set(p1DonePath, oldTs)
+    h.mtimes.set(p2DonePath, oldTs)
+    h.advanceNow(25 * 60 * 60_000)
+    // Keep childPath leased so retention runs while childPath stays live.
+    h.store.set(`lease:${TABLE_REF}/${childName}`, { by: 'other-session', until: h.ioFor().now() + 5 * 60_000 })
+
+    // Right as parent0's done mark is truncated, overwrite childPath with same-size childForP2 at the EXACT same mtimeMs!
+    let switched = false
+    h.setWriteFileHook(async (p, text) => {
+      if (p === p0DonePath && text === '' && !switched) {
+        switched = true
+        h.files.set(childPath, childForP2)
+        h.mtimes.set(childPath, 50_000)
+      }
+    })
+    h.setFetch(async () => OK_INSERT)
+
+    await h.newWriter('s-16ag-b1').backfill(['spill', 'retry'], 'auto')
+    expect(switched).toBe(true)
+    // confirmDirStable(parent2) MUST re-read childPath's seal and preserve BOTH parent2's done mark AND store record!
+    expect(h.files.get(p2DonePath)).not.toBe('')
+    expect(h.store.get(`replayed:v2:${TABLE_REF}/${parent2}`)).toBeDefined()
+
+    // Once lease expires, parent2's preserved done mark (files: []) drops childForP2 cleanly without resending rowC!
+    h.setWriteFileHook(null)
+    await h.advance(10 * 60_000)
+    await h.newWriter('s-16ag-b2').backfill(['spill', 'retry'], 'auto')
+    expect(h.sentOf(rowC)).toBe(0)
+    expect(h.files.get(childPath)).toBe('')
+  }
+
+  // Subcase C (Item 7 mark variant): confirmDirStable catches a live file's companion mark switching `replaces` to parent2 at the exact same size and mtimeMs.
+  {
+    const h = exitReplayHarness()
+    const parent0 = 'spill-20261013T200102000Z-t53-16ag-c-p0.jsonl'
+    const parent1 = 'spill-20261013T200102001Z-t53-16ag-c-p1.jsonl'
+    const parent2 = 'spill-20261013T200102002Z-t53-16ag-c-p2.jsonl'
+    const replName = 'retry-20261013T200102003Z-t53-16ag-c-repl.jsonl'
+    const replPath = `${PARTITION_DIR}/${replName}`
+    const replMarkPath = `${PARTITION_DIR}/outcome-done-w14-${replName}`
+    const replText = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ])[0]!
+    const markForP1 = sealFile(`${JSON.stringify({ size: utf8Bytes(replText), sending: true, by: 'w14', stagedFor: parent1, stagedForSize: 200, replaces: parent1 })}\n`)
+    const markForP2 = sealFile(`${JSON.stringify({ size: utf8Bytes(replText), sending: true, by: 'w14', stagedFor: parent1, stagedForSize: 200, replaces: parent2 })}\n`)
+    expect(utf8Bytes(markForP2)).toBe(utf8Bytes(markForP1))
+    const oldTs = 1_000
+    const p0DonePath = `${PARTITION_DIR}/outcome-done-old0-${parent0}`
+    const p2DonePath = `${PARTITION_DIR}/outcome-done-old2-${parent2}`
+    h.files.set(`${PARTITION_DIR}/${parent0}`, '')
+    h.files.set(`${PARTITION_DIR}/${parent1}`, '')
+    h.files.set(`${PARTITION_DIR}/${parent2}`, '')
+    h.files.set(replPath, replText)
+    h.files.set(replMarkPath, markForP1)
+    h.mtimes.set(replPath, 50_000)
+    h.mtimes.set(replMarkPath, 50_000)
+    h.files.set(
+      p0DonePath,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: 200, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: oldTs })}\n`),
+    )
+    h.files.set(
+      p2DonePath,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: 200, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: oldTs })}\n`),
+    )
+    h.mtimes.set(p0DonePath, oldTs)
+    h.mtimes.set(p2DonePath, oldTs)
+    h.advanceNow(25 * 60 * 60_000)
+    h.store.set(`lease:${TABLE_REF}/${replName}`, { by: 'other-session', until: h.ioFor().now() + 5 * 60_000 })
+
+    let switched = false
+    h.setWriteFileHook(async (p, text) => {
+      if (p === p0DonePath && text === '' && !switched) {
+        switched = true
+        h.files.set(replMarkPath, markForP2)
+        h.mtimes.set(replMarkPath, 50_000)
+      }
+    })
+    h.setFetch(async () => OK_INSERT)
+
+    await h.newWriter('s-16ag-c1').backfill(['spill', 'retry'], 'auto')
+    expect(switched).toBe(true)
+    expect(h.files.get(p2DonePath)).not.toBe('')
   }
 })
