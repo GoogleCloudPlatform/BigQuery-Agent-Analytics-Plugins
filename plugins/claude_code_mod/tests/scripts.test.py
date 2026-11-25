@@ -1985,31 +1985,40 @@ def setup_sh_checks():
           solo.returncode == 0 and 'setup.sh --team' in solo.stdout and 'docs/service-account-auth.md' in solo.stdout
           and 'scripts/setup_gcp_prereqs.py' not in solo.stdout,
           f'{solo.returncode} {solo.stdout!r} {solo.stderr!r}')
-    for what, env, wanted in (
-        ('with the variables the docs name', {'BQAA_PROJECT_ID': PROJECT, 'BQAA_DATASET': DATASET},
-         (PROJECT, DATASET, TABLE, '', 'US')),
-        ('with the other variables, and a table, a views dataset and a location of its own',
-         {'GOOGLE_CLOUD_PROJECT': 'other-project', 'BQ_DATASET': 'events', 'BQ_TABLE': 'coding_events',
-          'BQAA_LOCATION': 'EU', 'BQAA_VIEWS_DATASET': 'reports'},
-         ('other-project', 'events', 'coding_events', 'reports', 'EU')),
-    ):
-        result = subprocess.run([bash, str(PLUGIN / 'setup.sh'), '--dry-run', '--team'], capture_output=True, text=True,
-                                env={**clean_environment(), **env}, cwd=tempfile.gettempdir())
-        line = next((line for line in result.stdout.replace('\\\n', ' ').splitlines()
-                     if 'scripts/setup_gcp_prereqs.py' in line), '')
-        words = shlex.split(line)
-        check(f'setup.sh --dry-run --team, {what}: it prints a command that runs the bootstrap of the scripts folder',
-              result.returncode == 0 and len(words) > 2 and words[0] == 'python3'
-              and pathlib.Path(words[1]).resolve() == (SCRIPTS / 'setup_gcp_prereqs.py').resolve()
-              and 'google-cloud-bigquery' in result.stdout and '~/.bqaa-mod/venv' in result.stdout
-              and '.venv' not in result.stdout,
-              f'{result.returncode} {line!r} {result.stderr!r}')
-        args = parsed(*words[2:])
-        check('  ... naming the project, dataset, table, views dataset and location it was given',
-              args is not None and (args.project, args.dataset, args.table, args.views_dataset, args.location) == wanted,
-              args and (args.project, args.dataset, args.table, args.views_dataset, args.location))
-        status, out, err = attempt(*words[2:])
-        check('  ... which the bootstrap takes: a dry run, exit 0', status == 0 and 'DRY RUN' in out, f'{status} {err!r}')
+    for flags in (['--dry-run', '--team'], ['--team']):
+        for what, env, wanted in (
+            ('with the variables the docs name', {'BQAA_PROJECT_ID': PROJECT, 'BQAA_DATASET': DATASET},
+             (PROJECT, DATASET, TABLE, '', 'US')),
+            ('with the other variables, and a table, a views dataset and a location of its own',
+             {'GOOGLE_CLOUD_PROJECT': 'other-project', 'BQ_DATASET': 'events', 'BQ_TABLE': 'coding_events',
+              'BQAA_LOCATION': 'EU', 'BQAA_VIEWS_DATASET': 'reports'},
+             ('other-project', 'events', 'coding_events', 'reports', 'EU')),
+        ):
+            with tempfile.TemporaryDirectory() as fake_bin:
+                # Place a failing bq stub on PATH (or rely on clean_environment having no bq) to prove --team never invokes bq.
+                bq_stub = pathlib.Path(fake_bin) / 'bq'
+                bq_stub.write_text('#!/bin/sh\necho "unexpected bq call" >&2\nexit 99\n', encoding='utf-8')
+                bq_stub.chmod(0o755)
+                test_env = {**clean_environment(), **env, 'PATH': f'{fake_bin}:{clean_environment()["PATH"]}'}
+                result = subprocess.run([bash, str(PLUGIN / 'setup.sh'), *flags], capture_output=True, text=True,
+                                        env=test_env, cwd=tempfile.gettempdir())
+            flag_str = ' '.join(flags)
+            line = next((line for line in result.stdout.replace('\\\n', ' ').splitlines()
+                         if 'scripts/setup_gcp_prereqs.py' in line), '')
+            words = shlex.split(line)
+            check(f'setup.sh {flag_str}, {what}: prints setup_gcp_prereqs.py without invoking bq',
+                  result.returncode == 0 and 'unexpected bq call' not in result.stderr
+                  and len(words) > 2 and words[0] == 'python3'
+                  and pathlib.Path(words[1]).resolve() == (SCRIPTS / 'setup_gcp_prereqs.py').resolve()
+                  and 'google-cloud-bigquery' in result.stdout and '~/.bqaa-mod/venv' in result.stdout
+                  and '.venv' not in result.stdout,
+                  f'{result.returncode} {line!r} {result.stderr!r}')
+            args = parsed(*words[2:])
+            check('  ... naming the project, dataset, table, views dataset and location it was given',
+                  args is not None and (args.project, args.dataset, args.table, args.views_dataset, args.location) == wanted,
+                  args and (args.project, args.dataset, args.table, args.views_dataset, args.location))
+            status, out, err = attempt(*words[2:])
+            check('  ... which the bootstrap takes: a dry run, exit 0', status == 0 and 'DRY RUN' in out, f'{status} {err!r}')
 
 
 # ---------------------------------------------------------------------------
@@ -2130,8 +2139,8 @@ def clean_dead_letter_checks():
         return d
 
     def seal(text: str, parent: str | None = None) -> str:
-        """A dead-letter file: its content lines, then a completion record."""
-        record = {"v": 1, "complete": True, "lines": text.count("\n"), "fnv1a": "deadbeef"}
+        """A dead-letter file: its content lines, then a real FNV-1a completion record."""
+        record = {"v": 1, "complete": True, "lines": text.count("\n"), "fnv1a": clean._fnv1a_utf16(text)}
         if parent is not None:
             record["parent"] = parent
         return text + json.dumps(record) + "\n"
@@ -2658,6 +2667,156 @@ def clean_dead_letter_checks():
               status_ld == 0 and err_ld == '' and not (d / 'spill-listdir.jsonl').exists()
               and len(listdir_fds) == 2 and all(isinstance(fd, int) for fd in listdir_fds),
               f'{status_ld} listdir_fds={listdir_fds!r} {err_ld!r}')
+
+        v2_empty = d / 'spill-v2-done.jsonl'
+        v2_empty.write_bytes(b'')
+        v2_out_a = d / 'outcome2-spill-v2-done.jsonl'
+        v2_out_b = d / 'outcome2-b-spill-v2-done.jsonl'
+        v2_out_a.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        v2_out_b.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        v2_live = d / 'spill-v2-live.jsonl'
+        v2_live.write_text(seal('{"row":1}\n'), encoding='utf-8')
+        v2_live_out = d / 'outcome2-spill-v2-live.jsonl'
+        v2_live_out.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        check('13n. record_of recognizes outcome2- and outcome2-b- versioned split journals',
+              clean.record_of('outcome2-spill-v2-done.jsonl') == 'spill-v2-done.jsonl'
+              and clean.record_of('outcome2-b-spill-v2-done.jsonl') == 'spill-v2-done.jsonl'
+              and clean.plan_deletions(d) == [v2_out_b, v2_out_a, v2_empty],
+              f'{clean.plan_deletions(d)!r}')
+        status_v2, _out_v2, err_v2 = call(clean.main, '--dir', str(base), '--execute')
+        check('13o. --execute removes outcome2-* beside 0-byte source while keeping outcome2-* beside live source',
+              status_v2 == 0 and err_v2 == ''
+              and not v2_empty.exists() and not v2_out_a.exists() and not v2_out_b.exists()
+              and v2_live.exists() and v2_live_out.exists(),
+              f'{status_v2} {err_v2!r}')
+
+        # 13p & 13q: a live standalone replacement (parent: null) with a non-empty stagedFor sending mark
+        # must protect the referenced retired parent's outcome group (0-byte parent, outcome2-*, outcome-done-*,
+        # and >24h orphans), fail closed on corrupt marks beside live files, and allow cleanup once emptied.
+        sf_dir = base / 'my-proj.ds.staged_for_tbl'
+        sf_dir.mkdir(mode=0o700)
+        sf_parent = sf_dir / 'spill-sf-parent.jsonl'
+        sf_parent.write_bytes(b'')
+        sf_parent_done = sf_dir / 'outcome-done-w1-spill-sf-parent.jsonl'
+        sf_parent_done.write_text(seal('{"retired":true,"files":["retry-sf-repl.jsonl"]}\n'), encoding='utf-8')
+        sf_parent_v2 = sf_dir / 'outcome2-spill-sf-parent.jsonl'
+        sf_parent_v2.write_text(seal('{"journal":2}\n'), encoding='utf-8')
+        sf_orphan_old = sf_dir / 'outcome-done-w0-spill-sf-orphan.jsonl'
+        sf_orphan_old.write_text(seal('{"retired":true,"files":["retry-sf-repl2.jsonl"]}\n'), encoding='utf-8')
+        old_ts = time.time() - 48 * 3600
+        os.utime(sf_orphan_old, (old_ts, old_ts))
+        sf_replaced = sf_dir / 'retry-sf-replaced.jsonl'
+        sf_replaced.write_bytes(b'')
+        sf_replaced_done = sf_dir / 'outcome-done-w0-retry-sf-replaced.jsonl'
+        sf_replaced_done.write_text(seal('{"retired":true,"files":[]}\n'), encoding='utf-8')
+        sf_repl = sf_dir / 'retry-sf-repl.jsonl'
+        sf_repl.write_text(seal('{"row":1}\n'), encoding='utf-8')
+        sf_repl_mark = sf_dir / 'outcome-done-w1-retry-sf-repl.jsonl'
+        sf_repl_mark.write_text(
+            seal(json.dumps({
+                'size': sf_repl.stat().st_size,
+                'sending': True,
+                'by': 'w1',
+                'stagedFor': 'spill-sf-parent.jsonl',
+                'replaces': 'retry-sf-replaced.jsonl',
+            }) + '\n'),
+            encoding='utf-8',
+        )
+        sf_repl2 = sf_dir / 'retry-sf-repl2.jsonl'
+        sf_repl2.write_text(seal('{"row":2}\n'), encoding='utf-8')
+        sf_repl2_mark = sf_dir / 'outcome-done-w1g-retry-sf-repl2.jsonl'
+        sf_repl2_mark.write_text(
+            seal(json.dumps({'size': sf_repl2.stat().st_size, 'sending': True, 'by': 'w1g', 'stagedFor': 'spill-sf-orphan.jsonl', 'childGuard': True}) + '\n'),
+            encoding='utf-8',
+        )
+        status_sf, _out_sf, err_sf = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p. --execute protects retired parent, replaced sibling child, and >24h orphan while live standalone replacement has stagedFor/replaces mark',
+              status_sf == 0 and err_sf == ''
+              and sf_parent.exists() and sf_parent_done.exists() and sf_parent_v2.exists()
+              and sf_replaced.exists() and sf_replaced_done.exists()
+              and sf_orphan_old.exists() and sf_repl.exists() and sf_repl2.exists(),
+              f'{status_sf} {err_sf!r}')
+
+        # Corrupt mark beside a live file must fail closed (skip directory, delete nothing).
+        sf_repl2_mark.write_text('{corrupt\n', encoding='utf-8')
+        sf_parent_unrelated = sf_dir / 'spill-sf-unrelated.jsonl'
+        sf_parent_unrelated.write_bytes(b'')
+        status_sf_bad, _out_sf_bad, err_sf_bad = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p2. corrupt mark beside live file fails closed and skips directory',
+              status_sf_bad == 1 and 'skipping' in err_sf_bad and sf_parent_unrelated.exists(),
+              f'{status_sf_bad} {err_sf_bad!r}')
+
+        # Unsealed mark (valid JSON line 1 without completion seal line 2) must also fail closed.
+        sf_repl2_mark.write_text('{"sending":true}\n', encoding='utf-8')
+        status_sf_unsealed, _out_sf_unsealed, err_sf_unsealed = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p3. unsealed mark beside live file fails closed and skips directory',
+              status_sf_unsealed == 1 and 'skipping' in err_sf_unsealed and sf_parent_unrelated.exists(),
+              f'{status_sf_unsealed} {err_sf_unsealed!r}')
+
+        # Bad FNV-1a checksum in a mark seal must fail closed.
+        sf_mark_body = json.dumps({'size': sf_repl2.stat().st_size, 'sending': True, 'by': 'w1g', 'stagedFor': 'spill-sf-orphan.jsonl', 'childGuard': True}) + '\n'
+        sf_repl2_mark.write_text(
+            sf_mark_body + json.dumps({'v': 1, 'complete': True, 'lines': 1, 'fnv1a': '00000000'}) + '\n',
+            encoding='utf-8',
+        )
+        status_sf_badsum, _out_sf_badsum, err_sf_badsum = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p4. mark beside live file with wrong fnv1a checksum fails closed and skips directory',
+              status_sf_badsum == 1 and 'skipping' in err_sf_badsum and sf_parent_unrelated.exists(),
+              f'{status_sf_badsum} {err_sf_badsum!r}')
+
+        # Wrong line count in a mark seal must fail closed.
+        sf_repl2_mark.write_text(
+            sf_mark_body + json.dumps({'v': 1, 'complete': True, 'lines': 2, 'fnv1a': clean._fnv1a_utf16(sf_mark_body)}) + '\n',
+            encoding='utf-8',
+        )
+        status_sf_badlines, _out_sf_badlines, err_sf_badlines = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p5. mark beside live file with wrong seal line count fails closed and skips directory',
+              status_sf_badlines == 1 and 'skipping' in err_sf_badlines and sf_parent_unrelated.exists(),
+              f'{status_sf_badlines} {err_sf_badlines!r}')
+
+        # Missing trailing newline on a mark seal must fail closed.
+        sf_repl2_mark.write_text(seal(sf_mark_body).rstrip('\n'), encoding='utf-8')
+        status_sf_nonl, _out_sf_nonl, err_sf_nonl = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p6. mark beside live file missing trailing newline fails closed and skips directory',
+              status_sf_nonl == 1 and 'skipping' in err_sf_nonl and sf_parent_unrelated.exists(),
+              f'{status_sf_nonl} {err_sf_nonl!r}')
+
+        # Verify UTF-16 FNV-1a matches JS charCodeAt (including astral surrogate pair U+1F600).
+        check('13p7. _fnv1a_utf16 matches deadletter.ts fnv1a on ASCII and astral Unicode',
+              clean._fnv1a_utf16('{"row":1}\n') == '49fc8000' and clean._fnv1a_utf16('😀\n') == '9158a436',
+              f"{clean._fnv1a_utf16('{\"row\":1}\\n')} {clean._fnv1a_utf16('😀\\n')}")
+
+        # Restore valid mark, then test >4096-byte live dead-letter file seal verification.
+        sf_repl2_mark.write_text(seal(sf_mark_body), encoding='utf-8')
+        big_body = ('{"row":"' + 'x' * 600 + '"}\n') * 8  # >4800 bytes (>4096 tail window)
+        sf_big = sf_dir / 'retry-sf-big.jsonl'
+        sf_big.write_text(
+            big_body + json.dumps({'v': 1, 'complete': True, 'lines': 8, 'fnv1a': '00000000', 'parent': 'spill-sf-parent.jsonl'}) + '\n',
+            encoding='utf-8',
+        )
+        status_big_bad, _out_big_bad, err_big_bad = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p8. >4096-byte live dead-letter file with bad fnv1a seal fails closed and skips directory',
+              status_big_bad == 1 and 'skipping' in err_big_bad and sf_parent_unrelated.exists(),
+              f'{status_big_bad} {err_big_bad!r}')
+        sf_big.write_text(seal(big_body, parent='spill-sf-parent.jsonl'), encoding='utf-8')
+        status_big_ok, _out_big_ok, err_big_ok = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13p9. >4096-byte properly sealed live dead-letter file protects its parent while cleaning unrelated groups',
+              status_big_ok == 0 and err_big_ok == '' and sf_parent.exists() and not sf_parent_unrelated.exists(),
+              f'{status_big_ok} {err_big_ok!r}')
+        sf_big.write_bytes(b'')
+        sf_parent_unrelated.write_bytes(b'')
+
+        # Once both standalone replacements are emptied (0 bytes), all protected groups are cleaned up.
+        sf_repl.write_bytes(b'')
+        sf_repl2.write_bytes(b'')
+        status_sf_done, _out_sf_done, err_sf_done = call(clean.main, '--dir', str(sf_dir.parent), '--execute')
+        check('13q. once standalone replacements are emptied, --execute removes the parent outcome group, replaced child, and old orphan cleanly',
+              status_sf_done == 0 and err_sf_done == ''
+              and not sf_parent.exists() and not sf_parent_done.exists() and not sf_parent_v2.exists()
+              and not sf_replaced.exists() and not sf_replaced_done.exists()
+              and not sf_orphan_old.exists() and not sf_repl.exists() and not sf_repl2.exists()
+              and not sf_parent_unrelated.exists(),
+              f'{status_sf_done} {err_sf_done!r}')
 
 
 GROUPS = (run_bq_checks, setup_dry_run_checks, setup_refusal_checks, setup_plan_checks, reach_checks,

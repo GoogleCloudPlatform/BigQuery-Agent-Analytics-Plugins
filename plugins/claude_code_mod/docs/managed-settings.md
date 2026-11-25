@@ -433,7 +433,12 @@ To deploy a tag, the first one and every move after it:
    extraKnownMarketplaces entry"), `claude plugin list` shows the copy as
    failed to load, and `plugin update` alone fails ("not found"). Without
    `--sparse`, the add itself is refused: its source would not match the
-   policy's entry.
+   policy's entry. For CLI-pinned user installs in `~/.claude/settings.json`
+   (`$CLAUDE_CONFIG_DIR/settings.json`), either edit
+   `extraKnownMarketplaces["bqaa-tracing"].source.ref` to the new tag before
+   running `marketplace add` + `plugin update` (keeps saved `pluginConfigs`
+   options), or run `claude plugin marketplace remove bqaa-tracing` and re-add
+   at the new tag (drops saved options).
 4. **Check by commit, not by label, on every machine.** First look up the
    tag's commit, once:
 

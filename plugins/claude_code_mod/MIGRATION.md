@@ -79,7 +79,11 @@ move to this repository's marketplace:
    `/bqaa-setup` and `clean_dead_letter.py --dir DIR`, `0.1.2+` adds
    `/bqaa-mod-setup`, `/bqaa-status check`, `/bqaa-backfill wait`, and
    positional `clean_dead_letter.py [DIR]`, and `0.1.3+` decouples `/bqaa-status check`'s
-   `15 s` token timeout from the `3 s` `tables.get` HTTP check — verify your
+   `15 s` token timeout from the `3 s` `tables.get` HTTP check, and `0.1.4+` makes
+   `setup.sh --team` strictly print-only without invoking `bq` or creating datasets,
+   tables, or views—if a script previously used `setup.sh --team` as a single
+   provisioning step, run `./setup.sh` first without `--team` and then `./setup.sh --team`
+   or `scripts/setup_gcp_prereqs.py` — verify your
    installed version with `claude plugin list` before passing a slash command
    to `-p`, since unknown commands run as normal model prompts; in `-p` runs,
    pass `--debug-file /tmp/bqaa.log` to inspect exit diagnostics, since recent
@@ -278,7 +282,14 @@ claude plugin update bigquery-agent-analytics-mod@bqaa-tracing
 Until then the copy does not load, because the marketplace no longer
 matches the policy, and `plugin update` alone fails ("not found"). Without
 `--sparse`, the add itself is refused: its source would not match the
-policy's entry. Each release's tag carries its own version, which is what
+policy's entry.
+
+If you pinned a tag yourself from the CLI (`claude plugin marketplace add "…#mod-dist-vX.Y.Z" --sparse …`), the host wrote `ref` into your own `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) under `extraKnownMarketplaces["bqaa-tracing"].source.ref`. Running `marketplace add "…#NEW_TAG"` later fails with `Cannot add marketplace "bqaa-tracing": its source doesn't match its extraKnownMarketplaces entry in user or managed settings`. Either:
+
+- **Keep saved `pluginConfigs` options:** Edit `extraKnownMarketplaces["bqaa-tracing"].source.ref` in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) to the new `mod-dist-vX.Y.Z` tag, then run `claude plugin marketplace add "https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-Plugins.git#<NEW_TAG>" --sparse .claude-plugin plugins/claude_code_dist` and `claude plugin update bigquery-agent-analytics-mod@bqaa-tracing`.
+- **Fresh re-add (drops saved plugin options):** Run `claude plugin marketplace remove bqaa-tracing`, then re-run `marketplace add` at the new tag and `claude plugin install`.
+
+Each release's tag carries its own version, which is what
 `plugin update` compares and `plugin list` shows. Check by commit instead
 of by version. Look up the tag's commit once:
 

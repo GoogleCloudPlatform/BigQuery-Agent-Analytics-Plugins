@@ -92,6 +92,16 @@ let welcomeStarts = 0
 // /resume and /branch, which `classic.SessionStart` reports): a run's
 // welcome card begun before one is neither shown nor taken over after it.
 let resets = 0
+let classicSessionSeq = 0
+let classicCwdSeq = 0
+type StartupIdentity = {
+  start: number
+  resets: number
+  sessionId: string | null
+  cwd: string | null
+}
+let currentStartup: StartupIdentity | null = null
+const startupByResets = new Map<number, StartupIdentity>()
 const RESET_SOURCES: ReadonlySet<string> = new Set(['clear', 'resume', 'fork'])
 let records: CardRecords | null = null
 // Who speaks for the card a session.start run of this load showed (its
@@ -236,13 +246,29 @@ export function writeStderr(line: string): void {
 // would change it, the line names /bqaa-mod-setup, which prints it.
 function headlessNotice(current: Writer, hadActivity: boolean, logDebug?: (line: string) => void): void {
   const { counters } = current.snapshot()
-  if (current.problem === null || !(hadActivity || counters.spilled > 0 || counters.failed > 0)) return
-  const { headline, fix } = current.problemText()
-  const base = clean(`BigQuery Agent Analytics: rows could not be sent (${headline}; to fix, ${fix}).`, 1000)
-  const run = current.commandLine()
-  const withCommand = run === null ? base : clean(`${base} ${run}`, 2100)
-  const line = run === null || withCommand.includes(run) ? withCommand : `${base} Run /bqaa-mod-setup for the setup.sh command.`
-  const oneLine = line.replace(/[\r\n]+/g, ' ')
+  if (current.problem !== null) {
+    if (!(hadActivity || counters.spilled > 0 || counters.failed > 0)) return
+    const { headline, fix } = current.problemText()
+    const base = clean(`BigQuery Agent Analytics: rows could not be sent (${headline}; to fix, ${fix}).`, 1000)
+    const run = current.commandLine()
+    const withCommand = run === null ? base : clean(`${base} ${run}`, 2100)
+    const line = run === null || withCommand.includes(run) ? withCommand : `${base} Run /bqaa-mod-setup for the setup.sh command.`
+    const oneLine = line.replace(/[\r\n]+/g, ' ')
+    writeStderr(oneLine)
+    logDebug?.(oneLine)
+    return
+  }
+  const held = current.heldNoticeInfo()
+  if (held.files <= 0 || held.trigger === 'command' || held.trigger === 'force') return
+  const detail = held.reason ? held.reason.replace(/; (?:if (?:that session|it) stopped, )?\/bqaa-backfill force replays the file afresh$/, '') : ''
+  const suffix = detail ? ` (${detail})` : ''
+  const instruction = held.mayBeActive
+    ? `another session may still be replaying ${held.files === 1 ? 'it' : 'them'}; only after confirming that session stopped and its lease expired, run \`claude -p "/bqaa-backfill force" < /dev/null\` (or \`/bqaa-backfill force\`) with the same --plugin-dir, destination, and dead-letter dir to replay`
+    : `run \`claude -p "/bqaa-backfill force" < /dev/null\` (or \`/bqaa-backfill force\`) with the same --plugin-dir, destination, and dead-letter dir to replay`
+  const oneLine = clean(
+    `BigQuery Agent Analytics: ${held.files} dead-letter file(s) held; ${instruction}${suffix}.`,
+    1000,
+  ).replace(/[\r\n]+/g, ' ')
   writeStderr(oneLine)
   logDebug?.(oneLine)
 }
@@ -957,11 +983,22 @@ export const register: Register = (on, registered) => {
   config = resolveConfig(registered, {})
   configured = false
   awaitingConfig.length = 0
+  classicSessionSeq = 0
+  classicCwdSeq = 0
+  currentStartup = null
+  startupByResets.clear()
 
   on('session.start', async ($, e, next) => {
     // A read for the card by an earlier run of this load is not used from
     // here on.
     const start = ++welcomeStarts
+    const startResets = resets
+    const startClassicSession = configured ? classicSessionSeq : 0
+    const startClassicCwd = configured ? classicCwdSeq : 0
+    const startupIdentity: StartupIdentity = { start, resets: startResets, sessionId: null, cwd: e.cwd ?? null }
+    currentStartup = startupIdentity
+    startupByResets.set(startResets, startupIdentity)
+    const startupIdPromise = $.session.id().catch(() => null)
     cardReady = null
     // Its rank, in a session a person sees (a `-p` run draws no card).
     cardSession = e.isInteractive && e.surface !== null
@@ -1030,8 +1067,19 @@ export const register: Register = (on, registered) => {
       // denial of writes from the writer before (see adopt), which it shows.
       writer.clearStatus()
       for (const held of early.splice(0)) writer.enqueue(held.row, held.redactions)
-      const [sessionId, version] = await Promise.all([$.session.id().catch(() => null), $.session.version().catch(() => null)])
-      tracer.setSession({ sessionId, cwd: e.cwd, engineVersion: version?.version ?? null })
+      const [sessionId, version] = await Promise.all([startupIdPromise, $.session.version().catch(() => null)])
+      startupIdentity.sessionId = sessionId
+      const engineVersion = version?.version ?? null
+      if (engineVersion) tracer.setSession({ engineVersion })
+      if (start === welcomeStarts && resets === startResets) {
+        const nextSessionId = classicSessionSeq === startClassicSession ? sessionId : null
+        const nextCwd =
+          classicCwdSeq === startClassicCwd &&
+          (classicSessionSeq === startClassicSession || sessionId === null || tracer.sessionId === sessionId)
+            ? e.cwd
+            : null
+        if (nextSessionId || nextCwd) tracer.setSession({ sessionId: nextSessionId, cwd: nextCwd })
+      }
       flushTimer?.cancel()
       flushTimer = $.clock.every(config.flushIntervalMs, () => {
         if (ranModCommand && !tracer.hasActivity && writer !== null && writer.hasOnlyUnsentSessionStart(tracer.sessionId)) {
@@ -1108,12 +1156,22 @@ export const register: Register = (on, registered) => {
       resets += 1
       ranModCommand = false
     }
+    if (e.session_id) classicSessionSeq += 1
+    if (e.cwd) classicCwdSeq += 1
+    const eventResets = resets
+    const boundStartup = currentStartup !== null && currentStartup.resets === eventResets ? currentStartup : null
     const pending = next(e)
-    // Its row carries what session.start loads (the user, the agent name,
-    // the writer mode, the host version): written now if that is done, else
-    // once it is, at the time the event came.
-    const at = Date.now()
-    whenConfigured(() => tracer.sessionStarted(e, at))
+    // Apply session state / lastModel observations synchronously in event order,
+    // deferring only row emission until configurationLoaded() supplies host/config metadata.
+    const observed = tracer.observeSessionStart(e, Date.now())
+    whenConfigured(() => {
+      const startup = boundStartup ?? startupByResets.get(eventResets) ?? null
+      const cwdFallback =
+        startup !== null && (observed.sessionId === null || startup.sessionId === null || observed.sessionId === startup.sessionId)
+          ? startup.cwd
+          : null
+      tracer.emitSessionStart(observed, startup ? { sessionId: startup.sessionId, cwd: cwdFallback } : undefined)
+    })
     return pending
   }).catch(($, e, next) => next(e))
 

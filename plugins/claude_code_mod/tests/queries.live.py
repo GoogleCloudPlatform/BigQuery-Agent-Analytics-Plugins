@@ -103,7 +103,7 @@ SERVICE_DISABLED_403_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-MOD_WRITER = {"plugin": "bigquery-agent-analytics-mod", "version": "0.1.3", "label": "bigquery-agent-analytics-mod/0.1.3"}
+MOD_WRITER = {"plugin": "bigquery-agent-analytics-mod", "version": "0.1.4", "label": "bigquery-agent-analytics-mod/0.1.4"}
 TRACER_WRITER = {"plugin": "bqaa-coding-agent-plugin", "version": "0.1.0", "label": "bqaa-coding-agent-plugin/0.1.0"}
 # This repository's settings-hook tracer stamps another name.
 SDK_TRACER_WRITER = {"plugin": "bigquery-agent-analytics-tracing", "version": "0.1.0",

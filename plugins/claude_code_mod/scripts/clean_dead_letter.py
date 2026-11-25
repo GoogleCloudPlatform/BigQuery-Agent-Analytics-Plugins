@@ -26,7 +26,8 @@ This helper removes a ``(outcome-*, source)`` group **only** when:
 - the source file matches ``^(spill|retry|rejected)-[A-Za-z0-9._-]+\\.jsonl$``
   and is an owned, single-link, **0-byte** regular file, and
 - **no** non-empty mod file in the directory names that source as ``parent``
-  in its completion record.
+  in its completion record or in a non-empty ``stagedFor`` sending mark beside
+  a live file.
 
 Within each group, ``outcome-*`` files are deleted first (only after
 re-verifying ``source.lstat()``) and ``<source>`` is deleted last, so an
@@ -61,6 +62,7 @@ import json
 import os
 import re
 import stat
+import struct
 import sys
 import time
 from pathlib import Path
@@ -80,11 +82,11 @@ def _list_pinned_dir(directory: Path, dfd: int | None) -> list[Path]:
 
 
 def record_of(name: str) -> str | None:
-    """Return the valid mod source filename for an ``outcome-*`` record, or None."""
+    """Return the valid mod source filename for an ``outcome-*`` / ``outcome2-*`` record, or None."""
     m = MARKED_RE.match(name)
     candidate = m.group(1) if m is not None else None
     if candidate is None:
-        for prefix in ("outcome-b-", "outcome-"):
+        for prefix in ("outcome2-b-", "outcome2-", "outcome-b-", "outcome-"):
             if name.startswith(prefix):
                 candidate = name[len(prefix):]
                 break
@@ -113,13 +115,25 @@ def _open_nofollow_read(path: Path, dir_fd: int | None = None):
     return open(path, "rb", opener=_opener)
 
 
+MAX_MARK_BYTES = 4 * 1024 * 1024 + 4096
+
+
+def _fnv1a_utf16(text: str) -> str:
+    """FNV-1a 32-bit checksum over UTF-16 code units, matching deadletter.ts `fnv1a`."""
+    h = 0x811C9DC5
+    for (code_unit,) in struct.iter_unpack("<H", text.encode("utf-16-le")):
+        h ^= code_unit
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return f"{h:08x}"
+
+
 def _read_completion_parent_checked(
     path: Path,
     expected_st: os.stat_result | None = None,
     dir_fd: int | None = None,
     euid: int | None = None,
 ) -> tuple[bool, str | None, str]:
-    """Read and validate the completion record at the end of a non-empty file."""
+    """Read and validate the completion record and full FNV-1a seal of a non-empty file."""
     if euid is None:
         euid = os.geteuid()
     try:
@@ -135,29 +149,37 @@ def _read_completion_parent_checked(
                     return False, None, f"unexpected owner uid {fst.st_uid}"
                 if expected_st is not None and (fst.st_dev, fst.st_ino) != (expected_st.st_dev, expected_st.st_ino):
                     return False, None, "file replaced while reading"
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            if size == 0:
-                return False, None, "empty while reading completion record"
-            chunk = min(size, 4096)
-            f.seek(-chunk, os.SEEK_END)
-            tail = f.read()
-        if chunk < size:
-            tail = tail[tail.find(b"\n") + 1:]
-        text = tail.decode("utf-8")
+                if fst.st_size > MAX_MARK_BYTES:
+                    return False, None, "incomplete (file exceeds maximum readable size)"
+            raw = f.read(MAX_MARK_BYTES + 1)
+        if len(raw) > MAX_MARK_BYTES:
+            return False, None, "incomplete (file exceeds maximum readable size)"
+        if not raw:
+            return False, None, "empty while reading completion record"
+        text = raw.decode("utf-8")
     except OSError as exc:
         return False, None, f"incomplete or unreadable ({exc})"
     except UnicodeDecodeError:
         return False, None, "incomplete or invalid UTF-8 completion record"
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
+    if not text.endswith("\n"):
+        return False, None, "incomplete (missing trailing newline)"
+    start = text.rfind("\n", 0, len(text) - 1) + 1
+    body = text[:start]
+    seal_line = text[start:-1]
+    if not seal_line.strip():
         return False, None, "incomplete (missing completion record)"
     try:
-        record = json.loads(lines[-1])
+        record = json.loads(seal_line)
     except json.JSONDecodeError:
         return False, None, "incomplete (truncated or invalid trailing JSON line)"
-    if not isinstance(record, dict) or record.get("complete") is not True:
+    if not isinstance(record, dict) or record.get("complete") is not True or "row" in record:
         return False, None, "incomplete (missing \"complete\": true completion record)"
+    seal_lines = record.get("lines")
+    seal_fnv1a = record.get("fnv1a")
+    if isinstance(seal_lines, bool) or not isinstance(seal_lines, int) or not isinstance(seal_fnv1a, str):
+        return False, None, "incomplete (missing valid lines/fnv1a fields)"
+    if seal_lines != body.count("\n") or seal_fnv1a != _fnv1a_utf16(body):
+        return False, None, "incomplete (failed line-count or checksum verification)"
     parent = record.get("parent")
     if parent is not None and not isinstance(parent, str):
         return False, None, "incomplete (invalid parent field)"
@@ -168,6 +190,77 @@ def _read_completion_parent(path: Path) -> tuple[bool, str | None]:
     """Read the completion record that ends a non-empty file."""
     ok, parent, _reason = _read_completion_parent_checked(path)
     return ok, parent
+
+
+def _read_mark_staged_for_checked(
+    path: Path,
+    expected_st: os.stat_result | None = None,
+    dir_fd: int | None = None,
+    euid: int | None = None,
+) -> tuple[bool, list[str], str]:
+    """Read a non-empty outcome-done/sending mark beside a live file for ``stagedFor`` and ``replaces``."""
+    if euid is None:
+        euid = os.geteuid()
+    try:
+        with _open_nofollow_read(path, dir_fd=dir_fd) as f:
+            fileno = f.fileno() if hasattr(f, "fileno") else None
+            if fileno is not None:
+                fst = os.fstat(fileno)
+                if not stat.S_ISREG(fst.st_mode):
+                    return False, [], "not a regular file"
+                if fst.st_nlink > 1:
+                    return False, [], f"hardlinked (nlink={fst.st_nlink})"
+                if euid != 0 and fst.st_uid != euid:
+                    return False, [], f"unexpected owner uid {fst.st_uid}"
+                if expected_st is not None and (fst.st_dev, fst.st_ino) != (expected_st.st_dev, expected_st.st_ino):
+                    return False, [], "file replaced while reading"
+                if fst.st_size > MAX_MARK_BYTES:
+                    return False, [], "mark exceeds maximum readable size"
+            raw = f.read(MAX_MARK_BYTES + 1)
+        if len(raw) > MAX_MARK_BYTES:
+            return False, [], "mark exceeds maximum readable size"
+        if not raw:
+            return True, [], ""
+        text = raw.decode("utf-8")
+    except OSError as exc:
+        return False, [], f"unreadable mark ({exc})"
+    except UnicodeDecodeError:
+        return False, [], "invalid UTF-8 in mark"
+    if not text.endswith("\n"):
+        return False, [], "unsealed mark (missing trailing newline)"
+    start = text.rfind("\n", 0, len(text) - 1) + 1
+    body = text[:start]
+    seal_line = text[start:-1]
+    try:
+        tail = json.loads(seal_line)
+    except json.JSONDecodeError:
+        return False, [], "truncated or invalid JSON in mark seal"
+    if not isinstance(tail, dict) or tail.get("complete") is not True or "row" in tail:
+        return False, [], "unsealed mark missing completion record"
+    seal_lines = tail.get("lines")
+    seal_fnv1a = tail.get("fnv1a")
+    if isinstance(seal_lines, bool) or not isinstance(seal_lines, int) or not isinstance(seal_fnv1a, str):
+        return False, [], "unsealed mark missing valid lines/fnv1a fields"
+    if seal_lines != body.count("\n") or seal_fnv1a != _fnv1a_utf16(body):
+        return False, [], "unsealed mark failed line-count or checksum verification"
+    body_lines = [line for line in body.split("\n") if line.strip() != ""]
+    if len(body_lines) != 1:
+        return False, [], "unsealed or malformed mark"
+    try:
+        record = json.loads(body_lines[0])
+    except json.JSONDecodeError:
+        return False, [], "truncated or invalid JSON in mark"
+    if not isinstance(record, dict):
+        return False, [], "unexpected non-object mark JSON"
+    refs: list[str] = []
+    for field in ("stagedFor", "replaces"):
+        val = record.get(field)
+        if val is None:
+            continue
+        if not isinstance(val, str) or not val:
+            return False, [], f"invalid {field} field in mark"
+        refs.append(val)
+    return True, refs, ""
 
 
 def _dir_safety_error(
@@ -303,6 +396,7 @@ def _scan_single_dir(
 
         sources: dict[str, tuple[Path, int]] = {}
         outcomes_by_source: dict[str, list[tuple[Path, float]]] = {}
+        marks_by_source: dict[str, list[tuple[Path, os.stat_result]]] = {}
         non_empty_parents: set[str] = set()
 
         for entry in entries:
@@ -347,6 +441,24 @@ def _scan_single_dir(
                 if euid != 0 and st.st_uid != euid:
                     return [], [], [f"refusing outcome file {rel} owned by uid {st.st_uid}; skipping {_rel_label(directory, base)}"]
                 outcomes_by_source.setdefault(of, []).append((entry, st.st_mtime))
+                if st.st_size > 0 and MARKED_RE.match(name) is not None:
+                    marks_by_source.setdefault(of, []).append((entry, st))
+
+        # Protect any parent or replaced sibling child referenced by a live
+        # standalone file's `stagedFor`/`replaces` sending mark so `--execute`
+        # never deletes outcome groups needed for cross-version dedup/recovery.
+        for live_name, (_live_path, live_size) in sources.items():
+            if live_size <= 0:
+                continue
+            for mark_entry, mark_st in marks_by_source.get(live_name, ()):
+                ok, mark_refs, reason = _read_mark_staged_for_checked(mark_entry, expected_st=mark_st, dir_fd=dfd, euid=euid)
+                if not ok:
+                    return [], [], [f"{_rel_label(mark_entry, base)}: {reason}; skipping {_rel_label(directory, base)}"]
+                for ref_name in mark_refs:
+                    non_empty_parents.add(ref_name)
+                    ref_base = ref_name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                    if ref_base:
+                        non_empty_parents.add(ref_base)
 
         groups: list[tuple[Path, list[Path]]] = []
         for name in sorted(sources):
