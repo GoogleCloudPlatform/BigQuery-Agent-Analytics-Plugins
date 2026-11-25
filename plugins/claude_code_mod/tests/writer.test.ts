@@ -6524,10 +6524,18 @@ test('T53-16o: forced reconciliation respects child retired delivery record and 
     h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, { fates: 'WW', reasons: [], refusals: [], size: parentSize, waits: true, seq: 9, files: [childName], written: [true] })
     const now = h.ioFor().now()
     h.store.set(`lease:${TABLE_REF}/${childName}`, { by: 'other-session', until: now + 5 * 60_000 })
+    const standaloneName = 'spill-20261013T200102099Z-t53-16o-independent.jsonl'
+    const rowS = 's'.repeat(32)
+    const standalonePath = h.seedSpill(standaloneName, rowS)
     h.setFetch(async () => OK_INSERT)
 
     const rPre = await h.newWriter('s-16o-lease-1').backfill(['spill', 'retry'], 'force')
-    expect(rPre.error ?? '').toContain('standalone backups')
+    expect(rPre.error).toBeNull()
+    expect(rPre.held ?? '').toContain(childName)
+    expect((rPre.heldFiles ?? 0) >= 2).toBe(true)
+    // Independent standalone file sorting after the leased family must still be delivered.
+    expect(h.sentOf(rowS)).toBe(1)
+    expect(h.files.get(standalonePath)).toBe('')
     expect(h.sentOf(rowA)).toBe(0)
     expect(h.sentOf(rowB)).toBe(0)
     expect(h.sentOf(rowC)).toBe(0)
@@ -11688,5 +11696,450 @@ test('T53-16ah: on-disk backup dedup, legacy-cover strictness, safeTruncateStage
     // Verify pure printable ASCII (no unpaired UTF-16 surrogates).
     expect(/^[\x20-\x7e]+$/.test(gotId)).toBe(true)
     expect(h.files.get(filePath)).toBe('')
+  }
+})
+
+test('T53-16ai: linear backup discovery, absent-backup swap persistence, EACCES fail-closed, child-linked backup skip on force(C), and momentary empty child rollback', async () => {
+  const rowA = 'a'.repeat(32)
+  const rowB = 'b'.repeat(32)
+  const rowC = 'c'.repeat(32)
+
+  // Subcase 1: Backup discovery groups companions on the first walk so name accesses scale
+  // linearly rather than quadratically with unrelated g-marked files (32 vs 128).
+  const measureBackupNameAccesses = async (unrelatedCount: number): Promise<number> => {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ai-scale-p.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ai-scale-c.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const childText = packFiles(
+      [
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+      ],
+      parentName,
+    )[0]!
+    h.files.set(childPath, childText)
+    const otherParent = 'spill-20261013T200000000Z-unrelated-parent.jsonl'
+    const unrelatedBody = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:00:00.001Z', table: TABLE_REF, row: ownRow('u'.repeat(32)) }),
+    ])[0]!
+    const uSize = utf8Bytes(unrelatedBody)
+    const uDigest = fnv1a(unrelatedBody)
+    for (let i = 0; i < unrelatedCount; i += 1) {
+      const uName = `retry-20261013T200000${String(i).padStart(3, '0')}Z-unrelated-${i}.jsonl`
+      h.files.set(`${PARTITION_DIR}/${uName}`, unrelatedBody)
+      h.files.set(
+        `${PARTITION_DIR}/outcome-done-unrelg-${uName}`,
+        sealFile(
+          `${JSON.stringify({
+            size: uSize,
+            sending: true,
+            by: 'unrelg',
+            stagedFor: otherParent,
+            stagedForSize: 999,
+            replaces: `retry-20261013T200000000Z-rep-${i}.jsonl`,
+            backup: true,
+            backupForSize: uSize,
+            backupForFnv1a: uDigest,
+            backupFnv1a: uDigest,
+            attempt: `unrel-${i}`,
+          })}\n`,
+        ),
+      )
+    }
+    const baseIo = h.ioFor()
+    let nameAccesses = 0
+    const trackedIo = {
+      ...baseIo,
+      listDir: async (dir: string) => {
+        const raw = await baseIo.listDir(dir)
+        return raw.map(entry => {
+          const nameVal = entry.name
+          const proxy = { kind: entry.kind, size: entry.size, mtimeMs: entry.mtimeMs } as {
+            name: string
+            kind: string
+            size: number
+            mtimeMs?: number
+          }
+          Object.defineProperty(proxy, 'name', {
+            enumerable: true,
+            get() {
+              nameAccesses += 1
+              return nameVal
+            },
+          })
+          return proxy
+        })
+      },
+    }
+    // Fail parent dispatch after staging backups so we measure only staging + discovery for parentName.
+    h.setFetch(async () => ({ status: 503, text: 'busy' }))
+    const w = new Writer(trackedIo, () => h.config, () => `s-16ai-scale-${unrelatedCount}`)
+    // Lease all unrelated files so only parentName runs force staging.
+    const now = baseIo.now()
+    for (let i = 0; i < unrelatedCount; i += 1) {
+      const uName = `retry-20261013T200000${String(i).padStart(3, '0')}Z-unrelated-${i}.jsonl`
+      h.store.set(`lease:${TABLE_REF}/${uName}`, { by: 'other', until: now + 5 * 60_000 })
+    }
+    h.store.set(`lease:${TABLE_REF}/${childName}`, { by: 'other', until: now - 1 })
+    await w.backfill(['spill'], 'force')
+    expect(h.files.get(parentPath)).not.toBe('')
+    return nameAccesses
+  }
+  const acc32 = await measureBackupNameAccesses(32)
+  const acc128 = await measureBackupNameAccesses(128)
+  // Linear growth (~4x for 4x files), nowhere near quadratic (~15x / 33,666).
+  expect(acc128 < 6000).toBe(true)
+  expect(acc128 <= acc32 * 6).toBe(true)
+
+  // Subcase 2: Absent recorded backup swapped for an existing on-disk backup of the same array
+  // length (1 -> 1) persists the new backup name in v2 (`!sameBackups`), while EACCES still fails closed.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ai-swap-p.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ai-swap-c.jsonl'
+    const missingBkName = 'retry-20261013T200102003Z-t53-16ai-missing.jsonl'
+    const diskBkName = 'retry-20261013T200102004Z-t53-16ai-ondisk.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const childText = packFiles(
+      [
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+      ],
+      parentName,
+    )[0]!
+    const bkText = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ])[0]!
+    h.files.set(childPath, childText)
+    h.files.set(`${PARTITION_DIR}/${diskBkName}`, bkText)
+    const pSize = utf8Bytes(h.files.get(parentPath)!)
+    const cSize = utf8Bytes(childText)
+    const bSize = utf8Bytes(bkText)
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-prevg-${diskBkName}`,
+      sealFile(
+        `${JSON.stringify({
+          size: bSize,
+          sending: true,
+          by: 'prevg',
+          stagedFor: parentName,
+          stagedForSize: pSize,
+          replaces: childName,
+          backup: true,
+          backupForSize: cSize,
+          backupForFnv1a: fnv1a(childText),
+          backupFnv1a: fnv1a(bkText),
+          attempt: 'a-disk',
+        })}\n`,
+      ),
+    )
+    const v2Key = `replayed:v2:${TABLE_REF}/${parentName}`
+    h.store.set(v2Key, {
+      fates: 'LL',
+      reasons: [],
+      refusals: [],
+      size: pSize,
+      sourceFnv1a: fnv1a(h.files.get(parentPath)!),
+      waits: true,
+      seq: 3,
+      files: [],
+      written: [],
+      pendingReconcile: [{ name: childName, size: cSize, fnv1a: fnv1a(childText) }],
+      backupFiles: [{ name: missingBkName, size: bSize, fnv1a: fnv1a(bkText), replaces: childName, replacesSize: cSize, replacesFnv1a: fnv1a(childText) }],
+      accountedKeys: [rowA, rowB],
+      attempt: 'a-disk',
+      attempts: ['a-disk'],
+    })
+    // Defer Phase 3 via foreign lease on childName only AFTER writeOut records the updated backupFiles?
+    // Even simpler: fail markDone once so writeOut stops after recording updated v2 backupFiles.
+    h.setWriteFileHook(async (p, txt) => {
+      if (p.includes('/outcome-done-') && p.endsWith(`-${parentName}`) && txt.includes('"retired":true')) {
+        throw new Error('pause after v2 record')
+      }
+    })
+    h.setFetch(async () => OK_INSERT)
+    await h.newWriter('s-16ai-swap-1').backfill(['spill', 'retry'], 'auto')
+    const updatedV2 = h.store.get(v2Key) as { backupFiles?: { name: string }[] } | undefined
+    expect(updatedV2?.backupFiles?.map(b => b.name)).toEqual([diskBkName])
+
+    // Non-ENOENT errors reading an existing backup — including explicit non-ENOENT error codes
+    // whose message says "not found" and generic "table not found" strings — must fail closed.
+    const baseIo = h.ioFor()
+    h.setWriteFileHook(null)
+    for (const errFactory of [
+      () => Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }),
+      () => Object.assign(new Error('mount not found'), { code: 'EACCES' }),
+      () => new Error('table not found'),
+    ]) {
+      const errIo = {
+        ...baseIo,
+        readFile: async (p: string) => {
+          if (p.endsWith(`/${diskBkName}`)) throw errFactory()
+          return baseIo.readFile(p)
+        },
+      }
+      const wErr = new Writer(errIo, () => h.config, () => 's-16ai-eacces')
+      await wErr.backfill(['spill'], 'auto')
+      expect(h.files.get(parentPath)).not.toBe('')
+      const v2After = h.store.get(v2Key) as { backupFiles?: { name: string }[] } | undefined
+      expect(v2After?.backupFiles?.map(b => b.name)).toEqual([diskBkName])
+    }
+  }
+
+  // Subcase 3: `0.1.4 force` directly on C while a backup B carries `parent: C` (for legacy ID-less
+  // rows) skips B in discoverLiveChildrenForForce & classifyChild (no conflicting childGuard, no B in C's retired files).
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ai-cforce-p.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ai-cforce-c.jsonl'
+    const backupName = 'retry-20261013T200102003Z-t53-16ai-cforce-b.jsonl'
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const backupPath = `${PARTITION_DIR}/${backupName}`
+    const noIdC = { ...ownRow(''), event_id: '' }
+    delete (noIdC as Record<string, unknown>).event_id
+    const childText = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: noIdC }),
+    ])[0]!
+    const backupText = packFiles(
+      [
+        JSON.stringify({
+          v: 1,
+          kind: 'retry',
+          reason: 'retry',
+          attempts: 0,
+          failed_at: '2026-10-13T20:01:02.002Z',
+          table: TABLE_REF,
+          key: `${childName}#0`,
+          row: { ...noIdC, event_id: `dl:${childName}#0` },
+        }),
+      ],
+      childName,
+    )[0]!
+    h.files.set(childPath, childText)
+    h.files.set(backupPath, backupText)
+    const cSize = utf8Bytes(childText)
+    const bSize = utf8Bytes(backupText)
+    h.files.set(
+      `${PARTITION_DIR}/outcome-done-prevg-${backupName}`,
+      sealFile(
+        `${JSON.stringify({
+          size: bSize,
+          sending: true,
+          by: 'prevg',
+          stagedFor: parentName,
+          stagedForSize: 500,
+          replaces: childName,
+          backup: true,
+          backupForSize: cSize,
+          backupForFnv1a: fnv1a(childText),
+          backupFnv1a: fnv1a(backupText),
+          attempt: 'a-cforce',
+        })}\n`,
+      ),
+    )
+    h.setFetch(async () => OK_INSERT)
+    await h.newWriter('s-16ai-cforce-1').backfill(['retry'], 'force')
+    expect(h.files.get(childPath)).toBe('')
+    // C's retired done mark must NOT include backupName in `files`, and backupName must have no conflicting childGuard for C.
+    const cDoneMarks = [...h.files.entries()].filter(([p, t]) => p.includes('/outcome-done-') && p.endsWith(`-${childName}`) && t.includes('"retired":true'))
+    expect(cDoneMarks.length >= 1).toBe(true)
+    expect(cDoneMarks.every(([, t]) => !t.includes(backupName))).toBe(true)
+    const bGuardsForC = [...h.files.entries()].filter(
+      ([p, t]) => p.includes('/outcome-done-') && p.endsWith(`-${backupName}`) && t.includes(`"stagedFor":"${childName}"`),
+    )
+    expect(bGuardsForC.length).toBe(0)
+    // Subsequent auto drops the now-superseded backup cleanly without resending.
+    await h.newWriter('s-16ai-cforce-2').backfill(['retry'], 'auto')
+    expect(h.files.get(backupPath)).toBe('')
+  }
+
+  // Subcase 4: Momentary empty child (`''`, non-atomic overwrite window) during post-loop digest
+  // re-verify must abort dispatch and roll back newly staged backups & child guards.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ai-empty-p.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ai-empty-c.jsonl'
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const childText = packFiles(
+      [
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+      ],
+      parentName,
+    )[0]!
+    h.files.set(childPath, childText)
+    let childReads = 0
+    let flashedEmpty = false
+    const baseIo = h.ioFor()
+    const flakyIo = {
+      ...baseIo,
+      readFile: async (p: string) => {
+        if (p === childPath) {
+          childReads += 1
+          // Return momentary empty on the post-staging re-read after backup is staged.
+          const hasStagedBackup = [...h.files.entries()].some(
+            ([fp, txt]) => fp.includes('/retry-') && !fp.includes('/outcome') && fp !== childPath && txt !== '',
+          )
+          if (hasStagedBackup && !flashedEmpty) {
+            flashedEmpty = true
+            return ''
+          }
+        }
+        return baseIo.readFile(p)
+      },
+    }
+    h.setFetch(async () => OK_INSERT)
+    const w = new Writer(flakyIo, () => h.config, () => 's-16ai-empty-1')
+    const r = await w.backfill(['spill'], 'force')
+    expect(flashedEmpty).toBe(true)
+    expect(childReads >= 2).toBe(true)
+    expect(r.error ?? '').toContain('standalone backups')
+    expect(h.sentOf(rowA)).toBe(0)
+    expect(h.files.get(parentPath)).not.toBe('')
+    const liveBackups = [...h.files.entries()].filter(
+      ([fp, txt]) => fp.includes('/retry-') && !fp.includes('/outcome') && fp !== childPath && txt !== '',
+    )
+    expect(liveBackups.length).toBe(0)
+  }
+
+  // Subcase 5: writeOut leased-child direct path reports clean hold without error or double-counted
+  // report.files, delivers independent trailing file S, and clears heldPaths/heldNoticeInfo once the
+  // SAME Writer reconciles & empties C after the lease expires.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ai-wo-lease-p.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ai-wo-lease-c.jsonl'
+    const independentName = 'spill-20261013T200102099Z-t53-16ai-wo-lease-s.jsonl'
+    const rowS = 's'.repeat(32)
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const independentPath = h.seedSpill(independentName, rowS)
+    const childText = packFiles(
+      [
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+      ],
+      parentName,
+    )[0]!
+    h.files.set(childPath, childText)
+    const pSize = utf8Bytes(h.files.get(parentPath)!)
+    const cSize = utf8Bytes(childText)
+    // Seed a non-conflicting incomplete v2 checkpoint so execution enters writeOut directly (no backups staged yet).
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+      fates: 'LL',
+      reasons: [],
+      refusals: [],
+      size: pSize,
+      sourceFnv1a: fnv1a(h.files.get(parentPath)!),
+      waits: true,
+      seq: 3,
+      files: [],
+      written: [],
+      pendingReconcile: [{ name: childName, size: cSize, fnv1a: fnv1a(childText) }],
+      accountedKeys: [rowA, rowB],
+      attempt: 'a-wo-lease',
+      attempts: ['a-wo-lease'],
+    })
+    h.store.set(`lease:${TABLE_REF}/${childName}`, { by: 'other-session', until: h.ioFor().now() + 5 * 60_000 })
+    h.setFetch(async () => OK_INSERT)
+
+    const sameWriter = h.newWriter('s-16ai-wo-same')
+    const r1 = await sameWriter.backfill(['spill', 'retry'], 'force')
+    expect(r1.error).toBeNull()
+    expect(r1.held ?? '').toContain(childName)
+    expect((r1.heldFiles ?? 0) >= 2).toBe(true)
+    expect(r1.skippedFiles >= 2).toBe(true)
+    // Only the independent trailing spill S counted in report.files (not lease-deferred P).
+    expect(r1.files).toBe(1)
+    expect(h.sentOf(rowS)).toBe(1)
+    expect(h.files.get(independentPath)).toBe('')
+
+    // Expire lease and run auto on the SAME Writer: P reconciles & empties C in this pass.
+    // heldNoticeInfo() must already clear on this first auto pass (no stale hold on C).
+    await h.advance(15 * 60_000)
+    await sameWriter.backfill(['spill', 'retry'], 'auto')
+    expect(h.files.get(parentPath)).toBe('')
+    expect(h.files.get(childPath)).toBe('')
+    expect(sameWriter.heldNoticeInfo().files).toBe(0)
+    expect(sameWriter.heldNoticeInfo().reason).toBeNull()
+    expect(sameWriter.heldNoticeInfo().mayBeActive).toBe(false)
+    await sameWriter.backfill(['spill', 'retry'], 'auto')
+    expect(h.sentOf(rowC)).toBe(1)
+    expect(sameWriter.heldNoticeInfo().files).toBe(0)
+    expect(sameWriter.heldNoticeInfo().reason).toBeNull()
+    expect(sameWriter.heldNoticeInfo().mayBeActive).toBe(false)
+  }
+
+  // Subcase 6: Concurrent child mutation under an active foreign lease when `existing` already
+  // references a live backup for that child returns a clean lease hold (no hard report.error)
+  // and still delivers unrelated trailing files.
+  {
+    const h = exitReplayHarness()
+    const parentName = 'spill-20261013T200102001Z-t53-16ai-lease-mut-p.jsonl'
+    const childName = 'retry-20261013T200102002Z-t53-16ai-lease-mut-c.jsonl'
+    const bkName = 'retry-20261013T200102003Z-t53-16ai-lease-mut-bk.jsonl'
+    const trailingName = 'spill-20261013T200102099Z-t53-16ai-lease-mut-s.jsonl'
+    const rowS = 's'.repeat(32)
+    const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const childPath = `${PARTITION_DIR}/${childName}`
+    const trailingPath = h.seedSpill(trailingName, rowS)
+    const childText = packFiles(
+      [
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+        JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+      ],
+      parentName,
+    )[0]!
+    const bkText = packFiles([
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.002Z', table: TABLE_REF, row: ownRow(rowB) }),
+      JSON.stringify({ v: 1, kind: 'retry', reason: 'retry', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: ownRow(rowC) }),
+    ])[0]!
+    h.files.set(childPath, childText)
+    h.files.set(`${PARTITION_DIR}/${bkName}`, bkText)
+    const pSize = utf8Bytes(h.files.get(parentPath)!)
+    const cSize = utf8Bytes(childText)
+    const bSize = utf8Bytes(bkText)
+    h.store.set(`replayed:v2:${TABLE_REF}/${parentName}`, {
+      fates: 'LL',
+      reasons: [],
+      refusals: [],
+      size: pSize,
+      sourceFnv1a: fnv1a(h.files.get(parentPath)!),
+      waits: true,
+      seq: 3,
+      files: [],
+      written: [],
+      pendingReconcile: [{ name: childName, size: cSize, fnv1a: fnv1a(childText) }],
+      backupFiles: [{ name: bkName, size: bSize, fnv1a: fnv1a(bkText), replaces: childName, replacesSize: cSize, replacesFnv1a: fnv1a(childText) }],
+      accountedKeys: [rowA, rowB],
+      attempt: 'a-lease-mut',
+      attempts: ['a-lease-mut'],
+    })
+    h.store.set(`lease:${TABLE_REF}/${childName}`, { by: 'other-session', until: h.ioFor().now() + 5 * 60_000 })
+    const baseIo = h.ioFor()
+    let readCount = 0
+    const racyIo = {
+      ...baseIo,
+      readFile: async (p: string) => {
+        if (p === childPath) {
+          readCount += 1
+          // After writeOut inspects parent header on read 1, foreign lease holder empties C before stageChildBackups reads it.
+          if (readCount >= 2) return ''
+        }
+        return baseIo.readFile(p)
+      },
+    }
+    h.setFetch(async () => OK_INSERT)
+    const w = new Writer(racyIo, () => h.config, () => 's-16ai-lease-mut')
+    const r = await w.backfill(['spill', 'retry'], 'force')
+    expect(r.error).toBeNull()
+    expect(r.held ?? '').toContain(childName)
+    expect(h.sentOf(rowS)).toBe(1)
+    expect(h.files.get(trailingPath)).toBe('')
   }
 })
