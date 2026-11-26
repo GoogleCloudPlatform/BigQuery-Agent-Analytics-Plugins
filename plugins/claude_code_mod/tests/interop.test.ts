@@ -3175,3 +3175,79 @@ test('interop: 0.1.3 digest-less delivery of an adopted sibling does not cause a
   expect(h.count('C1_SIB_ISO')).toBe(1)
   expect(h.liveDataFiles()).toEqual([])
 })
+
+test('interop: resumed writeOut and childGuard marks on a parent-linked synthesized replacement never drop or duplicate the last backup', async () => {
+  const idA = 'a'.repeat(32)
+  const idB = 'b'.repeat(32)
+  for (const mode of ['resumed-writeout', 'preexisting-childguard-on-rep'] as const) {
+    const h = makeInteropHarness()
+    const pName = `retry-20200101T000000001Z-resrep-${mode}-p.jsonl`
+    const c1Name = `spill-20200101T000000002Z-resrep-${mode}-c1.jsonl`
+    const pText = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idB, 'B')])[0]!
+    const c1Text = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_RESUMED_UNIQUE')], pName)[0]!
+    const pSize = utf8Length(pText)
+    h.files.set(`${PART_DIR}/${pName}`, pText)
+    h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
+    // Seed conflicting v1 + v2 so 0.1.4 force re-dispatches P and reconciles c1Name;
+    // v1 clears cleanly during writeOut so v1ShadowNeeded() === false and R_rep1 gets `parent: pName`.
+    h.store.set(`replayed:${TABLE}/${pName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE}/${pName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [c1Name], written: [true] })
+    h.setWrite(async (p, text) => {
+      if (p.includes('/outcome-done-') && p.endsWith(`-${pName}`) && text.includes('"retired":true')) throw new Error('stopped before retired mark')
+      if (p === `${PART_DIR}/${pName}` && text === '') throw new Error('stopped before truncating parent')
+    })
+
+    // Pass 1 (0.1.4 force): stages linked bk1, clears v1, synthesizes parent-linked rep1, records v2, fails at markDone.
+    await h.newCurrent(`cur-resrep-${mode}-1`).backfill(['spill', 'retry'], 'force')
+    expect(h.count('C1_RESUMED_UNIQUE')).toBe(0)
+    const v2 = h.store.get(`replayed:v2:${TABLE}/${pName}`) as {
+      adopted: string[]
+      deliverableRefs?: { name: string; replaces?: string }[]
+      backupFiles: { name: string; replaces: string }[]
+    }
+    const rep1Name = v2.adopted[0]!
+    const bk1Name = v2.backupFiles.find(b => b.replaces === c1Name)!.name
+    const rep1Text = h.files.get(`${PART_DIR}/${rep1Name}`)!
+    expect(rep1Text.includes(`"parent":"${pName}"`)).toBe(true)
+    expect(v2.deliverableRefs?.find(d => d.name === rep1Name)?.replaces).toBe(c1Name)
+
+    if (mode === 'resumed-writeout') {
+      // Pass 2 (0.1.4 auto with markDone still failing): must NOT stage a duplicate backup for rep1Name.
+      await h.newCurrent(`cur-resrep-${mode}-2`).backfill(['spill', 'retry'], 'auto')
+      const v2After = h.store.get(`replayed:v2:${TABLE}/${pName}`) as { backupFiles: { name: string; replaces: string }[] }
+      expect(v2After.backupFiles.length).toBe(1)
+      expect(v2After.backupFiles[0]!.name).toBe(bk1Name)
+    } else {
+      // Simulate a preexisting childGuard mark stamped onto parent-linked rep1Name from an earlier build/session.
+      h.files.set(
+        `${PART_DIR}/outcome-done-pre2g-${rep1Name}`,
+        sealFile(
+          `${JSON.stringify({
+            size: utf8Length(rep1Text),
+            sending: true,
+            by: 'pre2g',
+            stagedFor: pName,
+            stagedForSize: pSize,
+            childGuard: true,
+            attempt: 'pre2-att',
+          })}\n`,
+        ),
+      )
+    }
+
+    // Pass 3 (0.1.3 force after lease expiry): retires pName with files: [] and drops c1Name and rep1Name unsent.
+    h.setWrite(null)
+    h.advance(15 * 60 * 1000)
+    await h.newDist(`dist-resrep-${mode}-1`).backfill(['spill', 'retry'], 'force')
+    expect(h.files.get(`${PART_DIR}/${pName}`)).toBe('')
+    expect(h.files.get(`${PART_DIR}/${c1Name}`)).toBe('')
+    expect(h.files.get(`${PART_DIR}/${rep1Name}`)).toBe('')
+    expect(h.files.get(`${PART_DIR}/${bk1Name}`) !== '').toBe(true)
+
+    // Pass 4 (0.1.4 auto): must recognize rep1Name belongs to c1Name via deliverableRefs.replaces and deliver bk1Name once.
+    await h.newCurrent(`cur-resrep-${mode}-3`).backfill(['spill', 'retry'], 'auto')
+    await h.newCurrent(`cur-resrep-${mode}-4`).backfill(['spill', 'retry'], 'auto')
+    expect(h.count('C1_RESUMED_UNIQUE')).toBe(1)
+    expect(h.liveDataFiles()).toEqual([])
+  }
+})

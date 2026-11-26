@@ -229,9 +229,10 @@ type Source = {
 // generation repopulating the same basename is never emptied.
 type ReconciledFile = { name: string; size: number; fnv1a: string; skipIndices?: number[] }
 
-// Exact content identity of a staged Phase 3 replacement part recorded in v2
-// before writing to disk, verified alongside foreign leases before cleanup.
-type StagedFile = { name: string; size: number; fnv1a: string }
+// Exact content identity of a staged Phase 3 replacement part or adopted/leftover
+// deliverable recorded in v2 before writing to disk (`replaces` records the
+// owning child basename for adopted children and synthesized replacements).
+type StagedFile = { name: string; size: number; fnv1a: string; replaces?: string }
 
 // Exact content identity of a pre-dispatch standalone backup (`parent: null`)
 // staged before forced parent HTTP dispatch so a `0.1.3` `/bqaa-backfill force`
@@ -766,14 +767,23 @@ const normalizeStagedRefs = (value: unknown): StagedFile[] => {
       continue
     }
     if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
-    const rec = item as { name?: unknown; size?: unknown; fnv1a?: unknown }
+    const rec = item as { name?: unknown; size?: unknown; fnv1a?: unknown; replaces?: unknown }
     if (typeof rec.name !== 'string' || rec.name === '') continue
     const name = baseOf(rec.name)
     const size = typeof rec.size === 'number' && Number.isFinite(rec.size) && rec.size >= 0 ? rec.size : -1
     const digest = typeof rec.fnv1a === 'string' ? rec.fnv1a : ''
+    const replaces = typeof rec.replaces === 'string' && rec.replaces !== '' ? baseOf(rec.replaces) : undefined
     const existing = byName.get(name)
-    if (existing === undefined || (existing.fnv1a === '' && digest !== '')) {
-      byName.set(name, { name, size, fnv1a: digest })
+    if (existing === undefined) {
+      byName.set(name, { name, size, fnv1a: digest, ...(replaces !== undefined ? { replaces } : {}) })
+    } else if ((existing.fnv1a === '' && digest !== '') || (existing.replaces === undefined && replaces !== undefined)) {
+      const mergedReplaces = existing.replaces ?? replaces
+      byName.set(name, {
+        name,
+        size: existing.size >= 0 ? existing.size : size,
+        fnv1a: existing.fnv1a !== '' ? existing.fnv1a : digest,
+        ...(mergedReplaces !== undefined ? { replaces: mergedReplaces } : {}),
+      })
     }
   }
   return [...byName.values()]
@@ -782,7 +792,7 @@ const normalizeStagedRefs = (value: unknown): StagedFile[] => {
 const normalizeStaged = (value: unknown): string[] => normalizeStagedRefs(value).map(s => s.name)
 
 const sameStaged = (a: readonly StagedFile[], b: readonly StagedFile[]): boolean =>
-  a.length === b.length && a.every((x, i) => x.name === b[i]?.name && x.size === b[i]?.size && x.fnv1a === b[i]?.fnv1a)
+  a.length === b.length && a.every((x, i) => x.name === b[i]?.name && x.size === b[i]?.size && x.fnv1a === b[i]?.fnv1a && x.replaces === b[i]?.replaces)
 
 const normalizeBackups = (value: unknown): BackupFile[] => {
   if (!Array.isArray(value)) return []
@@ -3238,25 +3248,20 @@ export class Writer {
               }
             }
           }
+          const expectedByName = new Map(normalizeStagedRefs(r.deliverableRefs).map(ref => [ref.name, ref]))
           for (const bn of adoptedSet) {
-            if (reconciledChild !== undefined && bn !== reconciledChild) {
-              try {
-                const dMarks = await this.marksDetailed(
-                  { ...sourceFor(dir, bn, -1, c), live: false },
-                  entryCompanions.get(bn) ?? [],
-                )
-                const isUnrelatedSibling =
-                  dMarks.stagedFor === parentName &&
-                  ((dMarks.replaces !== undefined && dMarks.replaces !== reconciledChild) ||
-                    (dMarks.childGuard === true && dMarks.replaces === undefined))
-                if (isUnrelatedSibling) continue
-              } catch {
-                // Fail closed: keep `bn` in `deliverableSet`.
-              }
+            const expectedRef = expectedByName.get(bn)
+            if (
+              reconciledChild !== undefined &&
+              bn !== reconciledChild &&
+              expectedRef?.replaces !== undefined &&
+              expectedRef.replaces !== '' &&
+              expectedRef.replaces !== reconciledChild
+            ) {
+              continue
             }
             deliverableSet.add(bn)
           }
-          const expectedByName = new Map(normalizeStagedRefs(r.deliverableRefs).map(ref => [ref.name, ref]))
           let sawLiveUnprotected = false
           for (const dName of deliverableSet) {
             const expected = expectedByName.get(dName)
@@ -6357,7 +6362,17 @@ export class Writer {
       for (const d of rewrite.deliverableRefs ?? []) mergedDeliverables.set(d.name, d)
       for (const d of foundDeliverables) {
         const cur = mergedDeliverables.get(d.name)
-        if (cur === undefined || (cur.fnv1a === '' && d.fnv1a !== '')) mergedDeliverables.set(d.name, d)
+        if (cur === undefined) {
+          mergedDeliverables.set(d.name, d)
+        } else if ((cur.fnv1a === '' && d.fnv1a !== '') || (cur.replaces === undefined && d.replaces !== undefined)) {
+          const mergedReplaces = cur.replaces ?? d.replaces
+          mergedDeliverables.set(d.name, {
+            name: cur.name,
+            size: cur.size > 0 ? cur.size : d.size,
+            fnv1a: cur.fnv1a !== '' ? cur.fnv1a : d.fnv1a,
+            ...(mergedReplaces !== undefined ? { replaces: mergedReplaces } : {}),
+          })
+        }
       }
       rewrite.deliverableRefs = mergedDeliverables.size > 0 ? [...mergedDeliverables.values()] : undefined
     }
@@ -6730,12 +6745,27 @@ export class Writer {
       if (ref === undefined || ref.size <= 0) return
       const existing = rewrite.deliverableRefs ?? []
       const idx = existing.findIndex(r => r.name === ref.name)
+      const entry: StagedFile = {
+        name: ref.name,
+        size: ref.size,
+        fnv1a: ref.fnv1a,
+        ...(ref.replaces !== undefined && ref.replaces !== '' ? { replaces: baseOf(ref.replaces) } : {}),
+      }
       if (idx === -1) {
-        rewrite.deliverableRefs = [...existing, { name: ref.name, size: ref.size, fnv1a: ref.fnv1a }]
-      } else if (existing[idx]!.fnv1a === '' && ref.fnv1a !== '') {
-        const next = [...existing]
-        next[idx] = { name: ref.name, size: ref.size, fnv1a: ref.fnv1a }
-        rewrite.deliverableRefs = next
+        rewrite.deliverableRefs = [...existing, entry]
+      } else {
+        const cur = existing[idx]!
+        if ((cur.fnv1a === '' && entry.fnv1a !== '') || (cur.replaces === undefined && entry.replaces !== undefined)) {
+          const mergedReplaces = cur.replaces ?? entry.replaces
+          const next = [...existing]
+          next[idx] = {
+            name: cur.name,
+            size: cur.size > 0 ? cur.size : entry.size,
+            fnv1a: cur.fnv1a !== '' ? cur.fnv1a : entry.fnv1a,
+            ...(mergedReplaces !== undefined ? { replaces: mergedReplaces } : {}),
+          }
+          rewrite.deliverableRefs = next
+        }
       }
     }
     type ChildClassification =
@@ -6891,13 +6921,13 @@ export class Writer {
           // `base` in `files` (no deadlock against a prior v2 listing it),
           // never fabricates an unverified digest in `reconciled`, never
           // truncates `base`, and never copies its rows into a replacement.
-          return { action: 'adopt', ref: { name: base, size: actualSize, fnv1a: actualDigest } }
+          return { action: 'adopt', ref: { name: base, size: actualSize, fnv1a: actualDigest, replaces: base } }
         } catch {
           return { action: 'defer', ref: fallback, reason: `cannot read retired child ${base}; deferring reconciliation` }
         }
       }
       if ((!forceStandalone && rewrite.accountedRowKeys === undefined) || sz > HOST_FILE_BYTES) {
-        return { action: 'adopt', ref: rawBeforeDigest !== undefined ? { name: base, size: sz, fnv1a: rawBeforeDigest } : undefined }
+        return { action: 'adopt', ref: rawBeforeDigest !== undefined ? { name: base, size: sz, fnv1a: rawBeforeDigest, replaces: base } : undefined }
       }
       let raw: string
       try {
@@ -6980,7 +7010,7 @@ export class Writer {
         return { action: 'reconciled', ref }
       }
       if (!forceStandalone && remainingEntries.length === parsed.lines.length) {
-        return { action: 'adopt', ref }
+        return { action: 'adopt', ref: { ...ref, replaces: base } }
       }
       const pendingRef: ReconciledFile = skipIndices.length > 0 ? { ...ref, skipIndices } : ref
       return {
@@ -7466,11 +7496,20 @@ export class Writer {
         ...getAdoptedNames(),
         ...getReconciledRefs().map(r => r.name),
       ])
+      const deliverableByName = new Map((rewrite.deliverableRefs ?? []).map(d => [d.name, d]))
       for (const childName of candidateNames) {
         const childSize = listedBeforeRecord.get(childName) ?? 0
         if (childSize <= 0 || childName === rewrite.name) continue
         const childPath = joinPath(rewrite.dir, childName)
         if (rewrite.tempMarks?.has(childPath)) continue
+        const dRef = deliverableByName.get(childName)
+        if (dRef?.replaces !== undefined && dRef.replaces !== '' && dRef.replaces !== childName) {
+          const origLive = (listedBeforeRecord.get(dRef.replaces) ?? 0) > 0
+          const origHasLiveBackup = (rewrite.backupFiles ?? []).some(
+            b => b.replaces === dRef.replaces && (listedBeforeRecord.get(b.name) ?? 0) > 0,
+          )
+          if (origLive || origHasLiveBackup) continue
+        }
         let hasParentHeader = false
         if (childSize <= HOST_FILE_BYTES) {
           const info = await this.readParentInfo(rewrite.dir, childName, childSize, parentIndex)
@@ -8102,7 +8141,7 @@ export class Writer {
           }
         }
         const plannedNames = planned.map(p => p.name)
-        const plannedRefs: StagedFile[] = planned.map(p => ({ name: p.name, size: p.size, fnv1a: p.digest }))
+        const plannedRefs: StagedFile[] = planned.map(p => ({ name: p.name, size: p.size, fnv1a: p.digest, replaces: pending.name }))
         const needsTempStageMark = omitParentHeader && !decision.markUncertain
         const prevStaged = [...getStagedRefs()]
         rewrite.stagedFiles = [...prevStaged, ...plannedRefs]
