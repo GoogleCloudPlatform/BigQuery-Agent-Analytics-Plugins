@@ -9965,7 +9965,8 @@ test('T53-16ab: pre-dispatch backup rollback, attempt-bound child guards, and mu
     h.setFetch(async () => OK_INSERT)
     const r = await h.newWriter('s-16ab-d').backfill(['spill', 'retry'], 'force')
     expect(mutatedC2).toBe(true)
-    expect(r.error).not.toBeNull()
+    expect(r.error).toBeNull()
+    expect(r.held ?? '').toContain(c2Name)
     expect(h.sent.length).toBe(0)
     expect([...h.files.entries()].filter(([p, v]) => p.startsWith(`${PARTITION_DIR}/`) && !p.includes('/outcome') && p !== parentPath && p !== c1Path && p !== c2Path && v !== '').length).toBe(0)
     expect([...h.files.entries()].filter(([k, v]) => k.includes('g-') && v.includes('"sending":true')).length).toBe(0)
@@ -11958,12 +11959,17 @@ test('T53-16ai: linear backup discovery, absent-backup swap persistence, EACCES 
   }
 
   // Subcase 4: Momentary empty child (`''`, non-atomic overwrite window) during post-loop digest
-  // re-verify must abort dispatch and roll back newly staged backups & child guards.
-  {
+  // re-verify (and owner emptying child right before initial read) must hold ONLY the parent
+  // without setting report.error, roll back newly staged backups & guards, and still deliver
+  // unrelated trailing files in the same forced scan.
+  for (const emptyStage of ['post-stage', 'before-read'] as const) {
     const h = exitReplayHarness()
-    const parentName = 'spill-20261013T200102001Z-t53-16ai-empty-p.jsonl'
-    const childName = 'retry-20261013T200102002Z-t53-16ai-empty-c.jsonl'
+    const parentName = `spill-20261013T200102001Z-t53-16ai-empty-${emptyStage}-p.jsonl`
+    const childName = `retry-20261013T200102002Z-t53-16ai-empty-${emptyStage}-c.jsonl`
+    const trailingName = `spill-20261013T200102099Z-t53-16ai-empty-${emptyStage}-s.jsonl`
+    const rowS = 's'.repeat(32)
     const parentPath = h.seedSpill(parentName, rowA, rowB)
+    const trailingPath = h.seedSpill(trailingName, rowS)
     const childPath = `${PARTITION_DIR}/${childName}`
     const childText = packFiles(
       [
@@ -11981,24 +11987,35 @@ test('T53-16ai: linear backup discovery, absent-backup swap persistence, EACCES 
       readFile: async (p: string) => {
         if (p === childPath) {
           childReads += 1
-          // Return momentary empty on the post-staging re-read after backup is staged.
-          const hasStagedBackup = [...h.files.entries()].some(
-            ([fp, txt]) => fp.includes('/retry-') && !fp.includes('/outcome') && fp !== childPath && txt !== '',
-          )
-          if (hasStagedBackup && !flashedEmpty) {
-            flashedEmpty = true
-            return ''
+          if (emptyStage === 'before-read') {
+            // Read 1 is discoverLiveChildrenForForce (parent header); read 2 is stageChildBackups initial read.
+            if (childReads === 2 && !flashedEmpty) {
+              flashedEmpty = true
+              return ''
+            }
+          } else {
+            // Return momentary empty on the post-staging re-read after backup is staged.
+            const hasStagedBackup = [...h.files.entries()].some(
+              ([fp, txt]) => fp.includes('/retry-') && !fp.includes('/outcome') && fp !== childPath && txt !== '',
+            )
+            if (hasStagedBackup && !flashedEmpty) {
+              flashedEmpty = true
+              return ''
+            }
           }
         }
         return baseIo.readFile(p)
       },
     }
     h.setFetch(async () => OK_INSERT)
-    const w = new Writer(flakyIo, () => h.config, () => 's-16ai-empty-1')
+    const w = new Writer(flakyIo, () => h.config, () => `s-16ai-empty-${emptyStage}`)
     const r = await w.backfill(['spill'], 'force')
     expect(flashedEmpty).toBe(true)
     expect(childReads >= 2).toBe(true)
-    expect(r.error ?? '').toContain('standalone backups')
+    expect(r.error).toBeNull()
+    expect(r.held ?? '').toContain(childName)
+    expect(h.sentOf(rowS)).toBe(1)
+    expect(h.files.get(trailingPath)).toBe('')
     expect(h.sentOf(rowA)).toBe(0)
     expect(h.files.get(parentPath)).not.toBe('')
     const liveBackups = [...h.files.entries()].filter(
