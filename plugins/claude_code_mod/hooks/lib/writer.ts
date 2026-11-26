@@ -3871,14 +3871,15 @@ export class Writer {
               if (kindOf(name) !== 'rejected') tally.waiting += 1
               continue
             }
-            // If an unretired same-size v1 record from an earlier equal-size
-            // generation (`sourceFnv1a !== liveDigest`) still protects a live
-            // child on disk, let that child replay and empty first (or hold
-            // this source cleanly without dispatching partial rows) so `v1`
-            // can be cleared before any new outcome leaves unwritten leftovers
+            // If a same-size v1 record (unretired or retired companion file) from
+            // an earlier equal-size generation (`sourceFnv1a !== liveDigest`) still
+            // protects a live child on disk, let that child replay and empty first
+            // (or hold this source cleanly without dispatching partial rows) so
+            // `v1` can be cleared before any new outcome leaves unwritten leftovers
             // exposed to a 0.1.3 reader retiring this source under stale `v1`.
             if (source.size > 0 && hadInitialRecord) {
               let v1ProtectedLiveChildren: string[] = []
+              let v1InspectFailed = false
               try {
                 const v1SlotNow = await this.readJournalSlotAll(source.recordKey, source.recordFiles)
                 const v1Records = [v1SlotNow.stored, ...v1SlotNow.filed].filter((r): r is Partial<Journal> => r !== undefined)
@@ -3886,7 +3887,6 @@ export class Writer {
                 for (const r of v1Records) {
                   if (
                     r.size === source.size &&
-                    r.retired !== true &&
                     typeof r.sourceFnv1a === 'string' &&
                     r.sourceFnv1a !== '' &&
                     r.sourceFnv1a !== liveDigest
@@ -3898,7 +3898,18 @@ export class Writer {
                 }
                 v1ProtectedLiveChildren = [...seenV1Children]
               } catch {
-                v1ProtectedLiveChildren = []
+                v1InspectFailed = true
+              }
+              if (v1InspectFailed) {
+                this.noteHeld(
+                  report,
+                  trigger,
+                  `cannot inspect prior replay record of ${name}; it waits for the next replay`,
+                  path,
+                )
+                report.skippedFiles += 1
+                if (kindOf(name) !== 'rejected') tally.waiting += 1
+                continue
               }
               if (v1ProtectedLiveChildren.length > 0) {
                 const hasPendingV1Child = v1ProtectedLiveChildren.some(cn => pendingLiveFiles.has(cn))
@@ -3911,14 +3922,11 @@ export class Writer {
                 const childHeld = this.currentScanHeld.get(joinPath(dir, firstChild)) ?? this.heldPaths.get(joinPath(dir, firstChild))
                 const mayBeActive = childHeld?.mayBeActive === true
                 const activeCertain = childHeld?.activeCertain === true
-                this.noteHeld(
-                  report,
-                  trigger,
-                  `prior replay record of ${name} still protects live child ${firstChild}; waiting until ${firstChild} clears`,
-                  path,
-                  mayBeActive,
-                  activeCertain,
-                )
+                const needsExplicitRejected = kindOf(firstChild) === 'rejected' && !kinds.includes('rejected')
+                const v1HoldMsg = needsExplicitRejected
+                  ? `prior replay record of ${name} still protects live rejected child ${firstChild}; run /bqaa-backfill to clear ${firstChild} first`
+                  : `prior replay record of ${name} still protects live child ${firstChild}; waiting until ${firstChild} clears`
+                this.noteHeld(report, trigger, v1HoldMsg, path, mayBeActive, activeCertain)
                 report.skippedFiles += 1
                 if (kindOf(name) !== 'rejected') tally.waiting += 1
                 continue
@@ -9039,13 +9047,20 @@ export class Writer {
     let leasedChild: string | undefined
     let mutatedChild: string | undefined
     const acquiredChildLeases: string[] = []
+    const isForeignChildLease = (lease: { by?: string; holder?: string; until?: number } | undefined): boolean =>
+      Boolean(
+        lease &&
+          typeof lease.until === 'number' &&
+          lease.until > this.io.now() &&
+          (lease.by !== me || (typeof lease.holder === 'string' && lease.holder !== '' && lease.holder !== this.mark)),
+      )
     const failChildMutated = async (cName: string, hadLease: boolean, msg: string): Promise<never> => {
       if (hadLease) {
         leasedChild = cName
       } else {
         try {
-          const leaseNow = (await this.io.storeGet(`lease:${dest}/${cName}`)) as { by?: string; until?: number } | undefined
-          if (leaseNow && typeof leaseNow.until === 'number' && leaseNow.until > this.io.now() && leaseNow.by !== me) {
+          const leaseNow = (await this.io.storeGet(`lease:${dest}/${cName}`)) as { by?: string; holder?: string; until?: number } | undefined
+          if (isForeignChildLease(leaseNow)) {
             leasedChild = cName
           }
         } catch {
@@ -9069,8 +9084,8 @@ export class Writer {
         if (childSize <= 0 || childSize > HOST_FILE_BYTES) continue
         const childName = baseOf(childPath)
         const childLeaseKey = `lease:${dest}/${childName}`
-        const lease = (await this.io.storeGet(childLeaseKey)) as { by?: string; until?: number } | undefined
-        const hasForeignLease = Boolean(lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me)
+        const lease = (await this.io.storeGet(childLeaseKey)) as { by?: string; holder?: string; until?: number } | undefined
+        const hasForeignLease = isForeignChildLease(lease)
         let ownedChildLease = false
         if (hasForeignLease) {
           let hasLiveBackup = false
@@ -9094,7 +9109,7 @@ export class Writer {
           // Establish temporary ownership over `childName` before reading it or
           // inspecting its retirement evidence for `parent: childName` linking.
           try {
-            await this.io.storeSet(childLeaseKey, { by: me, until: this.io.now() + LEASE_MS })
+            await this.io.storeSet(childLeaseKey, { by: me, holder: this.mark, until: this.io.now() + LEASE_MS })
             ownedChildLease = true
             acquiredChildLeases.push(childName)
           } catch {
@@ -9194,8 +9209,8 @@ export class Writer {
           let reused: BackupFile | null = null
           for (const cand of diskCandidatesByKey.get(diskKey) ?? []) {
             if (usedDiskBackups.has(cand.name)) continue
-            const bLease = (await this.io.storeGet(`lease:${dest}/${cand.name}`)) as { by?: string; until?: number } | undefined
-            if (bLease && typeof bLease.until === 'number' && bLease.until > this.io.now() && bLease.by !== me) continue
+            const bLease = (await this.io.storeGet(`lease:${dest}/${cand.name}`)) as { by?: string; holder?: string; until?: number } | undefined
+            if (isForeignChildLease(bLease)) continue
             const candRead = await readIfPresent(joinPath(dir, cand.name))
             if (candRead.present && candRead.text !== '' && utf8Length(candRead.text) === bSize && fnv1a(candRead.text) === bDigest) {
               usedDiskBackups.add(cand.name)
@@ -9240,8 +9255,8 @@ export class Writer {
       // match before returning control for dispatch/checkpoint.
       for (const entry of recheckTargets) {
         if (entry.hadMissing || entry.linkedBackup) {
-          const leaseAfter = (await this.io.storeGet(`lease:${dest}/${entry.childName}`)) as { by?: string; until?: number } | undefined
-          if (leaseAfter && typeof leaseAfter.until === 'number' && leaseAfter.until > this.io.now() && leaseAfter.by !== me) {
+          const leaseAfter = (await this.io.storeGet(`lease:${dest}/${entry.childName}`)) as { by?: string; holder?: string; until?: number } | undefined
+          if (isForeignChildLease(leaseAfter)) {
             leasedChild = entry.childName
             throw new Error(`another session's lease holds ${entry.childName}`)
           }
@@ -9291,8 +9306,8 @@ export class Writer {
     } finally {
       for (const cName of acquiredChildLeases) {
         try {
-          const curLease = (await this.io.storeGet(`lease:${dest}/${cName}`)) as { by?: string } | undefined
-          if (curLease?.by === me) await this.io.storeDelete(`lease:${dest}/${cName}`)
+          const curLease = (await this.io.storeGet(`lease:${dest}/${cName}`)) as { by?: string; holder?: string } | undefined
+          if (curLease?.by === me && curLease?.holder === this.mark) await this.io.storeDelete(`lease:${dest}/${cName}`)
         } catch {
           // Best-effort release of temporary child backup-staging lease.
         }
@@ -9748,6 +9763,15 @@ export class Writer {
           mayBeActive: active,
         }
       }
+    }
+    if (!done && rewrite.deferredByLease === true) {
+      const heldNow = this.currentScanHeld.get(path)
+      if (heldNow !== undefined) {
+        report.held ??= heldNow.reason
+        report.heldFiles = this.currentScanHeld.size
+      }
+      report.skippedFiles += 1
+      return 'skipped'
     }
     // The file done, clear our sending mark only when this write did not
     // replace it with a retired done mark (`wroteDone`). On `v2` splits,

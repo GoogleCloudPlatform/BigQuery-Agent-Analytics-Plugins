@@ -190,8 +190,8 @@ const ORDERS: readonly Order[] = ['parent-first', 'child-first']
 
 const pairNames = (order: Order, tag: string): { pName: string; cName: string } =>
   order === 'parent-first'
-    ? { pName: `retry-20261013T200102001Z-${tag}-parent.jsonl`, cName: `spill-20261013T200102002Z-${tag}-child.jsonl` }
-    : { pName: `spill-20261013T200102001Z-${tag}-parent.jsonl`, cName: `retry-20261013T200102002Z-${tag}-child.jsonl` }
+    ? { pName: `retry-20200101T000000001Z-${tag}-parent.jsonl`, cName: `spill-20200101T000000002Z-${tag}-child.jsonl` }
+    : { pName: `spill-20200101T000000001Z-${tag}-parent.jsonl`, cName: `retry-20200101T000000002Z-${tag}-child.jsonl` }
 
 test('interop: crash before record() never duplicates on auto recovery (even with pre-force v2) and never loses child rows on dist force', async () => {
   const idA = 'a'.repeat(32)
@@ -563,7 +563,7 @@ test('interop: equal-size repopulation after dist fallback record and current co
   const idX = 'a'.repeat(32)
   const idY = 'b'.repeat(32)
   const h = makeInteropHarness()
-  const pName = 'retry-20261013T200102001Z-interop-unmask-p.jsonl'
+  const pName = 'retry-20200101T000000001Z-interop-unmask-p.jsonl'
   const pPath = `${PART_DIR}/${pName}`
   const p1Text = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idB, 'B')])[0]!
   const p2Text = packFiles([dlLine('retry', idX, 'X'), dlLine('retry', idY, 'Y')])[0]!
@@ -651,7 +651,7 @@ test('interop: foreign lease on guarded child fails closed before dispatch, and 
       h.store.set(v2Key, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [cName], written: [true] })
       h.store.set(`lease:${TABLE}/${cName}`, { by: 'other-session', until: h.io.now() + 5 * 60 * 1000 })
 
-      const sName = `spill-20261013T200102999Z-independent-${order}.jsonl`
+      const sName = `spill-20200101T000000999Z-independent-${order}.jsonl`
       const sPath = `${PART_DIR}/${sName}`
       const idS = '9'.repeat(32)
       h.files.set(sPath, packFiles([dlLine('spill', idS, 'S')])[0]!)
@@ -808,8 +808,8 @@ test('interop: same-length parent retirement carries live child from unretired e
   const idB = 'f'.repeat(32)
   const idC = '1'.repeat(32)
   const h = makeInteropHarness()
-  const pName = 'spill-20261013T200102001Z-same-len-gen-p.jsonl'
-  const cName = 'retry-20261013T200102002Z-same-len-gen-c.jsonl'
+  const pName = 'spill-20200101T000000001Z-same-len-gen-p.jsonl'
+  const cName = 'retry-20200101T000000002Z-same-len-gen-c.jsonl'
   const pPath = `${PART_DIR}/${pName}`
   const cPath = `${PART_DIR}/${cName}`
   const pGen1 = packFiles([dlLine('spill', idA, 'A')])[0]!
@@ -869,7 +869,7 @@ test('interop: multi-part ID-less leftover checkpoint never loses rows across 0.
   // packing, and 0.1.4 command finishes and delivers all 3,900 distinct rows with zero loss.
   {
     const h = makeInteropHarness()
-    const pName = 'spill-20261013T200102001Z-idless-2part-cur.jsonl'
+    const pName = 'spill-20200101T000000001Z-idless-2part-cur.jsonl'
     const pPath = `${PART_DIR}/${pName}`
     h.files.set(pPath, sealedBig)
     h.setFetch(async tags => ({
@@ -930,7 +930,7 @@ test('interop: multi-part ID-less leftover checkpoint never loses rows across 0.
     expect(sealedWideParts.length).toBe(1)
     const sealedWide = sealedWideParts[0]!
     expect(utf8Length(sealedWide) < 3 * 1024 * 1024).toBe(true)
-    const pName = 'spill-20261013T200102002Z-idless-2part-dist.jsonl'
+    const pName = 'spill-20200101T000000002Z-idless-2part-dist.jsonl'
     const pPath = `${PART_DIR}/${pName}`
     h.files.set(pPath, sealedWide)
     const longErr = 'e'.repeat(180)
@@ -1438,6 +1438,127 @@ test('interop: v1 shadow on stuck v1 & defer-before-dispatch on protected v1 pre
     await h.newCurrent('cur-v1shadow-2').backfill(['spill', 'retry'], 'auto')
     expect(h.count(`G2B-${padV2}`)).toBe(1)
     expect(h.count(`G2C-${padV2}`)).toBe(1)
+    expect(h.liveDataFiles()).toEqual([])
+  }
+
+  // Arm 4: Retired v1 companion file (`outcome-<parent>`, retired: true, earlier sourceFnv1a)
+  // protecting live c1 + single-part stamped P_gen2 (`useV2 = false`) with EIO on leftover write:
+  // backfillRun must defer/hold P_gen2 until c1 clears so 0.1.3 auto never prefers retired
+  // `outcome-<parent>` over `v1` store and drops P_gen2's unsent row G2B!
+  for (const leaseChild of [false, true] as const) {
+    const h = makeInteropHarness()
+    const pName = `spill-20200101T000000001Z-retv1-${leaseChild ? 'leased' : 'free'}-p.jsonl`
+    const c1Name = `retry-20200101T000000002Z-retv1-${leaseChild ? 'leased' : 'free'}-c1.jsonl`
+    const sName = `spill-20200101T000000099Z-retv1-${leaseChild ? 'leased' : 'free'}-s.jsonl`
+    const pPath = `${PART_DIR}/${pName}`
+    const c1Path = `${PART_DIR}/${c1Name}`
+    const sPath = `${PART_DIR}/${sName}`
+    const pGen1Text = packFiles([dlLine('spill', idA, 'G1A'), dlLine('spill', null, 'G1B')])[0]!
+    const pGen2Text = packFiles([dlLine('spill', idA, 'G2A'), dlLine('spill', null, 'G2B')])[0]!
+    expect(utf8Length(pGen2Text)).toBe(utf8Length(pGen1Text))
+    const pSize = utf8Length(pGen2Text)
+    h.files.set(pPath, pGen2Text)
+    h.files.set(c1Path, packFiles([dlLine('retry', idC1, 'C1')], pName)[0]!)
+    h.files.set(sPath, packFiles([dlLine('spill', '9'.repeat(32), 'S')])[0]!)
+    h.files.set(
+      `${PART_DIR}/outcome-${pName}`,
+      sealFile(
+        `${JSON.stringify({
+          fates: 'LW',
+          reasons: ['', 'retry'],
+          refusals: ['', ''],
+          size: pSize,
+          sourceFnv1a: fnv1a(pGen1Text),
+          waits: true,
+          seq: 2,
+          files: [c1Name],
+          written: [true],
+          retired: true,
+          retiredAt: h.io.now(),
+        })}\n`,
+      ),
+    )
+    if (leaseChild) {
+      h.store.set(`lease:${TABLE}/${c1Name}`, { by: 'other-session', until: h.io.now() + 5 * 60 * 1000 })
+    }
+    h.setFetch(async tags => {
+      if (tags.includes('G2B')) return { status: 503, text: 'upstream unavailable' }
+      return null
+    })
+    h.setWrite(async p => {
+      if (p.includes('/spill-') && !p.includes('/outcome') && p !== pPath && p !== sPath) {
+        throw new Error('EIO: leftover write failed')
+      }
+    })
+    const r = await h.newCurrent(`cur-retv1-${leaseChild ? 'l' : 'f'}-1`, { maxBatchRows: 1 }).backfill(['spill', 'retry'], 'auto')
+    if (leaseChild) {
+      expect(r.error).toBeNull()
+      expect(r.held ?? '').toContain(c1Name)
+      expect(h.count('S')).toBe(1)
+      expect(h.count('G2A')).toBe(0)
+      expect(h.files.get(pPath)).toBe(pGen2Text)
+    } else {
+      expect(h.count('C1')).toBe(1)
+      expect(h.files.get(c1Path)).toBe('')
+      expect(h.files.get(`${PART_DIR}/outcome-${pName}`)).toBe('')
+    }
+
+    h.setWrite(null)
+    h.setFetch(null)
+    h.advance(15 * 60 * 1000)
+    if (!leaseChild) {
+      await h.newDist('dist-retv1-f-1').backfill(['spill', 'retry'], 'auto')
+    }
+    await h.newCurrent(`cur-retv1-${leaseChild ? 'l' : 'f'}-2`).backfill(['spill', 'retry'], 'auto')
+    await h.newCurrent(`cur-retv1-${leaseChild ? 'l' : 'f'}-3`).backfill(['spill', 'retry'], 'auto')
+    expect(h.count('C1')).toBe(1)
+    expect(h.count('S')).toBe(1)
+    expect(h.count('G2A')).toBe(1)
+    expect(h.count('G2B')).toBe(1)
+    expect(h.liveDataFiles()).toEqual([])
+  }
+
+  // Arm 5: Earlier-digest v1 record protecting a live `rejected-*` child during `auto` holds
+  // P_gen2 with explicit `/bqaa-backfill` guidance while unrelated S delivers; explicit
+  // `/bqaa-backfill` (`['spill', 'retry', 'rejected']`) drains the rejected child and P_gen2.
+  {
+    const h = makeInteropHarness()
+    const pName = 'spill-20200101T000000001Z-v1-rej-p.jsonl'
+    const rejName = 'rejected-20200101T000000002Z-v1-rej-c.jsonl'
+    const sName = 'spill-20200101T000000099Z-v1-rej-s.jsonl'
+    const pGen1Text = packFiles([dlLine('spill', idA, 'G1A'), dlLine('spill', null, 'G1B')])[0]!
+    const pGen2Text = packFiles([dlLine('spill', idA, 'G2A'), dlLine('spill', null, 'G2B')])[0]!
+    expect(utf8Length(pGen2Text)).toBe(utf8Length(pGen1Text))
+    const pSize = utf8Length(pGen2Text)
+    h.files.set(`${PART_DIR}/${pName}`, pGen2Text)
+    h.files.set(
+      `${PART_DIR}/${rejName}`,
+      packFiles([JSON.stringify({ v: 1, kind: 'rejected', reason: 'invalid', attempts: 1, failed_at: '2020-01-01T00:00:00.002Z', table: TABLE, row: rowOf(idC1, 'REJ1') })], pName)[0]!,
+    )
+    h.files.set(`${PART_DIR}/${sName}`, packFiles([dlLine('spill', '9'.repeat(32), 'S')])[0]!)
+    h.store.set(`replayed:${TABLE}/${pName}`, {
+      fates: 'LR',
+      reasons: ['invalid'],
+      refusals: [0],
+      size: pSize,
+      sourceFnv1a: fnv1a(pGen1Text),
+      waits: false,
+      seq: 2,
+      files: [rejName],
+      written: [true],
+    })
+    const rAuto = await h.newCurrent('cur-v1rej-auto').backfill(['spill', 'retry'], 'auto')
+    expect(rAuto.error).toBeNull()
+    expect(rAuto.held ?? '').toContain(rejName)
+    expect(rAuto.held ?? '').toContain('/bqaa-backfill')
+    expect(h.count('S')).toBe(1)
+    expect(h.count('G2A')).toBe(0)
+
+    const rCmd = await h.newCurrent('cur-v1rej-cmd').backfill(['spill', 'retry', 'rejected'], 'command')
+    expect(rCmd.error).toBeNull()
+    expect(h.count('REJ1')).toBe(1)
+    expect(h.count('G2A')).toBe(1)
+    expect(h.count('G2B')).toBe(1)
     expect(h.liveDataFiles()).toEqual([])
   }
 })
