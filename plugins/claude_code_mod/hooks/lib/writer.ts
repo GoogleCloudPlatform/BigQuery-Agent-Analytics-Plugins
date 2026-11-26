@@ -226,8 +226,10 @@ type Source = {
 // this write converted the writer's sending mark into a retired done mark.
 // Exact content identity of a reconciled or pending-reconciliation child file,
 // validated by byte length and FNV-1a checksum before any truncation so a newer
-// generation repopulating the same basename is never emptied.
-type ReconciledFile = { name: string; size: number; fnv1a: string; skipIndices?: number[] }
+// generation repopulating the same basename is never emptied. `needsLeftovers:
+// false` records that none of the child's skipped rows overlapped any non-`'L'`
+// parent leftover (`r.files \ r.adopted`).
+type ReconciledFile = { name: string; size: number; fnv1a: string; skipIndices?: number[]; needsLeftovers?: boolean }
 
 // Exact content identity of a staged Phase 3 replacement part or adopted/leftover
 // deliverable recorded in v2 before writing to disk (`replaces` records the
@@ -290,6 +292,11 @@ type Rewrite = Outcome &
     guardAttempts?: string[]
     supersedesV1?: SupersededV1
     accountedRowKeys?: ReadonlySet<string>
+    // Subset of `accountedRowKeys` whose rows were NOT `'L'` on the parent
+    // (i.e. carried by parent leftovers `r.files \ r.adopted`). Used during
+    // child reconciliation to stamp `needsLeftovers: false` when a child only
+    // overlapped already-landed parent rows.
+    leftoverRowKeys?: ReadonlySet<string>
     waits: boolean
     filed: boolean
     seq: number
@@ -730,7 +737,7 @@ const normalizeReconciled = (value: unknown, allowEmptyChecksum = false): Reconc
   const out: ReconciledFile[] = []
   for (const item of value) {
     if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
-    const rec = item as { name?: unknown; size?: unknown; fnv1a?: unknown; skipIndices?: unknown }
+    const rec = item as { name?: unknown; size?: unknown; fnv1a?: unknown; skipIndices?: unknown; needsLeftovers?: unknown }
     if (typeof rec.name !== 'string' || rec.name === '') continue
     const name = baseOf(rec.name)
     if (seen.has(name)) continue
@@ -741,7 +748,13 @@ const normalizeReconciled = (value: unknown, allowEmptyChecksum = false): Reconc
       ? [...new Set(rec.skipIndices.filter((n): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0))].sort((x, y) => x - y)
       : []
     seen.add(name)
-    out.push({ name, size, fnv1a: digest, ...(skipIndices.length > 0 ? { skipIndices } : {}) })
+    out.push({
+      name,
+      size,
+      fnv1a: digest,
+      ...(skipIndices.length > 0 ? { skipIndices } : {}),
+      ...(rec.needsLeftovers === false ? { needsLeftovers: false } : {}),
+    })
   }
   return out
 }
@@ -754,7 +767,14 @@ const sameSkipIndices = (a: readonly number[] | undefined, b: readonly number[] 
 
 const sameReconciled = (a: readonly ReconciledFile[], b: readonly ReconciledFile[]): boolean =>
   a.length === b.length &&
-  a.every((x, i) => x.name === b[i]?.name && x.size === b[i]?.size && x.fnv1a === b[i]?.fnv1a && sameSkipIndices(x.skipIndices, b[i]?.skipIndices))
+  a.every(
+    (x, i) =>
+      x.name === b[i]?.name &&
+      x.size === b[i]?.size &&
+      x.fnv1a === b[i]?.fnv1a &&
+      sameSkipIndices(x.skipIndices, b[i]?.skipIndices) &&
+      x.needsLeftovers === b[i]?.needsLeftovers,
+  )
 
 const normalizeStagedRefs = (value: unknown): StagedFile[] => {
   if (!Array.isArray(value)) return []
@@ -3109,19 +3129,16 @@ export class Writer {
         if (pj === undefined || pj === 'torn' || pj === 'conflict' || 'pending' in pj) {
           if (canCheckUnwrittenV1Hold) {
             try {
-              let foreignParentLease = false
-              if (trigger === 'force') {
-                const pLease = (await this.io.storeGet(`lease:${destinationDir(tableRef(c))}/${parentName}`)) as
-                  | { by?: string; holder?: string; until?: number }
-                  | undefined
-                const curMe = this.sessionId() ?? 'unknown'
-                foreignParentLease = Boolean(
-                  pLease &&
-                    typeof pLease.until === 'number' &&
-                    pLease.until > this.io.now() &&
-                    (pLease.by !== curMe || typeof pLease.holder !== 'string' || pLease.holder === '' || pLease.holder !== this.mark),
-                )
-              }
+              const pLease = (await this.io.storeGet(`lease:${destinationDir(tableRef(c))}/${parentName}`)) as
+                | { by?: string; holder?: string; until?: number }
+                | undefined
+              const curMe = this.sessionId() ?? 'unknown'
+              const foreignParentLease = Boolean(
+                pLease &&
+                  typeof pLease.until === 'number' &&
+                  pLease.until > this.io.now() &&
+                  (pLease.by !== curMe || typeof pLease.holder !== 'string' || pLease.holder === '' || pLease.holder !== this.mark),
+              )
               if (!foreignParentLease) {
                 let effectiveDigest = pLiveDigest
                 if ((effectiveDigest === undefined || effectiveDigest === '') && pSize <= HOST_FILE_BYTES) {
@@ -3239,8 +3256,13 @@ export class Writer {
               if (typeof a === 'string' && a !== '') adoptedSet.add(baseOf(a))
             }
           }
+          const reconciledEntry =
+            reconciledChild !== undefined
+              ? normalizeReconciled(r.reconciled).find(rec => rec.name === reconciledChild)
+              : undefined
+          const checkParentLeftovers = reconciledEntry?.needsLeftovers !== false
           const deliverableSet = new Set<string>()
-          if (Array.isArray(r.files)) {
+          if (checkParentLeftovers && Array.isArray(r.files)) {
             for (const f of r.files) {
               if (typeof f === 'string' && f !== '') {
                 const bn = baseOf(f)
@@ -6407,6 +6429,11 @@ export class Writer {
         if (h.sourceFnv1a !== undefined && fnv1a(text) !== h.sourceFnv1a) return undefined
         h.sourceFnv1a ??= fnv1a(text)
         h.accountedRowKeys = new Set(lines.lines.map((line, i) => parentRowIdentity(line, source.name, i)))
+        if (h.fates.length === lines.lines.length) {
+          h.leftoverRowKeys = new Set(
+            lines.lines.flatMap((line, i) => (h.fates[i] !== 'L' ? [parentRowIdentity(line, source.name, i)] : [])),
+          )
+        }
       }
       return h
     }
@@ -6514,6 +6541,11 @@ export class Writer {
     rewrite.fnv1a ??= liveDigest
     if (needsPendingReconcile || needsForceChildAudit) {
       rewrite.accountedRowKeys = new Set(lines.lines.map((line, i) => parentRowIdentity(line, source.name, i)))
+      if (outcome.fates.length === lines.lines.length) {
+        rewrite.leftoverRowKeys = new Set(
+          lines.lines.flatMap((line, i) => (outcome.fates[i] !== 'L' ? [parentRowIdentity(line, source.name, i)] : [])),
+        )
+      }
     }
     if (written.every(Boolean)) return rewrite
     let texts: { kind: DeadLetterKind; text: string; uncertain?: boolean }[] | null = null
@@ -6902,7 +6934,7 @@ export class Writer {
             return { action: 'defer', ref: fallback, reason: `${base} no longer matches its retired record; deferring reconciliation` }
           }
           if (retiredDigest !== undefined && retiredDigest === actualDigest) {
-            return { action: 'reconciled', ref: { name: base, size: actualSize, fnv1a: actualDigest } }
+            return { action: 'reconciled', ref: { name: base, size: actualSize, fnv1a: actualDigest, needsLeftovers: false } }
           }
           // Legacy retired mark without `sourceFnv1a`: never fabricate proof
           // of the old delivery into `P.reconciled` unless every row is
@@ -6915,7 +6947,17 @@ export class Writer {
               return identity !== null && rewrite.accountedRowKeys!.has(identity)
             })
           if (allRowsInParent) {
-            return { action: 'reconciled', ref: { name: base, size: actualSize, fnv1a: actualDigest } }
+            const overlapsLeftover =
+              rewrite.files.length > 0 &&
+              (rewrite.leftoverRowKeys === undefined ||
+                parsedRetired.lines.some(line => {
+                  const identity = childRowIdentity(line)
+                  return identity !== null && rewrite.leftoverRowKeys!.has(identity)
+                }))
+            return {
+              action: 'reconciled',
+              ref: { name: base, size: actualSize, fnv1a: actualDigest, ...(!overlapsLeftover ? { needsLeftovers: false } : {}) },
+            }
           }
           // Adopt unmodified instead of skipping or reconciling: P preserves
           // `base` in `files` (no deadlock against a prior v2 listing it),
@@ -6997,22 +7039,33 @@ export class Writer {
       }
       const remainingEntries: { line: DeadLetterLine; index: number; refusedReason?: string }[] = []
       const skipIndices: number[] = []
+      let overlapsParentLeftover = rewrite.files.length > 0 && rewrite.leftoverRowKeys === undefined
       for (let i = 0; i < parsed.lines.length; i += 1) {
         const line = parsed.lines[i] as DeadLetterLine
         const identity = childRowIdentity(line)
         if (identity !== null && rewrite.accountedRowKeys?.has(identity) === true) {
           skipIndices.push(i)
+          if (!overlapsParentLeftover && rewrite.files.length > 0 && rewrite.leftoverRowKeys?.has(identity) === true) {
+            overlapsParentLeftover = true
+          }
           continue
         }
         remainingEntries.push({ line, index: i })
       }
       if (remainingEntries.length === 0 && parsed.unreadable.length === 0) {
-        return { action: 'reconciled', ref }
+        return {
+          action: 'reconciled',
+          ref: !overlapsParentLeftover ? { ...ref, needsLeftovers: false } : ref,
+        }
       }
       if (!forceStandalone && remainingEntries.length === parsed.lines.length) {
         return { action: 'adopt', ref: { ...ref, replaces: base } }
       }
-      const pendingRef: ReconciledFile = skipIndices.length > 0 ? { ...ref, skipIndices } : ref
+      const pendingRef: ReconciledFile = {
+        ...ref,
+        ...(skipIndices.length > 0 ? { skipIndices } : {}),
+        ...(!overlapsParentLeftover ? { needsLeftovers: false } : {}),
+      }
       return {
         action: 'replace',
         ref: pendingRef,
@@ -7497,6 +7550,99 @@ export class Writer {
         ...getReconciledRefs().map(r => r.name),
       ])
       const deliverableByName = new Map((rewrite.deliverableRefs ?? []).map(d => [d.name, d]))
+      const origChildRefByName = new Map<string, ReconciledFile>()
+      for (const r of getReconciledRefs()) origChildRefByName.set(r.name, r)
+      for (const r of getPendingRefs()) if (!origChildRefByName.has(r.name)) origChildRefByName.set(r.name, r)
+      const origBackupsByReplaces = new Map<string, BackupFile[]>()
+      for (const b of rewrite.backupFiles ?? []) {
+        const list = origBackupsByReplaces.get(b.replaces)
+        if (list) list.push(b)
+        else origBackupsByReplaces.set(b.replaces, [b])
+      }
+      const hasVerifiedOrigOrBackup = async (origName: string): Promise<boolean> => {
+        const origRef = origChildRefByName.get(origName)
+        if (
+          origRef !== undefined &&
+          origRef.size > 0 &&
+          origRef.fnv1a !== '' &&
+          origRef.size <= HOST_FILE_BYTES &&
+          (listedBeforeRecord.get(origName) ?? 0) === origRef.size
+        ) {
+          try {
+            const origPath = joinPath(rewrite.dir, origName)
+            const origRaw = await this.io.readFile(origPath)
+            if (origRaw !== '' && utf8Length(origRaw) === origRef.size && fnv1a(origRaw) === origRef.fnv1a) {
+              const origParsed = parseFile(origRaw)
+              if (origParsed.complete && origParsed.parent !== null && baseOf(origParsed.parent) === rewrite.name) {
+                const origDone = await this.doneMarksAll(
+                  sourceFor(rewrite.dir, origName, origRef.size, c),
+                  companionsBeforeRecord.get(origName) ?? [],
+                )
+                const origAlreadyRetired =
+                  !origDone.torn &&
+                  origDone.records.length > 0 &&
+                  (!origDone.records.some(r => typeof r.sourceFnv1a === 'string' && r.sourceFnv1a !== '') ||
+                    Writer.matchesDoneMarks(origDone.records, origRef.fnv1a))
+                if (!origDone.torn && !origAlreadyRetired) return true
+              }
+            }
+          } catch {
+            // Fail closed: fall through to backup verification or guard the replacement.
+          }
+        }
+        const origBackups = (origBackupsByReplaces.get(origName) ?? []).filter(
+          b =>
+            origRef === undefined ||
+            origRef.size <= 0 ||
+            (b.replacesSize === origRef.size &&
+              (b.replacesFnv1a === undefined || b.replacesFnv1a === '' || origRef.fnv1a === '' || b.replacesFnv1a === origRef.fnv1a)),
+        )
+        if (origBackups.length === 0) return false
+        const destDir = destinationDir(tableRef(c))
+        const curMe = this.sessionId() ?? 'unknown'
+        for (const b of origBackups) {
+          if (b.size <= 0 || b.fnv1a === '' || b.size > HOST_FILE_BYTES) return false
+          if ((listedBeforeRecord.get(b.name) ?? 0) !== b.size) return false
+          try {
+            const bLease = (await this.io.storeGet(`lease:${destDir}/${b.name}`)) as { by?: string; holder?: string; until?: number } | undefined
+            if (
+              bLease &&
+              typeof bLease.until === 'number' &&
+              bLease.until > this.io.now() &&
+              (bLease.by !== curMe || typeof bLease.holder !== 'string' || bLease.holder === '' || bLease.holder !== this.mark)
+            ) {
+              return false
+            }
+            const bRaw = await this.io.readFile(joinPath(rewrite.dir, b.name))
+            if (bRaw === '' || utf8Length(bRaw) !== b.size || fnv1a(bRaw) !== b.fnv1a) return false
+            const bParsed = parseFile(bRaw)
+            if (!bParsed.complete) return false
+            if (bParsed.parent !== null) {
+              if (baseOf(bParsed.parent) !== origName) return false
+              // A parent-linked backup is vulnerable to 0.1.3 retiring `origName`
+              // whenever `origName` has been reused by another live generation or
+              // already carries a retirement/torn done mark.
+              if ((listedBeforeRecord.get(origName) ?? 0) > 0) return false
+              const origCompanions = companionsBeforeRecord.get(origName) ?? []
+              if (origCompanions.length > 0) {
+                const origDoneAny = await this.doneMarksAll(
+                  { ...sourceFor(rewrite.dir, origName, origRef?.size ?? 0, c), live: false },
+                  origCompanions,
+                )
+                if (origDoneAny.torn || origDoneAny.records.length > 0) return false
+              }
+            }
+            const bDone = await this.doneMarksAll(
+              sourceFor(rewrite.dir, b.name, b.size, c),
+              companionsBeforeRecord.get(b.name) ?? [],
+            )
+            if (bDone.torn || bDone.records.length > 0) return false
+          } catch {
+            return false
+          }
+        }
+        return true
+      }
       for (const childName of candidateNames) {
         const childSize = listedBeforeRecord.get(childName) ?? 0
         if (childSize <= 0 || childName === rewrite.name) continue
@@ -7504,11 +7650,7 @@ export class Writer {
         if (rewrite.tempMarks?.has(childPath)) continue
         const dRef = deliverableByName.get(childName)
         if (dRef?.replaces !== undefined && dRef.replaces !== '' && dRef.replaces !== childName) {
-          const origLive = (listedBeforeRecord.get(dRef.replaces) ?? 0) > 0
-          const origHasLiveBackup = (rewrite.backupFiles ?? []).some(
-            b => b.replaces === dRef.replaces && (listedBeforeRecord.get(b.name) ?? 0) > 0,
-          )
-          if (origLive || origHasLiveBackup) continue
+          if (await hasVerifiedOrigOrBackup(dRef.replaces)) continue
         }
         let hasParentHeader = false
         if (childSize <= HOST_FILE_BYTES) {
@@ -8031,7 +8173,15 @@ export class Writer {
       const addReconciled = (ref: ReconciledFile): void => {
         const existing = rewrite.reconciledFiles ?? []
         if (!existing.some(r => r.name === ref.name)) {
-          rewrite.reconciledFiles = [...existing, { name: ref.name, size: ref.size, fnv1a: ref.fnv1a }]
+          rewrite.reconciledFiles = [
+            ...existing,
+            {
+              name: ref.name,
+              size: ref.size,
+              fnv1a: ref.fnv1a,
+              ...(ref.needsLeftovers === false ? { needsLeftovers: false } : {}),
+            },
+          ]
         }
       }
       const addAdopted = (name: string, ref?: StagedFile): void => {
@@ -9791,6 +9941,7 @@ export class Writer {
       // no per-child payload buffers). If a child repacks, re-verify any
       // remaining still-linked siblings against a fresh listing.
       const stillLinked = recheckTargets.filter(entry => entry.linkedBackup)
+      const hadPhase3bLinkChecks = stillLinked.length > 0
       let repackedAny = false
       while (stillLinked.length > 0) {
         dirEntriesCache = await this.io.listDir(dir)
@@ -9839,7 +9990,7 @@ export class Writer {
           await verifyChildLeaseAndBytes(sibling, true, `child ${sibling.childName} changed while staging backups`)
         }
       }
-      if (repackedAny && recheckTargets.length > 1) {
+      if (hadPhase3bLinkChecks || (repackedAny && recheckTargets.length > 1)) {
         for (const entry of recheckTargets) {
           await verifyChildLeaseAndBytes(
             entry,
@@ -9851,12 +10002,19 @@ export class Writer {
       // Phase 4: Commit-point retirement of superseded backups for every
       // unleased child (both linked->standalone and standalone->linked
       // transitions). Pre-flight check foreign leases across all superseded
-      // backups BEFORE truncating any pre-existing copy, and promote a child's
-      // kept replacements out of `newlyStaged` as soon as a pre-existing backup
-      // for that child is truncated so neither outer rollback nor a later
-      // caller HTTP 503 cleanup can delete both copies.
+      // backups BEFORE truncating any pre-existing copy, re-check each backup's
+      // lease right before writing, and promote a child's kept replacements out
+      // of `newlyStaged` BEFORE truncating a pre-existing backup so even a
+      // truncate-then-throw I/O error or a later caller HTTP 503 cleanup never
+      // deletes both copies.
       if (recheckTargets.some(entry => !entry.hadForeignLease)) {
         await loadDiskBackups()
+        const backupsByChild = new Map<string, BackupFile[]>()
+        for (const b of backups) {
+          const list = backupsByChild.get(b.replaces)
+          if (list) list.push(b)
+          else backupsByChild.set(b.replaces, [b])
+        }
         const toRetireEntries: { entry: (typeof recheckTargets)[number]; ref: BackupFile }[] = []
         const seenRetireNames = new Set<string>()
         for (const entry of recheckTargets) {
@@ -9869,7 +10027,7 @@ export class Writer {
               toRetireEntries.push({ entry, ref })
             }
           }
-          for (const b of backups) addCandidate(b)
+          for (const b of backupsByChild.get(entry.childName) ?? []) addCandidate(b)
           for (const ref of entry.stagedForChild) addCandidate(ref)
           for (const cand of diskCandidatesByChild.get(entry.childName) ?? []) addCandidate(cand)
         }
@@ -9906,9 +10064,15 @@ export class Writer {
               removeFromNewlyStaged(ns => ns.name === ref.name)
               continue
             }
-            await this.io.writeFile(bPath, '')
-            this.retiredEmpty.add(bPath)
-            absentBackups.add(ref.name)
+            const bLeaseNow = (await this.io.storeGet(`lease:${dest}/${ref.name}`)) as { by?: string; holder?: string; until?: number } | undefined
+            if (isForeignChildLease(bLeaseNow)) {
+              leasedChild = ref.name
+              throw new Error(`another session's lease holds superseded backup ${ref.name}`)
+            }
+            // Promote the child's kept replacements out of `newlyStaged` BEFORE
+            // truncating a pre-existing backup so that even if `writeFile`
+            // truncates on disk and then throws an error, the outer `catch`
+            // never empties the kept replacement too.
             if (!newlyStagedNames.has(ref.name)) {
               removeFromNewlyStaged(
                 ns =>
@@ -9917,7 +10081,11 @@ export class Writer {
                   ns.replacesFnv1a === entry.childDigest &&
                   entry.finalKeepKeys.has(`${ns.size}\0${ns.fnv1a}`),
               )
-            } else {
+            }
+            await this.io.writeFile(bPath, '')
+            this.retiredEmpty.add(bPath)
+            absentBackups.add(ref.name)
+            if (newlyStagedNames.has(ref.name)) {
               removeFromNewlyStaged(ns => ns.name === ref.name)
             }
             try {
@@ -10371,6 +10539,10 @@ export class Writer {
             ...(parentAccountedKeys ?? []),
           ])
         : undefined
+    const leftoverRowKeys =
+      trigger === 'force' && (parentAccountedKeys === undefined || parentAccountedKeys.size === 0)
+        ? new Set(lines.flatMap((line, i) => (fates[i] !== 'L' ? [parentRowIdentity(line, name, i)] : [])))
+        : undefined
     const resolvedFnv1a = sourceFnv1a ?? source.fnv1a
     const rewrite: Rewrite = {
       ...source,
@@ -10385,6 +10557,7 @@ export class Writer {
       ...(layoutsDiffer ? { layoutsDiffer: true } : {}),
       ...(trigger === 'force' ? { force: true } : {}),
       ...(accountedRowKeys !== undefined ? { accountedRowKeys } : {}),
+      ...(leftoverRowKeys !== undefined ? { leftoverRowKeys } : {}),
       ...(supersededUnaccounted !== undefined ? { supersededUnaccounted } : {}),
       ...(prePlacedChildGuards !== undefined && prePlacedChildGuards.size > 0 ? { childGuardMarks: prePlacedChildGuards } : {}),
       ...(preStagedBackups !== undefined && preStagedBackups.length > 0 ? { backupFiles: preStagedBackups } : {}),
