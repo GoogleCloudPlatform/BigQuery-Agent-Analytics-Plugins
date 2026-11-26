@@ -7619,17 +7619,31 @@ export class Writer {
             if (!bParsed.complete) return false
             if (bParsed.parent !== null) {
               if (baseOf(bParsed.parent) !== origName) return false
-              // A parent-linked backup is vulnerable to 0.1.3 retiring `origName`
-              // whenever `origName` has been reused by another live generation or
-              // already carries a retirement/torn done mark.
+              // A parent-linked backup is vulnerable to 0.1.3 `parentFate`
+              // (`size: -1`) whenever `origName` is live on disk or carries
+              // any done mark, v1/v2 store slot, or companion record file
+              // (matching `canLinkBackupToChild`).
               if ((listedBeforeRecord.get(origName) ?? 0) > 0) return false
+              const origAnySource = { ...sourceFor(rewrite.dir, origName, -1, c), live: false }
               const origCompanions = companionsBeforeRecord.get(origName) ?? []
               if (origCompanions.length > 0) {
-                const origDoneAny = await this.doneMarksAll(
-                  { ...sourceFor(rewrite.dir, origName, origRef?.size ?? 0, c), live: false },
-                  origCompanions,
-                )
+                const origDoneAny = await this.doneMarksAll(origAnySource, origCompanions)
                 if (origDoneAny.torn || origDoneAny.records.length > 0) return false
+              }
+              // Strictly require undefined/null on v1 store (NOT isClearedSlot):
+              // 0.1.3 treats `{ cleared: true, size: -1 }` as matching `size: -1` and drops.
+              const rawV1 = await this.io.storeGet(origAnySource.recordKey)
+              if (rawV1 !== undefined && rawV1 !== null) return false
+              const rawV2 = await this.io.storeGet(origAnySource.v2RecordKey)
+              if (!isClearedSlot(rawV2)) return false
+              for (const rf of [...origAnySource.recordFiles, ...origAnySource.v2RecordFiles]) {
+                if (this.io.exists !== undefined && !(await this.io.exists(rf))) continue
+                try {
+                  const rfText = await this.io.readFile(rf)
+                  if (rfText !== '') return false
+                } catch (err) {
+                  if (!isNotFoundError(err)) return false
+                }
               }
             }
             const bDone = await this.doneMarksAll(
@@ -9990,7 +10004,7 @@ export class Writer {
           await verifyChildLeaseAndBytes(sibling, true, `child ${sibling.childName} changed while staging backups`)
         }
       }
-      if (hadPhase3bLinkChecks || (repackedAny && recheckTargets.length > 1)) {
+      if (hadPhase3bLinkChecks) {
         for (const entry of recheckTargets) {
           await verifyChildLeaseAndBytes(
             entry,

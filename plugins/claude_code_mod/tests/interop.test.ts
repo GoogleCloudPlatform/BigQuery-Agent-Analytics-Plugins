@@ -3281,10 +3281,16 @@ test('interop: resumed writeOut and childGuard marks on a parent-linked synthesi
   }
 })
 
-test('interop: resumed writeOut verifies child and backup fingerprints so same-size child basename reuse plus empty, mismatched, or parent-linked backup still backs up replacement', async () => {
+test('interop: resumed writeOut verifies child and backup fingerprints so same-size child basename reuse plus empty, mismatched, or exposed parent-linked backup still backs up replacement', async () => {
   const idA = 'a'.repeat(32)
   const idB = 'b'.repeat(32)
-  for (const bkMode of ['empty-backup', 'mismatched-backup', 'linked-backup'] as const) {
+  for (const bkMode of [
+    'empty-backup',
+    'mismatched-backup',
+    'linked-backup',
+    'diff-size-retired-linked-backup',
+    'v1-store-linked-backup',
+  ] as const) {
     const h = makeInteropHarness()
     const pName = `retry-20200101T000000001Z-reused-orig-${bkMode}-p.jsonl`
     const c1Name = `spill-20200101T000000002Z-reused-orig-${bkMode}-c1.jsonl`
@@ -3293,8 +3299,11 @@ test('interop: resumed writeOut verifies child and backup fingerprints so same-s
     const c1Gen2Text =
       bkMode === 'linked-backup'
         ? packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_REUSED_GEN2')])[0]!
-        : packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_REUSED_GEN2')], pName)[0]!
-    if (bkMode !== 'linked-backup') expect(utf8Length(c1Gen2Text)).toBe(utf8Length(c1Text))
+        : bkMode === 'diff-size-retired-linked-backup'
+          ? packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_REUSED_GEN2_DIFFERENT_SIZE_PAYLOAD')])[0]!
+          : packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_REUSED_GEN2')], pName)[0]!
+    if (bkMode === 'empty-backup' || bkMode === 'mismatched-backup') expect(utf8Length(c1Gen2Text)).toBe(utf8Length(c1Text))
+    if (bkMode === 'diff-size-retired-linked-backup') expect(utf8Length(c1Gen2Text)).not.toBe(utf8Length(c1Text))
     const pSize = utf8Length(pText)
     h.files.set(`${PART_DIR}/${pName}`, pText)
     h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
@@ -3317,11 +3326,12 @@ test('interop: resumed writeOut verifies child and backup fingerprints so same-s
     const origBk1Text = h.files.get(`${PART_DIR}/${bk1Name}`)!
     expect(h.files.get(`${PART_DIR}/${rep1Name}`)?.includes(`"parent":"${pName}"`)).toBe(true)
 
-    // Replace original child basename with a different generation; empty, mismatch, or leave parent-linked bk1 exposed.
-    h.files.set(`${PART_DIR}/${c1Name}`, c1Gen2Text)
+    // Mutate c1Name / bk1Name according to mode before resuming writeOut.
     if (bkMode === 'empty-backup') {
+      h.files.set(`${PART_DIR}/${c1Name}`, c1Gen2Text)
       h.files.set(`${PART_DIR}/${bk1Name}`, '')
     } else if (bkMode === 'mismatched-backup') {
+      h.files.set(`${PART_DIR}/${c1Name}`, c1Gen2Text)
       const bkDataLines = origBk1Text
         .trimEnd()
         .split('\n')
@@ -3330,8 +3340,25 @@ test('interop: resumed writeOut verifies child and backup fingerprints so same-s
       const mismatchedBk = packFiles(bkDataLines, c1Name)[0]!
       expect(utf8Length(mismatchedBk)).toBe(utf8Length(origBk1Text))
       h.files.set(`${PART_DIR}/${bk1Name}`, mismatchedBk)
-    } else {
+    } else if (bkMode === 'linked-backup') {
+      h.files.set(`${PART_DIR}/${c1Name}`, c1Gen2Text)
       expect(origBk1Text.includes(`"parent":"${c1Name}"`)).toBe(true)
+    } else if (bkMode === 'diff-size-retired-linked-backup') {
+      // Different-size standalone generation reuses c1Name; 0.1.3 auto delivers and retires it,
+      // emptying c1Name and leaving a different-size retired done mark that 0.1.3 parentFate(-1) matches.
+      expect(origBk1Text.includes(`"parent":"${c1Name}"`)).toBe(true)
+      h.files.set(`${PART_DIR}/${c1Name}`, c1Gen2Text)
+      h.advance(15 * 60 * 1000)
+      await h.newDist(`dist-rorig-pre-${bkMode}`).backfill(['spill'], 'auto')
+      expect(h.files.get(`${PART_DIR}/${c1Name}`)).toBe('')
+      expect(h.count('C1_REUSED_GEN2_DIFFERENT_SIZE_PAYLOAD')).toBe(1)
+      expect(h.files.get(`${PART_DIR}/${bk1Name}`) !== '').toBe(true)
+    } else {
+      // c1Name is empty on disk with a v1 store tombstone `{ cleared: true, size: -1 }`
+      // that shipped 0.1.3 parentFate(-1) treats as matching and drops linked bk1Name on.
+      expect(origBk1Text.includes(`"parent":"${c1Name}"`)).toBe(true)
+      h.files.set(`${PART_DIR}/${c1Name}`, '')
+      h.store.set(`replayed:${TABLE}/${c1Name}`, { cleared: true, size: -1, files: [], written: [] })
     }
     // Make delivery fail with HTTP 503 while markDone still fails on resume so rep1 stays live on disk.
     h.setFetch(async tags => (tags.includes('C1_ORIG_UNIQUE') ? { status: 503, text: 'upstream 503' } : null))
@@ -3347,16 +3374,16 @@ test('interop: resumed writeOut verifies child and backup fingerprints so same-s
     expect(h.files.get(`${PART_DIR}/${rep1Backup!.name}`)?.includes('C1_ORIG_UNIQUE')).toBe(true)
 
     // Pass 3 (0.1.3 force after lease expiry): retires pName with files: [] and drops rep1Name unsent
-    // (and in linked-backup mode also delivers c1Gen2Text, retiring c1Name and dropping linked bk1Name unsent).
+    // (and in the linked-backup modes also drops parent-linked bk1Name unsent via 0.1.3 parentFate).
     h.setWrite(null)
     h.setFetch(null)
     h.advance(15 * 60 * 1000)
     await h.newDist(`dist-rorig-${bkMode}-1`).backfill(['spill', 'retry'], 'force')
     expect(h.files.get(`${PART_DIR}/${pName}`)).toBe('')
     expect(h.files.get(`${PART_DIR}/${rep1Name}`)).toBe('')
-    if (bkMode === 'linked-backup') {
+    if (bkMode === 'linked-backup' || bkMode === 'diff-size-retired-linked-backup' || bkMode === 'v1-store-linked-backup') {
       expect(h.files.get(`${PART_DIR}/${bk1Name}`)).toBe('')
-      expect(h.count('C1_REUSED_GEN2')).toBe(1)
+      if (bkMode === 'linked-backup') expect(h.count('C1_REUSED_GEN2')).toBe(1)
     }
 
     // Pass 4 (0.1.4 auto): recovers C1_ORIG_UNIQUE exactly once from rep1Backup.
