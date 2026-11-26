@@ -2878,11 +2878,12 @@ test('interop: shadowed partial v1 store does not hold equal-size parent when co
 })
 
 test('interop: orphaned childGuard on live written v1 child does not deadlock with unwritten v1 parent hold on force or command', async () => {
-  for (const trigger of ['force', 'command'] as const) {
+  for (const mode of ['force', 'command', 'force-with-parent-sending'] as const) {
+    const trigger = mode === 'command' ? 'command' : 'force'
     const h = makeInteropHarness()
-    const pName = `spill-20200101T000000001Z-v1-cg-${trigger}-p.jsonl`
-    const c1Name = `rejected-20200101T000000002Z-v1-cg-${trigger}-c1.jsonl`
-    const c2Name = `spill-20200101T000000003Z-v1-cg-${trigger}-c2.jsonl`
+    const pName = `spill-20200101T000000001Z-v1-cg-${mode}-p.jsonl`
+    const c1Name = `rejected-20200101T000000002Z-v1-cg-${mode}-c1.jsonl`
+    const c2Name = `spill-20200101T000000003Z-v1-cg-${mode}-c2.jsonl`
     const pGen1 = packFiles([dlLine('spill', null, 'OLD_A'), dlLine('spill', null, 'OLD_B')])[0]!
     const pGen2 = packFiles([dlLine('spill', null, 'NEW_A'), dlLine('spill', null, 'NEW_B')])[0]!
     expect(utf8Length(pGen2)).toBe(utf8Length(pGen1))
@@ -2916,7 +2917,19 @@ test('interop: orphaned childGuard on live written v1 child does not deadlock wi
         })}\n`,
       ),
     )
-    const r = await h.newCurrent(`cur-cg-${trigger}-1`).backfill(['spill', 'retry', 'rejected'], trigger)
+    if (mode === 'force-with-parent-sending') {
+      // Simulate the crashed force run's parent sending mark standing alongside c1Name's childGuard.
+      h.files.set(
+        `${PART_DIR}/outcome-done-old-${pName}`,
+        sealFile(`${JSON.stringify({ size: pSize, sending: true, by: 'old' })}\n`),
+      )
+      // Non-force command must continue holding while the parent sending mark stands.
+      const rCmd = await h.newCurrent(`cur-cg-${mode}-cmd`).backfill(['spill', 'retry', 'rejected'], 'command')
+      expect(rCmd.error).toBeNull()
+      expect(h.count('OLD_A')).toBe(0)
+      expect(h.count('NEW_A')).toBe(0)
+    }
+    const r = await h.newCurrent(`cur-cg-${mode}-1`).backfill(['spill', 'retry', 'rejected'], trigger)
     expect(r.error).toBeNull()
     expect(r.held).toBeNull()
     expect(h.count('OLD_A')).toBe(1)
@@ -3097,4 +3110,68 @@ test('interop: commit-point backup retirement preserves predecessor on rollback,
     expect(liveC1Bks.length).toBe(1)
     expect(liveC1Bks[0]![1].includes(`"parent":"${c1Name}"`)).toBe(true)
   }
+})
+
+test('interop: 0.1.3 digest-less delivery of an adopted sibling does not cause a reconciled child backup whose own replacement was 0.1.4-delivered to double-send', async () => {
+  const idA = 'a'.repeat(32)
+  const idB = 'b'.repeat(32)
+  const h = makeInteropHarness()
+  // C2 (retry) sorts before P (retry) so 0.1.3 force(['retry']) delivers unmodified adopted C2
+  // (digest-less done mark) and retires P via stale v1, leaving spill R_rep1 for 0.1.4 auto.
+  const c2Name = 'retry-20200101T000000001Z-sib-iso-c2.jsonl'
+  const pName = 'retry-20200101T000000002Z-sib-iso-p.jsonl'
+  const c1Name = 'spill-20200101T000000003Z-sib-iso-c1.jsonl'
+  const pText = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idB, 'B')])[0]!
+  const c1Text = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_SIB_ISO')], pName)[0]!
+  const c2Text = packFiles([dlLine('retry', null, 'C2_SIB_ISO')], pName)[0]!
+  const pSize = utf8Length(pText)
+  h.files.set(`${PART_DIR}/${pName}`, pText)
+  h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
+  h.files.set(`${PART_DIR}/${c2Name}`, c2Text)
+  const v1Key = `replayed:${TABLE}/${pName}`
+  h.store.set(v1Key, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 2, files: [c2Name], written: [true] })
+  h.store.set(`replayed:v2:${TABLE}/${pName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [c1Name, c2Name], written: [true, true] })
+  h.setStoreSet(async k => {
+    if (k === v1Key) throw new Error('v1 stuck')
+  })
+  h.setStoreDelete(async k => {
+    if (k === v1Key) throw new Error('v1 delete failed')
+  })
+  h.setWrite(async (p, text) => {
+    if (p.includes('/outcome-done-') && p.endsWith(`-${pName}`) && text.includes('"retired":true')) throw new Error('stopped before retired mark')
+  })
+  await h.newCurrent('cur-sib-iso-1').backfill(['spill', 'retry'], 'force')
+  expect(h.count('C1_SIB_ISO')).toBe(0)
+  const v2 = h.store.get(`replayed:v2:${TABLE}/${pName}`) as {
+    files: string[]
+    adopted: string[]
+    backupFiles: { name: string; replaces: string }[]
+  }
+  expect(v2.adopted.includes(c2Name)).toBe(true)
+  expect(v2.files.includes(c2Name)).toBe(true)
+  const rep1Name = v2.adopted.find(n => n !== c2Name)!
+  const bk1Name = v2.backupFiles.find(b => b.replaces === c1Name)!.name
+
+  // Hold BK1; 0.1.3 force(['retry']) delivers unmodified adopted C2 (writing a
+  // digest-less 0.1.3 done mark alongside 0.1.4's childGuard) and retires P via v1;
+  // then 0.1.4 auto(['spill']) delivers R_rep1 (full sourceFnv1a retirement mark).
+  h.setWrite(null)
+  h.setStoreSet(null)
+  h.setStoreDelete(null)
+  h.store.set(`lease:${TABLE}/${bk1Name}`, { by: 'hold-bk1', until: h.io.now() + 10 * 60 * 1000 })
+  await h.newDist('dist-sib-iso-1').backfill(['retry'], 'force')
+  expect(h.count('C2_SIB_ISO')).toBe(1)
+  expect(h.files.get(`${PART_DIR}/${c2Name}`)).toBe('')
+  expect(h.files.get(`${PART_DIR}/${pName}`)).toBe('')
+  expect(h.files.get(`${PART_DIR}/${rep1Name}`) !== '').toBe(true)
+  await h.newCurrent('cur-sib-iso-2').backfill(['spill'], 'auto')
+  expect(h.count('C1_SIB_ISO')).toBe(1)
+  expect(h.files.get(`${PART_DIR}/${rep1Name}`)).toBe('')
+
+  // Release BK1's lease: 0.1.4 auto must drop BK1 cleanly via R_rep1's verified mark despite C2's digest-less 0.1.3 mark.
+  h.advance(15 * 60 * 1000)
+  await h.newCurrent('cur-sib-iso-3').backfill(['spill', 'retry'], 'auto')
+  await h.newCurrent('cur-sib-iso-4').backfill(['spill', 'retry'], 'auto')
+  expect(h.count('C1_SIB_ISO')).toBe(1)
+  expect(h.liveDataFiles()).toEqual([])
 })

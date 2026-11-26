@@ -3092,27 +3092,51 @@ export class Writer {
         } catch {
           return { action: 'hold' }
         }
-        if (pj === undefined) {
-          if (isChildGuard && pLiveDigest !== undefined && pLiveDigest !== '') {
+        const canCheckUnwrittenV1Hold =
+          isChildGuard &&
+          (pj === undefined ||
+            (trigger === 'force' && (pj === 'torn' || pj === 'conflict' || 'pending' in pj)))
+        if (pj === undefined || pj === 'torn' || pj === 'conflict' || 'pending' in pj) {
+          if (canCheckUnwrittenV1Hold) {
             try {
-              const pSource = sourceFor(dir, parentName, pSize, c)
-              const pEntries = await this.io.listDir(dir)
-              const pCompanions = groupCompanions(pEntries)
-              const [pV1Slot, pV1Done] = await Promise.all([
-                this.readJournalSlotAll(pSource.recordKey, pSource.recordFiles),
-                this.doneMarksAll({ ...pSource, fnv1a: undefined, strictFnv1a: undefined }, pCompanions.get(parentName) ?? []),
-              ])
-              const effV1 = effectiveUnretiredEarlierV1(pSize, pLiveDigest, pV1Slot, pV1Done.records)
-              if (effV1 !== undefined && writtenChildrenOfV1(effV1, parentName).has(targetName)) {
-                parentHeldForUnwrittenV1Child = true
+              let foreignParentLease = false
+              if (trigger === 'force') {
+                const pLease = (await this.io.storeGet(`lease:${destinationDir(tableRef(c))}/${parentName}`)) as
+                  | { by?: string; holder?: string; until?: number }
+                  | undefined
+                const curMe = this.sessionId() ?? 'unknown'
+                foreignParentLease = Boolean(
+                  pLease &&
+                    typeof pLease.until === 'number' &&
+                    pLease.until > this.io.now() &&
+                    (pLease.by !== curMe || typeof pLease.holder !== 'string' || pLease.holder === '' || pLease.holder !== this.mark),
+                )
+              }
+              if (!foreignParentLease) {
+                let effectiveDigest = pLiveDigest
+                if ((effectiveDigest === undefined || effectiveDigest === '') && pSize <= HOST_FILE_BYTES) {
+                  const pRaw = await this.io.readFile(joinPath(dir, parentName))
+                  if (pRaw !== '' && utf8Length(pRaw) === pSize) effectiveDigest = fnv1a(pRaw)
+                }
+                if (effectiveDigest !== undefined && effectiveDigest !== '') {
+                  const pSource = sourceFor(dir, parentName, pSize, c)
+                  const pEntries = await this.io.listDir(dir)
+                  const pCompanions = groupCompanions(pEntries)
+                  const [pV1Slot, pV1Done] = await Promise.all([
+                    this.readJournalSlotAll(pSource.recordKey, pSource.recordFiles),
+                    this.doneMarksAll({ ...pSource, fnv1a: undefined, strictFnv1a: undefined }, pCompanions.get(parentName) ?? []),
+                  ])
+                  const effV1 = effectiveUnretiredEarlierV1(pSize, effectiveDigest, pV1Slot, pV1Done.records)
+                  if (effV1 !== undefined && writtenChildrenOfV1(effV1, parentName).has(targetName)) {
+                    parentHeldForUnwrittenV1Child = true
+                  }
+                }
               }
             } catch {
               return { action: 'hold' }
             }
           }
           if (!parentHeldForUnwrittenV1Child) return { action: 'hold' }
-        } else if (pj === 'torn' || pj === 'conflict' || 'pending' in pj) {
-          return { action: 'hold' }
         } else if (pj.journal.retired === true) {
           if (backup !== undefined) {
             if (
@@ -3162,9 +3186,7 @@ export class Writer {
         for (const e of entries) {
           if ((e.kind === undefined || e.kind === 'file') && e.size > 0) liveNow.set(e.name, e.size)
         }
-        const entryCompanionsInit = groupCompanions(entries)
-        let entryCompanions = entryCompanionsInit
-        let refreshedCompanionsForLiveChange = false
+        let entryCompanions = groupCompanions(entries)
         const doneAll = await this.doneMarksAll(anySource, entryCompanions.get(parentName) ?? [])
         const [v1All, v2All] = await Promise.all([
           this.readJournalSlotAll(anySource.recordKey, anySource.recordFiles),
@@ -3201,46 +3223,46 @@ export class Writer {
           r: Partial<Journal>,
           reconciledChild?: string,
         ): Promise<'accounted' | 'live-unprotected' | 'missing'> => {
-          const rFilesSet = new Set<string>()
+          const adoptedSet = new Set<string>()
+          if (Array.isArray(r.adopted)) {
+            for (const a of r.adopted) {
+              if (typeof a === 'string' && a !== '') adoptedSet.add(baseOf(a))
+            }
+          }
           const deliverableSet = new Set<string>()
           if (Array.isArray(r.files)) {
             for (const f of r.files) {
               if (typeof f === 'string' && f !== '') {
                 const bn = baseOf(f)
-                rFilesSet.add(bn)
-                deliverableSet.add(bn)
+                if (!adoptedSet.has(bn)) deliverableSet.add(bn)
               }
             }
           }
-          if (Array.isArray(r.adopted)) {
-            for (const a of r.adopted) {
-              if (typeof a !== 'string' || a === '') continue
-              const bn = baseOf(a)
-              if (reconciledChild !== undefined && bn !== reconciledChild && !rFilesSet.has(bn)) {
-                try {
-                  const dMarks = await this.marksDetailed(
-                    { ...sourceFor(dir, bn, -1, c), live: false },
-                    entryCompanions.get(bn) ?? [],
-                  )
-                  const isUnrelatedSibling =
-                    dMarks.stagedFor === parentName &&
-                    ((dMarks.replaces !== undefined && dMarks.replaces !== reconciledChild) ||
-                      (dMarks.childGuard === true && dMarks.replaces === undefined))
-                  if (isUnrelatedSibling) continue
-                } catch {
-                  // Fail closed: keep `bn` in `deliverableSet`.
-                }
+          for (const bn of adoptedSet) {
+            if (reconciledChild !== undefined && bn !== reconciledChild) {
+              try {
+                const dMarks = await this.marksDetailed(
+                  { ...sourceFor(dir, bn, -1, c), live: false },
+                  entryCompanions.get(bn) ?? [],
+                )
+                const isUnrelatedSibling =
+                  dMarks.stagedFor === parentName &&
+                  ((dMarks.replaces !== undefined && dMarks.replaces !== reconciledChild) ||
+                    (dMarks.childGuard === true && dMarks.replaces === undefined))
+                if (isUnrelatedSibling) continue
+              } catch {
+                // Fail closed: keep `bn` in `deliverableSet`.
               }
-              deliverableSet.add(bn)
             }
+            deliverableSet.add(bn)
           }
           const expectedByName = new Map(normalizeStagedRefs(r.deliverableRefs).map(ref => [ref.name, ref]))
           let sawLiveUnprotected = false
           for (const dName of deliverableSet) {
             const expected = expectedByName.get(dName)
             const hasExpected = expected !== undefined && expected.size > 0
-            const listedLiveSize = liveNow.get(dName) ?? 0
-            let liveSize = listedLiveSize
+            let liveSize = liveNow.get(dName) ?? 0
+            let readObservedChange = false
             if (liveSize > 0) {
               let liveText: string | undefined
               let liveMatchesExpected = !hasExpected
@@ -3251,6 +3273,7 @@ export class Writer {
                   } catch (err) {
                     if (isNotFoundError(err)) {
                       liveSize = 0
+                      readObservedChange = true
                     } else {
                       sawLiveUnprotected = true
                       continue
@@ -3259,8 +3282,11 @@ export class Writer {
                   if (liveSize > 0) {
                     if (liveText === undefined || liveText === '') {
                       liveSize = 0
+                      readObservedChange = true
                     } else if (utf8Length(liveText) === expected.size && (expected.fnv1a === '' || fnv1a(liveText) === expected.fnv1a)) {
                       liveMatchesExpected = true
+                    } else {
+                      readObservedChange = true
                     }
                   }
                 }
@@ -3284,13 +3310,12 @@ export class Writer {
                 continue
               }
             }
-            // Refresh companion listing once if `dName` was live when `entries`
-            // was captured and has since emptied or changed bytes, so a
-            // concurrent retirement mark published right before truncation or
-            // repopulation is never missed.
-            if (listedLiveSize > 0 && !refreshedCompanionsForLiveChange) {
+            // Refresh companion listing if `readFile(dName)` observed a
+            // concurrent truncation or content change since `entries` was
+            // captured, so a retirement mark published right before truncation
+            // or repopulation is never missed.
+            if (readObservedChange) {
               entryCompanions = groupCompanions(await this.io.listDir(dir))
-              refreshedCompanionsForLiveChange = true
             }
             const dDone = await this.doneMarksAll(
               { ...sourceFor(dir, dName, hasExpected ? expected.size : -1, c), live: false },
@@ -3680,7 +3705,7 @@ export class Writer {
         ) {
           return { action: 'drop' }
         }
-        if (parentHeldForUnwrittenV1Child && !anyTorn) return { action: 'go' }
+        if (parentHeldForUnwrittenV1Child && (!anyTorn || trigger === 'force')) return { action: 'go' }
         return liveParentRetired || !isSourceLive(parentName) ? { action: 'wait', parentRetired: true } : { action: 'hold' }
       } catch {
         return { action: 'hold' }
