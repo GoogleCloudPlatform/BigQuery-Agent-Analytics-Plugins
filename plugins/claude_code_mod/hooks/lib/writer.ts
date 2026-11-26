@@ -3566,8 +3566,13 @@ export class Writer {
       }
       const leaseKey = `lease:${destinationDir(tableRef(c))}/${name}`
       try {
-        const lease = (await this.io.storeGet(leaseKey)) as { by?: string; until?: number } | undefined
-        if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
+        const lease = (await this.io.storeGet(leaseKey)) as { by?: string; holder?: string; until?: number } | undefined
+        if (
+          lease &&
+          typeof lease.until === 'number' &&
+          lease.until > this.io.now() &&
+          (lease.by !== me || (typeof lease.holder === 'string' && lease.holder !== '' && lease.holder !== this.mark))
+        ) {
           // Another session replays it. Record its active hold immediately so an
           // early cutoff on a later file qualifies heldNoticeInfo(), while
           // deferring report.held assignment until after parentWaits below.
@@ -6530,8 +6535,13 @@ export class Writer {
       const fallback: ReconciledFile = fallbackRef ?? { name: base, size: Math.max(0, sz), fnv1a: '' }
       // Check the child's own foreign lease before reading, copying, or reconciling it.
       try {
-        const lease = (await this.io.storeGet(`lease:${dest}/${base}`)) as { by?: string; until?: number } | undefined
-        if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
+        const lease = (await this.io.storeGet(`lease:${dest}/${base}`)) as { by?: string; holder?: string; until?: number } | undefined
+        if (
+          lease &&
+          typeof lease.until === 'number' &&
+          lease.until > this.io.now() &&
+          (lease.by !== me || typeof lease.holder !== 'string' || lease.holder === '' || lease.holder !== this.mark)
+        ) {
           return { action: 'defer', ref: fallback, reason: `another session's lease holds ${base}; deferring reconciliation` }
         }
       } catch {
@@ -7594,14 +7604,21 @@ export class Writer {
         }
         if (toStandalone.length > 0) {
           const prevAdopted = rewrite.adoptedFiles ? [...rewrite.adoptedFiles] : undefined
+          const prevDeliverables = rewrite.deliverableRefs ? [...rewrite.deliverableRefs] : undefined
           const prevPending = rewrite.pendingReconcile ? [...rewrite.pendingReconcile] : undefined
+          const toStandaloneNames = new Set(toStandalone.map(t => t.name))
           rewrite.adoptedFiles = keepAdopted.length > 0 ? keepAdopted : undefined
+          if (rewrite.deliverableRefs !== undefined) {
+            const nextDeliverables = rewrite.deliverableRefs.filter(d => !toStandaloneNames.has(d.name))
+            rewrite.deliverableRefs = nextDeliverables.length > 0 ? nextDeliverables : undefined
+          }
           rewrite.pendingReconcile = [...getPendingRefs(), ...toStandalone]
           rewrite.waits = true
           try {
             await record()
           } catch (err) {
             rewrite.adoptedFiles = prevAdopted
+            rewrite.deliverableRefs = prevDeliverables
             rewrite.pendingReconcile = prevPending
             this.recordError(`could not queue adopted children for standalone materialization on ${path}: ${errorText(err)}`)
             return false
@@ -7621,8 +7638,13 @@ export class Writer {
     ): Promise<'emptied' | 'foreign-live' | 'retry'> => {
       const targetPath = joinPath(rewrite.dir, ref.name)
       try {
-        const lease = (await this.io.storeGet(`lease:${dest}/${ref.name}`)) as { by?: string; until?: number } | undefined
-        if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
+        const lease = (await this.io.storeGet(`lease:${dest}/${ref.name}`)) as { by?: string; holder?: string; until?: number } | undefined
+        if (
+          lease &&
+          typeof lease.until === 'number' &&
+          lease.until > this.io.now() &&
+          (lease.by !== me || typeof lease.holder !== 'string' || lease.holder === '' || lease.holder !== this.mark)
+        ) {
           return 'retry'
         }
       } catch {
@@ -8082,8 +8104,15 @@ export class Writer {
                 (await isBackupReplacesAccounted(m.replaces, m.backupForSize, m.backupForFnv1a, entries, companionsMap, liveFiles))
               ) {
                 const livePath = joinPath(rewrite.dir, liveName)
-                const lease = (await this.io.storeGet(`lease:${dest}/${liveName}`)) as { by?: string; until?: number } | undefined
-                if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) continue
+                const lease = (await this.io.storeGet(`lease:${dest}/${liveName}`)) as { by?: string; holder?: string; until?: number } | undefined
+                if (
+                  lease &&
+                  typeof lease.until === 'number' &&
+                  lease.until > this.io.now() &&
+                  (lease.by !== me || typeof lease.holder !== 'string' || lease.holder === '' || lease.holder !== this.mark)
+                ) {
+                  continue
+                }
                 const cur = await this.io.readFile(livePath)
                 if (cur !== '' && utf8Length(cur) === liveSize && fnv1a(cur) === m.backupFnv1a) {
                   if (await this.emptyCopy(livePath)) {
@@ -9448,7 +9477,7 @@ export class Writer {
       // retirement evidence while its bytes/lease stayed unchanged, re-pack
       // only that child's backup standalone instead of aborting the whole pass.
       let recheckCompanions: Map<string, { name: string; kind?: string; size: number }[]> | null = null
-      if (recheckTargets.some(entry => entry.linkedBackup && entry.hadMissing)) {
+      if (recheckTargets.some(entry => entry.linkedBackup)) {
         dirEntriesCache = await this.io.listDir(dir)
         recheckCompanions = groupCompanions(dirEntriesCache)
         companionsBySource = recheckCompanions
@@ -9467,9 +9496,10 @@ export class Writer {
         if (curRaw === '' || utf8Length(curRaw) !== entry.childSize || fnv1a(curRaw) !== entry.childDigest) {
           await failChildMutated(entry.childName, entry.hadForeignLease, `child ${entry.childName} changed while staging backups`)
         }
-        if (entry.linkedBackup && entry.hadMissing && recheckCompanions !== null) {
+        if (entry.linkedBackup && recheckCompanions !== null) {
           if (!(await canLinkBackupToChild(entry.childName, true, recheckCompanions))) {
             const standalonePacked = packFiles(entry.texts)
+            const standaloneKeys = new Set(standalonePacked.map(part => `${utf8Length(part)}\0${fnv1a(part)}`))
             const standaloneMissing = await checkCoveredParts(standalonePacked, entry.childName, entry.childSize, entry.childDigest)
             if (standaloneMissing.length > 0) {
               await stageMissingParts(standaloneMissing, entry.childName, entry.childKind, entry.childSize, entry.childDigest)
@@ -9484,17 +9514,26 @@ export class Writer {
                 if (res.text === '' || (utf8Length(res.text) === ref.size && fnv1a(res.text) === ref.fnv1a)) {
                   if (res.text !== '') await this.io.writeFile(bPath, '')
                   if (res.present) this.retiredEmpty.add(bPath)
-                  await this.io.writeFile(
-                    doneFileOf(dir, ref.name, guardMark),
-                    res.present
-                      ? journalText({ fates: '', reasons: [], refusals: [], size: 0, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: this.io.now() })
-                      : '',
-                  )
                   retiredLinkedNames.add(ref.name)
                   absentBackups.add(ref.name)
+                  try {
+                    await this.io.writeFile(
+                      doneFileOf(dir, ref.name, guardMark),
+                      res.present
+                        ? journalText({ fates: '', reasons: [], refusals: [], size: 0, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: this.io.now() })
+                        : '',
+                    )
+                  } catch {
+                    // Best-effort sentinel write after linked backup truncation.
+                  }
                 }
               } catch {
                 // Best-effort retirement of superseded linked backup; standalone copy is already staged.
+              }
+            }
+            for (const b of backups) {
+              if (b.replaces === entry.childName && !standaloneKeys.has(`${b.size}\0${b.fnv1a}`)) {
+                absentBackups.add(b.name)
               }
             }
             if (retiredLinkedNames.size > 0) {
@@ -9873,8 +9912,15 @@ export class Writer {
             for (const ref of newlyStagedBackups) {
               const bPath = joinPath(dir, ref.name)
               try {
-                const lease = (await this.io.storeGet(`lease:${dest}/${ref.name}`)) as { by?: string; until?: number } | undefined
-                if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) continue
+                const lease = (await this.io.storeGet(`lease:${dest}/${ref.name}`)) as { by?: string; holder?: string; until?: number } | undefined
+                if (
+                  lease &&
+                  typeof lease.until === 'number' &&
+                  lease.until > this.io.now() &&
+                  (lease.by !== me || typeof lease.holder !== 'string' || lease.holder === '' || lease.holder !== this.mark)
+                ) {
+                  continue
+                }
                 const exists = this.io.exists === undefined ? true : await this.io.exists(bPath)
                 const cur = exists ? await this.io.readFile(bPath) : ''
                 if (cur === '' || (utf8Length(cur) === ref.size && fnv1a(cur) === ref.fnv1a)) {

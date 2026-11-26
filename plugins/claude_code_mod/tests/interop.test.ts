@@ -2198,9 +2198,12 @@ test('interop: live holderless same-session lease is treated as occupied during 
         ranConcurrent = true
         const curLease = h.store.get(childLeaseKey) as { by?: string; holder?: string; until?: number } | undefined
         sawHolderLease = Boolean(curLease?.by === 'cur-temp-1' && typeof curLease.holder === 'string' && curLease.holder.length > 0)
-        // A concurrent session attempting to replay C while staging is active must skip C as leased.
+        // Both a foreign session AND a concurrent writer sharing the same session id must
+        // respect the temporary staging `holder` lease and skip C without clobbering it.
         await h.newCurrent('concurrent-other').backfill(['spill'], 'auto')
+        await h.newCurrent('cur-temp-1').backfill(['spill'], 'auto')
         expect(h.count('C')).toBe(0)
+        expect(h.store.get(childLeaseKey)).toEqual(curLease)
       }
     })
     await h.newCurrent('cur-temp-1').backfill(['retry'], 'force')
