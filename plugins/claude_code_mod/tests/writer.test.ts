@@ -11794,6 +11794,87 @@ test('T53-16ai: linear backup discovery, absent-backup swap persistence, EACCES 
   expect(acc128 < 6000).toBe(true)
   expect(acc128 <= acc32 * 6).toBe(true)
 
+  // Subcase 1b: Staging many eligible ID-less children of one parent must also stay O(N)
+  // (one post-lease listing + at most one recheck listing, not O(N^2) listDir per child).
+  const measureLinkedChildrenScaling = async (childCount: number): Promise<{ listCalls: number; nameAccesses: number }> => {
+    const h = exitReplayHarness()
+    const parentName = `spill-20200101T000000001Z-t53-16ai-idless-${childCount}-p.jsonl`
+    h.seedSpill(parentName, rowA, rowB)
+    for (let i = 0; i < childCount; i += 1) {
+      const cn = `retry-20200101T000001${String(i).padStart(3, '0')}Z-t53-16ai-idless-c-${i}.jsonl`
+      h.files.set(
+        `${PARTITION_DIR}/${cn}`,
+        packFiles(
+          [
+            JSON.stringify({
+              v: 1,
+              kind: 'retry',
+              reason: 'retry',
+              attempts: 0,
+              failed_at: '2020-01-01T00:00:01.000Z',
+              table: TABLE_REF,
+              row: ownRow(rowB),
+            }),
+            JSON.stringify({
+              v: 1,
+              kind: 'retry',
+              reason: 'retry',
+              attempts: 0,
+              failed_at: '2020-01-01T00:00:01.000Z',
+              table: TABLE_REF,
+              row: { ...ownRow(rowC), event_id: undefined },
+            }),
+          ],
+          parentName,
+        )[0]!,
+      )
+    }
+    const baseIo = h.ioFor()
+    let listCalls = 0
+    let nameAccesses = 0
+    let linkedBackupsWritten = 0
+    const trackedIo = {
+      ...baseIo,
+      writeFile: async (p: string, text: string) => {
+        if (p.includes('/retry-') && !p.includes('/outcome') && text.includes('"parent":"retry-20200101T000001')) {
+          linkedBackupsWritten += 1
+        }
+        return baseIo.writeFile(p, text)
+      },
+      listDir: async (dir: string) => {
+        listCalls += 1
+        const raw = await baseIo.listDir(dir)
+        return raw.map(entry => {
+          const nameVal = entry.name
+          const proxy = { kind: entry.kind, size: entry.size, mtimeMs: entry.mtimeMs } as {
+            name: string
+            kind: string
+            size: number
+            mtimeMs?: number
+          }
+          Object.defineProperty(proxy, 'name', {
+            enumerable: true,
+            get() {
+              nameAccesses += 1
+              return nameVal
+            },
+          })
+          return proxy
+        })
+      },
+    }
+    h.setFetch(async () => ({ status: 503, text: 'busy' }))
+    const w = new Writer(trackedIo, () => h.config, () => `s-16ai-idless-${childCount}`)
+    await w.backfill(['spill'], 'force')
+    expect(linkedBackupsWritten).toBe(childCount)
+    return { listCalls, nameAccesses }
+  }
+  const linked32 = await measureLinkedChildrenScaling(32)
+  const linked128 = await measureLinkedChildrenScaling(128)
+  expect(linked128.listCalls <= 12).toBe(true)
+  expect(linked128.nameAccesses < 12000).toBe(true)
+  expect(linked128.nameAccesses <= linked32.nameAccesses * 6).toBe(true)
+
   // Subcase 2: Absent recorded backup swapped for an existing on-disk backup of the same array
   // length (1 -> 1) persists the new backup name in v2 (`!sameBackups`), while EACCES still fails closed.
   {
