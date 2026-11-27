@@ -3293,6 +3293,7 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
     'reused-rep-same-size',
     'backup-truncated-after-read',
     'backup-v1-store-record',
+    'late-rep-swap-syncs-v2',
   ] as const) {
     const h = makeInteropHarness()
     const pName = `retry-20200101T000000001Z-reused-orig-${bkMode}-p.jsonl`
@@ -3387,7 +3388,7 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
         }
         return undefined
       })
-    } else {
+    } else if (bkMode === 'backup-v1-store-record') {
       // c1Name is empty; bk1Name is intact on disk, but carries an unfinished v1 store record.
       h.files.set(`${PART_DIR}/${c1Name}`, '')
       h.store.set(`replayed:${TABLE}/${bk1Name}`, {
@@ -3400,22 +3401,66 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
         files: [],
         written: [],
       })
+    } else {
+      // c1Name stays live and enters guardTargets; bk1Name is repacked standalone during
+      // stageChildBackups Phase 4, and rep1Name is swapped to REP1_GEN2_UNIQ right before
+      // the post-staging check so abortAfterGuardStaging must sync the new standalone backup
+      // & attempt token to v2 instead of stranding it.
+      h.files.set(
+        `${PART_DIR}/outcome-done-prev8-${c1Name}`,
+        sealFile(
+          `${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: utf8Length(c1Text) + 77, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: h.io.now() })}\n`,
+        ),
+      )
+      const repDataLines = origRep1Text
+        .trimEnd()
+        .split('\n')
+        .slice(0, -1)
+        .map(line => line.replace('C1_ORIG_UNIQUE', 'REP1_GEN2_UNIQ'))
+      const swappedRep1 = packFiles(repDataLines, pName)[0]!
+      expect(utf8Length(swappedRep1)).toBe(utf8Length(origRep1Text))
+      let repReads = 0
+      h.setRead(async p => {
+        if (p === `${PART_DIR}/${rep1Name}`) {
+          repReads += 1
+          // Read 1 (initial dRef check) returns origRep1Text; read 2 (post-staging check) sees swappedRep1.
+          if (repReads === 2) {
+            h.files.set(p, swappedRep1)
+            return swappedRep1
+          }
+        }
+        return undefined
+      })
     }
     // Make delivery fail with HTTP 503 while markDone still fails on resume so rep1 stays live on disk.
     h.setFetch(async tags =>
       tags.includes('C1_ORIG_UNIQUE') || tags.includes('REP1_GEN2_UNIQ') ? { status: 503, text: 'upstream 503' } : null,
     )
 
-    // Pass 2 (0.1.4 auto resume): must guard rep1Name and stage a backup for rep1Name before failing markDone.
+    // Pass 2 (0.1.4 auto resume): must guard rep1Name and stage a backup for rep1Name before failing markDone
+    // (for late-rep-swap-syncs-v2, Pass 2a syncs the standalone repack of c1's backup to v2 before aborting,
+    // and Pass 2b guards/stages rep1Backup for the swapped rep1Name).
     await h.newCurrent(`cur-rorig-${bkMode}-2`).backfill(['spill', 'retry'], 'auto')
     h.setRead(null)
+    if (bkMode === 'late-rep-swap-syncs-v2') {
+      const v2Mid = h.store.get(`replayed:v2:${TABLE}/${pName}`) as {
+        backupFiles: { name: string; replaces: string }[]
+        attempts?: string[]
+      }
+      const repackedC1Bk = v2Mid.backupFiles.find(b => b.replaces === c1Name)
+      expect(repackedC1Bk).not.toBeUndefined()
+      expect(repackedC1Bk!.name).not.toBe(bk1Name)
+      expect(h.files.get(`${PART_DIR}/${bk1Name}`)).toBe('')
+      expect(h.files.get(`${PART_DIR}/${repackedC1Bk!.name}`)?.includes(`"parent":"${c1Name}"`)).toBe(false)
+      await h.newCurrent(`cur-rorig-${bkMode}-2b`).backfill(['spill', 'retry'], 'auto')
+    }
     if (bkMode === 'backup-truncated-after-read') expect(truncatedBkAfterRead).toBe(true)
     const v2After = h.store.get(`replayed:v2:${TABLE}/${pName}`) as {
       backupFiles: { name: string; replaces: string }[]
     }
     const rep1Backup = v2After.backupFiles.find(b => b.replaces === rep1Name)
     expect(rep1Backup).not.toBeUndefined()
-    const expectedTag = bkMode === 'reused-rep-same-size' ? 'REP1_GEN2_UNIQ' : 'C1_ORIG_UNIQUE'
+    const expectedTag = bkMode === 'reused-rep-same-size' || bkMode === 'late-rep-swap-syncs-v2' ? 'REP1_GEN2_UNIQ' : 'C1_ORIG_UNIQUE'
     expect(h.files.get(`${PART_DIR}/${rep1Backup!.name}`)?.includes(expectedTag)).toBe(true)
 
     // Pass 3 (0.1.3 force after lease expiry): retires pName with files: [] and drops rep1Name unsent.
@@ -3430,7 +3475,8 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
       bkMode === 'diff-size-retired-linked-backup' ||
       bkMode === 'v1-store-linked-backup' ||
       bkMode === 'backup-truncated-after-read' ||
-      bkMode === 'backup-v1-store-record'
+      bkMode === 'backup-v1-store-record' ||
+      bkMode === 'late-rep-swap-syncs-v2'
     ) {
       expect(h.files.get(`${PART_DIR}/${bk1Name}`)).toBe('')
       if (bkMode === 'linked-backup') expect(h.count('C1_REUSED_GEN2')).toBe(1)
@@ -3440,7 +3486,7 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
     await h.newCurrent(`cur-rorig-${bkMode}-3`).backfill(['spill', 'retry'], 'auto')
     await h.newCurrent(`cur-rorig-${bkMode}-4`).backfill(['spill', 'retry'], 'auto')
     expect(h.count(expectedTag)).toBe(1)
-    if (bkMode === 'reused-rep-same-size') expect(h.count('C1_ORIG_UNIQUE')).toBe(1)
+    if (bkMode === 'reused-rep-same-size' || bkMode === 'late-rep-swap-syncs-v2') expect(h.count('C1_ORIG_UNIQUE')).toBe(1)
     expect(h.liveDataFiles()).toEqual([])
   }
 })

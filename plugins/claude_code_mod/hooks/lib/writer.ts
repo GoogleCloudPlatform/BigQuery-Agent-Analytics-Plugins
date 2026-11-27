@@ -7687,9 +7687,13 @@ export class Writer {
               lease.until > this.io.now() &&
               (lease.by !== curMeForRelied || typeof lease.holder !== 'string' || lease.holder === '' || lease.holder !== this.mark),
           )
-        const hasCleanReplaySlots = async (targetName: string, checkAnyDoneMarks: boolean): Promise<boolean> => {
+        const hasCleanReplaySlots = async (
+          targetName: string,
+          checkAnyDoneMarks: boolean,
+          companionsMap: ReadonlyMap<string, { name: string; kind?: string; size: number }[]> = companionsBeforeRecord,
+        ): Promise<boolean> => {
           const anySource = { ...sourceFor(rewrite.dir, targetName, -1, c), live: false }
-          const targetCompanions = companionsBeforeRecord.get(targetName) ?? []
+          const targetCompanions = companionsMap.get(targetName) ?? []
           if (checkAnyDoneMarks && targetCompanions.length > 0) {
             const doneAny = await this.doneMarksAll(anySource, targetCompanions)
             if (doneAny.torn || doneAny.records.length > 0) return false
@@ -7792,13 +7796,17 @@ export class Writer {
                 await this.io.storeSet(bLeaseKey, { by: curMeForRelied, holder: this.mark, until: this.io.now() + LEASE_MS })
                 newlyLeasedHere.push(b.name)
               }
+              // Refresh directory entries under the backup lease so done-mark and
+              // live-origin checks reflect post-lease disk state.
+              const freshEntries = await this.io.listDir(rewrite.dir)
+              const freshCompanions = groupCompanions(freshEntries)
               // Verify the backup itself has no retired/torn done marks and no
               // unfinished v1/v2 store or companion record that could consume it.
               const bDone = await this.doneMarksAll(
                 sourceFor(rewrite.dir, b.name, b.size, c),
-                companionsBeforeRecord.get(b.name) ?? [],
+                freshCompanions.get(b.name) ?? [],
               )
-              if (bDone.torn || bDone.records.length > 0 || !(await hasCleanReplaySlots(b.name, false))) {
+              if (bDone.torn || bDone.records.length > 0 || !(await hasCleanReplaySlots(b.name, false, freshCompanions))) {
                 await releaseHere()
                 return null
               }
@@ -7822,7 +7830,8 @@ export class Writer {
                 // (`size: -1`) whenever `origName` is live on disk or carries
                 // any done mark, v1/v2 store slot, or companion record file
                 // (matching `canLinkBackupToChild`).
-                if ((listedBeforeRecord.get(origName) ?? 0) > 0 || !(await hasCleanReplaySlots(origName, true))) {
+                const origLiveNow = freshEntries.some(e => (e.kind === undefined || e.kind === 'file') && e.name === origName && e.size > 0)
+                if (origLiveNow || !(await hasCleanReplaySlots(origName, true, freshCompanions))) {
                   await releaseHere()
                   return null
                 }
@@ -8014,7 +8023,23 @@ export class Writer {
         }
         // Final pre-record verification under active backup leases: confirm
         // every skipped synthesized replacement still matches `dRef` and its
-        // relied original backup or leased backup copy is still intact.
+        // relied original backup or leased backup copy is still intact. If
+        // `guardTargets` already placed guards or promoted/truncated backups on
+        // disk (`!recorded`), sync that monotonic protective metadata to `v2`
+        // (keeping `waits: true`) before returning `false` so recovery never
+        // strands a newly promoted backup or `childGuard` attempt token.
+        const abortAfterGuardStaging = async (): Promise<false> => {
+          rewrite.waits = true
+          if (!recorded) {
+            try {
+              await record()
+              recorded = true
+            } catch {
+              // Best-effort sync of newly placed guard/backup metadata before aborting.
+            }
+          }
+          return false
+        }
         for (const item of skippedByOrig) {
           try {
             const hasCoveredBackup = (rewrite.backupFiles ?? []).some(
@@ -8023,42 +8048,31 @@ export class Writer {
                 b.replacesSize === item.origRef.size &&
                 (b.replacesFnv1a === undefined || b.replacesFnv1a === '' || b.replacesFnv1a === item.origRef.fnv1a),
             )
-            if (!hasCoveredBackup) {
-              rewrite.waits = true
-              return false
-            }
+            if (!hasCoveredBackup) return await abortAfterGuardStaging()
             const repNow = await this.io.readFile(item.childPath)
             if (repNow !== '' && (utf8Length(repNow) !== item.dRef.size || fnv1a(repNow) !== item.dRef.fnv1a)) {
-              rewrite.waits = true
-              return false
+              return await abortAfterGuardStaging()
             }
           } catch {
-            rewrite.waits = true
-            return false
+            return await abortAfterGuardStaging()
           }
         }
         for (const item of skippedByBackups) {
           try {
             for (const b of item.backups) {
               const curLease = (await this.io.storeGet(`lease:${destDirForRelied}/${b.name}`)) as { by?: string; holder?: string; until?: number } | undefined
-              if (!isOwnHeldLease(curLease)) {
-                rewrite.waits = true
-                return false
-              }
+              if (!isOwnHeldLease(curLease)) return await abortAfterGuardStaging()
               const bNow = await this.io.readFile(joinPath(rewrite.dir, b.name))
               if (bNow === '' || utf8Length(bNow) !== b.size || fnv1a(bNow) !== b.fnv1a) {
-                rewrite.waits = true
-                return false
+                return await abortAfterGuardStaging()
               }
             }
             const repNow = await this.io.readFile(item.childPath)
             if (repNow !== '' && (utf8Length(repNow) !== item.dRef.size || fnv1a(repNow) !== item.dRef.fnv1a)) {
-              rewrite.waits = true
-              return false
+              return await abortAfterGuardStaging()
             }
           } catch {
-            rewrite.waits = true
-            return false
+            return await abortAfterGuardStaging()
           }
         }
       }
