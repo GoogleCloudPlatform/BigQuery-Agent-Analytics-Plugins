@@ -3324,6 +3324,7 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
     'live-orig-backup-v1-slot',
     'live-orig-late-backup-v1-slot',
     'rep-emptied-on-last-read',
+    'rep-already-empty-orig-empty',
     'late-rep-swap-syncs-v2',
   ] as const) {
     const h = makeInteropHarness()
@@ -3364,6 +3365,7 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
 
     let truncatedBkAfterRead = false
     // Mutate c1Name / bk1Name / rep1Name according to mode before resuming writeOut.
+    let attemptedParentRetiredMark = false
     if (bkMode === 'empty-backup') {
       h.files.set(`${PART_DIR}/${c1Name}`, c1Gen2Text)
       h.files.set(`${PART_DIR}/${bk1Name}`, '')
@@ -3468,9 +3470,13 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
         }
       })
     } else if (bkMode === 'rep-emptied-on-last-read') {
-      // c1Name stays live; rep1Name matches dRef on read 1, then becomes empty ('')
-      // on the final post-staging read: writeOut must NOT treat '' as verified and
-      // must abort without dropping c1Name or bk1Name.
+      // c1Name stays live; allow markDone to succeed if Pass 2 fails to abort on ''
+      // so the test strictly fails without the empty-read rejection.
+      h.setWrite(async (p, text) => {
+        if (p.includes('/outcome-done-') && p.endsWith(`-${pName}`) && text.includes('"retired":true')) {
+          attemptedParentRetiredMark = true
+        }
+      })
       let repReads = 0
       h.setRead(async p => {
         if (p === `${PART_DIR}/${rep1Name}`) {
@@ -3482,6 +3488,12 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
         }
         return undefined
       })
+    } else if (bkMode === 'rep-already-empty-orig-empty') {
+      // Both rep1Name and c1Name are already empty unsent before Pass 2 with ONLY bk1Name live;
+      // allow markDone to succeed so writeOut must preserve bk1Name instead of dropping it on retirement.
+      h.setWrite(null)
+      h.files.set(`${PART_DIR}/${c1Name}`, '')
+      h.files.set(`${PART_DIR}/${rep1Name}`, '')
     } else {
       // c1Name stays live and enters guardTargets; bk1Name is repacked standalone during
       // stageChildBackups Phase 4, and rep1Name is swapped to REP1_GEN2_UNIQ right before
@@ -3513,9 +3525,11 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
         return undefined
       })
     }
-    // Make delivery fail with HTTP 503 while markDone still fails on resume so rep1 stays live on disk.
+    // Make delivery fail with HTTP 503 while markDone still fails on resume so rep1/bk1 stay live on disk.
     h.setFetch(async tags =>
-      tags.includes('C1_ORIG_UNIQUE') || tags.includes('REP1_GEN2_UNIQ') ? { status: 503, text: 'upstream 503' } : null,
+      tags.includes('C1_ORIG_UNIQUE') || tags.includes('REP1_GEN2_UNIQ') || (bkMode === 'rep-already-empty-orig-empty' && tags.includes('B'))
+        ? { status: 503, text: 'upstream 503' }
+        : null,
     )
 
     // Pass 2 (0.1.4 auto resume): must protect rep1Name / c1Name in a single pass before failing markDone.
@@ -3548,9 +3562,31 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
       expect(cleanC1Bk).not.toBeUndefined()
       expect(v2After.backupFiles.some(b => b.name === bk1Name)).toBe(false)
     } else if (bkMode === 'rep-emptied-on-last-read') {
-      // Aborted before dropping c1Name/bk1Name when rep1Name vanished on the final read.
+      // Aborted BEFORE markDone without dropping pName, c1Name, or bk1Name when rep1Name vanished on the final read.
+      expect(attemptedParentRetiredMark).toBe(false)
+      expect(h.files.get(`${PART_DIR}/${pName}`)).toBe(pText)
       expect(h.files.get(`${PART_DIR}/${c1Name}`)).toBe(c1Text)
       expect(h.files.get(`${PART_DIR}/${bk1Name}`)).toBe(origBk1Text)
+      // A subsequent 0.1.4 auto pass (without 0.1.3) must NOT drop c1Name and bk1Name together:
+      // it restores c1Name out of reconciledFiles and delivers C1_ORIG_UNIQUE exactly once.
+      h.setWrite(null)
+      h.setFetch(null)
+      await h.newCurrent(`cur-rorig-${bkMode}-3`).backfill(['spill', 'retry'], 'auto')
+      await h.newCurrent(`cur-rorig-${bkMode}-4`).backfill(['spill', 'retry'], 'auto')
+      expect(h.count('C1_ORIG_UNIQUE')).toBe(1)
+      expect(h.liveDataFiles()).toEqual([])
+      continue
+    } else if (bkMode === 'rep-already-empty-orig-empty') {
+      // Pass 2 retired pName while keeping bk1Name alive (did NOT drop bk1Name in cleanupBackups).
+      expect(h.files.get(`${PART_DIR}/${pName}`)).toBe('')
+      expect(h.files.get(`${PART_DIR}/${bk1Name}`)).toBe(origBk1Text)
+      // Next 0.1.4 auto pass delivers C1_ORIG_UNIQUE exactly once from bk1Name.
+      h.setFetch(null)
+      await h.newCurrent(`cur-rorig-${bkMode}-3`).backfill(['spill', 'retry'], 'auto')
+      await h.newCurrent(`cur-rorig-${bkMode}-4`).backfill(['spill', 'retry'], 'auto')
+      expect(h.count('C1_ORIG_UNIQUE')).toBe(1)
+      expect(h.liveDataFiles()).toEqual([])
+      continue
     } else {
       const rep1Backup = v2After.backupFiles.find(b => b.replaces === rep1Name)
       expect(rep1Backup).not.toBeUndefined()

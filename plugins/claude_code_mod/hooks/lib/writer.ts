@@ -7867,6 +7867,69 @@ export class Writer {
         const origChildRefByName = new Map<string, ReconciledFile>()
         for (const r of getReconciledRefs()) origChildRefByName.set(r.name, r)
         for (const r of getPendingRefs()) if (!origChildRefByName.has(r.name)) origChildRefByName.set(r.name, r)
+        // If a synthesized replacement (`deliverableRefs` with `replaces`) is
+        // already empty on disk without a matching `sourceFnv1a` retired mark,
+        // do not let `markDone` / `cleanupReconciledAndStaged` / `cleanupBackups`
+        // drop the original child and its backup: restore `origName` from
+        // `reconciledFiles` into `adoptedFiles` so either the live original or
+        // its surviving backup delivers the rows cleanly.
+        for (const dRef of [...(rewrite.deliverableRefs ?? [])]) {
+          if (
+            dRef.replaces === undefined ||
+            dRef.replaces === '' ||
+            dRef.replaces === dRef.name ||
+            dRef.size <= 0 ||
+            dRef.fnv1a === '' ||
+            (listedBeforeRecord.get(dRef.name) ?? 0) > 0
+          ) {
+            continue
+          }
+          let repDelivered = false
+          try {
+            const repDone = await this.doneMarksAll(
+              { ...sourceFor(rewrite.dir, dRef.name, dRef.size, c), live: false },
+              companionsBeforeRecord.get(dRef.name) ?? [],
+            )
+            if (repDone.torn) {
+              rewrite.waits = true
+              return false
+            }
+            repDelivered = repDone.records.some(
+              rec =>
+                !isEmptiedSentinel(rec) &&
+                typeof rec.size === 'number' &&
+                rec.size > 0 &&
+                typeof rec.sourceFnv1a === 'string' &&
+                rec.sourceFnv1a === dRef.fnv1a,
+            )
+          } catch {
+            rewrite.waits = true
+            return false
+          }
+          if (repDelivered) continue
+          const origName = dRef.replaces
+          const nextAdopted = (rewrite.adoptedFiles ?? []).filter(n => n !== dRef.name)
+          if (!nextAdopted.includes(origName)) nextAdopted.push(origName)
+          rewrite.adoptedFiles = nextAdopted.length > 0 ? nextAdopted : undefined
+          const nextDeliverables = (rewrite.deliverableRefs ?? []).filter(d => d.name !== dRef.name)
+          const origRef = origChildRefByName.get(origName)
+          if (
+            origRef !== undefined &&
+            origRef.size > 0 &&
+            origRef.fnv1a !== '' &&
+            (listedBeforeRecord.get(origName) ?? 0) > 0 &&
+            !nextDeliverables.some(d => d.name === origName)
+          ) {
+            nextDeliverables.push({ name: origName, size: origRef.size, fnv1a: origRef.fnv1a, replaces: origName })
+          }
+          rewrite.deliverableRefs = nextDeliverables.length > 0 ? nextDeliverables : undefined
+          deliverableByName.delete(dRef.name)
+          const nextReconciled = (rewrite.reconciledFiles ?? []).filter(r => r.name !== origName)
+          rewrite.reconciledFiles = nextReconciled.length > 0 ? nextReconciled : undefined
+          candidateNames.add(origName)
+          rewrite.waits = true
+          recorded = false
+        }
         const origBackupsByReplaces = new Map<string, BackupFile[]>()
         for (const b of rewrite.backupFiles ?? []) {
           const list = origBackupsByReplaces.get(b.replaces)
@@ -9115,6 +9178,50 @@ export class Writer {
         }
         return cachedEntries
       }
+      const areReplacementsAccountedFor = async (
+        replacesName: string,
+        entriesSnapshot?: readonly { name: string; kind?: string; size: number }[],
+        companionsSnapshot?: ReadonlyMap<string, readonly { name: string; kind?: string; size: number }[]>,
+        liveFilesSnapshot?: ReadonlyMap<string, number>,
+      ): Promise<boolean> => {
+        const reps = (rewrite.deliverableRefs ?? []).filter(
+          d => d.replaces === replacesName && d.name !== replacesName && d.size > 0,
+        )
+        if (reps.length === 0) return true
+        const dirEntries = entriesSnapshot ?? (await getEntriesSnapshot())
+        if (dirEntries === null) return false
+        const companionsMap = companionsSnapshot ?? cachedEntriesCompanions
+        const liveFilesMap = liveFilesSnapshot ?? cachedLiveFiles
+        for (const rep of reps) {
+          const repLiveSize = liveFilesMap !== null ? (liveFilesMap.get(rep.name) ?? 0) : 0
+          if (repLiveSize > 0 && repLiveSize === rep.size) {
+            try {
+              const rawRep = await this.io.readFile(joinPath(rewrite.dir, rep.name))
+              if (rawRep !== '' && utf8Length(rawRep) === rep.size && (rep.fnv1a === '' || fnv1a(rawRep) === rep.fnv1a)) {
+                continue
+              }
+            } catch {
+              return false
+            }
+          }
+          try {
+            const repDone = await this.doneMarksAll(
+              { ...sourceFor(rewrite.dir, rep.name, rep.size, c), live: false },
+              companionsMap !== null ? (companionsMap.get(rep.name) ?? []) : dirEntries,
+            )
+            if (repDone.torn) return false
+            const nonSentinels = repDone.records.filter(rec => !isEmptiedSentinel(rec) && typeof rec.size === 'number' && rec.size > 0)
+            const delivered =
+              rep.fnv1a !== ''
+                ? nonSentinels.some(rec => typeof rec.sourceFnv1a === 'string' && rec.sourceFnv1a === rep.fnv1a)
+                : nonSentinels.length > 0
+            if (!delivered) return false
+          } catch {
+            return false
+          }
+        }
+        return true
+      }
       const isBackupReplacesAccounted = async (
         replacesName: string | undefined,
         replacesSize: number | undefined,
@@ -9124,7 +9231,14 @@ export class Writer {
         liveFilesSnapshot?: ReadonlyMap<string, number>,
       ): Promise<boolean> => {
         if (replacesName === undefined || replacesName === '') return false
-        if (allLeftoversWritten && (done || v1ShadowNeeded()) && reconciledMatchesBackup(replacesName, replacesSize, replacesFnv1a)) return true
+        if (
+          allLeftoversWritten &&
+          (done || v1ShadowNeeded()) &&
+          reconciledMatchesBackup(replacesName, replacesSize, replacesFnv1a) &&
+          (await areReplacementsAccountedFor(replacesName, entriesSnapshot, companionsSnapshot, liveFilesSnapshot))
+        ) {
+          return true
+        }
         if (!dropAll) return false
         // On full retirement (`dropAll`), verify `replacesName` is still live
         // and listed in our deliverables (`files`/`adopted`) OR has its own
