@@ -84,6 +84,7 @@ function makeInteropHarness() {
   let storeGetHook: ((key: string) => Promise<void>) | null = null
   let storeSetHook: ((key: string, value: unknown) => Promise<void>) | null = null
   let storeDeleteHook: ((key: string) => Promise<void>) | null = null
+  let listDirHook: ((dir: string) => Promise<void>) | null = null
 
   const io: Io = {
     now: () => nowMs,
@@ -121,6 +122,7 @@ function makeInteropHarness() {
     },
     exists: async path => files.has(path),
     listDir: async dir => {
+      if (listDirHook !== null) await listDirHook(dir)
       const pref = `${dir}/`
       return [...files.entries()]
         .filter(([p]) => p.startsWith(pref) && !p.slice(pref.length).includes('/'))
@@ -181,6 +183,9 @@ function makeInteropHarness() {
     },
     setStoreDelete: (fn: typeof storeDeleteHook) => {
       storeDeleteHook = fn
+    },
+    setListDir: (fn: typeof listDirHook) => {
+      listDirHook = fn
     },
   }
 }
@@ -2456,23 +2461,41 @@ test('interop: stale v1 checkpoint with leased written child plus unwritten part
   const r1 = await h.newCurrent('cur-partunw-1').backfill(['spill', 'retry', 'rejected'], 'auto')
   expect(r1.error).toBeNull()
   expect(r1.held ?? '').toContain(c1Name)
+  expect(h.count('NEW_A')).toBe(0)
   expect(h.count('NEW_B')).toBe(0)
+  const skippedBackups1 = [...h.files.entries()].filter(
+    ([k, v]) => k.startsWith(`${PART_DIR}/spill-`) && k !== pPath && v.includes('NEW_A') && !v.includes('NEW_B'),
+  )
+  expect(skippedBackups1.length).toBe(1)
 
-  // Two legacy 0.1.3 auto passes rebuild c2 from P_gen2 once and deliver NEW_B once (never twice).
+  // A repeated 0.1.4 hold pass is idempotent and does not stage duplicate backups.
+  const r1b = await h.newCurrent('cur-partunw-1b').backfill(['spill', 'retry', 'rejected'], 'auto')
+  expect(r1b.error).toBeNull()
+  expect(r1b.held ?? '').toContain(c1Name)
+  const skippedBackups2 = [...h.files.entries()].filter(
+    ([k, v]) => k.startsWith(`${PART_DIR}/spill-`) && k !== pPath && v.includes('NEW_A') && !v.includes('NEW_B'),
+  )
+  expect(skippedBackups2.length).toBe(1)
+
+  // Two legacy 0.1.3 auto passes rebuild c2 from P_gen2 once and deliver NEW_B once (never twice),
+  // holding the staged v1-skipped backup for NEW_A because of its sending mark.
   h.setStoreSet(null)
   h.setWrite(null)
   await h.newDist('dist-partunw-1').backfill(['spill', 'retry'], 'auto')
   await h.newDist('dist-partunw-2').backfill(['spill', 'retry'], 'auto')
   expect(h.count('NEW_B')).toBe(1)
+  expect(h.count('NEW_A')).toBe(0)
 
-  // After lease expiry, command backfill drains the old rejected child cleanly.
+  // After lease expiry, command backfill drains BOTH the old rejected child AND NEW_A cleanly.
   h.advance(15 * 60 * 1000)
   await h.newCurrent('cur-partunw-2').backfill(['spill', 'retry', 'rejected'], 'command')
   expect(h.count('OLD_A')).toBe(1)
+  expect(h.count('NEW_A')).toBe(1)
+  expect(h.count('NEW_B')).toBe(1)
   expect(h.liveDataFiles()).toEqual([])
 
   // Arm 2: When c1 clears without a legacy 0.1.3 auto pass preempting the held parent,
-  // 0.1.4 delivers BOTH NEW_A and NEW_B exactly once after v1 clears.
+  // 0.1.4 delivers BOTH NEW_A and NEW_B exactly once and drops the v1-skipped backup unsent.
   const h2 = makeInteropHarness()
   h2.files.set(pPath, pGen2)
   h2.files.set(`${PART_DIR}/${c1Name}`, packFiles([dlLine('spill', null, 'OLD_A')], pName)[0]!)
@@ -2492,12 +2515,17 @@ test('interop: stale v1 checkpoint with leased written child plus unwritten part
   expect(rHold.held ?? '').toContain(c1Name)
   expect(h2.count('NEW_A')).toBe(0)
   expect(h2.count('NEW_B')).toBe(0)
+  const h2SkippedBks = [...h2.files.entries()].filter(
+    ([k, v]) => k.startsWith(`${PART_DIR}/spill-`) && k !== pPath && v.includes('NEW_A') && !v.includes('NEW_B'),
+  )
+  expect(h2SkippedBks.length).toBe(1)
   h2.advance(15 * 60 * 1000)
   await h2.newCurrent('cur-partunw2-2').backfill(['spill', 'retry', 'rejected'], 'command')
   await h2.newCurrent('cur-partunw2-3').backfill(['spill', 'retry', 'rejected'], 'auto')
   expect(h2.count('OLD_A')).toBe(1)
   expect(h2.count('NEW_A')).toBe(1)
   expect(h2.count('NEW_B')).toBe(1)
+  expect(h2.files.get(h2SkippedBks[0]![0])).toBe('')
   expect(h2.liveDataFiles()).toEqual([])
 })
 
@@ -3293,6 +3321,9 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
     'reused-rep-same-size',
     'backup-truncated-after-read',
     'backup-v1-store-record',
+    'live-orig-backup-v1-slot',
+    'live-orig-late-backup-v1-slot',
+    'rep-emptied-on-last-read',
     'late-rep-swap-syncs-v2',
   ] as const) {
     const h = makeInteropHarness()
@@ -3401,11 +3432,61 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
         files: [],
         written: [],
       })
+    } else if (bkMode === 'live-orig-backup-v1-slot') {
+      // c1Name stays live on disk (skippedByOrig path), while bk1Name already carries
+      // an unfinished v1 store record: stageChildBackups must NOT accept bk1Name as clean
+      // coverage, and instead stage a clean replacement backup (or guard rep1Name).
+      h.store.set(`replayed:${TABLE}/${bk1Name}`, {
+        fates: 'LL',
+        reasons: [],
+        refusals: [],
+        size: utf8Length(origBk1Text),
+        waits: false,
+        seq: 1,
+        files: [],
+        written: [],
+      })
+    } else if (bkMode === 'live-orig-late-backup-v1-slot') {
+      // c1Name stays live and bk1Name starts clean through stageChildBackups, then
+      // gains an unfinished v1 store record right before post-staging backup lease
+      // verification: writeOut must fall back to guarding & backing up rep1Name in
+      // the SAME pass before calling record().
+      let injectedLateV1 = false
+      h.setStoreSet(async k => {
+        if (!injectedLateV1 && k === `lease:${TABLE}/${bk1Name}`) {
+          injectedLateV1 = true
+          h.store.set(`replayed:${TABLE}/${bk1Name}`, {
+            fates: 'LL',
+            reasons: [],
+            refusals: [],
+            size: utf8Length(origBk1Text),
+            waits: false,
+            seq: 1,
+            files: [],
+            written: [],
+          })
+        }
+      })
+    } else if (bkMode === 'rep-emptied-on-last-read') {
+      // c1Name stays live; rep1Name matches dRef on read 1, then becomes empty ('')
+      // on the final post-staging read: writeOut must NOT treat '' as verified and
+      // must abort without dropping c1Name or bk1Name.
+      let repReads = 0
+      h.setRead(async p => {
+        if (p === `${PART_DIR}/${rep1Name}`) {
+          repReads += 1
+          if (repReads === 2) {
+            h.files.set(p, '')
+            return ''
+          }
+        }
+        return undefined
+      })
     } else {
       // c1Name stays live and enters guardTargets; bk1Name is repacked standalone during
       // stageChildBackups Phase 4, and rep1Name is swapped to REP1_GEN2_UNIQ right before
-      // the post-staging check so abortAfterGuardStaging must sync the new standalone backup
-      // & attempt token to v2 instead of stranding it.
+      // the post-staging check so writeOut must guard & stage rep1Backup for the swapped
+      // generation IN THE SAME PASS and persist both to v2.
       h.files.set(
         `${PART_DIR}/outcome-done-prev8-${c1Name}`,
         sealFile(
@@ -3437,11 +3518,10 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
       tags.includes('C1_ORIG_UNIQUE') || tags.includes('REP1_GEN2_UNIQ') ? { status: 503, text: 'upstream 503' } : null,
     )
 
-    // Pass 2 (0.1.4 auto resume): must guard rep1Name and stage a backup for rep1Name before failing markDone
-    // (for late-rep-swap-syncs-v2, Pass 2a syncs the standalone repack of c1's backup to v2 before aborting,
-    // and Pass 2b guards/stages rep1Backup for the swapped rep1Name).
+    // Pass 2 (0.1.4 auto resume): must protect rep1Name / c1Name in a single pass before failing markDone.
     await h.newCurrent(`cur-rorig-${bkMode}-2`).backfill(['spill', 'retry'], 'auto')
     h.setRead(null)
+    h.setStoreSet(null)
     if (bkMode === 'late-rep-swap-syncs-v2') {
       const v2Mid = h.store.get(`replayed:v2:${TABLE}/${pName}`) as {
         backupFiles: { name: string; replaces: string }[]
@@ -3452,16 +3532,30 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
       expect(repackedC1Bk!.name).not.toBe(bk1Name)
       expect(h.files.get(`${PART_DIR}/${bk1Name}`)).toBe('')
       expect(h.files.get(`${PART_DIR}/${repackedC1Bk!.name}`)?.includes(`"parent":"${c1Name}"`)).toBe(false)
-      await h.newCurrent(`cur-rorig-${bkMode}-2b`).backfill(['spill', 'retry'], 'auto')
+      // Swapped rep1Name MUST already be guarded & backed up in Pass 2a itself (not deferred to a later pass).
+      const rep1BkSamePass = v2Mid.backupFiles.find(b => b.replaces === rep1Name)
+      expect(rep1BkSamePass).not.toBeUndefined()
+      expect(h.files.get(`${PART_DIR}/${rep1BkSamePass!.name}`)?.includes('REP1_GEN2_UNIQ')).toBe(true)
     }
     if (bkMode === 'backup-truncated-after-read') expect(truncatedBkAfterRead).toBe(true)
     const v2After = h.store.get(`replayed:v2:${TABLE}/${pName}`) as {
       backupFiles: { name: string; replaces: string }[]
     }
-    const rep1Backup = v2After.backupFiles.find(b => b.replaces === rep1Name)
-    expect(rep1Backup).not.toBeUndefined()
     const expectedTag = bkMode === 'reused-rep-same-size' || bkMode === 'late-rep-swap-syncs-v2' ? 'REP1_GEN2_UNIQ' : 'C1_ORIG_UNIQUE'
-    expect(h.files.get(`${PART_DIR}/${rep1Backup!.name}`)?.includes(expectedTag)).toBe(true)
+    if (bkMode === 'live-orig-backup-v1-slot') {
+      // A fresh clean backup (not the v1-poisoned bk1Name) must now cover c1Name.
+      const cleanC1Bk = v2After.backupFiles.find(b => b.replaces === c1Name && b.name !== bk1Name)
+      expect(cleanC1Bk).not.toBeUndefined()
+      expect(v2After.backupFiles.some(b => b.name === bk1Name)).toBe(false)
+    } else if (bkMode === 'rep-emptied-on-last-read') {
+      // Aborted before dropping c1Name/bk1Name when rep1Name vanished on the final read.
+      expect(h.files.get(`${PART_DIR}/${c1Name}`)).toBe(c1Text)
+      expect(h.files.get(`${PART_DIR}/${bk1Name}`)).toBe(origBk1Text)
+    } else {
+      const rep1Backup = v2After.backupFiles.find(b => b.replaces === rep1Name)
+      expect(rep1Backup).not.toBeUndefined()
+      expect(h.files.get(`${PART_DIR}/${rep1Backup!.name}`)?.includes(expectedTag)).toBe(true)
+    }
 
     // Pass 3 (0.1.3 force after lease expiry): retires pName with files: [] and drops rep1Name unsent.
     h.setWrite(null)
@@ -3476,13 +3570,15 @@ test('interop: resumed writeOut verifies replacement, child, and leased backup f
       bkMode === 'v1-store-linked-backup' ||
       bkMode === 'backup-truncated-after-read' ||
       bkMode === 'backup-v1-store-record' ||
+      bkMode === 'live-orig-backup-v1-slot' ||
+      bkMode === 'live-orig-late-backup-v1-slot' ||
       bkMode === 'late-rep-swap-syncs-v2'
     ) {
       expect(h.files.get(`${PART_DIR}/${bk1Name}`)).toBe('')
       if (bkMode === 'linked-backup') expect(h.count('C1_REUSED_GEN2')).toBe(1)
     }
 
-    // Pass 4 (0.1.4 auto): recovers expectedTag exactly once from rep1Backup.
+    // Pass 4 (0.1.4 auto): recovers expectedTag exactly once from the verified backup.
     await h.newCurrent(`cur-rorig-${bkMode}-3`).backfill(['spill', 'retry'], 'auto')
     await h.newCurrent(`cur-rorig-${bkMode}-4`).backfill(['spill', 'retry'], 'auto')
     expect(h.count(expectedTag)).toBe(1)
@@ -3917,7 +4013,12 @@ test('interop: per-leftover scoping keeps unrelated 0.1.3-delivered parent lefto
     if (k === `replayed:${TABLE}/${pName}`) throw new Error('v1 neutralize unavailable')
   })
   h.setWrite(async (p, text) => {
-    if (p.includes('/outcome-done-') && p.endsWith(`-${pName}`) && text.includes('"retired":true')) throw new Error('stopped before retired mark')
+    // Block every retired write on pName (both outcome-done- and v1 shadow outcome-) so only
+    // the unretired v2 record carries `reconciled` + `leftoverParts` when 0.1.3 retires pName.
+    if (p.includes('/outcome') && p.endsWith(pName) && text.includes('"retired":true')) throw new Error('stopped before retired mark')
+    // Keep the staged backup alive across the simulated crash before backup cleanup finishes
+    // so the test exercises live backup release via `leftoverParts` rather than an already-empty file.
+    if (p !== `${PART_DIR}/${c1Name}` && p.includes('/spill-') && text === '') throw new Error('stopped before backup cleanup')
   })
 
   await h.newCurrent('cur-pscope-1', { maxBatchRows: 1 }).backfill(['spill', 'retry'], 'force')
@@ -3935,6 +4036,8 @@ test('interop: per-leftover scoping keeps unrelated 0.1.3-delivered parent lefto
   expect(lRejName).not.toBeUndefined()
   expect(lRetryName).not.toBeUndefined()
   expect(v2.reconciled.find(rec => rec.name === c1Name)?.leftoverParts).toEqual([lRejName])
+  expect(h.files.get(`${PART_DIR}/${c1Name}`)).toBe('')
+  expect(h.files.get(`${PART_DIR}/${bk1Name}`) ?? '').not.toBe('')
 
   // Hold BK1; 0.1.3 force(['retry']) retires P via stuck v1 and genuinely delivers
   // standalone unrelated L_retry (writing a digest-less 0.1.3 done mark for L_retry);
@@ -3960,6 +4063,7 @@ test('interop: per-leftover scoping keeps unrelated 0.1.3-delivered parent lefto
   expect(h.count('R_OVERLAP')).toBe(rOverlapBefore + 1)
   expect(h.files.get(`${PART_DIR}/${rep1Name}`)).toBe('')
   expect(h.files.get(`${PART_DIR}/${lRejName}`)).toBe('')
+  expect(h.files.get(`${PART_DIR}/${bk1Name}`) ?? '').not.toBe('')
 
   // Release BK1's lease: 0.1.4 auto must drop BK1 via R_rep1 + L_rej's verified marks despite L_retry's digest-less 0.1.3 mark.
   h.advance(15 * 60 * 1000)
@@ -3968,4 +4072,401 @@ test('interop: per-leftover scoping keeps unrelated 0.1.3-delivered parent lefto
   expect(h.count('C1_PART_SCOPED')).toBe(1)
   expect(h.count('R_OVERLAP')).toBe(rOverlapBefore + 1)
   expect(h.liveDataFiles()).toEqual([])
+})
+
+test('interop: disk-candidate backup reuse rejects candidates with unfinished v1 replay slots so Phase 4 never drops good backup for poisoned copy', async () => {
+  const idA = 'a'.repeat(32)
+  const idB = 'b'.repeat(32)
+  const h = makeInteropHarness()
+  const pName = 'retry-20200101T000000001Z-diskslot-p.jsonl'
+  const c1Name = 'spill-20200101T000000002Z-diskslot-c1.jsonl'
+  const bGoodName = 'spill-20200101T000000003Z-diskslot-bgood.jsonl'
+  const bPoisonName = 'spill-20200101T000000004Z-diskslot-bpoison.jsonl'
+  const pText = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idB, 'B')])[0]!
+  const c1Text = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_DISKSLOT_UNIQ')], pName)[0]!
+  const pSize = utf8Length(pText)
+  const c1Size = utf8Length(c1Text)
+  const bGoodText = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', `dl:${c1Name}#1`, 'C1_DISKSLOT_UNIQ', `${c1Name}#1`)])[0]!
+  const bPoisonText = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', `dl:${c1Name}#1`, 'C1_DISKSLOT_UNIQ', `${c1Name}#1`)], c1Name)[0]!
+  h.files.set(`${PART_DIR}/${pName}`, pText)
+  h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
+  h.files.set(`${PART_DIR}/${bGoodName}`, bGoodText)
+  h.files.set(`${PART_DIR}/${bPoisonName}`, bPoisonText)
+  const markFor = (by: string, text: string, attempt: string) =>
+    sealFile(
+      `${JSON.stringify({
+        size: utf8Length(text),
+        sending: true,
+        by,
+        stagedFor: pName,
+        stagedForSize: pSize,
+        replaces: c1Name,
+        backup: true,
+        backupForSize: c1Size,
+        backupForFnv1a: fnv1a(c1Text),
+        backupFnv1a: fnv1a(text),
+        attempt,
+      })}\n`,
+    )
+  h.files.set(`${PART_DIR}/outcome-done-gd1g-${bGoodName}`, markFor('gd1g', bGoodText, 'att-good'))
+  h.files.set(`${PART_DIR}/outcome-done-ps1g-${bPoisonName}`, markFor('ps1g', bPoisonText, 'att-poison'))
+  // Poison bPoisonName with an unfinished v1 store checkpoint that 0.1.3 would resume and empty unsent.
+  h.store.set(`replayed:${TABLE}/${bPoisonName}`, {
+    fates: 'LL',
+    reasons: [],
+    refusals: [],
+    size: utf8Length(bPoisonText),
+    waits: false,
+    seq: 1,
+    files: [],
+    written: [],
+  })
+  h.store.set(`replayed:${TABLE}/${pName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+  h.store.set(`replayed:v2:${TABLE}/${pName}`, {
+    fates: 'LW',
+    reasons: [],
+    refusals: [],
+    size: pSize,
+    waits: true,
+    seq: 5,
+    files: [c1Name],
+    written: [true],
+    backupFiles: [{ name: bGoodName, size: utf8Length(bGoodText), fnv1a: fnv1a(bGoodText), replaces: c1Name, replacesSize: c1Size, replacesFnv1a: fnv1a(c1Text) }],
+  })
+  // Fail markDone so 0.1.3 force exercises the staged backup after v2 persists.
+  h.setWrite(async (p, text) => {
+    if (p.includes('/outcome-done-') && p.endsWith(`-${pName}`) && text.includes('"retired":true')) throw new Error('stopped before retired mark')
+    if (p === `${PART_DIR}/${pName}` && text === '') throw new Error('stopped before truncating parent')
+  })
+
+  await h.newCurrent('cur-diskslot-1').backfill(['spill', 'retry'], 'force')
+  const v2 = h.store.get(`replayed:v2:${TABLE}/${pName}`) as { backupFiles: { name: string; replaces: string }[] }
+  // Must NOT reuse bPoisonName; must stage a fresh clean backup for c1Name.
+  expect(v2.backupFiles.some(b => b.name === bPoisonName)).toBe(false)
+  const freshBk = v2.backupFiles.find(b => b.replaces === c1Name && b.name !== bGoodName && b.name !== bPoisonName)
+  expect(freshBk).not.toBeUndefined()
+  expect(h.files.get(`${PART_DIR}/${freshBk!.name}`)?.includes('C1_DISKSLOT_UNIQ')).toBe(true)
+
+  // 0.1.3 force retires P, drops c1Name, and consumes bPoisonName via its stale v1 record;
+  // 0.1.4 auto still delivers C1_DISKSLOT_UNIQ exactly once from freshBk.
+  h.setWrite(null)
+  h.advance(15 * 60 * 1000)
+  await h.newDist('dist-diskslot-1').backfill(['spill', 'retry'], 'force')
+  expect(h.files.get(`${PART_DIR}/${pName}`)).toBe('')
+  expect(h.files.get(`${PART_DIR}/${c1Name}`)).toBe('')
+  expect(h.files.get(`${PART_DIR}/${bPoisonName}`)).toBe('')
+  await h.newCurrent('cur-diskslot-2').backfill(['spill', 'retry'], 'auto')
+  await h.newCurrent('cur-diskslot-3').backfill(['spill', 'retry'], 'auto')
+  expect(h.count('C1_DISKSLOT_UNIQ')).toBe(1)
+  expect(h.liveDataFiles()).toEqual([])
+})
+
+test('interop: Phase 4 tracks per-part old-to-new rollback coverage, promotes already-empty old part against 503, and claims backup lease before final read', async () => {
+  const idA = 'a'.repeat(32)
+  const idB = 'b'.repeat(32)
+
+  // Arm 1: Pre-existing old backup is already empty when Phase 4 reads it -> replacement MUST be promoted
+  // out of newlyStaged so a subsequent HTTP 503 rollback in backfillFile leaves 1 live backup (never 0).
+  {
+    const h = makeInteropHarness()
+    const pName = 'retry-20200101T000000001Z-p4-alremp-p.jsonl'
+    const c1Name = 'spill-20200101T000000002Z-p4-alremp-c1.jsonl'
+    const bOldName = 'spill-20200101T000000003Z-p4-alremp-bk.jsonl'
+    const pText = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idB, 'B')])[0]!
+    const c1Text = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_P4_ALREMP')], pName)[0]!
+    const pSize = utf8Length(pText)
+    const c1Size = utf8Length(c1Text)
+    const bOldText = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', `dl:${c1Name}#1`, 'C1_P4_ALREMP', `${c1Name}#1`)], c1Name)[0]!
+    h.files.set(`${PART_DIR}/${pName}`, pText)
+    h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
+    h.files.set(`${PART_DIR}/${bOldName}`, bOldText)
+    h.files.set(
+      `${PART_DIR}/outcome-done-old7g-${bOldName}`,
+      sealFile(
+        `${JSON.stringify({
+          size: utf8Length(bOldText),
+          sending: true,
+          by: 'old7g',
+          stagedFor: pName,
+          stagedForSize: pSize,
+          replaces: c1Name,
+          backup: true,
+          backupForSize: c1Size,
+          backupForFnv1a: fnv1a(c1Text),
+          backupFnv1a: fnv1a(bOldText),
+          attempt: 'old-p4-alremp',
+        })}\n`,
+      ),
+    )
+    h.files.set(
+      `${PART_DIR}/outcome-done-prev7-${c1Name}`,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: c1Size + 77, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: h.io.now() })}\n`),
+    )
+    h.store.set(`replayed:${TABLE}/${pName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE}/${pName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [c1Name], written: [true] })
+    let standaloneWritten = false
+    let emptiedBeforePhase4Read = false
+    h.setWrite(async (p, text) => {
+      if (p.includes('/spill-') && !p.includes('/outcome') && text.includes('C1_P4_ALREMP') && !text.includes(`"parent":"${c1Name}"`)) {
+        standaloneWritten = true
+      }
+    })
+    h.setRead(async p => {
+      if (standaloneWritten && !emptiedBeforePhase4Read && p === `${PART_DIR}/${bOldName}`) {
+        emptiedBeforePhase4Read = true
+        h.files.set(p, '')
+        return ''
+      }
+      return undefined
+    })
+    h.setFetch(async () => ({ status: 503, text: 'upstream 503 after Phase 4' }))
+    await h.newCurrent('cur-p4-alremp-1').backfill(['retry'], 'force')
+    expect(emptiedBeforePhase4Read).toBe(true)
+    expect(h.files.get(`${PART_DIR}/${bOldName}`)).toBe('')
+    const liveBks = [...h.files.entries()].filter(
+      ([k, v]) => k.includes('/spill-') && !k.includes('/outcome') && !k.endsWith(`/${c1Name}`) && v.includes('C1_P4_ALREMP'),
+    )
+    expect(liveBks.length).toBe(1)
+    expect(liveBks[0]![1].includes(`"parent":"${c1Name}"`)).toBe(false)
+  }
+
+  // Arm 2: Multi-part backup transition (oldPart0, oldPart1 -> newPart0, newPart1):
+  // truncating oldPart0 succeeds, then truncating oldPart1 fails before modifying bytes.
+  // newPart0 MUST survive (promoted), while newPart1 MUST roll back so part 1 is not duplicated!
+  {
+    const h = makeInteropHarness()
+    const pName = 'retry-20200101T000000001Z-p4-mpart-p.jsonl'
+    const c1Name = 'spill-20200101T000000002Z-p4-mpart-c1.jsonl'
+    const bOld0Name = 'spill-20200101T000000003Z-p4-mpart-bk0.jsonl'
+    const bOld1Name = 'spill-20200101T000000004Z-p4-mpart-bk1.jsonl'
+    const bigPad = 'p'.repeat(1_575_000)
+    const pText = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idB, 'B')])[0]!
+    const c1Text = sealFile(`${[dlLine('spill', null, `MP0-${bigPad}`), dlLine('spill', null, `MP1-${bigPad}`)].join('\n')}\n`, pName)
+    const pSize = utf8Length(pText)
+    const c1Size = utf8Length(c1Text)
+    const oldLinkedParts = packFiles(
+      [
+        dlLine('spill', `dl:${c1Name}#0`, `MP0-${bigPad}`, `${c1Name}#0`),
+        dlLine('spill', `dl:${c1Name}#1`, `MP1-${bigPad}`, `${c1Name}#1`),
+      ],
+      c1Name,
+    )
+    expect(oldLinkedParts.length).toBe(2)
+    const bOld0Text = oldLinkedParts[0]!
+    const bOld1Text = oldLinkedParts[1]!
+    h.files.set(`${PART_DIR}/${pName}`, pText)
+    h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
+    h.files.set(`${PART_DIR}/${bOld0Name}`, bOld0Text)
+    h.files.set(`${PART_DIR}/${bOld1Name}`, bOld1Text)
+    const seedOldMark = (name: string, text: string, by: string) =>
+      h.files.set(
+        `${PART_DIR}/outcome-done-${by}-${name}`,
+        sealFile(
+          `${JSON.stringify({
+            size: utf8Length(text),
+            sending: true,
+            by,
+            stagedFor: pName,
+            stagedForSize: pSize,
+            replaces: c1Name,
+            backup: true,
+            backupForSize: c1Size,
+            backupForFnv1a: fnv1a(c1Text),
+            backupFnv1a: fnv1a(text),
+            attempt: 'old-mpart',
+          })}\n`,
+        ),
+      )
+    seedOldMark(bOld0Name, bOld0Text, 'mp0g')
+    seedOldMark(bOld1Name, bOld1Text, 'mp1g')
+    h.files.set(
+      `${PART_DIR}/outcome-done-prevmp-${c1Name}`,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: c1Size + 77, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: h.io.now() })}\n`),
+    )
+    h.store.set(`replayed:${TABLE}/${pName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE}/${pName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [c1Name], written: [true] })
+    let blockedOld1 = false
+    h.setWrite(async (p, text) => {
+      if (p === `${PART_DIR}/${bOld1Name}` && text === '') {
+        blockedOld1 = true
+        throw new Error('EIO before truncating old part 1')
+      }
+    })
+    await h.newCurrent('cur-p4-mpart-1').backfill(['retry'], 'force')
+    expect(blockedOld1).toBe(true)
+    expect(h.files.get(`${PART_DIR}/${bOld0Name}`)).toBe('')
+    expect(h.files.get(`${PART_DIR}/${bOld1Name}`)).toBe(bOld1Text)
+    const liveMp0Bks = [...h.files.entries()].filter(
+      ([k, v]) => k.includes('/spill-') && !k.includes('/outcome') && !k.endsWith(`/${c1Name}`) && v.includes('MP0-'),
+    )
+    const liveMp1Bks = [...h.files.entries()].filter(
+      ([k, v]) => k.includes('/spill-') && !k.includes('/outcome') && !k.endsWith(`/${c1Name}`) && v.includes('MP1-'),
+    )
+    // Part 0 has exactly 1 live backup (newPart0 promoted); Part 1 has exactly 1 live backup (oldPart1 intact, newPart1 rolled back).
+    expect(liveMp0Bks.length).toBe(1)
+    expect(liveMp0Bks[0]![1].includes(`"parent":"${c1Name}"`)).toBe(false)
+    expect(liveMp1Bks.length).toBe(1)
+    expect(liveMp1Bks[0]![0]).toBe(`${PART_DIR}/${bOld1Name}`)
+  }
+
+  // Arm 3: Phase 4 claims a temporary backup lease BEFORE its final read (`resFinal`),
+  // catches a racing lease overwrite before truncating, and releases its lease on completion.
+  {
+    const h = makeInteropHarness()
+    const pName = 'retry-20200101T000000001Z-p4-claim-p.jsonl'
+    const c1Name = 'spill-20200101T000000002Z-p4-claim-c1.jsonl'
+    const bOldName = 'spill-20200101T000000003Z-p4-claim-bk.jsonl'
+    const pText = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idB, 'B')])[0]!
+    const c1Text = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_P4_CLAIM')], pName)[0]!
+    const pSize = utf8Length(pText)
+    const c1Size = utf8Length(c1Text)
+    const bOldText = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', `dl:${c1Name}#1`, 'C1_P4_CLAIM', `${c1Name}#1`)], c1Name)[0]!
+    h.files.set(`${PART_DIR}/${pName}`, pText)
+    h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
+    h.files.set(`${PART_DIR}/${bOldName}`, bOldText)
+    h.files.set(
+      `${PART_DIR}/outcome-done-old8g-${bOldName}`,
+      sealFile(
+        `${JSON.stringify({
+          size: utf8Length(bOldText),
+          sending: true,
+          by: 'old8g',
+          stagedFor: pName,
+          stagedForSize: pSize,
+          replaces: c1Name,
+          backup: true,
+          backupForSize: c1Size,
+          backupForFnv1a: fnv1a(c1Text),
+          backupFnv1a: fnv1a(bOldText),
+          attempt: 'old-p4-claim',
+        })}\n`,
+      ),
+    )
+    h.files.set(
+      `${PART_DIR}/outcome-done-prev8-${c1Name}`,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: c1Size + 77, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: h.io.now() })}\n`),
+    )
+    h.store.set(`replayed:${TABLE}/${pName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE}/${pName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [c1Name], written: [true] })
+    let sawOwnLeaseDuringFinalRead = false
+    let injectedForeignDuringFinalRead = false
+    let phase4ReadCount = 0
+    let standaloneWritten = false
+    h.setWrite(async (p, text) => {
+      if (p.includes('/spill-') && !p.includes('/outcome') && text.includes('C1_P4_CLAIM') && !text.includes(`"parent":"${c1Name}"`)) {
+        standaloneWritten = true
+      }
+    })
+    h.setRead(async p => {
+      if (standaloneWritten && p === `${PART_DIR}/${bOldName}`) {
+        phase4ReadCount += 1
+        // Read 1 is pre-claim read; Read 2 is `resFinal` under our claimed backup lease.
+        if (phase4ReadCount === 2) {
+          const lease = h.store.get(`lease:${TABLE}/${bOldName}`) as { by?: string; holder?: string; until?: number } | undefined
+          if (lease?.by === 'cur-p4-claim-1' && typeof lease.holder === 'string' && lease.holder !== '' && (lease.until ?? 0) > h.io.now()) {
+            sawOwnLeaseDuringFinalRead = true
+          }
+          injectedForeignDuringFinalRead = true
+          h.store.set(`lease:${TABLE}/${bOldName}`, { by: 'racer', holder: 'rh', until: h.io.now() + 5 * 60 * 1000 })
+        }
+      }
+      return undefined
+    })
+    await h.newCurrent('cur-p4-claim-1').backfill(['retry'], 'force')
+    expect(sawOwnLeaseDuringFinalRead).toBe(true)
+    expect(injectedForeignDuringFinalRead).toBe(true)
+    // Racing foreign lease during `resFinal` blocked truncation of bOldName.
+    expect(h.files.get(`${PART_DIR}/${bOldName}`)).toBe(bOldText)
+    // After the foreign lease expires, a clean pass claims, truncates bOldName, and releases its temporary lease.
+    h.setRead(null)
+    h.setWrite(null)
+    h.advance(15 * 60 * 1000)
+    await h.newCurrent('cur-p4-claim-2').backfill(['retry'], 'force')
+    expect(h.files.get(`${PART_DIR}/${bOldName}`)).toBe('')
+    expect(h.store.get(`lease:${TABLE}/${bOldName}`)).toBeUndefined()
+  }
+})
+
+test('interop: resumed writeOut batches directory listing across many synthesized replacements and backups', async () => {
+  const h = makeInteropHarness()
+  const pName = 'retry-20200101T000000001Z-batchlist-p.jsonl'
+  const pText = packFiles([dlLine('retry', 'a'.repeat(32), 'A')])[0]!
+  const pSize = utf8Length(pText)
+  h.files.set(`${PART_DIR}/${pName}`, pText)
+  const N = 8
+  const adopted: string[] = []
+  const reconciled: { name: string; size: number; fnv1a: string }[] = []
+  const deliverableRefs: { name: string; size: number; fnv1a: string; replaces: string }[] = []
+  const backupFiles: { name: string; size: number; fnv1a: string; replaces: string; replacesSize: number; replacesFnv1a: string }[] = []
+  for (let i = 0; i < N; i += 1) {
+    const cName = `spill-20200101T00000001${i}Z-batchlist-c${i}.jsonl`
+    const repName = `spill-20200101T00000002${i}Z-batchlist-r${i}.jsonl`
+    const bkName = `spill-20200101T00000003${i}Z-batchlist-b${i}.jsonl`
+    const cText = packFiles([dlLine('spill', null, `BATCH_ROW_${i}`)], pName)[0]!
+    const repText = packFiles([dlLine('spill', `dl:${cName}#0`, `BATCH_ROW_${i}`, `${cName}#0`)], pName)[0]!
+    const bkText = packFiles([dlLine('spill', `dl:${cName}#0`, `BATCH_ROW_${i}`, `${cName}#0`)])[0]!
+    h.files.set(`${PART_DIR}/${cName}`, '')
+    h.files.set(`${PART_DIR}/${repName}`, repText)
+    h.files.set(`${PART_DIR}/${bkName}`, bkText)
+    h.files.set(
+      `${PART_DIR}/outcome-done-bg${i}g-${bkName}`,
+      sealFile(
+        `${JSON.stringify({
+          size: utf8Length(bkText),
+          sending: true,
+          by: `bg${i}g`,
+          stagedFor: pName,
+          stagedForSize: pSize,
+          replaces: cName,
+          backup: true,
+          backupForSize: utf8Length(cText),
+          backupForFnv1a: fnv1a(cText),
+          backupFnv1a: fnv1a(bkText),
+          attempt: 'att-batch',
+        })}\n`,
+      ),
+    )
+    adopted.push(repName)
+    reconciled.push({ name: cName, size: utf8Length(cText), fnv1a: fnv1a(cText) })
+    deliverableRefs.push({ name: repName, size: utf8Length(repText), fnv1a: fnv1a(repText), replaces: cName })
+    backupFiles.push({
+      name: bkName,
+      size: utf8Length(bkText),
+      fnv1a: fnv1a(bkText),
+      replaces: cName,
+      replacesSize: utf8Length(cText),
+      replacesFnv1a: fnv1a(cText),
+    })
+  }
+  h.store.set(`replayed:v2:${TABLE}/${pName}`, {
+    fates: 'L',
+    reasons: [],
+    refusals: [],
+    size: pSize,
+    sourceFnv1a: fnv1a(pText),
+    waits: true,
+    seq: 4,
+    files: [],
+    written: [],
+    adopted,
+    reconciled,
+    deliverableRefs,
+    backupFiles,
+    attempts: ['att-batch'],
+  })
+  // Fail retired mark so only resumed writeOut's guard/backup verification runs on pName.
+  h.setWrite(async (p, text) => {
+    if (p.includes('/outcome-done-') && p.endsWith(`-${pName}`) && text.includes('"retired":true')) throw new Error('stopped before retired mark')
+    if (p === `${PART_DIR}/${pName}` && text === '') throw new Error('stopped before truncating parent')
+  })
+  let listDirCalls = 0
+  h.setListDir(async dir => {
+    if (dir === PART_DIR) listDirCalls += 1
+  })
+  await h.newCurrent('cur-batchlist-1').backfill(['retry'], 'auto')
+  h.setListDir(null)
+  // Batched verification must NOT scale listDir linearly with the 8 backups (would be >= 11 without batching).
+  expect(listDirCalls).toBeLessThanOrEqual(6)
+  const v2After = h.store.get(`replayed:v2:${TABLE}/${pName}`) as { backupFiles: { name: string }[] }
+  expect(v2After.backupFiles.length).toBe(N)
 })
