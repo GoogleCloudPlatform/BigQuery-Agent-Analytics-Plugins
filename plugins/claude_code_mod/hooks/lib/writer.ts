@@ -257,6 +257,14 @@ type SupersededV1 = { size: number; seq: number; fates: string; files: string[] 
 type Rewrite = Outcome &
   Source & {
     sourceFnv1a?: string
+    // In-memory digest of the live source bytes read during `resumeRewrite`,
+    // used to detect concurrent source swaps before truncation WITHOUT
+    // certifying `sourceFnv1a` onto journals resumed from digest-less 0.1.3 records.
+    liveDigest?: string
+    // Set when an emptied original child must recover from its pre-dispatch
+    // backup so `markDone` persists `accountedKeys` on the retired mark and
+    // backup recovery skips rows the parent already assigned an outcome to.
+    emitRetiredAccountedKeys?: boolean
     files: { path: string; text: string | null; uncertain?: boolean }[]
     // Live children adopted from a superseded same-size conflicting journal
     // during `/bqaa-backfill force`, kept separate from the positional plan
@@ -3672,18 +3680,26 @@ export class Writer {
                 jFiles.some(f => typeof f === 'string' && baseOf(f) === replaces) ||
                 jAdopted.some(f => typeof f === 'string' && baseOf(f) === replaces)
               ) {
+                if (allV2LeftoversWritten && Array.isArray(r.accountedKeys) && r.accountedKeys.length > 0) {
+                  return { action: 'go', accountedKeys: new Set(r.accountedKeys.filter((k): k is string => typeof k === 'string')) }
+                }
                 return { action: 'go' }
               }
             }
-            if (
-              allRetired.some(
-                r =>
-                  matchesParentSize(r) &&
-                  coversAllAttempts(r, guardAttempts) &&
-                  Array.isArray(r.files) &&
-                  r.files.some(f => typeof f === 'string' && baseOf(f) === replaces),
+            const matchedRetiredForBackup = allRetired.filter(
+              r =>
+                matchesParentSize(r) &&
+                coversAllAttempts(r, guardAttempts) &&
+                Array.isArray(r.files) &&
+                r.files.some(f => typeof f === 'string' && baseOf(f) === replaces),
+            )
+            if (matchedRetiredForBackup.length > 0) {
+              const withAccountedKeys = matchedRetiredForBackup.find(
+                r => Array.isArray(r.accountedKeys) && r.accountedKeys.length > 0,
               )
-            ) {
+              if (withAccountedKeys !== undefined) {
+                return { action: 'go', accountedKeys: new Set(withAccountedKeys.accountedKeys!.filter((k): k is string => typeof k === 'string')) }
+              }
               return { action: 'go' }
             }
             // If `P` already retired & emptied without naming or reconciling
@@ -4027,6 +4043,7 @@ export class Writer {
       }
       const path = joinPath(dir, name)
       const priorHeld = this.heldPaths.get(path)
+      let keepParentLease = false
       try {
         const source = sourceFor(dir, name, sizes.get(name) ?? -1, c)
         // A replay already has this file's outcome: what is left of it is
@@ -4484,7 +4501,16 @@ export class Writer {
                 // drops the backup unsent if the old child clears first.
                 if (unwrittenEarlierV1Children.length > 0) {
                   if (effUnwrittenV1 !== undefined) {
-                    await this.stageV1SkippedBackups(dir, name, source.size, liveDigest, parsed, kindOf(name) ?? 'retry', effUnwrittenV1, c)
+                    const stageErr = await this.stageV1SkippedBackups(dir, name, source.size, liveDigest, parsed, kindOf(name) ?? 'retry', effUnwrittenV1, c)
+                    if (stageErr !== null) {
+                      keepParentLease = true
+                      const errMsg = `could not stage skipped-row backup for ${name}: ${stageErr}`
+                      this.recordError(errMsg)
+                      report.error ??= diagnostic(errMsg)
+                      report.skippedFiles += 1
+                      if (kindOf(name) !== 'rejected') tally.waiting += 1
+                      continue
+                    }
                   }
                   const firstChild =
                     (!kinds.includes('rejected') ? unwrittenEarlierV1Children.find(cn => kindOf(cn) === 'rejected') : undefined) ??
@@ -4644,10 +4670,12 @@ export class Writer {
         report.skippedFiles += 1
         if (kindOf(name) !== 'rejected') tally.waiting += 1
       } finally {
-        try {
-          await this.io.storeDelete(leaseKey)
-        } catch {
-          // The lease expires on its own.
+        if (!keepParentLease) {
+          try {
+            await this.io.storeDelete(leaseKey)
+          } catch {
+            // The lease expires on its own.
+          }
         }
       }
     }
@@ -6667,6 +6695,65 @@ export class Writer {
     found: Found | undefined,
     trigger?: BackfillReport['trigger'],
   ): Promise<Rewrite | 'unaccounted' | undefined> {
+    // True when a live `v1SkippedBackup` staged for this exact `(source.name,
+    // source.size, digest)` is still on disk (or cannot be ruled out). In that
+    // case a digest-less `v1` checkpoint was advanced by `0.1.3` from an
+    // earlier generation, so resuming it must NEVER certify `sourceFnv1a` onto
+    // `source`'s retired mark and discard the skipped-row backup unsent.
+    const hasLiveV1SkippedBackup = async (digest: string): Promise<boolean> => {
+      if (source.size <= 0) return false
+      try {
+        const entries = await this.io.listDir(source.dir)
+        const liveSizes = new Map<string, number>()
+        const gMarkFiles: { markName: string; ofName: string }[] = []
+        for (const entry of entries) {
+          if (entry.kind !== undefined && entry.kind !== 'file') continue
+          if (entry.size <= 0) continue
+          if (kindOf(entry.name) !== null) {
+            liveSizes.set(entry.name, entry.size)
+          } else {
+            const of = recordOf(entry.name)
+            const by = of !== null ? doneMarkerOf(entry.name, of) : null
+            if (of !== null && by !== null && by.endsWith('g')) {
+              gMarkFiles.push({ markName: entry.name, ofName: of })
+            }
+          }
+        }
+        for (const { markName, ofName } of gMarkFiles) {
+          const liveSize = liveSizes.get(ofName) ?? 0
+          if (liveSize <= 0 || ofName === source.name) continue
+          const rawMark = await this.io.readFile(joinPath(source.dir, markName))
+          if (!markStands(rawMark, liveSize)) continue
+          const parsedMark = journalOf(rawMark) as
+            | {
+                backup?: unknown
+                v1SkippedBackup?: unknown
+                stagedFor?: unknown
+                stagedForSize?: unknown
+                backupForSize?: unknown
+                backupForFnv1a?: unknown
+              }
+            | 'torn'
+            | undefined
+          if (parsedMark === 'torn') return true
+          if (
+            parsedMark !== undefined &&
+            parsedMark.backup === true &&
+            parsedMark.v1SkippedBackup === true &&
+            typeof parsedMark.stagedFor === 'string' &&
+            baseOf(parsedMark.stagedFor) === source.name &&
+            parsedMark.stagedForSize === source.size &&
+            parsedMark.backupForSize === source.size &&
+            parsedMark.backupForFnv1a === digest
+          ) {
+            return true
+          }
+        }
+        return false
+      } catch {
+        return true
+      }
+    }
     const prepareHeldForForce = async (h: Rewrite): Promise<Rewrite | undefined> => {
       if (trigger !== 'force' || found?.journal.retired === true) return h
       h.force = true
@@ -6675,8 +6762,13 @@ export class Writer {
         if (text === '') return undefined
         const lines = parseFile(text)
         if (!lines.complete || (source.size >= 0 && utf8Length(text) !== source.size)) return undefined
-        if (h.sourceFnv1a !== undefined && fnv1a(text) !== h.sourceFnv1a) return undefined
-        h.sourceFnv1a ??= fnv1a(text)
+        const heldDigest = fnv1a(text)
+        if (h.sourceFnv1a !== undefined && heldDigest !== h.sourceFnv1a) return undefined
+        if (h.liveDigest !== undefined && heldDigest !== h.liveDigest) return undefined
+        h.liveDigest ??= heldDigest
+        if (h.sourceFnv1a === undefined && !(await hasLiveV1SkippedBackup(heldDigest))) {
+          h.sourceFnv1a = heldDigest
+        }
         h.accountedRowKeys = new Set(lines.lines.map((line, i) => parentRowIdentity(line, source.name, i)))
         if (h.files.length === 0) {
           h.leftoverPartsByRowKey = new Map()
@@ -6749,11 +6841,10 @@ export class Writer {
       (stagedFiles !== undefined && stagedFiles.length > 0) ||
       (backupFiles !== undefined && backupFiles.length > 0) ||
       supersedesV1 !== undefined
-    const resolvedFnv1a = savedSourceFnv1a ?? source.fnv1a
     const rewrite: Rewrite = {
       ...outcome,
       ...source,
-      ...(resolvedFnv1a !== undefined ? { fnv1a: resolvedFnv1a, sourceFnv1a: resolvedFnv1a } : {}),
+      ...(savedSourceFnv1a !== undefined ? { fnv1a: savedSourceFnv1a, sourceFnv1a: savedSourceFnv1a, liveDigest: savedSourceFnv1a } : {}),
       waits: journal.waits === true || (pendingReconcile !== undefined && pendingReconcile.length > 0) || (stagedFiles !== undefined && stagedFiles.length > 0),
       filed: found.filed,
       seq: seqOf(journal),
@@ -6768,6 +6859,7 @@ export class Writer {
       ...(guardAttempts ? { guardAttempts } : {}),
       ...(supersedesV1 ? { supersedesV1 } : {}),
       ...(savedAccountedKeys ? { accountedRowKeys: savedAccountedKeys } : {}),
+      ...(savedAccountedKeys && !pendingReconcile ? { emitRetiredAccountedKeys: true } : {}),
       ...(trigger === 'force' && journal.retired !== true ? { force: true } : {}),
       ...(useV2 ? { useV2: true } : {}),
       ...(stampedIds !== undefined ? { stampedIds } : {}),
@@ -6780,8 +6872,11 @@ export class Writer {
         if (current === '' || utf8Length(current) !== source.size) return undefined
         const curDigest = fnv1a(current)
         if (savedSourceFnv1a !== undefined && curDigest !== savedSourceFnv1a) return undefined
-        rewrite.sourceFnv1a ??= curDigest
-        rewrite.fnv1a ??= curDigest
+        rewrite.liveDigest ??= curDigest
+        if (rewrite.sourceFnv1a === undefined && !(await hasLiveV1SkippedBackup(curDigest))) {
+          rewrite.sourceFnv1a = curDigest
+          rewrite.fnv1a ??= curDigest
+        }
       }
       return rewrite
     }
@@ -6796,8 +6891,11 @@ export class Writer {
     if (!lines.complete || (source.size >= 0 && utf8Length(text) !== source.size)) return undefined
     const liveDigest = fnv1a(text)
     if (savedSourceFnv1a !== undefined && liveDigest !== savedSourceFnv1a) return undefined
-    rewrite.sourceFnv1a ??= liveDigest
-    rewrite.fnv1a ??= liveDigest
+    rewrite.liveDigest ??= liveDigest
+    if (rewrite.sourceFnv1a === undefined && !(await hasLiveV1SkippedBackup(liveDigest))) {
+      rewrite.sourceFnv1a = liveDigest
+      rewrite.fnv1a ??= liveDigest
+    }
     if (needsPendingReconcile || needsForceChildAudit) {
       rewrite.accountedRowKeys = new Set(lines.lines.map((line, i) => parentRowIdentity(line, source.name, i)))
       if (rewrite.files.length === 0) {
@@ -7735,7 +7833,7 @@ export class Writer {
       const backupsNow = getBackupRefs()
       const namesNow = getRewriteNames()
       const needsAccountedKeys =
-        pendingNow.length > 0 &&
+        (pendingNow.length > 0 || rewrite.emitRetiredAccountedKeys === true) &&
         rewrite.accountedRowKeys !== undefined &&
         rewrite.accountedRowKeys.size > 0
       const journal: Journal = {
@@ -7868,21 +7966,110 @@ export class Writer {
         for (const r of getReconciledRefs()) origChildRefByName.set(r.name, r)
         for (const r of getPendingRefs()) if (!origChildRefByName.has(r.name)) origChildRefByName.set(r.name, r)
         // If a synthesized replacement (`deliverableRefs` with `replaces`) is
-        // already empty on disk without a matching `sourceFnv1a` retired mark,
-        // do not let `markDone` / `cleanupReconciledAndStaged` / `cleanupBackups`
-        // drop the original child and its backup: restore `origName` from
-        // `reconciledFiles` into `adoptedFiles` so either the live original or
-        // its surviving backup delivers the rows cleanly.
+        // already empty or swapped to different bytes on disk without a
+        // matching `sourceFnv1a` retired mark, do not let `markDone` /
+        // `cleanupReconciledAndStaged` / `cleanupBackups` drop the original
+        // child and its backup — and do not re-submit rows the parent already
+        // assigned an outcome to (e.g. a rejected row still parked in a
+        // `rejected-*` file): when the original is still intact on disk, move
+        // it back into `pendingReconcile` (rebuilding `accountedRowKeys` from
+        // live `P`) so Phase 3 synthesizes a clean filtered replacement; when
+        // the original is already empty/swapped, recover from its backup with
+        // `accountedKeys` persisted on `P`'s retired mark so backup replay
+        // skips already-accounted rows.
+        const ensureAccountedRowKeysFromParent = async (): Promise<boolean> => {
+          if (rewrite.accountedRowKeys !== undefined) return true
+          if (rewrite.size < 0 || rewrite.size > HOST_FILE_BYTES) return false
+          try {
+            const pText = await this.io.readFile(path)
+            if (pText === '' || utf8Length(pText) !== rewrite.size) return false
+            const expectedParentDigest = rewrite.sourceFnv1a ?? rewrite.liveDigest
+            if (expectedParentDigest !== undefined && fnv1a(pText) !== expectedParentDigest) return false
+            const pLines = parseFile(pText)
+            if (!pLines.complete) return false
+            rewrite.accountedRowKeys = new Set(pLines.lines.map((line, i) => parentRowIdentity(line, rewrite.name, i)))
+            if (rewrite.files.length === 0) {
+              rewrite.leftoverPartsByRowKey = new Map()
+            } else if (fitsLines(pLines, rewrite)) {
+              const pFileKind = kindOf(rewrite.name) ?? 'retry'
+              if (rewrite.stampedIds === true) {
+                rewrite.leftoverPartsByRowKey = buildLeftoverPartsByRowKey(
+                  leftoverFiles(pLines, pFileKind, rewrite, rewrite.name, true).files,
+                  rewrite.files,
+                )
+              } else if (rewrite.stampedIds === false) {
+                rewrite.leftoverPartsByRowKey = buildLeftoverPartsByRowKey(
+                  leftoverFiles(pLines, pFileKind, rewrite, rewrite.name, false).files,
+                  rewrite.files,
+                )
+              } else {
+                const stampedParts = leftoverFiles(pLines, pFileKind, rewrite, rewrite.name, true).files
+                const unstampedParts = leftoverFiles(pLines, pFileKind, rewrite, rewrite.name, false).files
+                if (sameLeftoverPartitioning(stampedParts, unstampedParts)) {
+                  rewrite.leftoverPartsByRowKey = buildLeftoverPartsByRowKey(stampedParts, rewrite.files)
+                }
+              }
+            }
+            return true
+          } catch {
+            return false
+          }
+        }
+        const matchedRepByName = new Set<string>()
         for (const dRef of [...(rewrite.deliverableRefs ?? [])]) {
           if (
             dRef.replaces === undefined ||
             dRef.replaces === '' ||
             dRef.replaces === dRef.name ||
             dRef.size <= 0 ||
-            dRef.fnv1a === '' ||
-            (listedBeforeRecord.get(dRef.name) ?? 0) > 0
+            dRef.fnv1a === ''
           ) {
             continue
+          }
+          const liveRepSize = listedBeforeRecord.get(dRef.name) ?? 0
+          let repIsEmpty = liveRepSize <= 0
+          let swappedRepParent: string | null | undefined
+          if (!repIsEmpty) {
+            if (liveRepSize === dRef.size && liveRepSize <= HOST_FILE_BYTES) {
+              try {
+                const repRaw = await this.io.readFile(joinPath(rewrite.dir, dRef.name))
+                if (repRaw === '') {
+                  repIsEmpty = true
+                } else if (utf8Length(repRaw) === dRef.size && fnv1a(repRaw) === dRef.fnv1a) {
+                  matchedRepByName.add(dRef.name)
+                  continue
+                } else {
+                  const repParsed = parseFile(repRaw)
+                  swappedRepParent = repParsed.complete ? (repParsed.parent === null ? null : baseOf(repParsed.parent)) : undefined
+                }
+              } catch (err) {
+                if (isNotFoundError(err)) {
+                  repIsEmpty = true
+                } else {
+                  rewrite.waits = true
+                  return false
+                }
+              }
+            } else if (liveRepSize <= HOST_FILE_BYTES) {
+              try {
+                const repRaw = await this.io.readFile(joinPath(rewrite.dir, dRef.name))
+                if (repRaw === '') {
+                  repIsEmpty = true
+                } else {
+                  const repParsed = parseFile(repRaw)
+                  swappedRepParent = repParsed.complete ? (repParsed.parent === null ? null : baseOf(repParsed.parent)) : undefined
+                }
+              } catch (err) {
+                if (isNotFoundError(err)) {
+                  repIsEmpty = true
+                } else {
+                  rewrite.waits = true
+                  return false
+                }
+              }
+            } else if (dRef.size > HOST_FILE_BYTES) {
+              continue
+            }
           }
           let repDelivered = false
           try {
@@ -7908,24 +8095,57 @@ export class Writer {
           }
           if (repDelivered) continue
           const origName = dRef.replaces
-          const nextAdopted = (rewrite.adoptedFiles ?? []).filter(n => n !== dRef.name)
-          if (!nextAdopted.includes(origName)) nextAdopted.push(origName)
-          rewrite.adoptedFiles = nextAdopted.length > 0 ? nextAdopted : undefined
+          const haveAccountedKeys = await ensureAccountedRowKeysFromParent()
+          if (!haveAccountedKeys && rewrite.size >= 0 && rewrite.size <= HOST_FILE_BYTES) {
+            rewrite.waits = true
+            return false
+          }
+          const keepSwappedRepAdopted = !repIsEmpty && (swappedRepParent === rewrite.name || swappedRepParent === undefined)
+          const nextAdopted = keepSwappedRepAdopted
+            ? [...(rewrite.adoptedFiles ?? [])]
+            : (rewrite.adoptedFiles ?? []).filter(n => n !== dRef.name)
+          if (!keepSwappedRepAdopted) candidateNames.delete(dRef.name)
           const nextDeliverables = (rewrite.deliverableRefs ?? []).filter(d => d.name !== dRef.name)
+          deliverableByName.delete(dRef.name)
           const origRef = origChildRefByName.get(origName)
+          const origLiveSize = listedBeforeRecord.get(origName) ?? 0
+          let origLiveMatches = false
           if (
             origRef !== undefined &&
             origRef.size > 0 &&
             origRef.fnv1a !== '' &&
-            (listedBeforeRecord.get(origName) ?? 0) > 0 &&
-            !nextDeliverables.some(d => d.name === origName)
+            origLiveSize === origRef.size &&
+            origLiveSize <= HOST_FILE_BYTES
           ) {
-            nextDeliverables.push({ name: origName, size: origRef.size, fnv1a: origRef.fnv1a, replaces: origName })
+            try {
+              const origRaw = await this.io.readFile(joinPath(rewrite.dir, origName))
+              origLiveMatches = origRaw !== '' && utf8Length(origRaw) === origRef.size && fnv1a(origRaw) === origRef.fnv1a
+            } catch {
+              rewrite.waits = true
+              return false
+            }
           }
-          rewrite.deliverableRefs = nextDeliverables.length > 0 ? nextDeliverables : undefined
-          deliverableByName.delete(dRef.name)
           const nextReconciled = (rewrite.reconciledFiles ?? []).filter(r => r.name !== origName)
           rewrite.reconciledFiles = nextReconciled.length > 0 ? nextReconciled : undefined
+          if (origLiveMatches && origRef !== undefined && haveAccountedKeys) {
+            const pendingNow = [...(rewrite.pendingReconcile ?? [])]
+            if (!pendingNow.some(p => p.name === origName)) {
+              pendingNow.push({ name: origRef.name, size: origRef.size, fnv1a: origRef.fnv1a })
+            }
+            rewrite.pendingReconcile = pendingNow
+            rewrite.adoptedFiles = nextAdopted.length > 0 ? nextAdopted : undefined
+            rewrite.deliverableRefs = nextDeliverables.length > 0 ? nextDeliverables : undefined
+          } else {
+            if (!nextAdopted.includes(origName)) nextAdopted.push(origName)
+            rewrite.adoptedFiles = nextAdopted.length > 0 ? nextAdopted : undefined
+            if (origLiveMatches && origRef !== undefined && !nextDeliverables.some(d => d.name === origName)) {
+              nextDeliverables.push({ name: origName, size: origRef.size, fnv1a: origRef.fnv1a, replaces: origName })
+            }
+            rewrite.deliverableRefs = nextDeliverables.length > 0 ? nextDeliverables : undefined
+            if (haveAccountedKeys && rewrite.accountedRowKeys !== undefined && rewrite.accountedRowKeys.size > 0) {
+              rewrite.emitRetiredAccountedKeys = true
+            }
+          }
           candidateNames.add(origName)
           rewrite.waits = true
           recorded = false
@@ -8239,12 +8459,14 @@ export class Writer {
           ) {
             // Only consider skipping guarding/backing up `childName` if its live
             // bytes actually match `dRef` (exact size + digest).
-            let repMatchesDRef = false
-            try {
-              const repRaw = await this.io.readFile(childPath)
-              repMatchesDRef = repRaw !== '' && utf8Length(repRaw) === dRef.size && fnv1a(repRaw) === dRef.fnv1a
-            } catch {
-              repMatchesDRef = false
+            let repMatchesDRef = matchedRepByName.has(childName)
+            if (!repMatchesDRef) {
+              try {
+                const repRaw = await this.io.readFile(childPath)
+                repMatchesDRef = repRaw !== '' && utf8Length(repRaw) === dRef.size && fnv1a(repRaw) === dRef.fnv1a
+              } catch {
+                repMatchesDRef = false
+              }
             }
             if (repMatchesDRef) {
               repCandidates.push({ childName, childPath, childSize, dRef })
@@ -8407,11 +8629,16 @@ export class Writer {
           for (const item of skippedByOrig) {
             if (!postOrigMap.has(item.origRef.name)) postOrigMap.set(item.origRef.name, item.origRef)
           }
+          const postBackupsByReplaces = new Map<string, BackupFile[]>()
+          for (const b of rewrite.backupFiles ?? []) {
+            const list = postBackupsByReplaces.get(b.replaces)
+            if (list) list.push(b)
+            else postBackupsByReplaces.set(b.replaces, [b])
+          }
           const postOrigRequests: { origName: string; origRef?: ReconciledFile; allowOrigLive: boolean; backups: BackupFile[] }[] = []
           for (const [origName, origRef] of postOrigMap) {
-            const matchingBackups = (rewrite.backupFiles ?? []).filter(
+            const matchingBackups = (postBackupsByReplaces.get(origRef.name) ?? []).filter(
               b =>
-                b.replaces === origRef.name &&
                 b.replacesSize === origRef.size &&
                 (b.replacesFnv1a === undefined || b.replacesFnv1a === '' || b.replacesFnv1a === origRef.fnv1a),
             )
@@ -8425,6 +8652,7 @@ export class Writer {
         const fallbackGuardTargets = new Map<string, number>()
         const fallbackExpectedParents = new Set<string>()
         let sawEmptyOrReadError = false
+        let sawSwappedReplacement = false
         const checkFinalSkippedItem = async (
           item: { childName: string; childPath: string; dRef: StagedFile },
           predVerified: boolean,
@@ -8446,6 +8674,7 @@ export class Writer {
           const repSizeNow = utf8Length(repNow)
           const repMatchesNow = repSizeNow === item.dRef.size && fnv1a(repNow) === item.dRef.fnv1a
           if (predVerified && repMatchesNow) return
+          if (!repMatchesNow) sawSwappedReplacement = true
           if (repSizeNow <= HOST_FILE_BYTES) {
             const repParsed = parseFile(repNow)
             if (repParsed.complete && repParsed.parent !== null && baseOf(repParsed.parent) !== rewrite.name) return
@@ -8485,7 +8714,7 @@ export class Writer {
             return await abortAfterGuardStaging()
           }
         }
-        if (sawEmptyOrReadError) {
+        if (sawEmptyOrReadError || sawSwappedReplacement) {
           return await abortAfterGuardStaging()
         }
       }
@@ -9469,9 +9698,10 @@ export class Writer {
     try {
       if (rewrite.size >= 0) {
         const currentRaw = await this.io.readFile(path)
+        const expectedParentDigest = rewrite.sourceFnv1a ?? rewrite.liveDigest
         if (
           currentRaw !== '' &&
-          (utf8Length(currentRaw) !== rewrite.size || (rewrite.sourceFnv1a !== undefined && fnv1a(currentRaw) !== rewrite.sourceFnv1a))
+          (utf8Length(currentRaw) !== rewrite.size || (expectedParentDigest !== undefined && fnv1a(currentRaw) !== expectedParentDigest))
         ) {
           this.rewrites.delete(path)
           this.recordError(`${path} changed content before it could be emptied; keeping newer content for the next replay`)
@@ -9735,6 +9965,9 @@ export class Writer {
       ...(reconciledMarks.length > 0 ? { reconciled: reconciledMarks } : {}),
       ...(rewrite.guardAttempt ? { attempt: rewrite.guardAttempt } : {}),
       ...(rewrite.guardAttempts && rewrite.guardAttempts.length > 0 ? { attempts: rewrite.guardAttempts } : {}),
+      ...(rewrite.emitRetiredAccountedKeys && rewrite.accountedRowKeys !== undefined && rewrite.accountedRowKeys.size > 0
+        ? { accountedKeys: [...rewrite.accountedRowKeys] }
+        : {}),
       ...(rewrite.stampedIds !== undefined ? { stampedIds: rewrite.stampedIds } : {}),
     }
     try {
@@ -10316,19 +10549,10 @@ export class Writer {
     fileKind: DeadLetterKind,
     effUnwrittenV1: Partial<Journal>,
     c: Config,
-  ): Promise<void> {
+  ): Promise<string | null> {
     const parts = v1SkippedBackupParts(parsed, fileKind, effUnwrittenV1, parentName)
-    if (parts.length === 0) return
-    const dest = destinationDir(tableRef(c))
-    const me = this.sessionId() ?? 'unknown'
+    if (parts.length === 0) return null
     const guardMark = `${this.mark}g`
-    const isForeign = (lease: { by?: string; holder?: string; until?: number } | undefined): boolean =>
-      Boolean(
-        lease &&
-          typeof lease.until === 'number' &&
-          lease.until > this.io.now() &&
-          (lease.by !== me || typeof lease.holder !== 'string' || lease.holder === '' || lease.holder !== this.mark),
-      )
     const stagedHere: string[] = []
     try {
       const entries = await this.io.listDir(dir)
@@ -10367,8 +10591,6 @@ export class Writer {
         ) {
           continue
         }
-        const bLease = (await this.io.storeGet(`lease:${dest}/${liveName}`)) as { by?: string; holder?: string; until?: number } | undefined
-        if (isForeign(bLease)) continue
         const bDone = await this.doneMarksAll(liveSource, liveCompanions)
         if (bDone.torn || bDone.records.length > 0) continue
         const anySource = { ...sourceFor(dir, liveName, -1, c), live: false }
@@ -10424,7 +10646,8 @@ export class Writer {
         await this.io.writeFile(bPath, part.text)
         existingByKey.add(key)
       }
-    } catch {
+      return null
+    } catch (err) {
       for (const bName of stagedHere) {
         try {
           const bPath = joinPath(dir, bName)
@@ -10443,6 +10666,7 @@ export class Writer {
           // Best-effort cleanup of partially staged v1-skipped backup.
         }
       }
+      return errorText(err)
     }
   }
 
@@ -10624,13 +10848,23 @@ export class Writer {
     let leasedChild: string | undefined
     let mutatedChild: string | undefined
     const acquiredChildLeases: string[] = []
-    const acquiredPhase4BackupLeases: string[] = []
+    const acquiredPhase4BackupLeases = new Set<string>()
+    const reusedDiskBackups: BackupFile[] = []
     const isForeignChildLease = (lease: { by?: string; holder?: string; until?: number } | undefined): boolean =>
       Boolean(
         lease &&
           typeof lease.until === 'number' &&
           lease.until > this.io.now() &&
           (lease.by !== me || typeof lease.holder !== 'string' || lease.holder === '' || lease.holder !== this.mark),
+      )
+    const isOwnHeldBackupLease = (lease: { by?: string; holder?: string; until?: number } | undefined): boolean =>
+      Boolean(
+        lease &&
+          typeof lease.until === 'number' &&
+          lease.until > this.io.now() &&
+          lease.by === me &&
+          typeof lease.holder === 'string' &&
+          lease.holder === this.mark,
       )
     const failChildMutated = async (cName: string, hadLease: boolean, msg: string): Promise<never> => {
       if (hadLease) {
@@ -10703,15 +10937,27 @@ export class Writer {
         let reused: BackupFile | null = null
         for (const cand of diskCandidatesByKey.get(diskKey) ?? []) {
           if (usedDiskBackups.has(cand.name)) continue
-          const bLease = (await this.io.storeGet(`lease:${dest}/${cand.name}`)) as { by?: string; holder?: string; until?: number } | undefined
+          const candLeaseKey = `lease:${dest}/${cand.name}`
+          const bLease = (await this.io.storeGet(candLeaseKey)) as { by?: string; holder?: string; until?: number } | undefined
           if (isForeignChildLease(bLease)) continue
+          if (!isOwnHeldBackupLease(bLease)) {
+            try {
+              await this.io.storeSet(candLeaseKey, { by: me, holder: this.mark, until: this.io.now() + LEASE_MS })
+              acquiredPhase4BackupLeases.add(cand.name)
+            } catch {
+              continue
+            }
+          }
           const { companions } = await ensureCompanions()
           if (!(await hasCleanBackupReplaySlots(cand.name, bSize, companions))) continue
           const candRead = await readIfPresent(joinPath(dir, cand.name))
           if (candRead.present && candRead.text !== '' && utf8Length(candRead.text) === bSize && fnv1a(candRead.text) === bDigest) {
+            const bLeaseCheck = (await this.io.storeGet(candLeaseKey)) as { by?: string; holder?: string; until?: number } | undefined
+            if (!isOwnHeldBackupLease(bLeaseCheck)) continue
             usedDiskBackups.add(cand.name)
             for (const a of cand.attempts) priorAttemptsSet.add(a)
             reused = { name: cand.name, size: bSize, fnv1a: bDigest, replaces: childName, replacesSize: childSize, replacesFnv1a: childDigest }
+            reusedDiskBackups.push(reused)
             break
           }
         }
@@ -11024,6 +11270,83 @@ export class Writer {
           for (const ref of entry.stagedForChild) addCandidate(ref)
           for (const cand of diskCandidatesByChild.get(entry.childName) ?? []) addCandidate(cand)
         }
+        const keptBackupsByEntry = new Map<(typeof recheckTargets)[number], BackupFile[]>()
+        const keptBackupsToVerify = new Map<string, BackupFile>()
+        if (toRetireEntries.length > 0) {
+          const entriesWithRetire = new Set(toRetireEntries.map(item => item.entry))
+          for (const entry of entriesWithRetire) {
+            const entryKept: BackupFile[] = []
+            const coveredKeepKeys = new Set<string>()
+            for (const b of backupsByChild.get(entry.childName) ?? []) {
+              if (absentBackups.has(b.name) || uncleanBackups.has(b.name) || seenRetireNames.has(b.name)) continue
+              if (b.replaces !== entry.childName || b.replacesSize !== entry.childSize || b.replacesFnv1a !== entry.childDigest) continue
+              const k = `${b.size}\0${b.fnv1a}`
+              if (entry.finalKeepKeys.has(k)) {
+                entryKept.push(b)
+                coveredKeepKeys.add(k)
+                keptBackupsToVerify.set(b.name, b)
+              }
+            }
+            if (coveredKeepKeys.size < entry.finalKeepKeys.size) {
+              mutatedChild = entry.childName
+              throw new Error(`kept backup missing before retiring superseded backup of ${entry.childName}`)
+            }
+            keptBackupsByEntry.set(entry, entryKept)
+          }
+        }
+        for (const rRef of reusedDiskBackups) {
+          if (!absentBackups.has(rRef.name) && !uncleanBackups.has(rRef.name) && !seenRetireNames.has(rRef.name)) {
+            keptBackupsToVerify.set(rRef.name, rRef)
+          }
+        }
+        if (keptBackupsToVerify.size > 0) {
+          // Claim temporary leases on every kept/reused backup BEFORE taking
+          // ONE shared post-lease directory listing to re-verify replay slots,
+          // sending marks, live bytes, and lease ownership so a legacy outcome
+          // published after Phase 2/3b can never consume a kept copy unsent
+          // while Phase 4 truncates the old backup.
+          for (const kRef of keptBackupsToVerify.values()) {
+            const kLeaseKey = `lease:${dest}/${kRef.name}`
+            const kLease = (await this.io.storeGet(kLeaseKey)) as { by?: string; holder?: string; until?: number } | undefined
+            if (isForeignChildLease(kLease)) {
+              leasedChild = kRef.name
+              throw new Error(`another session's lease holds kept backup ${kRef.name}`)
+            }
+            if (!isOwnHeldBackupLease(kLease)) {
+              await this.io.storeSet(kLeaseKey, { by: me, holder: this.mark, until: this.io.now() + LEASE_MS })
+              acquiredPhase4BackupLeases.add(kRef.name)
+            }
+          }
+          const keptDirEntries = await this.io.listDir(dir)
+          const keptCompanions = groupCompanions(keptDirEntries)
+          for (const kRef of keptBackupsToVerify.values()) {
+            if (!(await hasCleanBackupReplaySlots(kRef.name, kRef.size, keptCompanions))) {
+              uncleanBackups.add(kRef.name)
+              mutatedChild = kRef.name
+              throw new Error(`kept backup ${kRef.name} gained replay records before Phase 4 retirement`)
+            }
+            const km = await this.marksDetailed(sourceFor(dir, kRef.name, kRef.size, c), keptCompanions.get(kRef.name) ?? [])
+            if (km.nonStagedBy.length > 0 || km.uncertain === true) {
+              uncleanBackups.add(kRef.name)
+              mutatedChild = kRef.name
+              throw new Error(`kept backup ${kRef.name} gained active sending mark before Phase 4 retirement`)
+            }
+            const kRead = await readIfPresent(joinPath(dir, kRef.name))
+            if (!kRead.present || kRead.text === '' || utf8Length(kRead.text) !== kRef.size || fnv1a(kRead.text) !== kRef.fnv1a) {
+              mutatedChild = kRef.name
+              throw new Error(`kept backup ${kRef.name} changed bytes before Phase 4 retirement`)
+            }
+            const kLeaseConfirm = (await this.io.storeGet(`lease:${dest}/${kRef.name}`)) as { by?: string; holder?: string; until?: number } | undefined
+            if (!isOwnHeldBackupLease(kLeaseConfirm)) {
+              if (isForeignChildLease(kLeaseConfirm)) {
+                leasedChild = kRef.name
+                throw new Error(`another session's lease holds kept backup ${kRef.name}`)
+              }
+              mutatedChild = kRef.name
+              throw new Error(`lost backup lease for kept backup ${kRef.name}`)
+            }
+          }
+        }
         if (toRetireEntries.length > 0) {
           for (const { ref } of toRetireEntries) {
             const bLease = (await this.io.storeGet(`lease:${dest}/${ref.name}`)) as { by?: string; holder?: string; until?: number } | undefined
@@ -11089,16 +11412,9 @@ export class Writer {
                 leasedChild = ref.name
                 throw new Error(`another session's lease holds superseded backup ${ref.name}`)
               }
-              const ownBackupLease = Boolean(
-                bLeaseNow &&
-                  typeof bLeaseNow.until === 'number' &&
-                  bLeaseNow.until > this.io.now() &&
-                  bLeaseNow.by === me &&
-                  bLeaseNow.holder === this.mark,
-              )
-              if (!ownBackupLease) {
+              if (!isOwnHeldBackupLease(bLeaseNow)) {
                 await this.io.storeSet(bLeaseKey, { by: me, holder: this.mark, until: this.io.now() + LEASE_MS })
-                acquiredPhase4BackupLeases.push(ref.name)
+                acquiredPhase4BackupLeases.add(ref.name)
               }
               // Final pre-truncate read under our claimed backup lease so
               // neither a concurrent reader nor a newer generation swapped in
@@ -11109,9 +11425,26 @@ export class Writer {
                 continue
               }
               const bLeaseConfirm = (await this.io.storeGet(bLeaseKey)) as { by?: string; holder?: string; until?: number } | undefined
-              if (isForeignChildLease(bLeaseConfirm)) {
-                leasedChild = ref.name
-                throw new Error(`another session's lease holds superseded backup ${ref.name}`)
+              if (!isOwnHeldBackupLease(bLeaseConfirm)) {
+                if (isForeignChildLease(bLeaseConfirm)) {
+                  leasedChild = ref.name
+                  throw new Error(`another session's lease holds superseded backup ${ref.name}`)
+                }
+                mutatedChild = ref.name
+                throw new Error(`lost backup lease for superseded backup ${ref.name}`)
+              }
+              const oldPartIdx = entry.partIndexByKey.get(`${ref.size}\0${ref.fnv1a}`)
+              for (const kRef of keptBackupsByEntry.get(entry) ?? []) {
+                if (oldPartIdx !== undefined && entry.partIndexByKey.get(`${kRef.size}\0${kRef.fnv1a}`) !== oldPartIdx) continue
+                const kLeaseNow = (await this.io.storeGet(`lease:${dest}/${kRef.name}`)) as { by?: string; holder?: string; until?: number } | undefined
+                if (!isOwnHeldBackupLease(kLeaseNow)) {
+                  if (isForeignChildLease(kLeaseNow)) {
+                    leasedChild = kRef.name
+                    throw new Error(`another session's lease holds kept backup ${kRef.name}`)
+                  }
+                  mutatedChild = kRef.name
+                  throw new Error(`lost backup lease for kept backup ${kRef.name}`)
+                }
               }
               try {
                 await this.io.writeFile(bPath, '')
