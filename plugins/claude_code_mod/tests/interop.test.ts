@@ -4875,17 +4875,32 @@ test('interop: Phase 4 leases and rechecks reused disk candidate replay slots be
 test('interop: empty synthesized replacement never re-submits parent-rejected row while rejected file stays parked', async () => {
   const idA = 'a'.repeat(32)
   const idRej = 'r'.repeat(32)
-  for (const arm of ['live-orig', 'empty-orig-backup'] as const) {
+  for (const arm of ['live-orig', 'empty-orig-backup', 'empty-orig-with-deferred-pending-sibling'] as const) {
     const h = makeInteropHarness()
     const pName = `retry-20200101T000000001Z-emptrep-${arm}-p.jsonl`
     const c1Name = `spill-20200101T000000002Z-emptrep-${arm}-c1.jsonl`
+    const c2Name = `spill-20200101T000000003Z-emptrep-${arm}-c2.jsonl`
     const pText = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idRej, 'R_OVERLAP')])[0]!
     const c1Text = packFiles([dlLine('spill', idRej, 'R_OVERLAP'), dlLine('spill', null, 'C1_UNIQUE')], pName)[0]!
+    const c2Text = packFiles([dlLine('spill', idRej, 'R_OVERLAP'), dlLine('spill', null, 'C2_UNIQUE')], pName)[0]!
     const pSize = utf8Length(pText)
     h.files.set(`${PART_DIR}/${pName}`, pText)
     h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
+    const childNames = arm === 'empty-orig-with-deferred-pending-sibling' ? [c1Name, c2Name] : [c1Name]
+    if (arm === 'empty-orig-with-deferred-pending-sibling') {
+      h.files.set(`${PART_DIR}/${c2Name}`, c2Text)
+    }
     h.store.set(`replayed:${TABLE}/${pName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
-    h.store.set(`replayed:v2:${TABLE}/${pName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [c1Name], written: [true] })
+    h.store.set(`replayed:v2:${TABLE}/${pName}`, {
+      fates: 'LW',
+      reasons: [],
+      refusals: [],
+      size: pSize,
+      waits: true,
+      seq: 5,
+      files: childNames,
+      written: childNames.map(() => true),
+    })
 
     let rOverlapAttempts = 0
     h.setFetch(async tags => {
@@ -4906,25 +4921,52 @@ test('interop: empty synthesized replacement never re-submits parent-rejected ro
       if (p === `${PART_DIR}/${pName}` && text === '') throw new Error('stopped before truncating parent')
     })
 
-    // Pass 1 (0.1.4 force): refuses R_OVERLAP into rejected-* file, reconciles c1Name into rep1 (C1_UNIQUE only), stops before markDone.
+    // Pass 1 (0.1.4 force): refuses R_OVERLAP into rejected-* file, reconciles child(ren) into rep(s), stops before markDone.
     await h.newCurrent(`cur-emptrep-${arm}-1`).backfill(['spill', 'retry'], 'force')
     expect(rOverlapAttempts).toBe(1)
     const v2 = h.store.get(`replayed:v2:${TABLE}/${pName}`) as {
       files: string[]
       adopted: string[]
+      deliverableRefs: { name: string; replaces?: string }[]
       backupFiles: { name: string; replaces: string }[]
     }
-    const rep1Name = v2.adopted[0]!
+    const rep1Name = v2.deliverableRefs.find(d => d.replaces === c1Name)!.name
     const rejFileName = v2.files.find(f => f.startsWith('rejected-'))!
     expect(rejFileName).not.toBeUndefined()
     expect(h.files.get(`${PART_DIR}/${rejFileName}`)?.includes('R_OVERLAP')).toBe(true)
     expect(h.files.get(`${PART_DIR}/${rep1Name}`)?.includes('C1_UNIQUE')).toBe(true)
     expect(h.files.get(`${PART_DIR}/${rep1Name}`)?.includes('R_OVERLAP')).toBe(false)
 
-    // Empty rep1Name unsent (and in Arm 2 also empty c1Name so recovery must come from bk1).
+    // Empty rep1Name unsent (and in Arm 2 / Arm 3 also empty c1Name so recovery must come from bk1).
     h.files.set(`${PART_DIR}/${rep1Name}`, '')
-    if (arm === 'empty-orig-backup') {
+    if (arm !== 'live-orig') {
       h.files.set(`${PART_DIR}/${c1Name}`, '')
+    }
+    if (arm === 'empty-orig-with-deferred-pending-sibling') {
+      const rep2Name = v2.deliverableRefs.find(d => d.replaces === c2Name)!.name
+      // Empty rep2Name while c2Name stays live, and hold c2Name under a foreign lease so Phase 3
+      // defers c2Name AFTER recording v2 with BOTH pendingReconcile: [c2Name] and emitRetiredAccountedKeys: true.
+      h.files.set(`${PART_DIR}/${rep2Name}`, '')
+      h.store.set(`lease:${TABLE}/${c2Name}`, { by: 'other-session', until: h.io.now() + 5 * 60 * 1000 })
+      h.setWrite(null)
+      await h.newCurrent(`cur-emptrep-${arm}-2`).backfill(['spill', 'retry'], 'auto')
+      expect(h.files.get(`${PART_DIR}/${pName}`)).toBe(pText)
+      const v2Deferred = h.store.get(`replayed:v2:${TABLE}/${pName}`) as {
+        pendingReconcile?: { name: string }[]
+        emitRetiredAccountedKeys?: boolean
+      }
+      expect(v2Deferred.pendingReconcile?.some(p => p.name === c2Name)).toBe(true)
+      expect(v2Deferred.emitRetiredAccountedKeys).toBe(true)
+      // Clear foreign lease on c2Name and finish recovery in a fresh session (resuming v2 with pendingReconcile non-empty!).
+      h.store.delete(`lease:${TABLE}/${c2Name}`)
+      await h.newCurrent(`cur-emptrep-${arm}-3`).backfill(['spill', 'retry'], 'auto')
+      await h.newCurrent(`cur-emptrep-${arm}-4`).backfill(['spill', 'retry'], 'auto')
+      expect(h.count('C1_UNIQUE')).toBe(1)
+      expect(h.count('C2_UNIQUE')).toBe(1)
+      expect(rOverlapAttempts).toBe(1)
+      expect(h.files.get(`${PART_DIR}/${rejFileName}`)?.includes('R_OVERLAP')).toBe(true)
+      expect(h.liveDataFiles()).toEqual([`${PART_DIR}/${rejFileName}`])
+      continue
     }
 
     // Pass 2 + 3 (0.1.4 auto): recovers C1_UNIQUE exactly once WITHOUT re-submitting R_OVERLAP while rejected-* stays parked!

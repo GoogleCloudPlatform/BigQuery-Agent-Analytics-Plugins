@@ -346,6 +346,7 @@ type Journal = Outcome & {
   attempt?: string
   attempts?: string[]
   accountedKeys?: string[]
+  emitRetiredAccountedKeys?: boolean
   supersedesV1?: SupersededV1
   uncertain?: boolean[]
   stampedIds?: boolean
@@ -6655,6 +6656,7 @@ export class Writer {
     if (rewrite.accountedRowKeys === undefined && Array.isArray(found.journal.accountedKeys) && found.journal.accountedKeys.length > 0) {
       rewrite.accountedRowKeys = new Set(found.journal.accountedKeys.filter((k): k is string => typeof k === 'string'))
     }
+    if (found.journal.emitRetiredAccountedKeys === true) rewrite.emitRetiredAccountedKeys = true
     const foundDeliverables = normalizeStagedRefs(found.journal.deliverableRefs)
     if (foundDeliverables.length > 0 || rewrite.deliverableRefs !== undefined) {
       const mergedDeliverables = new Map<string, StagedFile>()
@@ -6859,7 +6861,7 @@ export class Writer {
       ...(guardAttempts ? { guardAttempts } : {}),
       ...(supersedesV1 ? { supersedesV1 } : {}),
       ...(savedAccountedKeys ? { accountedRowKeys: savedAccountedKeys } : {}),
-      ...(savedAccountedKeys && !pendingReconcile ? { emitRetiredAccountedKeys: true } : {}),
+      ...(journal.emitRetiredAccountedKeys === true || (savedAccountedKeys && !pendingReconcile) ? { emitRetiredAccountedKeys: true } : {}),
       ...(trigger === 'force' && journal.retired !== true ? { force: true } : {}),
       ...(useV2 ? { useV2: true } : {}),
       ...(stampedIds !== undefined ? { stampedIds } : {}),
@@ -7858,6 +7860,7 @@ export class Writer {
         ...(rewrite.guardAttempt ? { attempt: rewrite.guardAttempt } : {}),
         ...(rewrite.guardAttempts && rewrite.guardAttempts.length > 0 ? { attempts: rewrite.guardAttempts } : {}),
         ...(needsAccountedKeys ? { accountedKeys: [...rewrite.accountedRowKeys!] } : {}),
+        ...(rewrite.emitRetiredAccountedKeys === true ? { emitRetiredAccountedKeys: true } : {}),
         ...(rewrite.supersedesV1 !== undefined ? { supersedesV1: rewrite.supersedesV1 } : {}),
         ...(rewrite.stampedIds !== undefined ? { stampedIds: rewrite.stampedIds } : {}),
         ...(rewrite.files.some(f => f.uncertain === true)
