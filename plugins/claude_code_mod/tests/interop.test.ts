@@ -3281,7 +3281,7 @@ test('interop: resumed writeOut and childGuard marks on a parent-linked synthesi
   }
 })
 
-test('interop: resumed writeOut verifies child and backup fingerprints so same-size child basename reuse plus empty, mismatched, or exposed parent-linked backup still backs up replacement', async () => {
+test('interop: resumed writeOut verifies replacement, child, and leased backup fingerprints across reuse, mid-check truncation, and backup v1 records', async () => {
   const idA = 'a'.repeat(32)
   const idB = 'b'.repeat(32)
   for (const bkMode of [
@@ -3290,6 +3290,9 @@ test('interop: resumed writeOut verifies child and backup fingerprints so same-s
     'linked-backup',
     'diff-size-retired-linked-backup',
     'v1-store-linked-backup',
+    'reused-rep-same-size',
+    'backup-truncated-after-read',
+    'backup-v1-store-record',
   ] as const) {
     const h = makeInteropHarness()
     const pName = `retry-20200101T000000001Z-reused-orig-${bkMode}-p.jsonl`
@@ -3323,10 +3326,12 @@ test('interop: resumed writeOut verifies child and backup fingerprints so same-s
     }
     const rep1Name = v2.adopted[0]!
     const bk1Name = v2.backupFiles.find(b => b.replaces === c1Name)!.name
+    const origRep1Text = h.files.get(`${PART_DIR}/${rep1Name}`)!
     const origBk1Text = h.files.get(`${PART_DIR}/${bk1Name}`)!
-    expect(h.files.get(`${PART_DIR}/${rep1Name}`)?.includes(`"parent":"${pName}"`)).toBe(true)
+    expect(origRep1Text.includes(`"parent":"${pName}"`)).toBe(true)
 
-    // Mutate c1Name / bk1Name according to mode before resuming writeOut.
+    let truncatedBkAfterRead = false
+    // Mutate c1Name / bk1Name / rep1Name according to mode before resuming writeOut.
     if (bkMode === 'empty-backup') {
       h.files.set(`${PART_DIR}/${c1Name}`, c1Gen2Text)
       h.files.set(`${PART_DIR}/${bk1Name}`, '')
@@ -3353,43 +3358,89 @@ test('interop: resumed writeOut verifies child and backup fingerprints so same-s
       expect(h.files.get(`${PART_DIR}/${c1Name}`)).toBe('')
       expect(h.count('C1_REUSED_GEN2_DIFFERENT_SIZE_PAYLOAD')).toBe(1)
       expect(h.files.get(`${PART_DIR}/${bk1Name}`) !== '').toBe(true)
-    } else {
+    } else if (bkMode === 'v1-store-linked-backup') {
       // c1Name is empty on disk with a v1 store tombstone `{ cleared: true, size: -1 }`
       // that shipped 0.1.3 parentFate(-1) treats as matching and drops linked bk1Name on.
       expect(origBk1Text.includes(`"parent":"${c1Name}"`)).toBe(true)
       h.files.set(`${PART_DIR}/${c1Name}`, '')
       h.store.set(`replayed:${TABLE}/${c1Name}`, { cleared: true, size: -1, files: [], written: [] })
+    } else if (bkMode === 'reused-rep-same-size') {
+      // Original c1Name and bk1Name remain intact, but rep1Name itself was overwritten
+      // by a different same-size generation carrying REP1_GEN2_UNIQ.
+      const repDataLines = origRep1Text
+        .trimEnd()
+        .split('\n')
+        .slice(0, -1)
+        .map(line => line.replace('C1_ORIG_UNIQUE', 'REP1_GEN2_UNIQ'))
+      const swappedRep1 = packFiles(repDataLines, pName)[0]!
+      expect(utf8Length(swappedRep1)).toBe(utf8Length(origRep1Text))
+      h.files.set(`${PART_DIR}/${rep1Name}`, swappedRep1)
+    } else if (bkMode === 'backup-truncated-after-read') {
+      // c1Name is empty; bk1Name is intact on first read inside hasVerifiedOrigOrBackup
+      // and then truncated immediately after that read returns.
+      h.files.set(`${PART_DIR}/${c1Name}`, '')
+      h.setRead(async p => {
+        if (!truncatedBkAfterRead && p === `${PART_DIR}/${bk1Name}`) {
+          truncatedBkAfterRead = true
+          h.files.set(p, '')
+          return origBk1Text
+        }
+        return undefined
+      })
+    } else {
+      // c1Name is empty; bk1Name is intact on disk, but carries an unfinished v1 store record.
+      h.files.set(`${PART_DIR}/${c1Name}`, '')
+      h.store.set(`replayed:${TABLE}/${bk1Name}`, {
+        fates: 'LL',
+        reasons: [],
+        refusals: [],
+        size: utf8Length(origBk1Text),
+        waits: false,
+        seq: 1,
+        files: [],
+        written: [],
+      })
     }
     // Make delivery fail with HTTP 503 while markDone still fails on resume so rep1 stays live on disk.
-    h.setFetch(async tags => (tags.includes('C1_ORIG_UNIQUE') ? { status: 503, text: 'upstream 503' } : null))
+    h.setFetch(async tags =>
+      tags.includes('C1_ORIG_UNIQUE') || tags.includes('REP1_GEN2_UNIQ') ? { status: 503, text: 'upstream 503' } : null,
+    )
 
-    // Pass 2 (0.1.4 auto resume): must NOT treat reused c1Name or empty/mismatched/exposed-linked bk1Name as proof;
-    // must guard rep1Name and stage a backup for rep1Name before failing markDone.
+    // Pass 2 (0.1.4 auto resume): must guard rep1Name and stage a backup for rep1Name before failing markDone.
     await h.newCurrent(`cur-rorig-${bkMode}-2`).backfill(['spill', 'retry'], 'auto')
+    h.setRead(null)
+    if (bkMode === 'backup-truncated-after-read') expect(truncatedBkAfterRead).toBe(true)
     const v2After = h.store.get(`replayed:v2:${TABLE}/${pName}`) as {
       backupFiles: { name: string; replaces: string }[]
     }
     const rep1Backup = v2After.backupFiles.find(b => b.replaces === rep1Name)
     expect(rep1Backup).not.toBeUndefined()
-    expect(h.files.get(`${PART_DIR}/${rep1Backup!.name}`)?.includes('C1_ORIG_UNIQUE')).toBe(true)
+    const expectedTag = bkMode === 'reused-rep-same-size' ? 'REP1_GEN2_UNIQ' : 'C1_ORIG_UNIQUE'
+    expect(h.files.get(`${PART_DIR}/${rep1Backup!.name}`)?.includes(expectedTag)).toBe(true)
 
-    // Pass 3 (0.1.3 force after lease expiry): retires pName with files: [] and drops rep1Name unsent
-    // (and in the linked-backup modes also drops parent-linked bk1Name unsent via 0.1.3 parentFate).
+    // Pass 3 (0.1.3 force after lease expiry): retires pName with files: [] and drops rep1Name unsent.
     h.setWrite(null)
     h.setFetch(null)
     h.advance(15 * 60 * 1000)
     await h.newDist(`dist-rorig-${bkMode}-1`).backfill(['spill', 'retry'], 'force')
     expect(h.files.get(`${PART_DIR}/${pName}`)).toBe('')
     expect(h.files.get(`${PART_DIR}/${rep1Name}`)).toBe('')
-    if (bkMode === 'linked-backup' || bkMode === 'diff-size-retired-linked-backup' || bkMode === 'v1-store-linked-backup') {
+    if (
+      bkMode === 'linked-backup' ||
+      bkMode === 'diff-size-retired-linked-backup' ||
+      bkMode === 'v1-store-linked-backup' ||
+      bkMode === 'backup-truncated-after-read' ||
+      bkMode === 'backup-v1-store-record'
+    ) {
       expect(h.files.get(`${PART_DIR}/${bk1Name}`)).toBe('')
       if (bkMode === 'linked-backup') expect(h.count('C1_REUSED_GEN2')).toBe(1)
     }
 
-    // Pass 4 (0.1.4 auto): recovers C1_ORIG_UNIQUE exactly once from rep1Backup.
+    // Pass 4 (0.1.4 auto): recovers expectedTag exactly once from rep1Backup.
     await h.newCurrent(`cur-rorig-${bkMode}-3`).backfill(['spill', 'retry'], 'auto')
     await h.newCurrent(`cur-rorig-${bkMode}-4`).backfill(['spill', 'retry'], 'auto')
-    expect(h.count('C1_ORIG_UNIQUE')).toBe(1)
+    expect(h.count(expectedTag)).toBe(1)
+    if (bkMode === 'reused-rep-same-size') expect(h.count('C1_ORIG_UNIQUE')).toBe(1)
     expect(h.liveDataFiles()).toEqual([])
   }
 })
@@ -3455,7 +3506,7 @@ test('interop: Phase 4 promotes replacement before truncating pre-existing backu
     expect(liveBks[0]![1].includes(`"parent":"${c1Name}"`)).toBe(false)
   }
 
-  // Arm 2: Foreign lease taken on old backup after Phase 4 pre-flight (during readIfPresent) blocks truncation.
+  // Arm 2: Foreign lease taken on old backup strictly AFTER Phase 4 pre-flight (during post-preflight readIfPresent) blocks truncation.
   {
     const h = makeInteropHarness()
     const pName = 'retry-20200101T000000001Z-p4-lease-p.jsonl'
@@ -3493,21 +3544,155 @@ test('interop: Phase 4 promotes replacement before truncating pre-existing backu
     )
     h.store.set(`replayed:${TABLE}/${pName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
     h.store.set(`replayed:v2:${TABLE}/${pName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [c1Name], written: [true] })
-    let leasedDuringRead = false
+    let standaloneWritten = false
+    let preflightChecked = false
+    let leasedAfterPreflight = false
+    h.setWrite(async (p, text) => {
+      if (p.includes('/spill-') && !p.includes('/outcome') && text.includes('C1_P4_LEASE') && !text.includes(`"parent":"${c1Name}"`)) {
+        standaloneWritten = true
+      }
+    })
+    h.setStoreGet(async k => {
+      if (standaloneWritten && !preflightChecked && k === `lease:${TABLE}/${bOldName}`) {
+        preflightChecked = true
+      }
+    })
     h.setRead(async p => {
-      if (!leasedDuringRead && p === `${PART_DIR}/${bOldName}`) {
-        leasedDuringRead = true
+      if (preflightChecked && !leasedAfterPreflight && p === `${PART_DIR}/${bOldName}`) {
+        leasedAfterPreflight = true
         h.store.set(`lease:${TABLE}/${bOldName}`, { by: 'foreign-bk', holder: 'fh', until: h.io.now() + 5 * 60 * 1000 })
       }
       return undefined
     })
     await h.newCurrent('cur-p4-lease-1').backfill(['spill', 'retry'], 'force')
-    expect(leasedDuringRead).toBe(true)
+    expect(standaloneWritten).toBe(true)
+    expect(preflightChecked).toBe(true)
+    expect(leasedAfterPreflight).toBe(true)
     // Foreign-leased bOld must remain untouched on disk and newly staged standalone copy rolled back.
     expect(h.files.get(`${PART_DIR}/${bOldName}`)).toBe(bOldText)
     const liveBks = [...h.files.entries()].filter(
       ([k, v]) => k.includes('/spill-') && !k.includes('/outcome') && !k.endsWith(`/${c1Name}`) && v.includes('C1_P4_LEASE'),
     )
+    expect(liveBks.length).toBe(1)
+    expect(liveBks[0]![0]).toBe(`${PART_DIR}/${bOldName}`)
+  }
+
+  // Arm 3: Different same-size generation swapped into bOldName during Phase 4's post-read lease lookup is NOT truncated.
+  {
+    const h = makeInteropHarness()
+    const pName = 'retry-20200101T000000001Z-p4-swap-p.jsonl'
+    const c1Name = 'spill-20200101T000000002Z-p4-swap-c1.jsonl'
+    const bOldName = 'spill-20200101T000000003Z-p4-swap-bk.jsonl'
+    const pText = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idB, 'B')])[0]!
+    const c1Text = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_P4_SWAP1')], pName)[0]!
+    const pSize = utf8Length(pText)
+    const c1Size = utf8Length(c1Text)
+    const bOldText = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', `dl:${c1Name}#1`, 'C1_P4_SWAP1', `${c1Name}#1`)], c1Name)[0]!
+    const bSwappedText = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', `dl:${c1Name}#1`, 'C1_P4_SWAP2', `${c1Name}#1`)], c1Name)[0]!
+    expect(utf8Length(bSwappedText)).toBe(utf8Length(bOldText))
+    h.files.set(`${PART_DIR}/${pName}`, pText)
+    h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
+    h.files.set(`${PART_DIR}/${bOldName}`, bOldText)
+    h.files.set(
+      `${PART_DIR}/outcome-done-old6g-${bOldName}`,
+      sealFile(
+        `${JSON.stringify({
+          size: utf8Length(bOldText),
+          sending: true,
+          by: 'old6g',
+          stagedFor: pName,
+          stagedForSize: pSize,
+          replaces: c1Name,
+          backup: true,
+          backupForSize: c1Size,
+          backupForFnv1a: fnv1a(c1Text),
+          backupFnv1a: fnv1a(bOldText),
+          attempt: 'old-p4-swap',
+        })}\n`,
+      ),
+    )
+    h.files.set(
+      `${PART_DIR}/outcome-done-prev6-${c1Name}`,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: c1Size + 77, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: h.io.now() })}\n`),
+    )
+    h.store.set(`replayed:${TABLE}/${pName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE}/${pName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [c1Name], written: [true] })
+    let standaloneWritten = false
+    let leaseLookups = 0
+    let swappedDuringLeaseCheck = false
+    h.setWrite(async (p, text) => {
+      if (p.includes('/spill-') && !p.includes('/outcome') && text.includes('C1_P4_SWAP1') && !text.includes(`"parent":"${c1Name}"`)) {
+        standaloneWritten = true
+      }
+    })
+    h.setStoreGet(async k => {
+      if (standaloneWritten && k === `lease:${TABLE}/${bOldName}`) {
+        leaseLookups += 1
+        // Lookup 1 is Phase 4 pre-flight; lookup 2 is the post-read `bLeaseNow` check right before truncate.
+        if (leaseLookups === 2 && !swappedDuringLeaseCheck) {
+          swappedDuringLeaseCheck = true
+          h.files.set(`${PART_DIR}/${bOldName}`, bSwappedText)
+        }
+      }
+    })
+    await h.newCurrent('cur-p4-swap-1').backfill(['retry'], 'force')
+    expect(swappedDuringLeaseCheck).toBe(true)
+    expect(h.files.get(`${PART_DIR}/${bOldName}`)).toBe(bSwappedText)
+    expect(h.count('C1_P4_SWAP2')).toBe(0)
+  }
+
+  // Arm 4: writeFile(bOld, '') throws BEFORE modifying bytes -> newly staged replacement IS rolled back (no duplicate).
+  {
+    const h = makeInteropHarness()
+    const pName = 'retry-20200101T000000001Z-p4-preerr-p.jsonl'
+    const c1Name = 'spill-20200101T000000002Z-p4-preerr-c1.jsonl'
+    const bOldName = 'spill-20200101T000000003Z-p4-preerr-bk.jsonl'
+    const pText = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idB, 'B')])[0]!
+    const c1Text = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', null, 'C1_P4_PREERR')], pName)[0]!
+    const pSize = utf8Length(pText)
+    const c1Size = utf8Length(c1Text)
+    const bOldText = packFiles([dlLine('spill', idB, 'B'), dlLine('spill', `dl:${c1Name}#1`, 'C1_P4_PREERR', `${c1Name}#1`)], c1Name)[0]!
+    h.files.set(`${PART_DIR}/${pName}`, pText)
+    h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
+    h.files.set(`${PART_DIR}/${bOldName}`, bOldText)
+    h.files.set(
+      `${PART_DIR}/outcome-done-old7g-${bOldName}`,
+      sealFile(
+        `${JSON.stringify({
+          size: utf8Length(bOldText),
+          sending: true,
+          by: 'old7g',
+          stagedFor: pName,
+          stagedForSize: pSize,
+          replaces: c1Name,
+          backup: true,
+          backupForSize: c1Size,
+          backupForFnv1a: fnv1a(c1Text),
+          backupFnv1a: fnv1a(bOldText),
+          attempt: 'old-p4-preerr',
+        })}\n`,
+      ),
+    )
+    h.files.set(
+      `${PART_DIR}/outcome-done-prev7-${c1Name}`,
+      sealFile(`${JSON.stringify({ fates: 'L', reasons: [], refusals: [], size: c1Size + 77, waits: false, seq: 1, files: [], written: [], retired: true, retiredAt: h.io.now() })}\n`),
+    )
+    h.store.set(`replayed:${TABLE}/${pName}`, { fates: 'LL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+    h.store.set(`replayed:v2:${TABLE}/${pName}`, { fates: 'LW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [c1Name], written: [true] })
+    let threwBeforeTruncate = false
+    h.setWrite(async (p, text) => {
+      if (p === `${PART_DIR}/${bOldName}` && text === '') {
+        threwBeforeTruncate = true
+        throw new Error('EACCES before modifying disk bytes')
+      }
+    })
+    await h.newCurrent('cur-p4-preerr-1').backfill(['spill', 'retry'], 'force')
+    expect(threwBeforeTruncate).toBe(true)
+    expect(h.files.get(`${PART_DIR}/${bOldName}`)).toBe(bOldText)
+    const liveBks = [...h.files.entries()].filter(
+      ([k, v]) => k.includes('/spill-') && !k.includes('/outcome') && !k.endsWith(`/${c1Name}`) && v.includes('C1_P4_PREERR'),
+    )
+    // Only the untouched bOld survives; the newly staged standalone replacement was rolled back.
     expect(liveBks.length).toBe(1)
     expect(liveBks[0]![0]).toBe(`${PART_DIR}/${bOldName}`)
   }
@@ -3653,5 +3838,88 @@ test('interop: unrelated parent leftover delivered by 0.1.3 does not release a r
   await h.newCurrent('cur-unrel-lp-3').backfill(['spill', 'retry'], 'auto')
   await h.newCurrent('cur-unrel-lp-4').backfill(['spill', 'retry'], 'auto')
   expect(h.count('C1_UNREL_LP')).toBe(1)
+  expect(h.liveDataFiles()).toEqual([])
+})
+
+test('interop: per-leftover scoping keeps unrelated 0.1.3-delivered parent leftover part from releasing a reconciled child backup', async () => {
+  const idA = 'a'.repeat(32)
+  const idR = 'd'.repeat(32)
+  const idX = 'e'.repeat(32)
+  const h = makeInteropHarness()
+  const pName = 'retry-20200101T000000001Z-part-scope-p.jsonl'
+  const c1Name = 'spill-20200101T000000002Z-part-scope-c1.jsonl'
+  // P emits TWO non-adopted leftover parts: L_rej (rejected row R_OVERLAP) and L_retry (503 row X_UNREL).
+  const pText = packFiles([dlLine('retry', idA, 'A'), dlLine('retry', idR, 'R_OVERLAP'), dlLine('retry', idX, 'X_UNREL')])[0]!
+  // C1 overlaps ONLY R_OVERLAP (in L_rej), NOT X_UNREL (in L_retry), plus its unique ID-less row.
+  const c1Text = packFiles([dlLine('spill', idR, 'R_OVERLAP'), dlLine('spill', null, 'C1_PART_SCOPED')], pName)[0]!
+  const pSize = utf8Length(pText)
+  h.files.set(`${PART_DIR}/${pName}`, pText)
+  h.files.set(`${PART_DIR}/${c1Name}`, c1Text)
+  h.store.set(`replayed:${TABLE}/${pName}`, { fates: 'LLL', reasons: [], refusals: [], size: pSize, waits: false, seq: 2, files: [], written: [] })
+  h.store.set(`replayed:v2:${TABLE}/${pName}`, { fates: 'LLW', reasons: [], refusals: [], size: pSize, waits: true, seq: 5, files: [c1Name], written: [true] })
+  h.setFetch(async tags => {
+    if (tags.includes('R_OVERLAP')) {
+      return { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: 'bad schema' }] }] }) }
+    }
+    if (tags.includes('X_UNREL')) return { status: 503, text: 'transient 503 on X_UNREL' }
+    return null
+  })
+  h.setStoreDelete(async k => {
+    if (k === `replayed:${TABLE}/${pName}`) throw new Error('v1 delete unavailable')
+  })
+  h.setStoreSet(async k => {
+    if (k === `replayed:${TABLE}/${pName}`) throw new Error('v1 neutralize unavailable')
+  })
+  h.setWrite(async (p, text) => {
+    if (p.includes('/outcome-done-') && p.endsWith(`-${pName}`) && text.includes('"retired":true')) throw new Error('stopped before retired mark')
+  })
+
+  await h.newCurrent('cur-pscope-1', { maxBatchRows: 1 }).backfill(['spill', 'retry'], 'force')
+  expect(h.count('C1_PART_SCOPED')).toBe(0)
+  const v2 = h.store.get(`replayed:v2:${TABLE}/${pName}`) as {
+    files: string[]
+    adopted: string[]
+    reconciled: { name: string; needsLeftovers?: boolean; leftoverParts?: string[] }[]
+    backupFiles: { name: string; replaces: string }[]
+  }
+  const rep1Name = v2.adopted[0]!
+  const lRejName = v2.files.find(n => !v2.adopted.includes(n) && n.startsWith('rejected-'))!
+  const lRetryName = v2.files.find(n => !v2.adopted.includes(n) && n.startsWith('retry-'))!
+  const bk1Name = v2.backupFiles.find(b => b.replaces === c1Name)!.name
+  expect(lRejName).not.toBeUndefined()
+  expect(lRetryName).not.toBeUndefined()
+  expect(v2.reconciled.find(rec => rec.name === c1Name)?.leftoverParts).toEqual([lRejName])
+
+  // Hold BK1; 0.1.3 force(['retry']) retires P via stuck v1 and genuinely delivers
+  // standalone unrelated L_retry (writing a digest-less 0.1.3 done mark for L_retry);
+  // 0.1.4 delivers R_rep1 and L_rej (explicit sourceFnv1a retirement marks).
+  h.setFetch(null)
+  h.setWrite(null)
+  h.setStoreDelete(null)
+  h.setStoreSet(null)
+  h.store.set(`lease:${TABLE}/${bk1Name}`, { by: 'hold-bk1', until: h.io.now() + 10 * 60 * 1000 })
+  await h.newDist('dist-pscope-1').backfill(['retry'], 'force')
+  expect(h.files.get(`${PART_DIR}/${pName}`)).toBe('')
+  expect(h.files.get(`${PART_DIR}/${lRetryName}`)).toBe('')
+  expect(h.count('X_UNREL')).toBe(1)
+  const lRetryDoneMarks = [...h.files.entries()].filter(
+    ([k, v]) => k.includes('/outcome-done-') && k.endsWith(`-${lRetryName}`) && v.includes('"retired":true'),
+  )
+  expect(lRetryDoneMarks.length).toBeGreaterThan(0)
+  expect(lRetryDoneMarks.every(([, v]) => !v.includes('"sourceFnv1a"'))).toBe(true)
+
+  const rOverlapBefore = h.count('R_OVERLAP')
+  await h.newCurrent('cur-pscope-2').backfill(['spill', 'rejected'], 'command')
+  expect(h.count('C1_PART_SCOPED')).toBe(1)
+  expect(h.count('R_OVERLAP')).toBe(rOverlapBefore + 1)
+  expect(h.files.get(`${PART_DIR}/${rep1Name}`)).toBe('')
+  expect(h.files.get(`${PART_DIR}/${lRejName}`)).toBe('')
+
+  // Release BK1's lease: 0.1.4 auto must drop BK1 via R_rep1 + L_rej's verified marks despite L_retry's digest-less 0.1.3 mark.
+  h.advance(15 * 60 * 1000)
+  await h.newCurrent('cur-pscope-3').backfill(['spill', 'retry', 'rejected'], 'auto')
+  await h.newCurrent('cur-pscope-4').backfill(['spill', 'retry', 'rejected'], 'auto')
+  expect(h.count('C1_PART_SCOPED')).toBe(1)
+  expect(h.count('R_OVERLAP')).toBe(rOverlapBefore + 1)
   expect(h.liveDataFiles()).toEqual([])
 })
